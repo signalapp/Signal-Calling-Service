@@ -1,0 +1,5 @@
+# https://docs.rs/crate/cargo-audit/0.14.1/source/audit.toml.example
+
+[output]
+deny = ["unmaintained", "unsound", "yanked"]
+quiet = false

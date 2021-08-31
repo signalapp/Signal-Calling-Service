@@ -1,0 +1,41 @@
+name: Continuous integration
+
+on: # rebuild any PRs and main branch changes
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions-rs/toolchain@v1
+      with:
+        override: true
+        profile: minimal
+        components: rustfmt, clippy
+    - name: Environment
+      run: rustup --version && cargo --version
+    - name: Build
+      run: cargo build
+    - name: Format
+      run: cargo fmt -- --check
+    - uses: actions-rs/clippy-check@v1
+      with:
+        name: Clippy
+        token: ${{ secrets.GITHUB_TOKEN }}
+        args: --all-targets -- -D warnings
+    - uses: actions-rs/clippy-check@v1
+      with:
+        name: Clippy (generic UDP)
+        token: ${{ secrets.GITHUB_TOKEN }}
+        args: --no-default-features -- -D warnings
+    - name: Clippy (fuzz targets)
+      run: cargo clippy --all-targets -- -D warnings
+      working-directory: fuzz
+      env:
+        RUSTFLAGS: --cfg fuzzing
+    - name: Test
+      run: cargo test

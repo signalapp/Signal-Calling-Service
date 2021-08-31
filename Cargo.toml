@@ -1,0 +1,94 @@
+#
+# Copyright 2019-2021 Signal Messenger, LLC
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+
+[package]
+name = "calling_server"
+version = "1.0.0"
+authors = ["Peter Thatcher <peter@signal.org>", "Jim Gustafson <jim@signal.org>", "Jordan Rose <jrose@signal.org>", "Alan Evans <alan@signal.org>"]
+edition = "2018"
+description = "Media forwarding server for group calls."
+license = "AGPL-3.0-only"
+
+[dependencies]
+# For error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# For logging and command line operations
+log = "0.4"
+env_logger = "0.8"
+structopt = "0.3"
+
+# For runtime and threading
+tokio = { version = "1", features = ["full"] }
+parking_lot = "0.11"
+lazy_static = "1.4"
+futures = "0.3"
+num_cpus = "1.13"
+
+# For http
+warp = "0.3"
+
+# For general conversions
+base64 = "0.13"
+hex = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+rcgen = "0.8"
+prost = "0.7"
+
+# For common
+sha2 = "0.9"
+
+# For ICE
+crc = "1.8"
+hmac = "0.11"
+sha-1 = "0.9"
+
+# For DTLS
+aes = "0.7"
+aes-gcm = "0.9"
+rand = "0.8"
+p256 = { version = "0.8", features = ["ecdh", "ecdsa", "pkcs8"] }
+ecdsa = { version = "0.11", features = ["sign"] }
+# Already needed by p256. But we also need it for certificate parsing.
+der = "0.3"
+
+# For DTLS and RTP
+zeroize = "1.4.1"
+
+# For congestion control
+tokio-stream = { version = "0.1", features = ["sync"] }
+async-stream = "0.3"
+# For congestion-control-specific helpers
+pin-project = "1.0"
+
+# For low-level UDP sockets
+nix = { version = "0.20", optional = true }
+
+# For current process memory stats
+psutil = { version = "3.2", default-features = false, features = ["process"] }
+
+[dev-dependencies]
+unzip3 = "1.0"
+
+# For simulating passage of time in timing tests
+mock_instant = { version = "0.2" }
+hex-literal = "0.3.2"
+
+# For matching WebRTC's randomness
+rand_distr = "0.4.1"
+
+# For testing warp responses
+serde_json = "1.0"
+
+[profile.release]
+debug = 1
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+
+[features]
+default = ["epoll"]
+epoll = ["nix"]
