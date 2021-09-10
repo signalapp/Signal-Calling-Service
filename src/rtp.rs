@@ -1369,14 +1369,18 @@ impl Endpoint {
             .remember_used(seqnum_in_header)
         {
             SequenceNumberReuse::UsedBefore => {
-                warn!("Dropping SRTP packet because we've already seen this seqnum ({}) from this ssrc ({})", seqnum_in_header, header.ssrc);
+                trace!("Dropping SRTP packet because we've already seen this seqnum ({}) from this ssrc ({})", seqnum_in_header, header.ssrc);
+                event!("calling.srtp.seqnum_drop.reused");
                 return None;
             }
-            SequenceNumberReuse::TooOldToKnow => {
-                warn!(
-                    "Dropping SRTP packet because it's such an old seqnum ({}) from this ssrc ({})",
-                    seqnum_in_header, header.ssrc
+            SequenceNumberReuse::TooOldToKnow { delta } => {
+                trace!(
+                    "Dropping SRTP packet because it's such an old seqnum ({}) from this ssrc ({}), delta: {}",
+                    seqnum_in_header,
+                    header.ssrc,
+                    delta
                 );
+                sampling_histogram!("calling.srtp.seqnum_drop.old", || delta.try_into().unwrap());
                 return None;
             }
             SequenceNumberReuse::NotUsedBefore => {
@@ -1640,7 +1644,7 @@ impl Endpoint {
 enum SequenceNumberReuse {
     UsedBefore,
     NotUsedBefore,
-    TooOldToKnow,
+    TooOldToKnow { delta: u64 },
 }
 
 /// Keeps track of a sliding window of history of whether
@@ -1671,7 +1675,9 @@ impl SequenceNumberReuseDetector {
     fn remember_used(&mut self, seqnum: FullSequenceNumber) -> SequenceNumberReuse {
         if seqnum < self.first {
             // seqnum is before the first in the history, so we can't know if it's been used before.
-            return SequenceNumberReuse::TooOldToKnow;
+            return SequenceNumberReuse::TooOldToKnow {
+                delta: self.first - seqnum,
+            };
         }
         let last = self
             .first
@@ -2327,10 +2333,31 @@ mod test {
 
         assert_eq!(NotUsedBefore, detector.remember_used(132));
         assert_eq!(UsedBefore, detector.remember_used(132));
-        assert_eq!(TooOldToKnow, detector.remember_used(1));
-        assert_eq!(TooOldToKnow, detector.remember_used(2));
-        assert_eq!(TooOldToKnow, detector.remember_used(3));
-        assert_eq!(TooOldToKnow, detector.remember_used(4));
+        let expected_first = 132 - 127;
+        assert_eq!(
+            TooOldToKnow {
+                delta: expected_first - 1
+            },
+            detector.remember_used(1)
+        );
+        assert_eq!(
+            TooOldToKnow {
+                delta: expected_first - 2
+            },
+            detector.remember_used(2)
+        );
+        assert_eq!(
+            TooOldToKnow {
+                delta: expected_first - 3
+            },
+            detector.remember_used(3)
+        );
+        assert_eq!(
+            TooOldToKnow {
+                delta: expected_first - 4
+            },
+            detector.remember_used(4)
+        );
 
         assert_eq!(NotUsedBefore, detector.remember_used(5));
         assert_eq!(UsedBefore, detector.remember_used(5));
@@ -2340,7 +2367,13 @@ mod test {
         assert_eq!(NotUsedBefore, detector.remember_used(100000));
         assert_eq!(UsedBefore, detector.remember_used(100001));
         assert_eq!(UsedBefore, detector.remember_used(100000));
-        assert_eq!(TooOldToKnow, detector.remember_used(132));
+        let expected_first = 100001 - 127;
+        assert_eq!(
+            TooOldToKnow {
+                delta: expected_first - 132
+            },
+            detector.remember_used(132)
+        );
     }
 
     #[test]
