@@ -168,7 +168,7 @@ checksum = "b700ce4376041dcd0a327fd0097c41095743c4c8af8887265942faf1100bd040"
 
 [[package]]
 name = "calling_server"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
