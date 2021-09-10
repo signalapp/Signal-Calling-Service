@@ -35,6 +35,29 @@ use feedback_rtts::*;
 mod stream;
 use stream::StreamExt as OurStreamExt;
 
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub initial_target_send_rate: DataRate,
+    pub min_target_send_rate: DataRate,
+    pub max_target_send_rate: DataRate,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            initial_target_send_rate: DataRate::from_kbps(1500),
+            min_target_send_rate: DataRate::from_kbps(5),
+            max_target_send_rate: DataRate::from_kbps(30000),
+        }
+    }
+}
+
+impl Config {
+    fn clamp_target_send_rate(&self, target_send_rate: DataRate) -> DataRate {
+        target_send_rate.clamp(self.min_target_send_rate, self.max_target_send_rate)
+    }
+}
+
 pub struct CongestionController {
     acks_sender1: Sender<Vec<Ack>>,
     acks_sender2: Sender<Vec<Ack>>,
@@ -43,7 +66,7 @@ pub struct CongestionController {
 }
 
 impl CongestionController {
-    pub fn new(initial_target_send_rate: DataRate, now: Instant) -> Self {
+    pub fn new(config: Config, now: Instant) -> Self {
         //                                       Acks
         //                                        |
         //             +--------------------------+--------------------------+
@@ -77,7 +100,7 @@ impl CongestionController {
         let delay_directions =
             calculate_delay_directions(ack_reports3.flat_map(futures::stream::iter));
         let target_send_rates = calculate_target_send_rates(
-            initial_target_send_rate,
+            config,
             now,
             feedback_rtts.latest_only(),
             acked_rates.latest_only(),
@@ -111,15 +134,12 @@ impl CongestionController {
 
 // Yields target send rates
 fn calculate_target_send_rates(
-    initial_target_send_rate: DataRate,
+    config: Config,
     start_time: Instant,
     feedback_rtts: impl Stream<Item = Duration>,
     acked_rates: impl Stream<Item = DataRate>,
     delay_directions: impl Stream<Item = (Instant, DelayDirection)>,
 ) -> impl Stream<Item = DataRate> {
-    // TODO: Maybe make some of these configurable (especially min/max bitrates)
-    let min_target_send_rate = DataRate::from_kbps(5);
-    let max_target_send_rate = DataRate::from_kbps(5000);
     let multiplicative_increase_per_second: f64 = 0.08;
     let min_multiplicative_increase = DataRate::from_kbps(1);
     let additive_increase_per_rtt = DataSize::from_bytes(1200);
@@ -129,21 +149,12 @@ fn calculate_target_send_rates(
     let max_rtt_for_decrease = Duration::from_millis(200);
     let decrease_from_acked_rate_multiplier = 0.85;
 
-    // If we didn't have an initial_rate, we'd have to do something like this:
-    // let first_acked_rate_time = None
-    // if target_send_rate.is_none() && acked_rate.is_some() {
-    //     let acked_rate_age = now - first_acked_rate_time.get_or_insert(now);
-    //     if acked_rate_age > Duration::from_secs(5) {
-    //         target_send_rate = acked_rate;
-    //     }
-    // }
-
     stream! {
         let mut rtt = Duration::from_millis(100); // This shouldn't ever be used.
         let mut acked_rate = None;
         let mut previous_direction = None;
         let mut acked_rate_when_overusing = RateAverager::new();
-        let mut target_send_rate = initial_target_send_rate;
+        let mut target_send_rate = config.initial_target_send_rate;
         let mut target_send_rate_updated = start_time;
 
         pin_mut!(feedback_rtts);
@@ -206,8 +217,7 @@ fn calculate_target_send_rates(
                     }
                     // Don't end up decreasing when we were supposed to increase.
                     increased_rate = max(target_send_rate, increased_rate);
-                    target_send_rate =
-                        increased_rate.clamp(min_target_send_rate, max_target_send_rate);
+                    target_send_rate = config.clamp_target_send_rate(increased_rate);
                     target_send_rate_updated = now;
                     yield target_send_rate;
                 }
@@ -233,8 +243,7 @@ fn calculate_target_send_rates(
                             // Don't accidentally increase the estimated rate!
                             decreased_rate = min(target_send_rate, decreased_rate);
 
-                            target_send_rate =
-                                decreased_rate.clamp(min_target_send_rate, max_target_send_rate);
+                            target_send_rate = config.clamp_target_send_rate(decreased_rate);
                             target_send_rate_updated = now;
                             yield target_send_rate;
 
@@ -247,8 +256,7 @@ fn calculate_target_send_rates(
                     } else {
                         // We're increasing before we even have an acked rate.  Aggressively reduce.
                         let half_rate = target_send_rate / 2.0;
-                        target_send_rate =
-                            half_rate.clamp(min_target_send_rate, max_target_send_rate);
+                        target_send_rate = config.clamp_target_send_rate(half_rate);
                         target_send_rate_updated = now;
                         yield target_send_rate;
                     }
@@ -276,20 +284,27 @@ mod calculate_target_send_rates_tests {
         }))
     }
 
+    fn config() -> Config {
+        Config {
+            initial_target_send_rate: DataRate::from_kbps(100),
+            ..Default::default()
+        }
+    }
+
     // These are glass-box tests; they should not fail if the implementation is changed,
     // but additional tests may be necessary to regain coverage.
     // Many of them include contrived scenarios that aren't possible with real Acks.
 
     #[test]
     fn decrease_holds_steady() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             futures::stream::repeat(Duration::from_millis(100)),
-            futures::stream::repeat(initial_rate),
+            futures::stream::repeat(config.initial_target_send_rate),
             futures::stream::repeat((start_time, DelayDirection::Decreasing)).take(100),
         );
 
@@ -300,7 +315,7 @@ mod calculate_target_send_rates_tests {
 
         // Try again without any acks.
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config,
             start_time,
             futures::stream::repeat(Duration::from_millis(100)),
             futures::stream::pending(),
@@ -315,11 +330,11 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn increase_without_acks_cuts_aggressively() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config,
             start_time,
             futures::stream::repeat(Duration::from_millis(100)),
             futures::stream::pending(),
@@ -338,14 +353,14 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn increase_is_okay_for_short_intervals_if_acks_are_keeping_up() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             futures::stream::repeat(Duration::from_millis(100)),
-            futures::stream::repeat(initial_rate),
+            futures::stream::repeat(config.initial_target_send_rate),
             // "short intervals" in this case is "zero interval"
             futures::stream::repeat((start_time, DelayDirection::Increasing)).take(5),
         );
@@ -358,15 +373,15 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn increase_over_long_intervals_cuts_based_on_ack_rate() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::from_millis(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             futures::stream::repeat(interval),
-            futures::stream::repeat(initial_rate),
+            futures::stream::repeat(config.initial_target_send_rate),
             instants_at_regular_intervals(start_time + interval, interval)
                 .zip(futures::stream::repeat(DelayDirection::Increasing))
                 .take(10),
@@ -384,15 +399,15 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn increase_with_low_ack_rate_cuts_based_on_ack_rate() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::from_millis(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             futures::stream::repeat(interval),
-            futures::stream::repeat(initial_rate / 2.0),
+            futures::stream::repeat(config.initial_target_send_rate / 2.0),
             futures::stream::repeat((start_time, DelayDirection::Increasing)).take(5),
         );
 
@@ -408,12 +423,12 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn increase_with_single_high_ack_rate_should_still_cut() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::from_millis(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config,
             start_time,
             futures::stream::repeat(interval),
             futures::stream::iter([10, 10, 10, 10, 100]).map(DataRate::from_kbps),
@@ -437,12 +452,12 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn increase_should_never_grow_the_target_rate() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::from_millis(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config,
             start_time,
             futures::stream::repeat(interval),
             // ...no matter how nonsense our acks are.
@@ -464,12 +479,12 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn increase_rtt_determines_interval() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::from_millis(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             futures::stream::repeat(interval),
             futures::stream::repeat(DataRate::from_kbps(100)),
@@ -485,7 +500,7 @@ mod calculate_target_send_rates_tests {
         );
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             futures::stream::repeat(interval / 2),
             futures::stream::repeat(DataRate::from_kbps(100)),
@@ -506,7 +521,7 @@ mod calculate_target_send_rates_tests {
 
         // There is a minimum, though...
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             futures::stream::repeat(Duration::ZERO),
             futures::stream::repeat(DataRate::from_kbps(100)),
@@ -520,7 +535,7 @@ mod calculate_target_send_rates_tests {
 
         // ...as well as a maximum.
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config,
             start_time,
             futures::stream::repeat(Duration::from_secs(1)),
             futures::stream::repeat(DataRate::from_kbps(100)),
@@ -542,8 +557,8 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn increase_can_cut_by_average_if_current_ack_rate_is_too_high() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::from_millis(100);
 
         let (rates, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
@@ -557,7 +572,7 @@ mod calculate_target_send_rates_tests {
         .unzip3();
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config,
             start_time,
             futures::stream::repeat(interval),
             futures::stream::iter(rates).map(DataRate::from_kbps),
@@ -577,12 +592,12 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn steady_should_grow_multiplicatively_without_acks() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::from_millis(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config,
             start_time,
             futures::stream::repeat(interval),
             futures::stream::pending(),
@@ -605,12 +620,12 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn steady_growth_is_limited_by_ack_rate() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::from_millis(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             futures::stream::repeat(interval),
             futures::stream::repeat(DataRate::from_kbps(67)),
@@ -631,7 +646,7 @@ mod calculate_target_send_rates_tests {
 
         // Try again with an even lower ack rate.
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config,
             start_time,
             futures::stream::repeat(interval),
             futures::stream::repeat(DataRate::from_kbps(50)),
@@ -654,12 +669,12 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn steady_growth_has_maximum() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::from_millis(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config,
             start_time,
             futures::stream::repeat(interval),
             futures::stream::pending(),
@@ -694,15 +709,15 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn steady_should_grow_additively_after_overuse() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::from_millis(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             futures::stream::repeat(interval),
-            futures::stream::repeat(initial_rate),
+            futures::stream::repeat(config.initial_target_send_rate),
             instants_at_regular_intervals(start_time + interval, interval)
                 .zip(
                     futures::stream::once(ready(DelayDirection::Increasing))
@@ -725,17 +740,17 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn steady_should_grow_additively_after_overuse_with_minimum() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::from_millis(100);
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             // One proper RTT for the "Increasing" feedback, then some ridiculous RTT for "Steady"
             futures::stream::once(ready(interval))
                 .chain(futures::stream::repeat(Duration::from_secs(10))),
-            futures::stream::repeat(initial_rate),
+            futures::stream::repeat(config.initial_target_send_rate),
             instants_at_regular_intervals(start_time + interval, interval)
                 .zip(
                     futures::stream::once(ready(DelayDirection::Increasing))
@@ -758,8 +773,8 @@ mod calculate_target_send_rates_tests {
 
     #[test]
     fn acked_rate_resets_on_outliers() {
+        let config = config();
         let start_time = Instant::now();
-        let initial_rate = DataRate::from_kbps(100);
         let interval = Duration::SECOND;
 
         let (rates, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
@@ -773,7 +788,7 @@ mod calculate_target_send_rates_tests {
         .unzip3();
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             futures::stream::repeat(interval),
             futures::stream::iter(rates).map(DataRate::from_kbps),
@@ -801,7 +816,7 @@ mod calculate_target_send_rates_tests {
         .unzip3();
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config.clone(),
             start_time,
             futures::stream::repeat(interval),
             futures::stream::iter(rates).map(DataRate::from_kbps),
@@ -834,7 +849,7 @@ mod calculate_target_send_rates_tests {
         .unzip3();
 
         let stream = calculate_target_send_rates(
-            initial_rate,
+            config,
             start_time,
             futures::stream::repeat(interval),
             futures::stream::iter(rates).map(DataRate::from_kbps),

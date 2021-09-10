@@ -23,7 +23,7 @@ use crate::{
     common::{DataRate, Duration, Instant, TwoGenerationCacheWithManualRemoveOld},
     config,
     connection::{self, Connection, HandleRtcpResult, PacketToSend},
-    dtls, ice,
+    dtls, googcc, ice,
     ice::BindingRequest,
     metrics::{Histogram, Timer},
     rtp,
@@ -231,6 +231,10 @@ impl Sfu {
 
         let initial_target_send_rate =
             DataRate::from_kbps(self.config.initial_target_send_rate_kbps);
+        let min_target_send_rate = DataRate::from_kbps(self.config.min_target_send_rate_kbps);
+        let max_target_send_rate = DataRate::from_kbps(self.config.max_target_send_rate_kbps);
+        let default_requested_max_send_rate =
+            DataRate::from_kbps(self.config.default_requested_max_send_rate_kbps);
 
         trace!("  {:25}{}", "server_ice_ufrag:", server_ice_ufrag);
         trace!("  {:25}{}", "server_ice_pwd:", server_ice_pwd);
@@ -256,6 +260,7 @@ impl Sfu {
                     user_id.clone(),
                     Duration::from_millis(active_speaker_message_interval_ms),
                     initial_target_send_rate,
+                    default_requested_max_send_rate,
                     now,
                     SystemTime::now(),
                 )))
@@ -296,7 +301,11 @@ impl Sfu {
                 &self.config.server_certificate_der[..],
                 &self.config.server_private_key_der[..],
                 ack_ssrc,
-                initial_target_send_rate,
+                googcc::Config {
+                    initial_target_send_rate,
+                    min_target_send_rate,
+                    max_target_send_rate,
+                },
                 inactivity_timeout,
                 now,
             ))),

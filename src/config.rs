@@ -53,6 +53,25 @@ pub struct Config {
     #[structopt(long, default_value = "1500")]
     pub initial_target_send_rate_kbps: u64,
 
+    /// The min target send rate for sending.
+    /// This affects the congestion controller (googcc).
+    #[structopt(long, default_value = "5")]
+    pub min_target_send_rate_kbps: u64,
+
+    /// The max target send rate for sending.
+    /// This affects the congestion controller (googcc)
+    /// and indirectly the maximum that any client can receive
+    /// no matter how much the client requests.
+    #[structopt(long, default_value = "30000")]
+    pub max_target_send_rate_kbps: u64,
+
+    /// If the client doesn't request a max send rate,
+    /// use this as the max send rate.
+    /// Affects the allocation of the target send rate,
+    /// not the calculation of the of the target send rate.
+    #[structopt(long, default_value = "5000")]
+    pub default_requested_max_send_rate_kbps: u64,
+
     /// Timer tick period for operating on the Sfu state (ms).
     #[structopt(long, default_value = "100")]
     pub tick_interval_ms: u64,
@@ -135,6 +154,9 @@ pub(crate) fn default_test_config() -> Config {
         max_clients_per_call: 8,
         udp_threads: Some(1),
         initial_target_send_rate_kbps: 1500,
+        min_target_send_rate_kbps: 5,
+        max_target_send_rate_kbps: 30000,
+        default_requested_max_send_rate_kbps: 20000,
         tick_interval_ms: 100,
         diagnostics_interval_secs: None,
         active_speaker_message_interval_ms: 1000,

@@ -233,6 +233,7 @@ pub struct Call {
     created: SystemTime, // For knowing how old the call is
     active_speaker_message_interval: Duration,
     initial_target_send_rate: DataRate,
+    default_requested_max_send_rate: DataRate,
 
     /// Clients (AKA devices) that have joined the call
     clients: Vec<Client>,
@@ -272,6 +273,7 @@ impl Call {
         creator_id: UserId,
         active_speaker_message_interval: Duration,
         initial_target_send_rate: DataRate,
+        default_requested_max_send_rate: DataRate,
         now: Instant,
         system_now: SystemTime,
     ) -> Self {
@@ -282,6 +284,7 @@ impl Call {
             created: system_now,
             active_speaker_message_interval,
             initial_target_send_rate,
+            default_requested_max_send_rate,
 
             clients: Vec::new(),
             client_added_or_removed: now,
@@ -341,6 +344,7 @@ impl Call {
             user_id,
             active_speaker_id,
             resolution_request_id,
+            self.default_requested_max_send_rate,
             now,
         ));
         // An update message to clients about clients will be sent at the next tick().
@@ -408,6 +412,7 @@ impl Call {
         incoming_rtp: rtp::Packet<&mut [u8]>,
         now: Instant,
     ) -> Result<Vec<RtpToSend>, Error> {
+        let default_requested_max_send_rate = self.default_requested_max_send_rate;
         let sender = self
             .find_client_mut(sender_demux_id)
             .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
@@ -437,9 +442,13 @@ impl Call {
                             }
                         })
                         .collect();
+                    sender.requested_max_send_rate = video_request_proto
+                        .max_kbps
+                        .map(|kbps| DataRate::from_kbps(kbps as u64))
+                        .unwrap_or(default_requested_max_send_rate);
                     sender.video_request_proto = Some(video_request_proto);
                     // We reallocate immediately to make a more pleasant expereience for the user
-                    // (no extra delay for selecting a higher resolution)
+                    // (no extra delay for selecting a higher resolution or requesting a new max send rate)
                     let target_send_rate = sender.target_send_rate;
                     self.allocate_target_send_rate(sender_demux_id, target_send_rate, now);
                 }
@@ -532,13 +541,14 @@ impl Call {
             }
         }
 
-        let mut rtp_to_send = vec![];
-        self.send_update_proto_to_all_clients(active_speaker_just_changed, &mut rtp_to_send, now);
-
         // A change to the layer rate or resolution may impact how the receiver allocates the target sent rate.
         // So can a change in active speaker.
         // So we should reallocate after changing the incoming rates above and active speaker above.
         self.reallocate_target_send_rates_if_its_been_too_long(now);
+
+        // Do this after reallocation so it has the lastest info about what is being forwarded.
+        let mut rtp_to_send = vec![];
+        self.send_update_proto_to_all_clients(active_speaker_just_changed, &mut rtp_to_send, now);
 
         // Reallocation can change what key frames to send, so we should do this after reallocating.
         let key_frame_requests_to_send = self.send_key_frame_requests_if_its_been_too_long(now);
@@ -649,9 +659,10 @@ impl Call {
             .map(|video| video.sender_demux_id)
             .filter(|sender_demux_id| *sender_demux_id != receiver.demux_id)
             .collect();
-        let ideal_send_rate = ideal_send_rate(&allocatable_videos);
+        let ideal_send_rate =
+            ideal_send_rate(&allocatable_videos, receiver.requested_max_send_rate);
         let allocated_video_by_sender_demux_id =
-            allocate_send_rate(new_target_send_rate, allocatable_videos);
+            allocate_send_rate(new_target_send_rate, ideal_send_rate, allocatable_videos);
         let allocated_send_rate = allocated_video_by_sender_demux_id
             .values()
             .map(|allocated| allocated.rate)
@@ -778,12 +789,30 @@ impl Call {
         }
 
         if update.device_joined_or_left.is_some() || update.speaker.is_some() {
-            let mut update_rtp_payload: Vec<u8> = Vec::with_capacity(update.encoded_len());
-            update
-                .encode(&mut update_rtp_payload)
-                .expect("Encode protobuf to client");
-
             for client in &mut self.clients {
+                update.forwarding_video = Some(protos::sfu_to_device::ForwardingVideo {
+                    demux_ids: client
+                        .video_forwarder_by_sender_demux_id
+                        .iter()
+                        .filter_map(|(demux_id, forwarder)| {
+                            // We don't want the clients to draw an empty box when a key frame might be coming soon,
+                            // so we count it as forwarding if we're still waiting for a key frame.
+                            if forwarder.forwarding_ssrc().is_some()
+                                || forwarder.needs_key_frame().is_some()
+                            {
+                                Some(demux_id.as_u32())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                });
+
+                let mut update_rtp_payload: Vec<u8> = Vec::with_capacity(update.encoded_len());
+                update
+                    .encode(&mut update_rtp_payload)
+                    .expect("Encode protobuf to client");
+
                 let seqnum: rtp::FullSequenceNumber = client.next_server_to_client_data_rtp_seqnum;
                 client.next_server_to_client_data_rtp_seqnum += 1;
                 let timestamp = seqnum as rtp::TruncatedTimestamp;
@@ -924,6 +953,7 @@ struct Client {
 
     // Updated by Call::set_target_send_rate
     target_send_rate: DataRate,
+    requested_max_send_rate: DataRate,
     send_rate_allocated: Instant,
 
     // Updated by send rate allocation, which is affected by
@@ -956,6 +986,7 @@ impl Client {
         user_id: UserId,
         active_speaker_id: String,
         resolution_request_id: u64,
+        requested_max_send_rate: DataRate,
         now: Instant,
     ) -> Self {
         Self {
@@ -975,6 +1006,7 @@ impl Client {
             requested_height_by_sender_resolution_request_id: HashMap::new(),
 
             target_send_rate: DataRate::default(),
+            requested_max_send_rate,
             send_rate_allocated: now,
             send_rate_reset: now,
 
@@ -1241,20 +1273,23 @@ fn ideal_video_layer_index(video: &AllocatableVideo) -> Option<usize> {
     }
 }
 
-fn ideal_send_rate(videos: &[AllocatableVideo]) -> DataRate {
-    videos
+fn ideal_send_rate(videos: &[AllocatableVideo], max_requested_send_rate: DataRate) -> DataRate {
+    let allocatable: DataRate = videos
         .iter()
         .filter_map(|video| {
             let ideal_layer_index = ideal_video_layer_index(video)?;
             Some(video.layers[ideal_layer_index].incoming_rate)
         })
-        .sum()
+        .sum();
+    min(allocatable, max_requested_send_rate)
 }
 
 fn allocate_send_rate(
     target_send_rate: DataRate,
+    ideal_send_rate: DataRate,
     mut videos: Vec<AllocatableVideo>,
 ) -> HashMap<DemuxId, AllocatedVideo> {
+    let allocatable_rate = min(target_send_rate, ideal_send_rate);
     let mut allocated_by_sender_demux_id: HashMap<DemuxId, AllocatedVideo> = HashMap::new();
     let mut allocated_rate = DataRate::default();
 
@@ -1296,11 +1331,11 @@ fn allocate_send_rate(
                 .unwrap_or_default();
             let rate_increase = layer_rate.saturating_sub(lower_layer_rate);
             let increased_allocated_rate = allocated_rate + rate_increase;
-            if increased_allocated_rate > target_send_rate {
+            if increased_allocated_rate > allocatable_rate {
                 trace!(
                     "Skipped layer that's too big ({}/{} allocated and {}={}-{} increase)",
                     allocated_rate.as_kbps(),
-                    target_send_rate.as_kbps(),
+                    allocatable_rate.as_kbps(),
                     rate_increase.as_kbps(),
                     layer_rate.as_kbps(),
                     lower_layer_rate.as_kbps()
@@ -2108,22 +2143,25 @@ mod call_tests {
         fn allocate(
             target_send_rate_kbps: u64,
             videos: &[&AllocatableVideo],
+            max_requested_send_rate_kbps: u64,
         ) -> (u64, Vec<(u32, usize, u64)>) {
             let videos: Vec<AllocatableVideo> = videos.iter().copied().cloned().collect();
             let target_send_rate = DataRate::from_kbps(target_send_rate_kbps);
-            let ideal_rate = ideal_send_rate(&videos);
-            let mut allocated: Vec<_> = allocate_send_rate(target_send_rate, videos)
-                .iter()
-                .map(|(demux_id, allocated)| {
-                    (
-                        u32::from(*demux_id),
-                        allocated.layer_index,
-                        allocated.rate.as_kbps(),
-                    )
-                })
-                .collect();
+            let max_requested_send_rate = DataRate::from_kbps(max_requested_send_rate_kbps);
+            let ideal_send_rate = ideal_send_rate(&videos, max_requested_send_rate);
+            let mut allocated: Vec<_> =
+                allocate_send_rate(target_send_rate, ideal_send_rate, videos)
+                    .iter()
+                    .map(|(demux_id, allocated)| {
+                        (
+                            u32::from(*demux_id),
+                            allocated.layer_index,
+                            allocated.rate.as_kbps(),
+                        )
+                    })
+                    .collect();
             allocated.sort_unstable();
-            (ideal_rate.as_kbps(), allocated)
+            (ideal_send_rate.as_kbps(), allocated)
         }
 
         let nothing = layer(0, VideoHeight::from(0));
@@ -2136,27 +2174,28 @@ mod call_tests {
         let video2 = video(DemuxId(2), [&layer0, &layer1, &nothing]);
         let video3 = video(DemuxId(3), [&layer0, &layer1, &layer2]);
         let video4 = video(DemuxId(4), [&layer0, &layer1, &layer2]);
+        let no_max = 100000;
 
         // Can't send and nothing to receive
-        assert_eq!((0, vec![]), allocate(0, &[]));
+        assert_eq!((0, vec![]), allocate(0, &[], no_max));
 
         // Can send but nothing to receive
-        assert_eq!((0, vec![]), allocate(1000, &[]));
-        assert_eq!((0, vec![]), allocate(1000, &[&video0]));
+        assert_eq!((0, vec![]), allocate(1000, &[], no_max));
+        assert_eq!((0, vec![]), allocate(1000, &[&video0], no_max));
 
         // Can send and receive but nothing requested.
-        assert_eq!((0, vec![]), allocate(1000, &[&video1]));
+        assert_eq!((0, vec![]), allocate(1000, &[&video1], no_max));
 
         // Can receive and requested, but nothing to send.
         assert_eq!(
             (200, vec![]),
-            allocate(0, &[&request(VideoHeight::from(1080), &video1)])
+            allocate(0, &[&request(VideoHeight::from(1080), &video1)], no_max)
         );
 
         // Finally can send, receive, and have requested
         assert_eq!(
             (200, vec![(1, 0, 200)]),
-            allocate(1000, &[&request(VideoHeight::from(1080), &video1)])
+            allocate(1000, &[&request(VideoHeight::from(1080), &video1)], no_max)
         );
 
         // Verify we fill lower layers first, starting with highest resolution requested.
@@ -2168,7 +2207,8 @@ mod call_tests {
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
                     &request(VideoHeight::from(720), &video3)
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2179,7 +2219,8 @@ mod call_tests {
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
                     &request(VideoHeight::from(720), &video3)
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2190,7 +2231,8 @@ mod call_tests {
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
                     &request(VideoHeight::from(720), &video3)
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2201,7 +2243,8 @@ mod call_tests {
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
                     &request(VideoHeight::from(720), &video3)
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2212,7 +2255,8 @@ mod call_tests {
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
                     &request(VideoHeight::from(720), &video3)
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2223,7 +2267,22 @@ mod call_tests {
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
                     &request(VideoHeight::from(720), &video3)
-                ]
+                ],
+                no_max
+            )
+        );
+
+        // We ignore higher bitrates available if we request a max
+        assert_eq!(
+            (1200, vec![(1, 0, 200), (2, 0, 200), (3, 1, 800)]),
+            allocate(
+                3000,
+                &[
+                    &request(VideoHeight::from(180), &video1),
+                    &request(VideoHeight::from(360), &video2),
+                    &request(VideoHeight::from(720), &video3)
+                ],
+                1200
             )
         );
 
@@ -2236,7 +2295,8 @@ mod call_tests {
                     &request(VideoHeight::from(1080), &video1),
                     &request(VideoHeight::from(1081), &video2),
                     &request(VideoHeight::from(1082), &video3)
-                ]
+                ],
+                no_max
             )
         );
 
@@ -2249,7 +2309,8 @@ mod call_tests {
                     &request(VideoHeight::from(1), &video1),
                     &request(VideoHeight::from(2), &video2),
                     &request(VideoHeight::from(3), &video3)
-                ]
+                ],
+                no_max
             )
         );
 
@@ -2262,7 +2323,8 @@ mod call_tests {
                     &request(VideoHeight::from(1080), &interesting(1, &video1)),
                     &request(VideoHeight::from(1080), &interesting(2, &video2)),
                     &request(VideoHeight::from(1080), &interesting(3, &video3)),
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2273,7 +2335,8 @@ mod call_tests {
                     &request(VideoHeight::from(1080), &interesting(1, &video1)),
                     &request(VideoHeight::from(1080), &interesting(2, &video2)),
                     &request(VideoHeight::from(1080), &interesting(3, &video3)),
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2285,7 +2348,8 @@ mod call_tests {
                     &request(VideoHeight::from(1080), &interesting(2, &video2)),
                     &request(VideoHeight::from(1080), &interesting(3, &video4)),
                     &request(VideoHeight::from(1080), &interesting(4, &video3)),
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2300,7 +2364,8 @@ mod call_tests {
                     &request(VideoHeight::from(1080), &interesting(2, &video2)),
                     &request(VideoHeight::from(1080), &interesting(3, &video4)),
                     &request(VideoHeight::from(1080), &interesting(4, &video3)),
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2310,7 +2375,8 @@ mod call_tests {
                 &[
                     &request(VideoHeight::from(1080), &interesting(3, &video4)),
                     &request(VideoHeight::from(1080), &interesting(4, &video3)),
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2320,7 +2386,8 @@ mod call_tests {
                 &[
                     &request(VideoHeight::from(1080), &interesting(3, &video4)),
                     &request(VideoHeight::from(1080), &interesting(4, &video3)),
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2330,7 +2397,8 @@ mod call_tests {
                 &[
                     &request(VideoHeight::from(1080), &interesting(3, &video4)),
                     &request(VideoHeight::from(1080), &interesting(4, &video3)),
-                ]
+                ],
+                no_max
             )
         );
 
@@ -2343,7 +2411,8 @@ mod call_tests {
                     &request(VideoHeight::from(1), &interesting(1, &video1)),
                     &request(VideoHeight::from(2), &interesting(2, &video2)),
                     &request(VideoHeight::from(3), &interesting(3, &video3)),
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2354,7 +2423,8 @@ mod call_tests {
                     &request(VideoHeight::from(1), &interesting(1, &video1)),
                     &request(VideoHeight::from(2), &interesting(2, &video2)),
                     &request(VideoHeight::from(3), &interesting(3, &video3)),
-                ]
+                ],
+                no_max
             )
         );
         assert_eq!(
@@ -2365,7 +2435,8 @@ mod call_tests {
                     &request(VideoHeight::from(1), &interesting(1, &video1)),
                     &request(VideoHeight::from(2), &interesting(2, &video2)),
                     &request(VideoHeight::from(3), &interesting(3, &video3)),
-                ]
+                ],
+                no_max
             )
         );
 
@@ -2383,15 +2454,27 @@ mod call_tests {
 
         assert_eq!(
             (0, vec![]),
-            allocate(2000, &[&request(VideoHeight::from(0), &screenshare),])
+            allocate(
+                2000,
+                &[&request(VideoHeight::from(0), &screenshare),],
+                no_max
+            )
         );
         assert_eq!(
             (1500, vec![(4, 0, 100)]),
-            allocate(600, &[&request(VideoHeight::from(1), &screenshare),])
+            allocate(
+                600,
+                &[&request(VideoHeight::from(1), &screenshare),],
+                no_max
+            )
         );
         assert_eq!(
             (1500, vec![(4, 1, 1500)]),
-            allocate(2000, &[&request(VideoHeight::from(1), &screenshare),])
+            allocate(
+                2000,
+                &[&request(VideoHeight::from(1), &screenshare),],
+                no_max
+            )
         );
     }
 
@@ -2399,11 +2482,13 @@ mod call_tests {
         let creator_id = UserId::from(b"creator_id".to_vec());
         let active_speaker_message_interval = Duration::from_secs(1);
         let initial_target_send_rate = DataRate::from_kbps(600);
+        let default_requested_max_send_rate = DataRate::from_kbps(20000);
         Call::new(
             LoggableCallId::from(call_id),
             creator_id,
             active_speaker_message_interval,
             initial_target_send_rate,
+            default_requested_max_send_rate,
             now,
             system_now,
         )
@@ -2544,6 +2629,7 @@ mod call_tests {
             speaker: active_speaker_id.map(|active_speaker_id| protos::sfu_to_device::Speaker {
                 id: Some(active_speaker_id.to_owned()),
             }),
+            forwarding_video: Some(protos::sfu_to_device::ForwardingVideo::default()),
             ..Default::default()
         }
     }
@@ -2562,7 +2648,19 @@ mod call_tests {
                     }],
                     ..Default::default()
                 }),
-                ..Default::default()
+            })
+            .as_slice(),
+        )
+    }
+
+    fn create_max_receive_rate_request(max_receive_rate: DataRate) -> rtp::Packet<Vec<u8>> {
+        create_server_to_client_rtp(
+            1,
+            encode_proto(protos::DeviceToSfu {
+                video_request: Some(protos::device_to_sfu::VideoRequestMessage {
+                    max_kbps: Some(max_receive_rate.as_kbps() as u32),
+                    ..Default::default()
+                }),
             })
             .as_slice(),
         )
@@ -3296,6 +3394,127 @@ mod call_tests {
                 )
             ],
             rtp_to_send
+        );
+    }
+
+    #[test]
+    fn send_forwarding_video_updates() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+        let get_forwading_video_demux_ids =
+            |from_server: &[RtpToSend], receiver_demux_id: DemuxId| -> Option<Vec<DemuxId>> {
+                let (_demux_id, rtp) = from_server
+                    .iter()
+                    .find(|(demux_id, _rtp)| *demux_id == receiver_demux_id)?;
+                let proto = protos::SfuToDevice::decode(rtp.payload()).ok()?;
+                let mut demux_ids: Vec<DemuxId> = proto
+                    .forwarding_video?
+                    .demux_ids
+                    .iter()
+                    .map(|demux_id| DemuxId::try_from(*demux_id).unwrap())
+                    .collect();
+                demux_ids.sort();
+                Some(demux_ids)
+            };
+
+        let mut call = create_call(b"call_id", now, system_now);
+        let demux_id1 = add_client(&mut call, "1", 1, at(1));
+        let demux_id2 = add_client(&mut call, "2", 2, at(2));
+        let demux_id3 = add_client(&mut call, "3", 3, at(3));
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(4));
+        // Nothing to forward yet
+        assert_eq!(
+            Some(vec![]),
+            get_forwading_video_demux_ids(&from_server, demux_id1)
+        );
+        assert_eq!(
+            Some(vec![]),
+            get_forwading_video_demux_ids(&from_server, demux_id2)
+        );
+        assert_eq!(
+            Some(vec![]),
+            get_forwading_video_demux_ids(&from_server, demux_id3)
+        );
+
+        // Send some video from client2 so the incoming rate goes up.
+        for seqnum in 0..10 {
+            let mut to_server = create_video_rtp(
+                demux_id2,
+                LayerId::Video0,
+                1,
+                1,
+                seqnum,
+                Some(PixelSize {
+                    width: 640,
+                    height: 480,
+                }),
+            );
+            call.handle_rtp(demux_id2, to_server.borrow_mut(), at(5))
+                .unwrap();
+        }
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(1006));
+        assert_eq!(
+            Some(vec![demux_id2]),
+            get_forwading_video_demux_ids(&from_server, demux_id1)
+        );
+        assert_eq!(
+            Some(vec![]),
+            get_forwading_video_demux_ids(&from_server, demux_id2)
+        );
+        assert_eq!(
+            Some(vec![demux_id2]),
+            get_forwading_video_demux_ids(&from_server, demux_id3)
+        );
+
+        // Make sure we keep forwarding even after getting a key frame
+        let mut to_server = create_video_rtp(
+            demux_id2,
+            LayerId::Video0,
+            1,
+            1,
+            11,
+            Some(PixelSize {
+                width: 640,
+                height: 480,
+            }),
+        );
+        call.handle_rtp(demux_id2, to_server.borrow_mut(), at(1007))
+            .unwrap();
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(2008));
+        assert_eq!(
+            Some(vec![demux_id2]),
+            get_forwading_video_demux_ids(&from_server, demux_id1)
+        );
+        assert_eq!(
+            Some(vec![]),
+            get_forwading_video_demux_ids(&from_server, demux_id2)
+        );
+        assert_eq!(
+            Some(vec![demux_id2]),
+            get_forwading_video_demux_ids(&from_server, demux_id3)
+        );
+
+        // Request a really low max recv rate to prevent things from being forwarded
+        let mut to_server = create_max_receive_rate_request(DataRate::from_kbps(1));
+        call.handle_rtp(demux_id1, to_server.borrow_mut(), at(2009))
+            .unwrap();
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(3010));
+        assert_eq!(
+            Some(vec![]),
+            get_forwading_video_demux_ids(&from_server, demux_id1)
+        );
+        assert_eq!(
+            Some(vec![]),
+            get_forwading_video_demux_ids(&from_server, demux_id2)
+        );
+        assert_eq!(
+            Some(vec![demux_id2]),
+            get_forwading_video_demux_ids(&from_server, demux_id3)
         );
     }
 }

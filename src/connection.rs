@@ -114,9 +114,9 @@ struct Rtp {
 
 struct CongestionControl {
     // Immutable
-    /// Initial value used in the congestion controller and also
-    /// the value used when the congestion controller is reset.
-    initial_target_send_rate: DataRate,
+    /// Initial config used in the congestion controller and also
+    /// the config used when the congestion controller is reset.
+    config: googcc::Config,
 
     // Mutable
     controller: googcc::CongestionController,
@@ -149,7 +149,7 @@ impl Connection {
         server_certificate_der: &'static [u8],
         server_private_key_der: &'static [u8],
         ack_ssrc: rtp::Ssrc,
-        initial_target_send_rate: DataRate,
+        googcc_config: googcc::Config,
         inactivity_timeout: Duration,
         now: Instant,
     ) -> Self {
@@ -178,9 +178,9 @@ impl Connection {
                 nacks_sent: None,
             },
             congestion_control: CongestionControl {
-                initial_target_send_rate,
+                config: googcc_config.clone(),
 
-                controller: googcc::CongestionController::new(initial_target_send_rate, now),
+                controller: googcc::CongestionController::new(googcc_config, now),
                 controller_reset: now,
 
                 padding_interval: None,
@@ -499,10 +499,8 @@ impl Connection {
     }
 
     pub fn reset_congestion_controller(&mut self, now: Instant) {
-        self.congestion_control.controller = googcc::CongestionController::new(
-            self.congestion_control.initial_target_send_rate,
-            now,
-        );
+        self.congestion_control.controller =
+            googcc::CongestionController::new(self.congestion_control.config.clone(), now);
         self.congestion_control.controller_reset = now;
     }
 
@@ -575,7 +573,10 @@ mod connection_tests {
         let server_certificate_der = b"fake server cert der";
         let server_private_key_der = b"fake server private key der";
         let ack_ssrc = 0xACC;
-        let initial_target_send_rate = DataRate::from_kbps(500);
+        let googcc_config = googcc::Config {
+            initial_target_send_rate: DataRate::from_kbps(500),
+            ..Default::default()
+        };
         let inactivity_timeout = Duration::from_secs(30);
         Connection::new(
             ice_request_username.to_vec(),
@@ -585,7 +586,7 @@ mod connection_tests {
             server_certificate_der,
             server_private_key_der,
             ack_ssrc,
-            initial_target_send_rate,
+            googcc_config,
             inactivity_timeout,
             now,
         )
