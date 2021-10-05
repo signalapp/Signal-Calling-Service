@@ -3,3 +3,8 @@
 [output]
 deny = ["unmaintained", "unsound", "yanked"]
 quiet = false
+
+[advisories]
+ignore = [
+    "RUSTSEC-2021-0119" # Ignore advisory for nix (dependency of psutil); getgrouplist is not used.
+]
