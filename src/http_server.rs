@@ -267,7 +267,7 @@ fn parse_and_authenticate(
     config: &'static config::Config,
     authorization_header: &str,
 ) -> Result<(sfu::UserId, sfu::CallId)> {
-    let (_, password) = parse_basic_authorization_header(&authorization_header)?;
+    let (_, password) = parse_basic_authorization_header(authorization_header)?;
     authenticate(config, &password)
 }
 

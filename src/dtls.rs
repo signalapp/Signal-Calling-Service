@@ -971,8 +971,7 @@ fn write_server_finished_packet<'a>(
     server_salt: [u8; SALT_LEN],
 ) -> impl Writer + 'a {
     let change_cipher_spec = write_change_cipher_spec_record();
-    let server_finished =
-        write_server_finished_record(&server_verify_data, &server_key, server_salt);
+    let server_finished = write_server_finished_record(server_verify_data, server_key, server_salt);
     (change_cipher_spec, server_finished)
 }
 
@@ -989,7 +988,7 @@ fn write_server_finished_record<'a>(
 ) -> impl Writer + 'a {
     let epoch = 1;
     let seqnum = 5;
-    let body = write_finished_handshake_message(seqnum, &server_verify_data);
+    let body = write_finished_handshake_message(seqnum, server_verify_data);
     write_encrypted_record(
         epoch,
         U48::from(seqnum),

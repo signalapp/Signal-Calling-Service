@@ -21,7 +21,7 @@ fuzz_target!(|data: Vec<u8>| {
             let _ = ice_binding_request.verify_hmac(pwd);
 
             VerifiedBindingRequest::new_for_fuzzing(&ice_binding_request)
-                .to_binding_response(&ice_request_username, pwd);
+                .to_binding_response(ice_request_username, pwd);
         }
 
         Ok(())

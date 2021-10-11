@@ -128,7 +128,7 @@ impl KeysAndSalts {
     }
 
     fn derive_key_from_master(master: &KeyAndSalt, label: u8) -> Key {
-        let cipher = Aes128::new(&GenericArray::from_slice(&master.key[..]));
+        let cipher = Aes128::new(GenericArray::from_slice(&master.key[..]));
         let mut derived = Zeroizing::new([0; SRTP_KEY_LEN]);
         derived[..SRTP_SALT_LEN].copy_from_slice(&master.salt);
         derived[7] ^= label;
@@ -521,7 +521,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         assert!(self.encrypted, "Can't decrypt an unencrypted packet");
         let (cipher, nonce, aad, ciphertext, tag) = self.prepare_for_crypto(key, salt);
         let nonce = GenericArray::from_slice(&nonce);
-        let tag = GenericArray::from_slice(&tag);
+        let tag = GenericArray::from_slice(tag);
         cipher
             .decrypt_in_place_detached(nonce, aad, ciphertext, tag)
             .ok()?;
@@ -536,7 +536,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         let (cipher, nonce, aad, plaintext, tag) = self.prepare_for_crypto(key, salt);
         let nonce = GenericArray::from_slice(&nonce);
         let computed_tag = cipher
-            .encrypt_in_place_detached(&nonce, aad, plaintext)
+            .encrypt_in_place_detached(nonce, aad, plaintext)
             .ok()?;
         tag.copy_from_slice(&computed_tag);
         self.encrypted = true;
@@ -876,7 +876,7 @@ impl<'packet> ControlPacket<'packet> {
             let (cipher, nonce, aad, ciphertext, tag) =
                 Self::prepare_for_crypto(serialized, sender_ssrc, srtcp_index, key, salt)?;
             let nonce = GenericArray::from_slice(&nonce);
-            let tag = GenericArray::from_slice(&tag);
+            let tag = GenericArray::from_slice(tag);
             let _ = cipher
                 .decrypt_in_place_detached(nonce, &aad, ciphertext, tag)
                 .ok()?;
@@ -1721,8 +1721,8 @@ mod test {
     #[test]
     fn test_packet_classification_rtp() {
         fn run_tests(packet: &mut [u8], is_rtcp: bool) {
-            assert_eq!(!is_rtcp, looks_like_rtp(&packet));
-            assert_eq!(is_rtcp, looks_like_rtcp(&packet));
+            assert_eq!(!is_rtcp, looks_like_rtp(packet));
+            assert_eq!(is_rtcp, looks_like_rtcp(packet));
 
             assert!(!looks_like_rtp(&packet[..RTP_PAYLOAD_TYPE_OFFSET]));
             assert!(!looks_like_rtcp(&packet[..RTCP_PAYLOAD_TYPE_OFFSET]));
@@ -1739,20 +1739,20 @@ mod test {
             );
 
             let version = std::mem::replace(&mut packet[0], 0);
-            assert!(!looks_like_rtp(&packet));
-            assert!(!looks_like_rtcp(&packet));
+            assert!(!looks_like_rtp(packet));
+            assert!(!looks_like_rtcp(packet));
             packet[0] = version;
 
             // Bottom six bits are ignored.
             packet[0] ^= 0b11_1111;
-            assert_eq!(!is_rtcp, looks_like_rtp(&packet));
-            assert_eq!(is_rtcp, looks_like_rtcp(&packet));
+            assert_eq!(!is_rtcp, looks_like_rtp(packet));
+            assert_eq!(is_rtcp, looks_like_rtcp(packet));
             packet[0] ^= 0b11_1111;
 
             // Top bit of payload type is ignored.
             packet[RTP_PAYLOAD_TYPE_OFFSET] ^= 0b1000_0000;
-            assert_eq!(!is_rtcp, looks_like_rtp(&packet));
-            assert_eq!(is_rtcp, looks_like_rtcp(&packet));
+            assert_eq!(!is_rtcp, looks_like_rtp(packet));
+            assert_eq!(is_rtcp, looks_like_rtcp(packet));
             packet[RTP_PAYLOAD_TYPE_OFFSET] ^= 0b1000_0000;
         }
 

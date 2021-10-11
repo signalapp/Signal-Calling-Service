@@ -259,8 +259,8 @@ impl Connection {
         // Once the handshake completes, use the DTLS-SRTP master key.
         let response_packet = self.dtls.handshake_state.process_packet(
             incoming_packet,
-            &self.dtls.server_certificate_der,
-            &self.dtls.server_private_key_der,
+            self.dtls.server_certificate_der,
+            self.dtls.server_private_key_der,
             &self.dtls.client_fingerprint,
             system_now,
             rng,

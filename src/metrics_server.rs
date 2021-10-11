@@ -29,7 +29,7 @@ pub async fn start(
     sfu: Arc<Mutex<Sfu>>,
     shutdown_signal_rx: Receiver<()>,
 ) -> Result<()> {
-    match Datadog::new(&config) {
+    match Datadog::new(config) {
         None => {
             metrics!().disable();
             info!("metrics server not started because not configured, metrics disabled");

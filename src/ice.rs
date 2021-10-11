@@ -208,7 +208,7 @@ impl<'a> BindingRequest<'a> {
 
     pub fn verify_hmac(&self, pwd: &[u8]) -> Result<VerifiedBindingRequest, MacError> {
         Self::calculate_hmac(self.packet, &self.ranges, pwd)
-            .verify(&self.hmac())
+            .verify(self.hmac())
             .map(|_| VerifiedBindingRequest::new(self))
     }
 

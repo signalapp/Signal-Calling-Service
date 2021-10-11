@@ -79,7 +79,7 @@ fn accumulate_ack_groups(
                         || (arrival_gap_is_small && arrival_duration_wouldnt_be_big)
                     {
                         // Combine into existing group
-                        group.add(&next);
+                        group.add(next);
                     } else {
                         // Start a new group.
                         yield (group, next.clone());

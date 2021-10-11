@@ -379,7 +379,7 @@ mod tests {
         let report = reporter.report();
 
         assert_eq!("Mocked Time", report.name);
-        assert_histogram_eq(&&report.histogram, vec![(2000, 2), (5000, 1)]);
+        assert_histogram_eq(&report.histogram, vec![(2000, 2), (5000, 1)]);
         assert_eq!(Precision::Millisecond, report.sample_precision());
     }
 
@@ -401,7 +401,7 @@ mod tests {
         let report = reporter.report();
 
         assert_eq!("Mocked Time", report.name);
-        assert_histogram_eq(&&report.histogram, vec![(500, 1)]);
+        assert_histogram_eq(&report.histogram, vec![(500, 1)]);
         assert_eq!(Precision::Centisecond, report.sample_precision());
     }
 
@@ -423,7 +423,7 @@ mod tests {
         let report = reporter.report();
 
         assert_eq!("Mocked Time", report.name);
-        assert_histogram_eq(&&report.histogram, vec![(3621, 1)]);
+        assert_histogram_eq(&report.histogram, vec![(3621, 1)]);
         assert_eq!(Precision::Microsecond, report.sample_precision());
     }
 
@@ -445,7 +445,7 @@ mod tests {
         let report = reporter.report();
 
         assert_eq!("Mocked Time", report.name);
-        assert_histogram_eq(&&report.histogram, vec![(123, 1)]);
+        assert_histogram_eq(&report.histogram, vec![(123, 1)]);
         assert_eq!(Precision::Nanosecond, report.sample_precision());
     }
 
@@ -466,7 +466,7 @@ mod tests {
 
         let report = reporter.report();
 
-        assert_histogram_eq(&&report.histogram, vec![(1000, 1)]);
+        assert_histogram_eq(&report.histogram, vec![(1000, 1)]);
     }
 
     #[test]
@@ -486,7 +486,7 @@ mod tests {
 
         let report = reporter.report();
 
-        assert_histogram_eq(&&report.histogram, vec![(1000, 1)]);
+        assert_histogram_eq(&report.histogram, vec![(1000, 1)]);
     }
 
     #[test]

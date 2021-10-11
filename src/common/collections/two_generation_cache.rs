@@ -94,7 +94,7 @@ where
             removed_gen
                 .drain()
                 .map(|(k, _v)| k)
-                .filter(|k| !self.generation1.contains_key(&k))
+                .filter(|k| !self.generation1.contains_key(k))
                 .collect()
         } else {
             vec![]

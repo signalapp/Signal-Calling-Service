@@ -450,7 +450,7 @@ impl UdpServerState {
 
                     // Mark clients to be cleaned up next tick.
                     for addr in tick_update.expired_client_addrs.iter() {
-                        socket_lock.mark_closed(&addr);
+                        socket_lock.mark_closed(addr);
                     }
                     persistent_tick_state.clients_that_left_previously =
                         tick_update.expired_client_addrs;

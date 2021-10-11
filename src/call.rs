@@ -1029,7 +1029,7 @@ impl Client {
         incoming_rtp: &rtp::Packet<&[u8]>,
         now: Instant,
     ) -> Option<vp8::ParsedHeader> {
-        let incoming_vp8 = vp8::ParsedHeader::read(&incoming_rtp.payload()).ok()?;
+        let incoming_vp8 = vp8::ParsedHeader::read(incoming_rtp.payload()).ok()?;
         let incoming_layer_id = LayerId::from_ssrc(incoming_rtp.ssrc());
         let incoming_video = match incoming_layer_id {
             Some(LayerId::Video0) => &mut self.incoming_video0,
@@ -1664,7 +1664,7 @@ impl Vp8SimulcastRtpForwarder {
                 );
                 // If the sub fails, it's because the incoming packet predates the switch (before the key frame)
                 let outgoing =
-                    first_outgoing.checked_add(&incoming.checked_sub(&first_incoming)?)?;
+                    first_outgoing.checked_add(&incoming.checked_sub(first_incoming)?)?;
                 self.max_outgoing = self.max_outgoing.max(&outgoing);
 
                 if incoming_vp8.is_key_frame {
