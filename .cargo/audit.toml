@@ -1,10 +1,12 @@
-# https://docs.rs/crate/cargo-audit/0.14.1/source/audit.toml.example
-
 [output]
 deny = ["unmaintained", "unsound", "yanked"]
 quiet = false
 
 [advisories]
 ignore = [
-    "RUSTSEC-2021-0119" # Ignore advisory for nix (dependency of psutil); getgrouplist is not used.
+    # Ignore advisory for chrono and time; the issue depends on modifying the environment across threads. It's not impossible but it's very unlikely in our use cases.
+    "RUSTSEC-2020-0071",
+    "RUSTSEC-2020-0159",
+    # Ignore advisory for nix (dependency of psutil); getgrouplist is not used.
+    "RUSTSEC-2021-0119",
 ]
