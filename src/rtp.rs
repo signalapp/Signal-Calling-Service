@@ -214,7 +214,7 @@ impl Header {
                 // 2-byte header extension is only needed for extensions of size = 0
                 // size > 16, and we don't use any such extensions.
                 warn!(
-                    "Invalid RTP: not using 1-byte extensions; profile = {}",
+                    "Invalid RTP: not using 1-byte extensions; profile = 0x{:x}",
                     extensions_profile
                 );
                 warn!("{}", hex::encode(&packet[..packet.len().min(100)]));
