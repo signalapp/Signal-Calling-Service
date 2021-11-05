@@ -434,7 +434,7 @@ impl Call {
                         .iter()
                         .filter_map(|request| {
                             if let (Some(resolution_request_id), Some(height)) =
-                                (request.id, request.height)
+                                (request.short_device_id, request.height)
                             {
                                 Some((resolution_request_id, VideoHeight::from(height as u16)))
                             } else {
@@ -782,7 +782,7 @@ impl Call {
         {
             if let Some((_demux_id, active_speaker_id)) = self.active_speaker_ids.as_ref() {
                 update.speaker = Some(protos::sfu_to_device::Speaker {
-                    id: Some(active_speaker_id.clone()),
+                    long_device_id: Some(active_speaker_id.clone()),
                 });
             }
             self.active_speaker_update_sent = now;
@@ -2627,7 +2627,7 @@ mod call_tests {
                 None
             },
             speaker: active_speaker_id.map(|active_speaker_id| protos::sfu_to_device::Speaker {
-                id: Some(active_speaker_id.to_owned()),
+                long_device_id: Some(active_speaker_id.to_owned()),
             }),
             forwarding_video: Some(protos::sfu_to_device::ForwardingVideo::default()),
             ..Default::default()
@@ -2643,7 +2643,7 @@ mod call_tests {
             encode_proto(protos::DeviceToSfu {
                 video_request: Some(protos::device_to_sfu::VideoRequestMessage {
                     requests: vec![protos::device_to_sfu::video_request_message::VideoRequest {
-                        id: Some(10_000_000_000 + (demux_id_without_shifting as u64)),
+                        short_device_id: Some(10_000_000_000 + (demux_id_without_shifting as u64)),
                         height: Some(height as u32),
                     }],
                     ..Default::default()

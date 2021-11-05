@@ -23,6 +23,8 @@ RUN cargo build --release
 
 # Copy the source and build the calling-server proper.
 COPY src ./src
+COPY protobuf ./protobuf
+COPY build.rs ./
 RUN cargo build --release
 
 # Export the calling-server executable if the '-o' option is specified.

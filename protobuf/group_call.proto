@@ -1,0 +1,49 @@
+/*
+ * Copyright 2019-2021 Signal Messenger, LLC
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
+syntax = "proto2";
+
+package group_call;
+
+message DeviceToSfu {
+  message VideoRequestMessage {
+    message VideoRequest {
+      // Functionally the same as a DemuxId, but oddly different.
+      optional uint64 short_device_id = 1;
+      optional uint32 height = 2;
+    }
+
+    repeated VideoRequest requests = 1;
+    reserved 2; // tag 2 was previously "max_count", which is no longer used
+    optional uint32 max_kbps = 3;
+  }
+
+  optional VideoRequestMessage video_request = 1;
+}
+
+message SfuToDevice {
+  message DeviceJoinedOrLeft {
+  }
+
+  message Speaker {
+    // Functionally the same as a DemuxId, but oddly different.
+    optional string long_device_id = 1;
+  } 
+
+  // The resolution the SFU wants you to send to it to satisfy the requests
+  // of all of the other devices.
+  message VideoRequest {
+    optional uint32 height = 1;
+  }
+
+  message ForwardingVideo {
+    repeated uint32 demux_ids = 1;
+  }
+
+  optional VideoRequest video_request               = 2;
+  optional Speaker speaker                          = 4;
+  optional DeviceJoinedOrLeft device_joined_or_left = 6;
+  optional ForwardingVideo forwarding_video         = 7;
+}

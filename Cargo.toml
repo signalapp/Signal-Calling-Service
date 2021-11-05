@@ -70,6 +70,9 @@ nix = { version = "0.20", optional = true }
 # For current process memory stats
 psutil = { version = "3.2", default-features = false, features = ["process"] }
 
+[build-dependencies]
+prost-build = "0.7"
+
 [dev-dependencies]
 unzip3 = "1.0"
 
