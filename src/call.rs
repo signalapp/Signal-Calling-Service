@@ -412,11 +412,6 @@ impl Call {
         incoming_rtp: rtp::Packet<&mut [u8]>,
         now: Instant,
     ) -> Result<Vec<RtpToSend>, Error> {
-        let default_requested_max_send_rate = self.default_requested_max_send_rate;
-        let sender = self
-            .find_client_mut(sender_demux_id)
-            .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
-
         if incoming_rtp.ssrc() == CLIENT_SERVER_DATA_SSRC
             && incoming_rtp.payload_type() == CLIENT_SERVER_DATA_PAYLOAD_TYPE
         {
@@ -425,18 +420,36 @@ impl Call {
             let proto = protos::DeviceToSfu::decode(incoming_rtp.payload())
                 .map_err(|_| Error::InvalidClientToServerProtobuf)?;
 
+            // Snapshot these so we can get a mutable reference to the sender.
+            let default_requested_max_send_rate = self.default_requested_max_send_rate;
+            let demux_id_by_resolution_request_id: HashMap<u64, DemuxId> = self
+                .clients
+                .iter()
+                .map(|client| (client.resolution_request_id, client.demux_id))
+                .collect();
+
+            let sender = self
+                .find_client_mut(sender_demux_id)
+                .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
+
             // The client resends this periodically, so we don't want to do anything
             // if it didn't change.
             if proto.video_request != sender.video_request_proto {
                 if let Some(video_request_proto) = proto.video_request {
-                    sender.requested_height_by_sender_resolution_request_id = video_request_proto
+                    sender.requested_height_by_demux_id = video_request_proto
                         .requests
                         .iter()
                         .filter_map(|request| {
-                            if let (Some(resolution_request_id), Some(height)) =
-                                (request.short_device_id, request.height)
-                            {
-                                Some((resolution_request_id, VideoHeight::from(height as u16)))
+                            let raw_height = request.height?;
+                            let height = VideoHeight::from(raw_height as u16);
+
+                            if let Some(raw_demux_id) = request.demux_id {
+                                let demux_id = DemuxId::try_from(raw_demux_id).ok()?;
+                                Some((demux_id, height))
+                            } else if let Some(resolution_request_id) = request.short_device_id {
+                                demux_id_by_resolution_request_id
+                                    .get(&resolution_request_id)
+                                    .map(|demux_id| (*demux_id, height))
                             } else {
                                 None
                             }
@@ -466,6 +479,10 @@ impl Call {
                 sender_demux_id,
             ));
         }
+
+        let sender = self
+            .find_client_mut(sender_demux_id)
+            .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
 
         let incoming_rtp = incoming_rtp.borrow();
         let incoming_vp8 = if incoming_rtp.payload_type() == rtp::VP8_PAYLOAD_TYPE {
@@ -640,8 +657,8 @@ impl Call {
                         sender.incoming_video2.as_allocatable_layer(),
                     ],
                     requested_height: receiver
-                        .requested_height_by_sender_resolution_request_id
-                        .get(&sender.resolution_request_id)
+                        .requested_height_by_demux_id
+                        .get(&sender.demux_id)
                         .copied()
                         .unwrap_or_else(|| VideoHeight::from(1)),
                     interesting: sender.became_active_speaker,
@@ -780,9 +797,10 @@ impl Call {
             || update.device_joined_or_left.is_some()
             || (now >= self.active_speaker_update_sent + self.active_speaker_message_interval)
         {
-            if let Some((_demux_id, active_speaker_id)) = self.active_speaker_ids.as_ref() {
+            if let Some((demux_id, active_speaker_id)) = self.active_speaker_ids.as_ref() {
                 update.speaker = Some(protos::sfu_to_device::Speaker {
                     long_device_id: Some(active_speaker_id.clone()),
+                    demux_id: Some(demux_id.as_u32()),
                 });
             }
             self.active_speaker_update_sent = now;
@@ -949,7 +967,7 @@ struct Client {
 
     // Updated by incoming video requests
     video_request_proto: Option<protos::device_to_sfu::VideoRequestMessage>,
-    requested_height_by_sender_resolution_request_id: HashMap<u64, VideoHeight>,
+    requested_height_by_demux_id: HashMap<DemuxId, VideoHeight>,
 
     // Updated by Call::set_target_send_rate
     target_send_rate: DataRate,
@@ -1003,7 +1021,7 @@ impl Client {
             became_active_speaker: None,
 
             video_request_proto: None,
-            requested_height_by_sender_resolution_request_id: HashMap::new(),
+            requested_height_by_demux_id: HashMap::new(),
 
             target_send_rate: DataRate::default(),
             requested_max_send_rate,
@@ -1137,11 +1155,7 @@ impl Client {
             ideal_send_rate: self.ideal_send_rate,
             allocated_send_rate: self.allocated_send_rate,
             padding_send_rate: self.padding_send_rate,
-            max_requested_height: self
-                .requested_height_by_sender_resolution_request_id
-                .values()
-                .max()
-                .copied(),
+            max_requested_height: self.requested_height_by_demux_id.values().max().copied(),
         }
     }
 }
@@ -2618,7 +2632,7 @@ mod call_tests {
 
     fn create_sfu_to_device(
         joined_or_left: bool,
-        active_speaker_id: Option<&str>,
+        active_speaker_ids: Option<(&str, DemuxId)>,
     ) -> protos::SfuToDevice {
         protos::SfuToDevice {
             device_joined_or_left: if joined_or_left {
@@ -2626,26 +2640,53 @@ mod call_tests {
             } else {
                 None
             },
-            speaker: active_speaker_id.map(|active_speaker_id| protos::sfu_to_device::Speaker {
-                long_device_id: Some(active_speaker_id.to_owned()),
+            speaker: active_speaker_ids.map(|(device_id, demux_id)| {
+                protos::sfu_to_device::Speaker {
+                    long_device_id: Some(device_id.to_owned()),
+                    demux_id: Some(demux_id.as_u32()),
+                }
             }),
             forwarding_video: Some(protos::sfu_to_device::ForwardingVideo::default()),
             ..Default::default()
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum IdentifiedBy {
+        DeviceId,
+        DemuxId,
+        Both,
+    }
+
     fn create_resolution_request_rtp(
         demux_id_without_shifting: u32,
         height: u16,
+        identified_by: IdentifiedBy,
     ) -> rtp::Packet<Vec<u8>> {
+        use protos::device_to_sfu::video_request_message::VideoRequest;
+        let request = match identified_by {
+            IdentifiedBy::DeviceId => VideoRequest {
+                short_device_id: Some(10_000_000_000 + (demux_id_without_shifting as u64)),
+                height: Some(height as u32),
+                demux_id: None,
+            },
+            IdentifiedBy::DemuxId => VideoRequest {
+                short_device_id: None,
+                height: Some(height as u32),
+                demux_id: Some(demux_id_from_unshifted(demux_id_without_shifting).as_u32()),
+            },
+            IdentifiedBy::Both => VideoRequest {
+                short_device_id: Some(10_000_000_000 + (demux_id_without_shifting as u64)),
+                height: Some(height as u32),
+                demux_id: Some(demux_id_from_unshifted(demux_id_without_shifting).as_u32()),
+            },
+        };
+
         create_server_to_client_rtp(
             1,
             encode_proto(protos::DeviceToSfu {
                 video_request: Some(protos::device_to_sfu::VideoRequestMessage {
-                    requests: vec![protos::device_to_sfu::video_request_message::VideoRequest {
-                        short_device_id: Some(10_000_000_000 + (demux_id_without_shifting as u64)),
-                        height: Some(height as u32),
-                    }],
+                    requests: vec![request],
                     ..Default::default()
                 }),
             })
@@ -2814,8 +2855,7 @@ mod call_tests {
         );
     }
 
-    #[test]
-    fn forward_video() {
+    fn forward_video_by_identifier(identifier: IdentifiedBy) {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
@@ -3023,7 +3063,7 @@ mod call_tests {
             call.clients[0].incoming_video1.height
         );
 
-        let mut resolution_request = create_resolution_request_rtp(1, 480);
+        let mut resolution_request = create_resolution_request_rtp(1, 480, identifier);
 
         // When a receiver requests a resolution high enough for layer1, it triggers key frame request for that layer,
         call.handle_rtp(
@@ -3178,7 +3218,7 @@ mod call_tests {
 
         // Trigger a congestion control reset by
         // 1. requesting nothing and reallocating (ideal rate of 0)
-        let mut resolution_request = create_resolution_request_rtp(1, 0);
+        let mut resolution_request = create_resolution_request_rtp(1, 0, identifier);
         call.handle_rtp(
             receiver2_demux_id,
             resolution_request.borrow_mut(),
@@ -3192,7 +3232,7 @@ mod call_tests {
             call.set_target_send_rate(receiver2_demux_id, DataRate::from_kbps(100))
         );
         // 3. requesting something and reallocating (ideal rate > 0)
-        let mut resolution_request = create_resolution_request_rtp(1, 480);
+        let mut resolution_request = create_resolution_request_rtp(1, 480, identifier);
         call.handle_rtp(
             receiver2_demux_id,
             resolution_request.borrow_mut(),
@@ -3227,18 +3267,28 @@ mod call_tests {
     }
 
     #[test]
+    fn forward_video() {
+        forward_video_by_identifier(IdentifiedBy::DeviceId);
+        forward_video_by_identifier(IdentifiedBy::DemuxId);
+        forward_video_by_identifier(IdentifiedBy::Both);
+    }
+
+    #[test]
     fn send_updates_when_someone_joins_or_leaves() {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let expected_update_payload =
-            encode_proto(create_sfu_to_device(true, Some("1_active_speaker_id")));
-
         let mut call = create_call(b"call_id", now, system_now);
 
         // It's a little weird that you get updates for when you join, but it doesn't really do any harm and it's much easier to implement.
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
+
+        let expected_update_payload = encode_proto(create_sfu_to_device(
+            true,
+            Some(("1_active_speaker_id", demux_id1)),
+        ));
+
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
         assert_eq!(
             vec![(
@@ -3292,8 +3342,10 @@ mod call_tests {
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(301));
 
         let active_speaker_id = "1_active_speaker_id";
-        let expected_update_payload =
-            encode_proto(create_sfu_to_device(true, Some(active_speaker_id)));
+        let expected_update_payload = encode_proto(create_sfu_to_device(
+            true,
+            Some((active_speaker_id, demux_id1)),
+        ));
         assert_eq!(
             Some((demux_id1, active_speaker_id.to_owned())),
             call.active_speaker_ids
@@ -3322,8 +3374,10 @@ mod call_tests {
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(602));
 
         let active_speaker_id = "2_active_speaker_id";
-        let expected_update_payload =
-            encode_proto(create_sfu_to_device(false, Some(active_speaker_id)));
+        let expected_update_payload = encode_proto(create_sfu_to_device(
+            false,
+            Some((active_speaker_id, demux_id2)),
+        ));
         assert_eq!(
             Some((demux_id2, active_speaker_id.to_owned())),
             call.active_speaker_ids
@@ -3356,8 +3410,10 @@ mod call_tests {
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(903));
 
         let active_speaker_id = "1_active_speaker_id";
-        let expected_update_payload =
-            encode_proto(create_sfu_to_device(false, Some(active_speaker_id)));
+        let expected_update_payload = encode_proto(create_sfu_to_device(
+            false,
+            Some((active_speaker_id, demux_id1)),
+        ));
         assert_eq!(
             Some((demux_id1, active_speaker_id.to_owned())),
             call.active_speaker_ids
