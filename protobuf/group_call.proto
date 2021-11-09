@@ -21,7 +21,10 @@ message DeviceToSfu {
     optional uint32 max_kbps = 3;
   }
 
+  message LeaveMessage {}
+
   optional VideoRequestMessage video_request = 1;
+  optional LeaveMessage leave = 2;
 }
 
 message SfuToDevice {

@@ -364,11 +364,12 @@ impl Call {
             .position(|client| client.demux_id == demux_id)
         {
             self.clients.swap_remove(index);
+
+            // An update message to clients about clients will be sent at the next tick().
+            self.client_added_or_removed = now;
+            self.reallocate_target_send_rates(now);
+            self.update_padding_ssrcs();
         }
-        // An update message to clients about clients will be sent at the next tick().
-        self.client_added_or_removed = now;
-        self.reallocate_target_send_rates(now);
-        self.update_padding_ssrcs();
     }
 
     /// This updates the SSRCs that will be used to send padding.  We have to keep updating them
@@ -432,6 +433,16 @@ impl Call {
             let sender = self
                 .find_client_mut(sender_demux_id)
                 .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
+
+            if proto.leave.is_some() {
+                info!(
+                    "call: {} removing client: {} (via RTP)",
+                    self.loggable_call_id(),
+                    sender_demux_id.as_u32()
+                );
+                self.remove_client(sender_demux_id, now);
+                return Ok(vec![]);
+            }
 
             // The client resends this periodically, so we don't want to do anything
             // if it didn't change.
@@ -2688,6 +2699,7 @@ mod call_tests {
                     requests: vec![request],
                     ..Default::default()
                 }),
+                ..Default::default()
             })
             .as_slice(),
         )
@@ -2701,6 +2713,18 @@ mod call_tests {
                     max_kbps: Some(max_receive_rate.as_kbps() as u32),
                     ..Default::default()
                 }),
+                ..Default::default()
+            })
+            .as_slice(),
+        )
+    }
+
+    fn create_leave_rtp() -> rtp::Packet<Vec<u8>> {
+        create_server_to_client_rtp(
+            1,
+            encode_proto(protos::DeviceToSfu {
+                leave: Some(protos::device_to_sfu::LeaveMessage {}),
+                ..Default::default()
             })
             .as_slice(),
         )
@@ -3570,6 +3594,39 @@ mod call_tests {
         assert_eq!(
             Some(vec![demux_id2]),
             get_forwading_video_demux_ids(&from_server, demux_id3)
+        );
+    }
+
+    #[test]
+    fn test_leave_message() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+
+        let demux_id1 = add_client(&mut call, "1", 1, at(99));
+        let demux_id2 = add_client(&mut call, "2", 2, at(200));
+        assert_eq!(2, call.clients.len());
+
+        // Clear out updates.
+        let (_rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
+
+        call.handle_rtp(demux_id1, create_leave_rtp().borrow_mut(), at(400))
+            .unwrap();
+        assert_eq!(1, call.clients.len());
+
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
+        let expected_update_payload = encode_proto(create_sfu_to_device(
+            true,
+            Some(("1_active_speaker_id", demux_id1)),
+        ));
+        assert_eq!(
+            vec![(
+                demux_id2,
+                create_server_to_client_rtp(2, &expected_update_payload)
+            )],
+            rtp_to_send
         );
     }
 }
