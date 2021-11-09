@@ -140,6 +140,8 @@ pub struct JoinRequest {
 pub struct JoinResponse {
     #[serde(rename = "endpointId")]
     pub endpoint_id: String,
+    #[serde(rename = "opaqueUserId")]
+    pub opaque_user_id: String,
     #[serde(rename = "ssrcPrefix")]
     pub demux_id: u32,
     pub transport: Transport,
@@ -450,11 +452,8 @@ async fn join(
     let resolution_request_id = rand::thread_rng().gen::<u64>();
     // The endpoint_id is the term currently used on the client side, it is
     // equivalent to the active_speaker_id in the Sfu.
-    let endpoint_id = format!(
-        "{}-{}",
-        user_id.as_slice().encode_hex::<String>(),
-        resolution_request_id
-    );
+    let user_id_string = user_id.as_slice().encode_hex::<String>();
+    let endpoint_id = format!("{}-{}", user_id_string, resolution_request_id);
     let demux_id = demux_id_from_endpoint_id(&endpoint_id);
     let server_ice_ufrag = ice::random_ufrag();
     let server_ice_pwd = ice::random_pwd();
@@ -497,6 +496,7 @@ async fn join(
 
     let response = JoinResponse {
         endpoint_id,
+        opaque_user_id: user_id_string,
         demux_id: demux_id.into(),
         transport,
     };
