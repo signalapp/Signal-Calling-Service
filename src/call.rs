@@ -46,7 +46,8 @@ const ACTIVE_SPEAKER_CALCULATION_INTERVAL: Duration = Duration::from_millis(300)
 /// It comes from signaling, but isn't known by the clients.
 // It would be easier to change this to a u64, and we don't have
 // to change the clients to do so.  Just the SFU frontend.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+// Note that this is deliberately not Debug; see LoggableCallId.
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct CallId(Arc<[u8]>);
 
 impl From<Vec<u8>> for CallId {

@@ -842,14 +842,13 @@ mod http_server_tests {
         assert!(authenticate(config, "1:1a:2b:1:2:3").is_err());
         assert!(authenticate(config, "3:1a:2b:1:2:3").is_err());
 
-        assert_eq!(
-            authenticate(config, "1a:2b:1:").unwrap(),
-            (sfu::UserId::from(vec![26]), sfu::CallId::from(vec![43]))
+        assert!(
+            authenticate(config, "1a:2b:1:").unwrap()
+                == (sfu::UserId::from(vec![26]), sfu::CallId::from(vec![43]))
         );
 
-        assert_eq!(
-            authenticate(config, "2:1a:2b:1:2:3").unwrap(),
-            (vec![26].into(), vec![43].into())
+        assert!(
+            authenticate(config, "2:1a:2b:1:2:3").unwrap() == (vec![26].into(), vec![43].into())
         );
     }
 
@@ -863,11 +862,11 @@ mod http_server_tests {
         // Version 1: "username:1a:2b:1:"
         let result = parse_and_authenticate(config, "Basic dXNlcm5hbWU6MWE6MmI6MTo=");
         assert!(!result.is_err());
-        assert_eq!(result.unwrap(), (vec![26].into(), vec![43].into()));
+        assert!(result.unwrap() == (vec![26].into(), vec![43].into()));
 
         // Version 2: "username:2:1a:2b:1:2:3"
         let result = parse_and_authenticate(config, "Basic dXNlcm5hbWU6MjoxYToyYjoxOjI6Mw==");
         assert!(!result.is_err());
-        assert_eq!(result.unwrap(), (vec![26].into(), vec![43].into()));
+        assert!(result.unwrap() == (vec![26].into(), vec![43].into()));
     }
 }

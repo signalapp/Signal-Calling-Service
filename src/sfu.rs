@@ -29,7 +29,7 @@ use crate::{
     rtp,
 };
 
-#[derive(Error, Debug, Eq, PartialEq)]
+#[derive(Error, Eq, PartialEq)]
 pub enum SfuError {
     #[error("DemuxId is already in use for the call")]
     DuplicateDemuxIdDetected,
@@ -37,9 +37,13 @@ pub enum SfuError {
     UnknownAddress(SocketAddr),
     #[error("packet with unknown type from {0}")]
     UnknownPacketType(SocketAddr),
-    #[error("connection with (CallId={0:?} DemuxId={1:?}) went missing")]
+    #[error(
+        "connection with (CallId={:?} DemuxId={:?}) went missing",
+        LoggableCallId::from(.0),
+        .1
+    )]
     MissingConnection(CallId, DemuxId),
-    #[error("call {0:?} went missing")]
+    #[error("call {:?} went missing", LoggableCallId::from(.0))]
     MissingCall(CallId),
     #[error("parsing ICE binding request failed: {0}")]
     ParseIceBindingRequest(ice::ParseError),
@@ -51,9 +55,16 @@ pub enum SfuError {
     CallError(call::Error),
 }
 
+impl std::fmt::Debug for SfuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Rely on the Display synthesized by thiserror.
+        write!(f, "SfuError({})", self)
+    }
+}
+
 /// Uniquely identifies a Connection across calls using a combination
 /// of CallId and DemuxId.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct ConnectionId {
     call_id: CallId,
     demux_id: DemuxId,
@@ -62,6 +73,15 @@ struct ConnectionId {
 impl ConnectionId {
     fn from_call_id_and_demux_id(call_id: CallId, demux_id: DemuxId) -> ConnectionId {
         Self { call_id, demux_id }
+    }
+}
+
+impl std::fmt::Debug for ConnectionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionId")
+            .field("call_id", &LoggableCallId::from(&self.call_id))
+            .field("demux_id", &self.demux_id)
+            .finish()
     }
 }
 
