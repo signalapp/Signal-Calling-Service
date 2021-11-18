@@ -819,9 +819,16 @@ impl Call {
         }
 
         if update.device_joined_or_left.is_some() || update.speaker.is_some() {
+            let raw_demux_ids: Vec<u32> = self
+                .clients
+                .iter()
+                .map(|client| client.demux_id.as_u32())
+                .collect();
+
             for client in &mut self.clients {
-                update.forwarding_video = Some(protos::sfu_to_device::ForwardingVideo {
-                    demux_ids: client
+                update.current_devices = Some(protos::sfu_to_device::CurrentDevices {
+                    all_demux_ids: raw_demux_ids.clone(),
+                    demux_ids_with_video: client
                         .video_forwarder_by_sender_demux_id
                         .iter()
                         .filter_map(|(demux_id, forwarder)| {
@@ -2643,6 +2650,7 @@ mod call_tests {
     fn create_sfu_to_device(
         joined_or_left: bool,
         active_speaker_ids: Option<(&str, DemuxId)>,
+        all_demux_ids: &[DemuxId],
     ) -> protos::SfuToDevice {
         protos::SfuToDevice {
             device_joined_or_left: if joined_or_left {
@@ -2656,7 +2664,10 @@ mod call_tests {
                     demux_id: Some(demux_id.as_u32()),
                 }
             }),
-            forwarding_video: Some(protos::sfu_to_device::ForwardingVideo::default()),
+            current_devices: Some(protos::sfu_to_device::CurrentDevices {
+                demux_ids_with_video: vec![],
+                all_demux_ids: all_demux_ids.iter().map(|id| id.as_u32()).collect(),
+            }),
             ..Default::default()
         }
     }
@@ -3307,31 +3318,39 @@ mod call_tests {
         // It's a little weird that you get updates for when you join, but it doesn't really do any harm and it's much easier to implement.
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
 
-        let expected_update_payload = encode_proto(create_sfu_to_device(
+        let expected_update_payload_just_client1 = encode_proto(create_sfu_to_device(
             true,
             Some(("1_active_speaker_id", demux_id1)),
+            &[demux_id1],
         ));
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
         assert_eq!(
             vec![(
                 demux_id1,
-                create_server_to_client_rtp(1, &expected_update_payload)
+                create_server_to_client_rtp(1, &expected_update_payload_just_client1)
             )],
             rtp_to_send
         );
 
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
+
+        let expected_update_payload_both_clients = encode_proto(create_sfu_to_device(
+            true,
+            Some(("1_active_speaker_id", demux_id1)),
+            &[demux_id1, demux_id2],
+        ));
+
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
         assert_eq!(
             vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(2, &expected_update_payload)
+                    create_server_to_client_rtp(2, &expected_update_payload_both_clients)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(1, &expected_update_payload)
+                    create_server_to_client_rtp(1, &expected_update_payload_both_clients)
                 )
             ],
             rtp_to_send
@@ -3342,11 +3361,18 @@ mod call_tests {
         assert_eq!(0, rtp_to_send.len());
 
         call.remove_client(demux_id1, at(400));
+
+        let expected_update_payload_just_client2 = encode_proto(create_sfu_to_device(
+            true,
+            Some(("1_active_speaker_id", demux_id1)), // Is it okay that the active speaker left?
+            &[demux_id2],
+        ));
+
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
         assert_eq!(
             vec![(
                 demux_id2,
-                create_server_to_client_rtp(2, &expected_update_payload)
+                create_server_to_client_rtp(2, &expected_update_payload_just_client2)
             )],
             rtp_to_send
         );
@@ -3368,6 +3394,7 @@ mod call_tests {
         let expected_update_payload = encode_proto(create_sfu_to_device(
             true,
             Some((active_speaker_id, demux_id1)),
+            &[demux_id1, demux_id2],
         ));
         assert_eq!(
             Some((demux_id1, active_speaker_id.to_owned())),
@@ -3400,6 +3427,7 @@ mod call_tests {
         let expected_update_payload = encode_proto(create_sfu_to_device(
             false,
             Some((active_speaker_id, demux_id2)),
+            &[demux_id1, demux_id2],
         ));
         assert_eq!(
             Some((demux_id2, active_speaker_id.to_owned())),
@@ -3436,6 +3464,7 @@ mod call_tests {
         let expected_update_payload = encode_proto(create_sfu_to_device(
             false,
             Some((active_speaker_id, demux_id1)),
+            &[demux_id1, demux_id2],
         ));
         assert_eq!(
             Some((demux_id1, active_speaker_id.to_owned())),
@@ -3481,15 +3510,15 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
-        let get_forwading_video_demux_ids =
+        let get_forwarding_video_demux_ids =
             |from_server: &[RtpToSend], receiver_demux_id: DemuxId| -> Option<Vec<DemuxId>> {
                 let (_demux_id, rtp) = from_server
                     .iter()
                     .find(|(demux_id, _rtp)| *demux_id == receiver_demux_id)?;
                 let proto = protos::SfuToDevice::decode(rtp.payload()).ok()?;
                 let mut demux_ids: Vec<DemuxId> = proto
-                    .forwarding_video?
-                    .demux_ids
+                    .current_devices?
+                    .demux_ids_with_video
                     .iter()
                     .map(|demux_id| DemuxId::try_from(*demux_id).unwrap())
                     .collect();
@@ -3506,15 +3535,15 @@ mod call_tests {
         // Nothing to forward yet
         assert_eq!(
             Some(vec![]),
-            get_forwading_video_demux_ids(&from_server, demux_id1)
+            get_forwarding_video_demux_ids(&from_server, demux_id1)
         );
         assert_eq!(
             Some(vec![]),
-            get_forwading_video_demux_ids(&from_server, demux_id2)
+            get_forwarding_video_demux_ids(&from_server, demux_id2)
         );
         assert_eq!(
             Some(vec![]),
-            get_forwading_video_demux_ids(&from_server, demux_id3)
+            get_forwarding_video_demux_ids(&from_server, demux_id3)
         );
 
         // Send some video from client2 so the incoming rate goes up.
@@ -3537,15 +3566,15 @@ mod call_tests {
         let (from_server, _outgoing_key_frame_requests) = call.tick(at(1006));
         assert_eq!(
             Some(vec![demux_id2]),
-            get_forwading_video_demux_ids(&from_server, demux_id1)
+            get_forwarding_video_demux_ids(&from_server, demux_id1)
         );
         assert_eq!(
             Some(vec![]),
-            get_forwading_video_demux_ids(&from_server, demux_id2)
+            get_forwarding_video_demux_ids(&from_server, demux_id2)
         );
         assert_eq!(
             Some(vec![demux_id2]),
-            get_forwading_video_demux_ids(&from_server, demux_id3)
+            get_forwarding_video_demux_ids(&from_server, demux_id3)
         );
 
         // Make sure we keep forwarding even after getting a key frame
@@ -3566,15 +3595,15 @@ mod call_tests {
         let (from_server, _outgoing_key_frame_requests) = call.tick(at(2008));
         assert_eq!(
             Some(vec![demux_id2]),
-            get_forwading_video_demux_ids(&from_server, demux_id1)
+            get_forwarding_video_demux_ids(&from_server, demux_id1)
         );
         assert_eq!(
             Some(vec![]),
-            get_forwading_video_demux_ids(&from_server, demux_id2)
+            get_forwarding_video_demux_ids(&from_server, demux_id2)
         );
         assert_eq!(
             Some(vec![demux_id2]),
-            get_forwading_video_demux_ids(&from_server, demux_id3)
+            get_forwarding_video_demux_ids(&from_server, demux_id3)
         );
 
         // Request a really low max recv rate to prevent things from being forwarded
@@ -3585,15 +3614,15 @@ mod call_tests {
         let (from_server, _outgoing_key_frame_requests) = call.tick(at(3010));
         assert_eq!(
             Some(vec![]),
-            get_forwading_video_demux_ids(&from_server, demux_id1)
+            get_forwarding_video_demux_ids(&from_server, demux_id1)
         );
         assert_eq!(
             Some(vec![]),
-            get_forwading_video_demux_ids(&from_server, demux_id2)
+            get_forwarding_video_demux_ids(&from_server, demux_id2)
         );
         assert_eq!(
             Some(vec![demux_id2]),
-            get_forwading_video_demux_ids(&from_server, demux_id3)
+            get_forwarding_video_demux_ids(&from_server, demux_id3)
         );
     }
 
@@ -3620,6 +3649,7 @@ mod call_tests {
         let expected_update_payload = encode_proto(create_sfu_to_device(
             true,
             Some(("1_active_speaker_id", demux_id1)),
+            &[demux_id2],
         ));
         assert_eq!(
             vec![(
