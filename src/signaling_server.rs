@@ -93,8 +93,8 @@ fn call_id_from_hex(call_id: &str) -> Result<sfu::CallId> {
 /// ```
 /// use calling_server::signaling_server::parse_user_id_and_resolution_request_id_from_endpoint_id;
 ///
-/// assert_eq!(parse_user_id_and_resolution_request_id_from_endpoint_id("abcdef-0").unwrap(), (vec![171, 205, 239].into(), 0));
-/// assert_eq!(parse_user_id_and_resolution_request_id_from_endpoint_id("abcdef-12345").unwrap(), (vec![171, 205, 239].into(), 12345));
+/// assert!(parse_user_id_and_resolution_request_id_from_endpoint_id("abcdef-0").unwrap() == (vec![171, 205, 239].into(), 0));
+/// assert!(parse_user_id_and_resolution_request_id_from_endpoint_id("abcdef-12345").unwrap() == (vec![171, 205, 239].into(), 12345));
 /// assert_eq!(parse_user_id_and_resolution_request_id_from_endpoint_id("").is_err(), true);
 /// assert_eq!(parse_user_id_and_resolution_request_id_from_endpoint_id("abcdef-").is_err(), true);
 /// assert_eq!(parse_user_id_and_resolution_request_id_from_endpoint_id("abcdef-a").is_err(), true);

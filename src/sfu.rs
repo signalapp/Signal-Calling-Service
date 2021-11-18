@@ -238,7 +238,7 @@ impl Sfu {
         trace!("get_or_create_call_and_add_client():");
 
         trace!("  {:25}{}", "call_id:", loggable_call_id);
-        trace!("  {:25}{:?}", "user_id:", user_id);
+        trace!("  {:25}{}", "user_id:", hex::encode(user_id.as_slice()));
         trace!("  {:25}{}", "client_ice_ufrag:", client_ice_ufrag);
         trace!(
             "  {:25}{:?}",
@@ -1015,7 +1015,7 @@ mod sfu_tests {
                 //  - The client should be in all mappings
 
                 let call_info = sfu.get_call_signaling_info(call_id).unwrap();
-                assert_eq!(user_id, call_info.creator_id);
+                assert_eq!(user_id.as_slice(), call_info.creator_id.as_slice());
                 assert_eq!(1, call_info.size);
                 assert_eq!(demux_id, call_info.client_ids[0].0);
                 assert_eq!(1, sfu.call_by_call_id.len());
