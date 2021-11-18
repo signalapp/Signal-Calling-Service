@@ -136,8 +136,14 @@ pub struct DeploymentConfig {
 pub fn get_server_media_address(config: &'static Config) -> SocketAddr {
     let ip = config
         .ice_candidate_ip
-        .as_ref()
-        .unwrap_or(&config.binding_ip)
+        .as_deref()
+        .unwrap_or_else(|| {
+            if config.binding_ip == "0.0.0.0" {
+                "127.0.0.1"
+            } else {
+                &config.binding_ip
+            }
+        })
         .parse()
         .expect("ice_candidate_ip should parse");
     SocketAddr::new(ip, config.ice_candidate_port)
