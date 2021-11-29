@@ -173,6 +173,7 @@ impl Sfu {
     pub fn get_stats(&self) -> SfuStats {
         let mut histograms = HashMap::new();
         let mut values = HashMap::new();
+        let mut all_clients = 0;
         let mut calls_above_one = 0;
         let mut clients_in_calls_above_one = 0;
         let mut call_size = Histogram::default();
@@ -188,6 +189,7 @@ impl Sfu {
             let call_duration =
                 (call.created().elapsed().unwrap_or_default().as_secs() / 60) as usize;
 
+            all_clients += clients;
             call_size.push(clients);
             call_size_squared.push(clients_squared);
             call_age_minutes.push(call_duration);
@@ -211,6 +213,8 @@ impl Sfu {
             "calling.sfu.call_age_minutes.above_one",
             call_age_minutes_above_one,
         );
+        values.insert("calling.sfu.calls.count", self.call_by_call_id.len() as f32);
+        values.insert("calling.sfu.calls.clients.count", all_clients as f32);
         values.insert("calling.sfu.calls.above_one.count", calls_above_one as f32);
         values.insert(
             "calling.sfu.calls.above_one.clients.count",
