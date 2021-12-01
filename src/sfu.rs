@@ -5,28 +5,34 @@
 
 //! The model for the SFU's shared state.
 
+use core::ops::DerefMut;
 use std::{
     collections::HashMap, convert::TryInto, fmt::Write, net::SocketAddr, sync::Arc,
     time::SystemTime,
 };
 
 use anyhow::Result;
+use hkdf::Hkdf;
 use log::*;
 use parking_lot::Mutex;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use x25519_dalek::{EphemeralSecret, PublicKey};
 
-pub use crate::call::{CallId, DemuxId, UserId};
 use crate::{
     call::{self, Call, LoggableCallId},
     common::{DataRate, Duration, Instant, TwoGenerationCacheWithManualRemoveOld},
     config,
-    connection::{self, Connection, HandleRtcpResult, PacketToSend},
+    connection::{self, Connection, HandleRtcpResult, PacketToSend, SrtpMasterSource},
     dtls, googcc, ice,
     ice::BindingRequest,
     metrics::{Histogram, Timer},
     rtp,
+};
+pub use crate::{
+    call::{CallId, DemuxId, UserId},
+    connection::{SrtpMasterSourceClientPublic, SrtpMasterSourceServerPublic},
 };
 
 #[derive(Error, Eq, PartialEq)]
@@ -145,10 +151,6 @@ impl Sfu {
         })
     }
 
-    pub fn server_dtls_fingerprint(&self) -> &[u8] {
-        &self.server_dtls_fingerprint
-    }
-
     /// Return a snapshot of all calls tracked by the Sfu. For metrics only.
     pub fn get_calls_snapshot(&self) -> Vec<Arc<Mutex<Call>>> {
         self.call_by_call_id
@@ -236,19 +238,15 @@ impl Sfu {
         server_ice_ufrag: String,
         server_ice_pwd: String,
         client_ice_ufrag: String,
-        client_dtls_fingerprint: [u8; 32],
-    ) -> Result<(), SfuError> {
+        client_public: SrtpMasterSourceClientPublic,
+    ) -> Result<SrtpMasterSourceServerPublic, SfuError> {
         let loggable_call_id = LoggableCallId::from(&call_id);
         trace!("get_or_create_call_and_add_client():");
 
         trace!("  {:25}{}", "call_id:", loggable_call_id);
         trace!("  {:25}{}", "user_id:", hex::encode(user_id.as_slice()));
         trace!("  {:25}{}", "client_ice_ufrag:", client_ice_ufrag);
-        trace!(
-            "  {:25}{:?}",
-            "client_dtls_fingerprint:",
-            client_dtls_fingerprint
-        );
+        trace!("  {:25}{:?}", "client_public:", client_public,);
         trace!("  {:25}{:?}", "demux_id:", demux_id);
         trace!("  {:25}{}", "resolution_request_id:", resolution_request_id);
         trace!("  {:25}{}", "active_speaker_id:", active_speaker_id);
@@ -314,6 +312,42 @@ impl Sfu {
         // video base layer, so use that.
         let ack_ssrc = call::LayerId::Video0.to_ssrc(demux_id);
 
+        let (srtp_master_source, server_public) = match client_public {
+            SrtpMasterSourceClientPublic::DtlsFingerprint(client_fingerprint) => (
+                SrtpMasterSource::DtlsHandshake {
+                    client_fingerprint,
+                    server_certificate_der: &self.config.server_certificate_der[..],
+                    server_private_key_der: &self.config.server_private_key_der[..],
+                },
+                SrtpMasterSourceServerPublic::DtlsFingerprint(self.server_dtls_fingerprint),
+            ),
+            SrtpMasterSourceClientPublic::Dhe {
+                public_key,
+                hkdf_extra_info,
+            } => {
+                let server_secret = EphemeralSecret::new(OsRngCompatibleWithDalek);
+                let server_public_key = PublicKey::from(&server_secret).to_bytes();
+                let shared_secret = server_secret.diffie_hellman(&PublicKey::from(public_key));
+                let mut master_key_material =
+                    zeroize::Zeroizing::new([0u8; rtp::MASTER_KEY_MATERIAL_LEN]);
+                Hkdf::<Sha256>::new(None, shared_secret.as_bytes())
+                    .expand_multi_info(
+                        &[
+                            b"Signal_Group_Call_20211105_SignallingDH_SRTPKey_KDF",
+                            &hkdf_extra_info[..],
+                        ],
+                        master_key_material.deref_mut(),
+                    )
+                    .expect("Expand SRTP master key material");
+                (
+                    SrtpMasterSource::Value(master_key_material),
+                    SrtpMasterSourceServerPublic::Dhe {
+                        public_key: server_public_key,
+                    },
+                )
+            }
+        };
+
         let inactivity_timeout = Duration::from_secs(self.config.inactivity_timeout_secs);
         self.connection_by_id.insert(
             connection_id.clone(),
@@ -321,9 +355,7 @@ impl Sfu {
                 ice_request_username.clone(),
                 ice_response_username,
                 ice_pwd,
-                client_dtls_fingerprint,
-                &self.config.server_certificate_der[..],
-                &self.config.server_private_key_der[..],
+                srtp_master_source,
                 ack_ssrc,
                 googcc::Config {
                     initial_target_send_rate,
@@ -338,7 +370,7 @@ impl Sfu {
             .insert(ice_request_username, connection_id);
         // Entries are inserted into self.connection_id_by_address as we received ICE binding
 
-        Ok(())
+        Ok(server_public)
     }
 
     /// Remove a client from a call.
@@ -813,6 +845,28 @@ pub struct CallSignalingInfo {
     pub client_ids: Vec<(DemuxId, String)>,
 }
 
+struct OsRngCompatibleWithDalek;
+
+impl rand_core5::RngCore for OsRngCompatibleWithDalek {
+    fn next_u32(&mut self) -> u32 {
+        rand_core::RngCore::next_u32(&mut OsRng)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        rand_core::RngCore::next_u64(&mut OsRng)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        rand_core::RngCore::fill_bytes(&mut OsRng, dest)
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core5::Error> {
+        rand_core::RngCore::try_fill_bytes(&mut OsRng, dest).map_err(rand_core5::Error::new)
+    }
+}
+
+impl rand_core5::CryptoRng for OsRngCompatibleWithDalek {}
+
 #[cfg(test)]
 mod sfu_tests {
     use std::{net::IpAddr, ops::Add, str::FromStr, sync::Arc};
@@ -867,7 +921,7 @@ mod sfu_tests {
         user_id: &'a UserId,
         demux_id: DemuxId,
         client_ice_ufrag: String,
-        client_dtls_fingerprint: [u8; 32],
+        client_dhe_pub_key: [u8; 32],
     ) -> Result<(), SfuError> {
         // Generate ids for the client.
         let resolution_request_id = rand::thread_rng().gen::<u64>();
@@ -879,7 +933,7 @@ mod sfu_tests {
         let server_ice_ufrag = ice::random_ufrag();
         let server_ice_pwd = ice::random_pwd();
 
-        sfu.get_or_create_call_and_add_client(
+        let _ = sfu.get_or_create_call_and_add_client(
             call_id.clone(),
             user_id,
             resolution_request_id,
@@ -888,8 +942,12 @@ mod sfu_tests {
             server_ice_ufrag,
             server_ice_pwd,
             client_ice_ufrag,
-            client_dtls_fingerprint,
-        )
+            SrtpMasterSourceClientPublic::Dhe {
+                public_key: client_dhe_pub_key,
+                hkdf_extra_info: vec![],
+            },
+        )?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -976,7 +1034,7 @@ mod sfu_tests {
                 &user_id,
                 demux_id,
                 "1".to_string(),
-                [0; 32],
+                [0u8; 32],
             );
         }
         let end = Instant::now();

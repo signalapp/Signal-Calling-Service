@@ -62,7 +62,8 @@ pub struct Connection {
     inactivity_timeout: Duration,
 
     ice: Ice,
-    dtls: Dtls,
+    // None if not using DTLS
+    dtls: Option<Dtls>,
     rtp: Rtp,
     congestion_control: CongestionControl,
 
@@ -139,20 +140,84 @@ struct CongestionControl {
     padding_sent: Instant,
 }
 
+/// The source of the master key material to be passed into rtp::KeysAndSalts::derive*.
+/// It's either from a DTLS handshake or the result of a more simple DHE,
+/// in which case we can simply pass in the value directly.
+pub enum SrtpMasterSource {
+    Value(rtp::MasterKeyMaterial),
+    // TODO: After 90 days of using the above, remove this.
+    DtlsHandshake {
+        client_fingerprint: [u8; 32],
+        server_certificate_der: &'static [u8],
+        server_private_key_der: &'static [u8],
+    },
+}
+
+// The publicly exchanged info needed for either SrtpMasterSource.
+// We don't need it in this file, but it's nice to be lined up with
+// SrtpMasterSource.  This is the info provided from the client.
+#[derive(Debug)]
+pub enum SrtpMasterSourceClientPublic {
+    Dhe {
+        public_key: [u8; 32],
+        hkdf_extra_info: Vec<u8>,
+    },
+    DtlsFingerprint([u8; 32]),
+}
+
+// The publicly exchanged info needed for either SrtpMasterSource.
+// We don't need it in this file, but it's nice to be lined up with
+// SrtpMasterSource.  This is the info provided from the server.
+#[derive(Debug)]
+pub enum SrtpMasterSourceServerPublic {
+    Dhe { public_key: [u8; 32] },
+    DtlsFingerprint([u8; 32]),
+}
+
 impl Connection {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ice_request_username: Vec<u8>,
         ice_response_username: Vec<u8>,
         ice_pwd: Vec<u8>,
-        dtls_client_fingerprint: [u8; 32],
-        server_certificate_der: &'static [u8],
-        server_private_key_der: &'static [u8],
+        srtp_master_source: SrtpMasterSource,
         ack_ssrc: rtp::Ssrc,
         googcc_config: googcc::Config,
         inactivity_timeout: Duration,
         now: Instant,
     ) -> Self {
+        let (rtp_endpoint, dtls) = match srtp_master_source {
+            SrtpMasterSource::DtlsHandshake {
+                client_fingerprint,
+                server_certificate_der,
+                server_private_key_der,
+            } => (
+                None,
+                Some(Dtls {
+                    client_fingerprint,
+                    server_certificate_der,
+                    server_private_key_der,
+                    handshake_state: dtls::HandshakeState::new(),
+                }),
+            ),
+            SrtpMasterSource::Value(master_key_material) => {
+                let (decrypt, encrypt) =
+                    rtp::KeysAndSalts::derive_client_and_server_from_master_key_material(
+                        &master_key_material,
+                    );
+                (
+                    Some(rtp::Endpoint::new(
+                        decrypt,
+                        encrypt,
+                        now,
+                        RTCP_SENDER_SSRC,
+                        ack_ssrc,
+                    )),
+                    None,
+                )
+            }
+        };
+
         Self {
             created: now,
 
@@ -165,15 +230,10 @@ impl Connection {
 
                 binding_request_received: None,
             },
-            dtls: Dtls {
-                client_fingerprint: dtls_client_fingerprint,
-                server_certificate_der,
-                server_private_key_der,
-                handshake_state: dtls::HandshakeState::new(),
-            },
+            dtls,
             rtp: Rtp {
                 ack_ssrc,
-                endpoint: None,
+                endpoint: rtp_endpoint,
                 acks_sent: None,
                 nacks_sent: None,
             },
@@ -255,29 +315,34 @@ impl Connection {
         system_now: SystemTime,
         rng: &mut (impl Rng + CryptoRng),
     ) -> Option<PacketToSend> {
-        // When we get a DTLS packet, process it as part of the DTLS handshake.
-        // Once the handshake completes, use the DTLS-SRTP master key.
-        let response_packet = self.dtls.handshake_state.process_packet(
-            incoming_packet,
-            self.dtls.server_certificate_der,
-            self.dtls.server_private_key_der,
-            &self.dtls.client_fingerprint,
-            system_now,
-            rng,
-        );
-        if let Some(dtls_srtp_master_key) = self.dtls.handshake_state.srtp_master_key() {
-            let (client, server) =
-                rtp::KeysAndSalts::derive_from_dtls_srtp_master(dtls_srtp_master_key);
-            let (decrypt, encrypt) = (client, server);
-            self.rtp.endpoint = Some(rtp::Endpoint::new(
-                decrypt,
-                encrypt,
-                now,
-                RTCP_SENDER_SSRC,
-                self.rtp.ack_ssrc,
-            ));
+        if let Some(dtls) = &mut self.dtls {
+            // When we get a DTLS packet, process it as part of the DTLS handshake.
+            // Once the handshake completes, use the DTLS-SRTP master key.
+            let response_packet = dtls.handshake_state.process_packet(
+                incoming_packet,
+                dtls.server_certificate_der,
+                dtls.server_private_key_der,
+                &dtls.client_fingerprint,
+                system_now,
+                rng,
+            );
+            if let Some(dtls_srtp_master_key) = dtls.handshake_state.srtp_master_key() {
+                let (client, server) =
+                    rtp::KeysAndSalts::derive_from_dtls_srtp_master(dtls_srtp_master_key);
+                let (decrypt, encrypt) = (client, server);
+                self.rtp.endpoint = Some(rtp::Endpoint::new(
+                    decrypt,
+                    encrypt,
+                    now,
+                    RTCP_SENDER_SSRC,
+                    self.rtp.ack_ssrc,
+                ));
+            }
+            response_packet
+        } else {
+            warn!("Received DTLS packet when DTLS was not enabled.");
+            None
         }
-        response_packet
     }
 
     // This effectively skips DTLS.  For now, we use it for tests.
@@ -569,9 +634,6 @@ mod connection_tests {
         let ice_request_username = b"server:client";
         let ice_response_username = b"client:server";
         let ice_pwd = b"the_pwd_should_be_long";
-        let dtls_client_fingerprint = [0; 32];
-        let server_certificate_der = b"fake server cert der";
-        let server_private_key_der = b"fake server private key der";
         let ack_ssrc = 0xACC;
         let googcc_config = googcc::Config {
             initial_target_send_rate: DataRate::from_kbps(500),
@@ -582,9 +644,7 @@ mod connection_tests {
             ice_request_username.to_vec(),
             ice_response_username.to_vec(),
             ice_pwd.to_vec(),
-            dtls_client_fingerprint,
-            server_certificate_der,
-            server_private_key_der,
+            SrtpMasterSource::Value(zeroize::Zeroizing::new([0u8; 56])),
             ack_ssrc,
             googcc_config,
             inactivity_timeout,

@@ -55,6 +55,14 @@ ecdsa = { version = "0.11", features = ["sign"] }
 # Already needed by p256. But we also need it for certificate parsing.
 der = "0.3"
 
+# For SRTP key derivation using DHE
+hkdf = "0.11"
+# x25519-dalek is only compatible with rand/rand_core 0.5, so we need to pull these
+# in to make a source of OsRng that's compatible with both x25519-dalek and ecdsa.
+rand_core = { version = "0.6.3", features = [] }
+rand_core5 = { package = "rand_core", version = "0.5.1", features = [] }
+x25519-dalek = { version = "1.1" }
+
 # For DTLS and RTP
 zeroize = "1.4.1"
 

@@ -37,7 +37,7 @@ use crate::{
     common,
     common::Instant,
     config, ice,
-    sfu::{self, Sfu},
+    sfu::{self, Sfu, SrtpMasterSourceServerPublic},
 };
 
 #[derive(Serialize, Debug)]
@@ -68,7 +68,11 @@ pub struct Fingerprint {
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Transport {
     pub candidates: Vec<Candidate>,
-    pub fingerprints: Vec<Fingerprint>,
+    #[serde(rename = "dhePublicKey")]
+    pub dhe_pub_key: Option<String>,
+    #[serde(rename = "hkdfExtraInfo")]
+    pub hkdf_extra_info: Option<String>,
+    pub fingerprints: Option<Vec<Fingerprint>>,
     pub ufrag: String,
     pub pwd: String,
 }
@@ -138,8 +142,8 @@ pub struct JoinRequest {
 
 #[derive(Serialize, Debug)]
 pub struct JoinResponse {
-    #[serde(rename = "endpointId")]
-    pub endpoint_id: String,
+    #[serde(rename = "endpointId", with = "hex")]
+    pub leave_request_token: String,
     #[serde(rename = "opaqueUserId")]
     pub opaque_user_id: String,
     #[serde(rename = "ssrcPrefix")]
@@ -421,7 +425,6 @@ async fn join(
         || join_request.video_payload_type.id != 108
         || join_request.video_ssrc_groups.len() != 4
         || join_request.video_ssrcs.len() != 6
-        || join_request.transport.fingerprints.len() != 1
     {
         return Ok(warp::reply::with_status(
             warp::reply::json(&"Missing required fields in the request.".to_string()),
@@ -430,18 +433,54 @@ async fn join(
         .into_response());
     }
 
-    let client_dtls_fingerprint = match common::colon_separated_hexstring_to_array(
-        &join_request
-            .transport
-            .fingerprints
-            .get(0)
-            .unwrap() // It has already been established that this fingerprint exists.
-            .fingerprint,
+    let client_public = match (
+        join_request.transport.dhe_pub_key,
+        join_request.transport.fingerprints.as_deref(),
     ) {
-        Ok(v) => v,
-        Err(_) => {
+        (Some(dhe_pub_key), _) => match <[u8; 32]>::from_hex(dhe_pub_key) {
+            Ok(public_key) => sfu::SrtpMasterSourceClientPublic::Dhe {
+                public_key,
+                hkdf_extra_info: match join_request.transport.hkdf_extra_info {
+                    None => vec![],
+                    Some(hkdf_extra_info) => match Vec::<u8>::from_hex(hkdf_extra_info) {
+                        Ok(hkdf_extra_info) => hkdf_extra_info,
+                        Err(_) => {
+                            return Ok(warp::reply::with_status(
+                                warp::reply::json(
+                                    &"Invalid hkdf_extra_info in the request.".to_string(),
+                                ),
+                                StatusCode::NOT_ACCEPTABLE,
+                            )
+                            .into_response());
+                        }
+                    },
+                },
+            },
+            Err(_) => {
+                return Ok(warp::reply::with_status(
+                    warp::reply::json(&"Invalid dhe_pub_key in the request.".to_string()),
+                    StatusCode::NOT_ACCEPTABLE,
+                )
+                .into_response());
+            }
+        },
+        (None, Some([fingerprint, ..])) => {
+            match common::colon_separated_hexstring_to_array(&fingerprint.fingerprint) {
+                Ok(v) => sfu::SrtpMasterSourceClientPublic::DtlsFingerprint(v),
+                Err(_) => {
+                    return Ok(warp::reply::with_status(
+                        warp::reply::json(&"Invalid DTLS fingerprint in the request".to_string()),
+                        StatusCode::NOT_ACCEPTABLE,
+                    )
+                    .into_response());
+                }
+            }
+        }
+        (None, _) => {
             return Ok(warp::reply::with_status(
-                warp::reply::json(&"Invalid dtls_fingerprint in the request.".to_string()),
+                warp::reply::json(
+                    &"Must provide either dtls_fingerprint or dhe_pub_key".to_string(),
+                ),
                 StatusCode::NOT_ACCEPTABLE,
             )
             .into_response());
@@ -459,18 +498,19 @@ async fn join(
     let server_ice_pwd = ice::random_pwd();
 
     let mut sfu = sfu.lock();
-    sfu.get_or_create_call_and_add_client(
-        call_id,
-        &user_id,
-        resolution_request_id,
-        endpoint_id.clone(),
-        demux_id,
-        server_ice_ufrag.clone(),
-        server_ice_pwd.clone(),
-        join_request.transport.ufrag,
-        client_dtls_fingerprint,
-    )
-    .unwrap();
+    let server_public = sfu
+        .get_or_create_call_and_add_client(
+            call_id,
+            &user_id,
+            resolution_request_id,
+            endpoint_id.clone(),
+            demux_id,
+            server_ice_ufrag.clone(),
+            server_ice_pwd.clone(),
+            join_request.transport.ufrag,
+            client_public,
+        )
+        .unwrap();
     let socket_addr = config::get_server_media_address(config);
     let candidate = Candidate {
         port: socket_addr.port(),
@@ -480,32 +520,40 @@ async fn join(
 
     let candidates = vec![candidate];
 
-    let fingerprint = Fingerprint {
-        fingerprint: common::bytes_to_colon_separated_hexstring(sfu.server_dtls_fingerprint()),
-        hash: "sha-256".to_string(),
+    let (dhe_pub_key, fingerprints) = match server_public {
+        SrtpMasterSourceServerPublic::Dhe { public_key, .. } => {
+            (Some(public_key.encode_hex()), None)
+        }
+        SrtpMasterSourceServerPublic::DtlsFingerprint(fingerprint) => (
+            None,
+            Some(vec![Fingerprint {
+                fingerprint: common::bytes_to_colon_separated_hexstring(&fingerprint),
+                hash: "sha-256".to_string(),
+            }]),
+        ),
     };
-
-    let fingerprints = vec![fingerprint];
 
     let transport = Transport {
         candidates,
+        dhe_pub_key,
+        hkdf_extra_info: None,
         fingerprints,
         ufrag: server_ice_ufrag,
         pwd: server_ice_pwd,
     };
 
     let response = JoinResponse {
-        endpoint_id,
-        opaque_user_id: user_id_string,
         demux_id: demux_id.into(),
         transport,
+        opaque_user_id: user_id_string,
+        leave_request_token: endpoint_id,
     };
 
     Ok(warp::reply::with_status(warp::reply::json(&response), StatusCode::OK).into_response())
 }
 
 async fn leave(
-    endpoint_id: String,
+    leave_request_token: String,
     config: &'static config::Config,
     sfu: Arc<Mutex<Sfu>>,
     authorization_header: String,
@@ -525,6 +573,7 @@ async fn leave(
     };
 
     // Calculate the demux_id with some simple validation of the endpoint_id.
+    let endpoint_id = leave_request_token;
     let demux_id = if endpoint_id.chars().count() > 3 && endpoint_id.contains('-') {
         demux_id_from_endpoint_id(&endpoint_id)
     } else {

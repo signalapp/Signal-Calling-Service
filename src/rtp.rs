@@ -68,6 +68,10 @@ pub type Salt = [u8; SRTP_SALT_LEN];
 // Not needed when using DTLS-SRTP
 // pub type KeyPlusSalt = [u8; SRTP_KEY_LEN + SRTP_SALT_LEN];
 pub type Iv = [u8; SRTP_IV_LEN];
+// In the order [client_key, client_salt, server_key, server_salt]
+pub const MASTER_KEY_MATERIAL_LEN: usize =
+    SRTP_KEY_LEN + SRTP_SALT_LEN + SRTP_KEY_LEN + SRTP_SALT_LEN;
+pub type MasterKeyMaterial = Zeroizing<[u8; MASTER_KEY_MATERIAL_LEN]>;
 
 #[derive(Debug, Clone)]
 pub struct KeyAndSalt {
@@ -98,6 +102,35 @@ impl KeysAndSalts {
             .unwrap();
         let server_salt: Salt = dtls_srtp_master[SRTP_KEY_LEN..][SRTP_KEY_LEN..][SRTP_SALT_LEN..]
             [..SRTP_SALT_LEN]
+            .try_into()
+            .unwrap();
+        let client = Self::derive_from_master(&KeyAndSalt {
+            key: client_key,
+            salt: client_salt,
+        });
+        let server = Self::derive_from_master(&KeyAndSalt {
+            key: server_key,
+            salt: server_salt,
+        });
+        (client, server)
+    }
+
+    // Returns (client, server)
+    pub fn derive_client_and_server_from_master_key_material(
+        master_key_material: &MasterKeyMaterial,
+    ) -> (KeysAndSalts, KeysAndSalts) {
+        let client_key: Key =
+            Zeroizing::new(master_key_material[..SRTP_KEY_LEN].try_into().unwrap());
+        let client_salt: Salt = master_key_material[SRTP_KEY_LEN..][..SRTP_SALT_LEN]
+            .try_into()
+            .unwrap();
+        let server_key: Key = Zeroizing::new(
+            master_key_material[SRTP_KEY_LEN..][SRTP_SALT_LEN..][..SRTP_KEY_LEN]
+                .try_into()
+                .unwrap(),
+        );
+        let server_salt: Salt = master_key_material[SRTP_KEY_LEN..][SRTP_SALT_LEN..]
+            [SRTP_KEY_LEN..][..SRTP_SALT_LEN]
             .try_into()
             .unwrap();
         let client = Self::derive_from_master(&KeyAndSalt {

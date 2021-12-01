@@ -23,14 +23,19 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use hex::FromHex;
+use hex::{FromHex, ToHex};
 use log::*;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot::Receiver;
 use warp::{http::StatusCode, Filter, Reply};
 
-use crate::{call, common, common::Instant, config, ice, sfu, sfu::Sfu};
+use crate::{
+    call, common,
+    common::Instant,
+    config, ice, sfu,
+    sfu::{Sfu, SrtpMasterSourceServerPublic},
+};
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -49,7 +54,9 @@ pub struct ClientsResponse {
 pub struct JoinRequest {
     pub endpoint_id: String, // Aka active_speaker_id, a concatenation of user_id + '-' + resolution_request_id.
     pub client_ice_ufrag: String,
-    pub client_dtls_fingerprint: String,
+    pub client_dhe_public_key: Option<String>,
+    pub hkdf_extra_info: Option<String>,
+    pub client_dtls_fingerprint: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -59,7 +66,10 @@ pub struct JoinResponse {
     pub server_port: u16,
     pub server_ice_ufrag: String,
     pub server_ice_pwd: String,
-    pub server_dtls_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_dhe_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_dtls_fingerprint: Option<String>,
 }
 
 /// Struct to support warp rejection (errors) for invalid argument values.
@@ -195,14 +205,40 @@ async fn join(
             },
         )?;
 
-    let client_dtls_fingerprint = common::colon_separated_hexstring_to_array(
-        &request.client_dtls_fingerprint,
-    )
-    .map_err(|err| {
-        warp::reject::custom(InvalidArgument {
-            reason: err.to_string(),
-        })
-    })?;
+    let client_public = match (
+        request.client_dhe_public_key,
+        request.client_dtls_fingerprint,
+    ) {
+        (Some(dhe_pub_key), _) => match <[u8; 32]>::from_hex(dhe_pub_key) {
+            Ok(public_key) => Ok(sfu::SrtpMasterSourceClientPublic::Dhe {
+                public_key,
+                hkdf_extra_info: match request.hkdf_extra_info {
+                    None => vec![],
+                    Some(hkdf_extra_info) => {
+                        Vec::<u8>::from_hex(hkdf_extra_info).map_err(|err| {
+                            warp::reject::custom(InvalidArgument {
+                                reason: err.to_string(),
+                            })
+                        })?
+                    }
+                },
+            }),
+            Err(err) => Err(warp::reject::custom(InvalidArgument {
+                reason: err.to_string(),
+            })),
+        },
+        (None, Some(fingerprint)) => {
+            match common::colon_separated_hexstring_to_array(&fingerprint) {
+                Ok(v) => Ok(sfu::SrtpMasterSourceClientPublic::DtlsFingerprint(v)),
+                Err(err) => Err(warp::reject::custom(InvalidArgument {
+                    reason: err.to_string(),
+                })),
+            }
+        }
+        (None, None) => Err(warp::reject::custom(InvalidArgument {
+            reason: "Must provide either a DHE public key or DTLS fingerprint".to_owned(),
+        })),
+    }?;
 
     let server_ice_ufrag = ice::random_ufrag();
     let server_ice_pwd = ice::random_pwd();
@@ -217,18 +253,27 @@ async fn join(
         server_ice_ufrag.to_string(),
         server_ice_pwd.to_string(),
         request.client_ice_ufrag,
-        client_dtls_fingerprint,
+        client_public,
     ) {
-        Ok(_) => {
+        Ok(server_public) => {
             let media_addr = config::get_server_media_address(config);
+            let (server_dhe_public_key, server_dtls_fingerprint) = match server_public {
+                SrtpMasterSourceServerPublic::Dhe { public_key, .. } => {
+                    (Some(public_key.encode_hex()), None)
+                }
+                SrtpMasterSourceServerPublic::DtlsFingerprint(fingerprint) => (
+                    None,
+                    Some(common::bytes_to_colon_separated_hexstring(&fingerprint)),
+                ),
+            };
+
             let response = JoinResponse {
                 server_ip: media_addr.ip().to_string(),
                 server_port: media_addr.port(),
                 server_ice_ufrag,
                 server_ice_pwd,
-                server_dtls_fingerprint: common::bytes_to_colon_separated_hexstring(
-                    sfu.server_dtls_fingerprint(),
-                ),
+                server_dhe_public_key,
+                server_dtls_fingerprint,
             };
 
             Ok(warp::reply::json(&response).into_response())
@@ -433,6 +478,10 @@ mod signaling_server_tests {
     use crate::sfu::DemuxId;
 
     const CALL_ID: &str = "fe076d76bffb54b1";
+    const CLIENT_DHE_PUB_KEY: [u8; 32] = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        26, 27, 28, 29, 30, 31, 32,
+    ];
     const DTLS_FINGERPRINT: &str = "6F:A3:AE:74:FD:FA:2C:85:1B:19:52:55:D1:AE:4E:08:84:42:25:B9:7D:03:C1:62:C6:49:2B:C7:DC:0E:5E:09";
     const ENDPOINT_ID_1: &str =
         "7ab9bbf0b71f81598ae1b592aaf82f9b20b638142a9610c3e37965bec7519112-5287417572362992825";
@@ -463,15 +512,14 @@ mod signaling_server_tests {
         endpoint_id: &str,
         demux_id: DemuxId,
         client_ice_ufrag: &str,
-        client_dtls_fingerprint: &str,
+        client_pub_key: [u8; 32],
     ) {
         let call_id = call_id_from_hex(call_id).unwrap();
         let (user_id, resolution_request_id) =
             parse_user_id_and_resolution_request_id_from_endpoint_id(endpoint_id).unwrap();
-        let client_dtls_fingerprint =
-            common::colon_separated_hexstring_to_array(client_dtls_fingerprint).unwrap();
 
-        sfu.lock()
+        let _ = sfu
+            .lock()
             .get_or_create_call_and_add_client(
                 call_id,
                 &user_id,
@@ -481,9 +529,12 @@ mod signaling_server_tests {
                 ice::random_ufrag(),
                 ice::random_pwd(),
                 client_ice_ufrag.to_string(),
-                client_dtls_fingerprint,
+                sfu::SrtpMasterSourceClientPublic::Dhe {
+                    public_key: client_pub_key,
+                    hkdf_extra_info: vec![],
+                },
             )
-            .unwrap()
+            .unwrap();
     }
 
     fn remove_client_from_sfu(sfu: Arc<Mutex<Sfu>>, call_id: &str, demux_id: DemuxId) {
@@ -610,7 +661,7 @@ mod signaling_server_tests {
             ENDPOINT_ID_1,
             16u32.try_into().unwrap(),
             UFRAG,
-            DTLS_FINGERPRINT,
+            CLIENT_DHE_PUB_KEY,
         );
 
         let response = request()
@@ -636,7 +687,7 @@ mod signaling_server_tests {
             ENDPOINT_ID_2,
             32u32.try_into().unwrap(),
             UFRAG,
-            DTLS_FINGERPRINT,
+            CLIENT_DHE_PUB_KEY,
         );
 
         let response = request()
@@ -695,7 +746,9 @@ mod signaling_server_tests {
             .json(&JoinRequest {
                 endpoint_id: ENDPOINT_ID_1.to_string(),
                 client_ice_ufrag: UFRAG.to_string(),
-                client_dtls_fingerprint: DTLS_FINGERPRINT.to_string(),
+                client_dtls_fingerprint: None,
+                client_dhe_public_key: Some(CLIENT_DHE_PUB_KEY.encode_hex()),
+                hkdf_extra_info: None,
             })
             .reply(&api)
             .await;
@@ -709,7 +762,9 @@ mod signaling_server_tests {
             .json(&JoinRequest {
                 endpoint_id: ENDPOINT_ID_1.to_string(),
                 client_ice_ufrag: UFRAG.to_string(),
-                client_dtls_fingerprint: DTLS_FINGERPRINT.to_string(),
+                client_dtls_fingerprint: None,
+                client_dhe_public_key: Some(CLIENT_DHE_PUB_KEY.encode_hex()),
+                hkdf_extra_info: None,
             })
             .reply(&api)
             .await;
@@ -723,7 +778,9 @@ mod signaling_server_tests {
             .json(&JoinRequest {
                 endpoint_id: "MALFORMEDNOHYPHEN".to_string(),
                 client_ice_ufrag: UFRAG.to_string(),
-                client_dtls_fingerprint: DTLS_FINGERPRINT.to_string(),
+                client_dtls_fingerprint: None,
+                client_dhe_public_key: Some(CLIENT_DHE_PUB_KEY.encode_hex()),
+                hkdf_extra_info: None,
             })
             .reply(&api)
             .await;
@@ -737,7 +794,41 @@ mod signaling_server_tests {
             .json(&JoinRequest {
                 endpoint_id: "MALFORMEDNOHYPHEN".to_string(),
                 client_ice_ufrag: UFRAG.to_string(),
-                client_dtls_fingerprint: DTLS_FINGERPRINT.to_string(),
+                client_dtls_fingerprint: None,
+                client_dhe_public_key: Some(CLIENT_DHE_PUB_KEY.encode_hex()),
+                hkdf_extra_info: None,
+            })
+            .reply(&api)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Join with an invalid DHE public key
+        let response = request()
+            .method("POST")
+            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+            .json(&JoinRequest {
+                endpoint_id: ENDPOINT_ID_1.to_string(),
+                client_ice_ufrag: UFRAG.to_string(),
+                client_dtls_fingerprint: None,
+                client_dhe_public_key: Some("INVALIDNOCOLONS".to_string()),
+                hkdf_extra_info: None,
+            })
+            .reply(&api)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Join with an invalid HKDF extra info
+        let response = request()
+            .method("POST")
+            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+            .json(&JoinRequest {
+                endpoint_id: ENDPOINT_ID_1.to_string(),
+                client_ice_ufrag: UFRAG.to_string(),
+                client_dtls_fingerprint: None,
+                client_dhe_public_key: Some(CLIENT_DHE_PUB_KEY.encode_hex()),
+                hkdf_extra_info: Some("G".to_string()),
             })
             .reply(&api)
             .await;
@@ -751,7 +842,25 @@ mod signaling_server_tests {
             .json(&JoinRequest {
                 endpoint_id: ENDPOINT_ID_1.to_string(),
                 client_ice_ufrag: UFRAG.to_string(),
-                client_dtls_fingerprint: "INVALIDNOCOLONS".to_string(),
+                client_dtls_fingerprint: Some("INVALIDNOCOLONS".to_string()),
+                client_dhe_public_key: None,
+                hkdf_extra_info: None,
+            })
+            .reply(&api)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Join with neither a DHE public key nor a DTLS fingerprint
+        let response = request()
+            .method("POST")
+            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+            .json(&JoinRequest {
+                endpoint_id: ENDPOINT_ID_1.to_string(),
+                client_ice_ufrag: UFRAG.to_string(),
+                client_dtls_fingerprint: None,
+                client_dhe_public_key: None,
+                hkdf_extra_info: None,
             })
             .reply(&api)
             .await;
@@ -765,7 +874,9 @@ mod signaling_server_tests {
             .json(&JoinRequest {
                 endpoint_id: ENDPOINT_ID_1.to_string(),
                 client_ice_ufrag: UFRAG.to_string(),
-                client_dtls_fingerprint: DTLS_FINGERPRINT.to_string(),
+                client_dtls_fingerprint: None,
+                client_dhe_public_key: Some(CLIENT_DHE_PUB_KEY.encode_hex()),
+                hkdf_extra_info: None,
             })
             .reply(&api)
             .await;
@@ -779,7 +890,8 @@ mod signaling_server_tests {
         let response: JoinResponse = serde_json::from_slice(response.body()).unwrap();
         assert_eq!(response.server_ip, "127.0.0.1");
         assert_eq!(response.server_port, 10000);
-        assert_eq!(response.server_dtls_fingerprint.chars().count(), 95);
+        assert_eq!(None, response.server_dtls_fingerprint);
+        assert_eq!(64, response.server_dhe_public_key.unwrap().len());
 
         assert!(
             check_call_exists_in_sfu(sfu.clone(), CALL_ID),
@@ -794,12 +906,94 @@ mod signaling_server_tests {
             .json(&JoinRequest {
                 endpoint_id: ENDPOINT_ID_1.to_string(),
                 client_ice_ufrag: UFRAG.to_string(),
-                client_dtls_fingerprint: DTLS_FINGERPRINT.to_string(),
+                client_dtls_fingerprint: None,
+                client_dhe_public_key: Some(CLIENT_DHE_PUB_KEY.encode_hex()),
+                hkdf_extra_info: None,
             })
             .reply(&api)
             .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(get_client_count_in_call_from_sfu(sfu.clone(), CALL_ID), 1);
+    }
+
+    #[tokio::test]
+    async fn test_join_dtls() {
+        let config = &DEFAULT_CONFIG;
+        let sfu = new_sfu(Instant::now(), config);
+        let is_healthy = Arc::new(AtomicBool::new(true));
+
+        let api = signaling_api(config, sfu.clone(), is_healthy).recover(rejection_handler);
+
+        let response = request()
+            .method("POST")
+            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+            .json(&JoinRequest {
+                endpoint_id: ENDPOINT_ID_1.to_string(),
+                client_ice_ufrag: UFRAG.to_string(),
+                client_dtls_fingerprint: Some(DTLS_FINGERPRINT.to_string()),
+                client_dhe_public_key: None,
+                hkdf_extra_info: None,
+            })
+            .reply(&api)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+
+        let response: JoinResponse = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(response.server_ip, "127.0.0.1");
+        assert_eq!(response.server_port, 10000);
+        assert_eq!(response.server_dtls_fingerprint.unwrap().len(), 95);
+        assert_eq!(None, response.server_dhe_public_key);
+
+        assert!(
+            check_call_exists_in_sfu(sfu.clone(), CALL_ID),
+            "Call doesn't exist"
+        );
+        assert_eq!(get_client_count_in_call_from_sfu(sfu.clone(), CALL_ID), 1);
+    }
+
+    #[tokio::test]
+    async fn test_join_both() {
+        let config = &DEFAULT_CONFIG;
+        let sfu = new_sfu(Instant::now(), config);
+        let is_healthy = Arc::new(AtomicBool::new(true));
+
+        let api = signaling_api(config, sfu.clone(), is_healthy).recover(rejection_handler);
+
+        let response = request()
+            .method("POST")
+            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+            .json(&JoinRequest {
+                endpoint_id: ENDPOINT_ID_1.to_string(),
+                client_ice_ufrag: UFRAG.to_string(),
+                client_dtls_fingerprint: Some(DTLS_FINGERPRINT.to_string()),
+                client_dhe_public_key: Some(CLIENT_DHE_PUB_KEY.encode_hex()),
+                hkdf_extra_info: None,
+            })
+            .reply(&api)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+
+        let response: JoinResponse = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(response.server_ip, "127.0.0.1");
+        assert_eq!(response.server_port, 10000);
+        assert_eq!(None, response.server_dtls_fingerprint);
+        assert_eq!(64, response.server_dhe_public_key.unwrap().len());
+
+        assert!(
+            check_call_exists_in_sfu(sfu.clone(), CALL_ID),
+            "Call doesn't exist"
+        );
         assert_eq!(get_client_count_in_call_from_sfu(sfu.clone(), CALL_ID), 1);
     }
 
@@ -818,7 +1012,7 @@ mod signaling_server_tests {
             ENDPOINT_ID_1,
             16u32.try_into().unwrap(),
             UFRAG,
-            DTLS_FINGERPRINT,
+            CLIENT_DHE_PUB_KEY,
         );
         assert!(
             check_call_exists_in_sfu(sfu.clone(), CALL_ID),
