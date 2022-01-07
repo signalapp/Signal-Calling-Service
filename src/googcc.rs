@@ -46,7 +46,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             initial_target_send_rate: DataRate::from_kbps(1500),
-            min_target_send_rate: DataRate::from_kbps(5),
+            min_target_send_rate: DataRate::from_kbps(100),
             max_target_send_rate: DataRate::from_kbps(30000),
         }
     }
@@ -286,6 +286,7 @@ mod calculate_target_send_rates_tests {
 
     fn config() -> Config {
         Config {
+            min_target_send_rate: DataRate::from_kbps(5),
             initial_target_send_rate: DataRate::from_kbps(100),
             ..Default::default()
         }

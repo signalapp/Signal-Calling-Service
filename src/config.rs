@@ -55,7 +55,7 @@ pub struct Config {
 
     /// The min target send rate for sending.
     /// This affects the congestion controller (googcc).
-    #[structopt(long, default_value = "5")]
+    #[structopt(long, default_value = "100")]
     pub min_target_send_rate_kbps: u64,
 
     /// The max target send rate for sending.
@@ -160,7 +160,7 @@ pub(crate) fn default_test_config() -> Config {
         max_clients_per_call: 8,
         udp_threads: Some(1),
         initial_target_send_rate_kbps: 1500,
-        min_target_send_rate_kbps: 5,
+        min_target_send_rate_kbps: 100,
         max_target_send_rate_kbps: 30000,
         default_requested_max_send_rate_kbps: 20000,
         tick_interval_ms: 100,
