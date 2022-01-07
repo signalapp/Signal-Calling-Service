@@ -792,7 +792,10 @@ impl Sfu {
                     if send_rate_allocation_info.send_rate_reset
                         > connection.congestion_controller_reset()
                     {
-                        connection.reset_congestion_controller(now);
+                        connection.reset_congestion_controller(
+                            send_rate_allocation_info.initial_target_send_rate_after_reset,
+                            now,
+                        );
                     }
                 }
             }

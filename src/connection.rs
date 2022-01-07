@@ -563,9 +563,16 @@ impl Connection {
         self.congestion_control.padding_ssrc = padding_ssrc;
     }
 
-    pub fn reset_congestion_controller(&mut self, now: Instant) {
-        self.congestion_control.controller =
-            googcc::CongestionController::new(self.congestion_control.config.clone(), now);
+    pub fn reset_congestion_controller(
+        &mut self,
+        initial_target_send_rate: DataRate,
+        now: Instant,
+    ) {
+        let config = googcc::Config {
+            initial_target_send_rate,
+            ..self.congestion_control.config.clone()
+        };
+        self.congestion_control.controller = googcc::CongestionController::new(config, now);
         self.congestion_control.controller_reset = now;
     }
 
@@ -1259,7 +1266,7 @@ mod connection_tests {
             );
         }
 
-        connection.reset_congestion_controller(at(250));
+        connection.reset_congestion_controller(DataRate::from_kbps(500), at(250));
 
         for seqnum in 26..=50 {
             let sent = at(10 * seqnum);
