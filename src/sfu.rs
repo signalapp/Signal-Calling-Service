@@ -545,7 +545,7 @@ impl Sfu {
                     if let Err(err) = call
                         .set_target_send_rate(incoming_connection_id.demux_id, new_target_send_rate)
                     {
-                        warn!("Failed to set target send rate: {:?}", err);
+                        debug!("Failed to set target send rate: {:?}", err);
                     }
                 }
                 call.handle_key_frame_requests(
