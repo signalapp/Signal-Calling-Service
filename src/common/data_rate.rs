@@ -11,7 +11,7 @@ use std::{
 
 use crate::common::Duration;
 
-#[derive(Debug, Copy, Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DataSize {
     bits: u64,
 }
@@ -19,6 +19,21 @@ pub struct DataSize {
 impl Default for DataSize {
     fn default() -> Self {
         Self::from_bits(0)
+    }
+}
+
+impl std::fmt::Debug for DataSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (unit, bits) in [
+            ("gbits", 1_000_000_000),
+            ("mbits", 1_000_000),
+            ("kbits", 1_000),
+        ] {
+            if self.bits > bits {
+                return write!(f, "{}{}", self.bits / bits, unit);
+            }
+        }
+        write!(f, "{}bits", self.bits)
     }
 }
 
