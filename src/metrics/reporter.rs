@@ -59,7 +59,7 @@ impl NumericValueReporter {
         self.sample(|sample_interval| RunningTimer::start(self, Instant::now(), sample_interval))
     }
 
-    /// This will use ths sampling interval and only invoke the sampler periodically to push an
+    /// This will use the sampling interval and only invoke the sampler periodically to push an
     /// arbitrary unit value to the histogram.
     pub fn push(&self, sampler: impl FnOnce() -> usize) {
         self.sample(|sample_interval| self.push_sample(sampler(), sample_interval));
