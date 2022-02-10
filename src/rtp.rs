@@ -940,7 +940,7 @@ impl<'packet> ControlPacket<'packet> {
 
             if payload_len_in_words_plus_1 == 0 {
                 // This could only happen if we received an RTCP packet without a sender_ssrc, which should never happen.
-                warn!("Ingoring RTCP packet with expressed len of 0");
+                warn!("Ignoring RTCP packet with expressed len of 0");
                 return None;
             }
             let payload_len = (payload_len_in_words_plus_1 as usize - 1) * 4;

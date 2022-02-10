@@ -576,7 +576,7 @@ impl Call {
         // So we should reallocate after changing the incoming rates above and active speaker above.
         self.reallocate_target_send_rates_if_its_been_too_long(now);
 
-        // Do this after reallocation so it has the lastest info about what is being forwarded.
+        // Do this after reallocation so it has the latest info about what is being forwarded.
         let mut rtp_to_send = vec![];
         self.send_update_proto_to_all_clients(active_speaker_just_changed, &mut rtp_to_send, now);
 
@@ -1463,7 +1463,7 @@ struct Vp8SimulcastRtpForwarder {
     // We have to keep track of the max outgoing IDs
     // to know what to make the "first" when we switch.
     // (generally, the max + 1).  And we have to retain
-    // that outside of the forwading state below so we
+    // that outside of the forwarding state below so we
     // retain it across various pause/forward cycles.
     max_outgoing: Vp8RewrittenIds,
 }
@@ -1494,7 +1494,7 @@ enum Vp8SimulcastRtpForwardingState {
     },
 }
 
-// These are the IDs that we rewrite when forwaring VP8.
+// These are the IDs that we rewrite when forwarding VP8.
 // These is a convenience for keep track of all 4 together,
 // which is a common thing in Vp8SimulcastRtpForwarder.
 #[derive(Default, Debug, Clone, Eq, PartialEq)]
@@ -1665,7 +1665,7 @@ impl Vp8SimulcastRtpForwarder {
             // ask for a new key frame.  That should hopefully be infrequent.
             // 2. The last packet we forwarded (of the previous layer) is the last packet we'd ever want to forward.
             // If this is false, the last frame of the previous layer will be dropped by the receiving client.
-            // Which hopefully will not be noticable.
+            // Which hopefully will not be noticeable.
             // These assumptions allow us to have no gap between the last seqnum before the switch
             // and the first seqnum/picture_id after the switch and doesn't require any fancy logic or queuing.
             // Ok, there is a gap of 1 seqnum to signify to the encoder that the

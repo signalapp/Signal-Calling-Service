@@ -553,7 +553,7 @@ impl<T: AsRawFd> ConnectionMap<T> {
     /// connection for the given peer, or if it was already closed, returns `None`.
     fn mark_closed(&mut self, peer_addr: &SocketAddr) -> Option<T> {
         let entry = self.by_peer_addr.get_mut(peer_addr)?;
-        // Not stricly necessary, but a small perf optimization for when
+        // Not strictly necessary, but a small perf optimization for when
         // mark_closed is called more than once.
         if *entry == Self::TOMBSTONE_FD {
             return None;
