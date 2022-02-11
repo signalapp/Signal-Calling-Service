@@ -153,10 +153,7 @@ impl Sfu {
 
     /// Return a snapshot of all calls tracked by the Sfu. For metrics only.
     pub fn get_calls_snapshot(&self) -> Vec<Arc<Mutex<Call>>> {
-        self.call_by_call_id
-            .values()
-            .map(|call| Arc::clone(call))
-            .collect()
+        self.call_by_call_id.values().map(Arc::clone).collect()
     }
 
     /// Get info about a call that is relevant to call signaling.

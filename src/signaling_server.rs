@@ -287,7 +287,7 @@ async fn join(
                 }))
             } else {
                 Err(warp::reject::custom(InternalError {
-                    reason: format!("failed to add client to call {}", err.to_string()),
+                    reason: format!("failed to add client to call {}", err),
                 }))
             }
         }

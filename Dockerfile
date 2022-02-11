@@ -4,7 +4,7 @@
 #
 
 # Use the current rust environment for building.
-FROM rust:1.55.0-buster AS build-stage
+FROM rust:1.58.1-buster AS build-stage
 RUN apt-get update
 
 WORKDIR /usr/src

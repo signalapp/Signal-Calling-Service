@@ -27,20 +27,11 @@ pub struct Metrics {
     registry: Mutex<Registry>,
 }
 
+#[derive(Default)]
 struct Registry {
     registered_names: HashSet<&'static str>,
     numeric_reporters: Vec<Arc<NumericValueReporter>>,
     event_reporters: Vec<Arc<EventCountReporter>>,
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Registry {
-            registered_names: Default::default(),
-            numeric_reporters: Default::default(),
-            event_reporters: Default::default(),
-        }
-    }
 }
 
 pub struct Report {

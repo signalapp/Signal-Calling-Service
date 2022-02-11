@@ -304,7 +304,7 @@ mod estimate_acked_rates_from_groups_tests {
                     // If it went down, the estimate goes down.
                     // Except...we're doing this in floating-point math,
                     // so we could have rounding errors when we go back to integers.
-                    if previous_estimate.as_bps().abs_diff(previous_sample) > 1 {
+                    if AbsDiff::abs_diff(previous_estimate.as_bps(), previous_sample) > 1 {
                         let change = previous_estimate.cmp(&current_estimate);
                         // And estimate_acked_rates weights by variance to avoid outliers,
                         // so a sample can end up not making a change.

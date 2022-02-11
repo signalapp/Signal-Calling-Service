@@ -616,7 +616,7 @@ mod test {
     fn test_tcc_sender() {
         let now = Instant::now();
         let at = |millis| now + Duration::from_millis(millis);
-        let bytes = |bytes| DataSize::from_bytes(bytes);
+        let bytes = DataSize::from_bytes;
 
         let mut sender = Sender::new(now);
         sender.remember_sent(1, bytes(1201), at(10));
