@@ -47,10 +47,8 @@ pub struct Config {
     pub udp_threads: Option<usize>,
 
     /// The initial bitrate target for sending. In a 16-person call with
-    /// each base layer at 200kbps you'd need 3.2mbps to send them all.
-    /// With an increase of 8% per second it will take 10 seconds to
-    /// increase from 1.5mbps to 3.2.
-    #[structopt(long, default_value = "1500")]
+    /// each base layer at 50kbps you'd need 800kbps to send them all.
+    #[structopt(long, default_value = "800")]
     pub initial_target_send_rate_kbps: u64,
 
     /// The min target send rate for sending.

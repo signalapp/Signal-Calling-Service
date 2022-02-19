@@ -114,18 +114,7 @@ struct Rtp {
 }
 
 struct CongestionControl {
-    // Immutable
-    /// Initial config used in the congestion controller and also
-    /// the config used when the congestion controller is reset.
-    config: googcc::Config,
-
-    // Mutable
     controller: googcc::CongestionController,
-
-    /// The last time the congestion controller was reset by
-    /// Connection::reset_congestion_controller.
-    /// See Connection::congestion_controller_reset().
-    controller_reset: Instant,
 
     /// Padding is sent if both of these are set, and will
     /// be sent with the set interval with the set SSRC.
@@ -238,10 +227,7 @@ impl Connection {
                 nacks_sent: None,
             },
             congestion_control: CongestionControl {
-                config: googcc_config.clone(),
-
                 controller: googcc::CongestionController::new(googcc_config, now),
-                controller_reset: now,
 
                 padding_interval: None,
                 padding_ssrc: None,
@@ -563,21 +549,8 @@ impl Connection {
         self.congestion_control.padding_ssrc = padding_ssrc;
     }
 
-    pub fn reset_congestion_controller(
-        &mut self,
-        initial_target_send_rate: DataRate,
-        now: Instant,
-    ) {
-        let config = googcc::Config {
-            initial_target_send_rate,
-            ..self.congestion_control.config.clone()
-        };
-        self.congestion_control.controller = googcc::CongestionController::new(config, now);
-        self.congestion_control.controller_reset = now;
-    }
-
-    pub fn congestion_controller_reset(&self) -> Instant {
-        self.congestion_control.controller_reset
+    pub fn send_request_to_congestion_controller(&mut self, request: googcc::Request) {
+        self.congestion_control.controller.request(request)
     }
 
     fn send_padding_if_its_been_too_long(
@@ -1266,9 +1239,13 @@ mod connection_tests {
             );
         }
 
-        connection.reset_congestion_controller(DataRate::from_kbps(500), at(250));
+        // Cap the target send rate by a new ideal send rate.
+        connection.send_request_to_congestion_controller(googcc::Request {
+            base: DataRate::from_kbps(100),
+            ideal: DataRate::from_kbps(250),
+        });
 
-        for seqnum in 26..=50 {
+        for seqnum in 26..=35 {
             let sent = at(10 * seqnum);
             let received = at(10 * (seqnum + 1));
 
@@ -1289,12 +1266,46 @@ mod connection_tests {
             .unwrap();
             let result = connection.handle_rtcp_packet(&mut acks, now).unwrap();
 
+            assert_eq!(
+                Some(DataRate::from_kbps(375)),
+                result.new_target_send_rate,
+                "failed at seqnum {}",
+                seqnum
+            );
+        }
+
+        // Uncap the target send rate by a new ideal send rate.
+        connection.send_request_to_congestion_controller(googcc::Request {
+            base: DataRate::from_kbps(100),
+            ideal: DataRate::from_kbps(1000),
+        });
+
+        for seqnum in 36..=40 {
+            let sent = at(10 * seqnum);
+            let received = at(10 * (seqnum + 1));
+
+            let encrypted_rtp = new_encrypted_rtp(seqnum, Some(seqnum), &encrypt);
+            let unencrypted_rtp = decrypt_rtp(&encrypted_rtp, &encrypt);
+            connection.send_rtp(unencrypted_rtp, &mut vec![], sent);
+            let mut acks = rtp::ControlPacket::serialize_and_encrypt(
+                rtp::RTCP_TYPE_GENERIC_FEEDBACK,
+                rtp::RTCP_FORMAT_TRANSPORT_CC,
+                RTCP_SENDER_SSRC,
+                tcc::write_feedback(10000, &mut 0, now, vec![(seqnum, received)].into_iter())
+                    .collect::<Vec<_>>(),
+                1,
+                &decrypt.rtcp.key,
+                &decrypt.rtcp.salt,
+            )
+            .unwrap();
+            let result = connection.handle_rtcp_packet(&mut acks, now).unwrap();
+
             let expected_new_target_send_rate = match seqnum {
-                28 => Some(501),
-                47 => Some(502),
-                48 => Some(503),
-                49 => Some(504),
-                50 => Some(505),
+                36 => Some(501),
+                37 => Some(502),
+                38 => Some(503),
+                39 => Some(504),
+                40 => Some(505),
                 _ => None,
             }
             .map(DataRate::from_kbps);

@@ -265,8 +265,8 @@ pub struct SendRateAllocationInfo {
     pub demux_id: DemuxId,
     pub padding_send_rate: DataRate,
     pub padding_ssrc: Option<rtp::Ssrc>,
-    pub send_rate_reset: Instant,
-    pub initial_target_send_rate_after_reset: DataRate,
+    pub requested_base_rate: DataRate,
+    pub ideal_send_rate: DataRate,
 }
 
 impl Call {
@@ -607,8 +607,8 @@ impl Call {
             demux_id: client.demux_id,
             padding_send_rate: client.padding_send_rate,
             padding_ssrc: client.padding_ssrc,
-            send_rate_reset: client.send_rate_reset,
-            initial_target_send_rate_after_reset: client.target_send_rate,
+            requested_base_rate: client.requested_base_rate,
+            ideal_send_rate: client.ideal_send_rate,
         })
     }
 
@@ -679,8 +679,6 @@ impl Call {
                 })
             })
             .collect();
-        let initial_target_send_rate = self.initial_target_send_rate;
-
         let receiver = self.find_client_mut(receiver_demux_id).unwrap();
 
         // We have to collect these because we can't get a mutable ref to the receiver while getting
@@ -690,6 +688,8 @@ impl Call {
             .map(|video| video.sender_demux_id)
             .filter(|sender_demux_id| *sender_demux_id != receiver.demux_id)
             .collect();
+        let requested_base_rate =
+            requested_base_rate(&allocatable_videos, receiver.requested_max_send_rate);
         let ideal_send_rate =
             ideal_send_rate(&allocatable_videos, receiver.requested_max_send_rate);
         let allocated_video_by_sender_demux_id =
@@ -720,42 +720,12 @@ impl Call {
         let padding_send_rate =
             min(ideal_send_rate, new_target_send_rate).saturating_sub(allocated_send_rate);
 
-        let previous_ideal_send_rate = receiver.ideal_send_rate;
         receiver.target_send_rate = new_target_send_rate;
+        receiver.requested_base_rate = requested_base_rate;
         receiver.ideal_send_rate = ideal_send_rate;
         receiver.allocated_send_rate = allocated_send_rate;
         receiver.padding_send_rate = padding_send_rate;
         receiver.send_rate_allocated = now;
-
-        // What just happened is something like:
-        // A. The client is all alone in the call and someone just joined.
-        // B. The client is with an audio-only client and a video client just joined.
-        // C. The client is with one other client and it just unmuted video.
-        // In any of these cases, the congestion controller probably has a very low
-        // acked rate because there was nothing to forward (not even padding
-        // because you we don't pad above the ideal).  And a low acked rate
-        // leads to a low target send rate if the target send rate decreases.
-        // So, to mitigate this we reset the congestion controller to a
-        // percentage of the current target send rate.
-        // And we can't do this directly.  We have to report that the send rate has been
-        // reset and then the SFU needs to hand that info over to the Connection.
-        let should_reset_congestion_controller =
-            previous_ideal_send_rate.as_bps() == 0 && ideal_send_rate.as_bps() > 0;
-        if should_reset_congestion_controller {
-            trace!("Resetting the congestion controller to {} because we just went to a non-zero ideal rate.", initial_target_send_rate.as_kbps());
-            // This will be reported via get_send_rate_allocation_info, which should trigger
-            // a Connection to reset the congestion controller.
-            let initial_target_send_rate_after_reset = new_target_send_rate * 0.85;
-            receiver.send_rate_reset = now;
-            receiver.target_send_rate = initial_target_send_rate_after_reset;
-            // This is a recursive call that won't be called infinitely because,
-            // the previous_ideal_send_rate will no longer be 0.
-            self.allocate_target_send_rate(
-                receiver_demux_id,
-                initial_target_send_rate_after_reset,
-                now,
-            );
-        }
     }
 
     pub fn handle_key_frame_requests(
@@ -1002,10 +972,12 @@ struct Client {
     // Updated by send rate allocation, which is affected by
     // incoming video requests, target send rate,
     // incoming packets, and calls to tick().
+    // requested_base_rate is the sum of the rates of the requested base layers.
+    // Like ideal_send_rate, it's capped by max_requested_send_rate.
+    requested_base_rate: DataRate,
     ideal_send_rate: DataRate,
     allocated_send_rate: DataRate,
     padding_send_rate: DataRate,
-    send_rate_reset: Instant,
 
     // Updated by Call::update_padding_ssrc()
     padding_ssrc: Option<rtp::Ssrc>,
@@ -1051,8 +1023,8 @@ impl Client {
             target_send_rate: DataRate::default(),
             requested_max_send_rate,
             send_rate_allocated: now,
-            send_rate_reset: now,
 
+            requested_base_rate: DataRate::default(),
             ideal_send_rate: DataRate::default(),
             allocated_send_rate: DataRate::default(),
             padding_send_rate: DataRate::default(),
@@ -1176,6 +1148,7 @@ impl Client {
             video0_incoming_height: self.incoming_video0.height,
             video1_incoming_height: self.incoming_video1.height,
             video2_incoming_height: self.incoming_video2.height,
+            requested_base_rate: self.requested_base_rate,
             target_send_rate: self.target_send_rate,
             ideal_send_rate: self.ideal_send_rate,
             allocated_send_rate: self.allocated_send_rate,
@@ -1318,6 +1291,27 @@ fn ideal_send_rate(videos: &[AllocatableVideo], max_requested_send_rate: DataRat
         .filter_map(|video| {
             let ideal_layer_index = ideal_video_layer_index(video)?;
             Some(video.layers[ideal_layer_index].incoming_rate)
+        })
+        .sum();
+    min(allocatable, max_requested_send_rate)
+}
+
+fn base_video_layer_index(video: &AllocatableVideo) -> Option<usize> {
+    if video.requested_height == VideoHeight::from(0) || video.layers[0].incoming_rate.as_bps() == 0
+    {
+        // Nothing was requested or the base layer doesn't have a rate
+        None
+    } else {
+        Some(0)
+    }
+}
+
+fn requested_base_rate(videos: &[AllocatableVideo], max_requested_send_rate: DataRate) -> DataRate {
+    let allocatable: DataRate = videos
+        .iter()
+        .filter_map(|video| {
+            let base_layer_index = base_video_layer_index(video)?;
+            Some(video.layers[base_layer_index].incoming_rate)
         })
         .sum();
     min(allocatable, max_requested_send_rate)
@@ -1743,6 +1737,7 @@ pub struct ClientStats {
     pub video1_incoming_height: Option<VideoHeight>,
     pub video2_incoming_height: Option<VideoHeight>,
     pub target_send_rate: DataRate,
+    pub requested_base_rate: DataRate,
     pub ideal_send_rate: DataRate,
     pub allocated_send_rate: DataRate,
     pub padding_send_rate: DataRate,
@@ -3235,79 +3230,25 @@ mod call_tests {
                     demux_id: sender_demux_id,
                     padding_send_rate: DataRate::default(),
                     padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(receiver1_demux_id)),
-                    send_rate_reset: at(0),
-                    initial_target_send_rate_after_reset: DataRate::from_kbps(600),
+                    requested_base_rate: DataRate::default(),
+                    ideal_send_rate: DataRate::from_bps(0),
                 },
                 SendRateAllocationInfo {
                     demux_id: receiver1_demux_id,
-                    padding_send_rate: DataRate::from_bps(495261),
+                    padding_send_rate: DataRate::from_bps(585261),
                     padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(sender_demux_id)),
-                    send_rate_reset: at(502),
-                    initial_target_send_rate_after_reset: DataRate::from_kbps(510),
+                    requested_base_rate: DataRate::from_bps(14739),
+                    ideal_send_rate: DataRate::from_bps(1002048),
                 },
                 SendRateAllocationInfo {
                     demux_id: receiver2_demux_id,
                     padding_send_rate: DataRate::default(),
                     padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(sender_demux_id)),
-                    send_rate_reset: at(503),
-                    initial_target_send_rate_after_reset: DataRate::from_kbps(510),
+                    requested_base_rate: DataRate::from_bps(14739),
+                    ideal_send_rate: DataRate::from_bps(14739),
                 }
             ],
             call.get_send_rate_allocation_info().collect::<Vec<_>>()
-        );
-
-        // Just to simplify a bit
-        call.remove_client(receiver1_demux_id, at(5000));
-
-        // Trigger a congestion control reset by
-        // 1. requesting nothing and reallocating (ideal rate of 0)
-        let mut resolution_request = create_resolution_request_rtp(1, 0, identifier);
-        call.handle_rtp(
-            receiver2_demux_id,
-            resolution_request.borrow_mut(),
-            at(6000),
-        )
-        .unwrap();
-        call.tick(at(6000));
-        // 2. setting the target send rate below the initial target send rate
-        assert_eq!(
-            Ok(()),
-            call.set_target_send_rate(receiver2_demux_id, DataRate::from_kbps(100))
-        );
-        // 3. requesting something and reallocating (ideal rate > 0)
-        let mut resolution_request = create_resolution_request_rtp(1, 480, identifier);
-        call.handle_rtp(
-            receiver2_demux_id,
-            resolution_request.borrow_mut(),
-            at(7000),
-        )
-        .unwrap();
-        call.tick(at(7000));
-
-        assert_eq!(
-            vec![
-                SendRateAllocationInfo {
-                    demux_id: sender_demux_id,
-                    padding_send_rate: DataRate::default(),
-                    padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(receiver2_demux_id)),
-                    send_rate_reset: at(0),
-                    initial_target_send_rate_after_reset: DataRate::from_kbps(600),
-                },
-                SendRateAllocationInfo {
-                    demux_id: receiver2_demux_id,
-                    padding_send_rate: DataRate::from_bps(81929),
-                    padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(sender_demux_id)),
-                    send_rate_reset: at(7000),
-                    initial_target_send_rate_after_reset: DataRate::from_kbps(85),
-                }
-            ],
-            call.get_send_rate_allocation_info().collect::<Vec<_>>()
-        );
-
-        let invalid_demux_id = demux_id_from_unshifted(10);
-        assert_eq!(
-            Err(Error::UnknownDemuxId(invalid_demux_id)),
-            call.set_target_send_rate(invalid_demux_id, DataRate::from_kbps(100))
         );
     }
 

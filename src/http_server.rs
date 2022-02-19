@@ -170,6 +170,7 @@ mod metrics {
         pub video1_incoming_bps: u64,
         pub video2_incoming_bps: u64,
         pub target_send_bps: u64,
+        pub requested_base_bps: u64,
         pub ideal_send_bps: u64,
         pub allocated_send_bps: u64,
         pub padding_send_bps: u64,
@@ -302,6 +303,7 @@ async fn get_metrics(sfu: Arc<Mutex<Sfu>>) -> Result<warp::reply::Response, warp
                     video1_incoming_bps: client.video1_incoming_rate.unwrap_or_default().as_bps(),
                     video2_incoming_bps: client.video2_incoming_rate.unwrap_or_default().as_bps(),
                     padding_send_bps: client.padding_send_rate.as_bps(),
+                    requested_base_bps: client.requested_base_rate.as_bps(),
                     ideal_send_bps: client.ideal_send_rate.as_bps(),
                     allocated_send_bps: client.allocated_send_rate.as_bps(),
                     video0_incoming_height: client

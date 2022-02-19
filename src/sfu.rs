@@ -663,7 +663,7 @@ impl Sfu {
                         let _ = write!(diagnostic_string, "call: {}", stats.loggable_call_id);
 
                         for client in stats.clients {
-                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), target: {}, ideal: {}, allocated: {}, padding: {}, max_requested_height: {} }}",
+                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), target: {}, requested_base: {}, ideal: {}, allocated: {}, padding: {}, max_requested_height: {} }}",
                                   client.demux_id.as_u32(),
                                   client.video0_incoming_height.unwrap_or_default().as_u16(),
                                   client.video1_incoming_height.unwrap_or_default().as_u16(),
@@ -671,6 +671,7 @@ impl Sfu {
                                   client.video0_incoming_rate.unwrap_or_default().as_kbps(),
                                   client.video1_incoming_rate.unwrap_or_default().as_kbps(),
                                   client.video2_incoming_rate.unwrap_or_default().as_kbps(),
+                                  client.requested_base_rate.as_kbps(),
                                   client.target_send_rate.as_kbps(),
                                   client.ideal_send_rate.as_kbps(),
                                   client.allocated_send_rate.as_kbps(),
@@ -786,14 +787,10 @@ impl Sfu {
                         send_rate_allocation_info.padding_send_rate,
                         send_rate_allocation_info.padding_ssrc,
                     );
-                    if send_rate_allocation_info.send_rate_reset
-                        > connection.congestion_controller_reset()
-                    {
-                        connection.reset_congestion_controller(
-                            send_rate_allocation_info.initial_target_send_rate_after_reset,
-                            now,
-                        );
-                    }
+                    connection.send_request_to_congestion_controller(googcc::Request {
+                        base: send_rate_allocation_info.requested_base_rate,
+                        ideal: send_rate_allocation_info.ideal_send_rate,
+                    });
                 }
             }
 
