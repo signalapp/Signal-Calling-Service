@@ -39,6 +39,13 @@ use crate::{
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct HealthResponse {
+    pub call_count: usize,
+    pub client_count: usize,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct InfoResponse {
     pub direct_access_ip: String,
 }
@@ -123,10 +130,41 @@ pub fn parse_user_id_and_resolution_request_id_from_endpoint_id(
     }
 }
 
+/// Return a health response after accessing the SFU and obtaining basic information.
+async fn get_health(
+    sfu: Arc<Mutex<Sfu>>,
+    is_healthy: Arc<AtomicBool>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    trace!("get_health():");
+
+    if is_healthy.load(Ordering::Relaxed) {
+        let calls = sfu.lock().get_calls_snapshot(); // SFU lock released here.
+
+        let client_count = calls
+            .iter()
+            .map(|call| {
+                // We can take this call lock after closing the SFU lock because we are treating
+                // it as read-only and can accommodate stale data.
+                let call = call.lock();
+                call.size()
+            })
+            .sum();
+
+        let response = HealthResponse {
+            call_count: calls.len(),
+            client_count,
+        };
+
+        Ok(warp::reply::with_status(warp::reply::json(&response), StatusCode::OK).into_response())
+    } else {
+        // Return a server error because it is not healthy for external reasons.
+        Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    }
+}
+
 /// Obtain information about the server.
 async fn get_info(
     config: &'static config::Config,
-    _sfu: Arc<Mutex<Sfu>>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     trace!("get_info():");
 
@@ -148,7 +186,6 @@ async fn get_info(
 /// currently in the call.
 async fn get_clients(
     call_id: String,
-    _config: &'static config::Config,
     sfu: Arc<Mutex<Sfu>>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     trace!("get_clients(): {}", call_id);
@@ -298,7 +335,6 @@ async fn join(
 async fn leave(
     call_id: String,
     demux_id: u32,
-    _config: &'static config::Config,
     sfu: Arc<Mutex<Sfu>>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     trace!("leave(): {} {}", call_id, demux_id);
@@ -351,14 +387,21 @@ async fn rejection_handler(rejection: warp::Rejection) -> Result<impl Reply, Inf
     Ok(warp::reply::with_status(message, code))
 }
 
-/// A warp filter for providing the config for a route.
+/// A warp filter that provides the is_healthy flag to a route.
+fn with_is_healthy(
+    is_healthy: Arc<AtomicBool>,
+) -> impl Filter<Extract = (Arc<AtomicBool>,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || is_healthy.clone())
+}
+
+/// A warp filter that provides the config to a route.
 fn with_config(
     config: &'static config::Config,
 ) -> impl Filter<Extract = (&'static config::Config,), Error = std::convert::Infallible> + Clone {
     warp::any().map(move || config)
 }
 
-/// A warp filter for extracting the Sfu state for a route.
+/// A warp filter that provides the sfu state to a route.
 fn with_sfu(
     sfu: Arc<Mutex<Sfu>>,
 ) -> impl Filter<Extract = (Arc<Mutex<Sfu>>,), Error = std::convert::Infallible> + Clone {
@@ -367,39 +410,32 @@ fn with_sfu(
 
 /// Filter to support the "GET /about/health" API for the server and testing.
 fn get_health_api(
+    sfu: Arc<Mutex<Sfu>>,
     is_healthy: Arc<AtomicBool>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    warp::path!("about" / "health")
+    warp::path!("health")
         .and(warp::get())
-        .map(move || {
-            if is_healthy.load(Ordering::Relaxed) {
-                Ok(StatusCode::OK.into_response())
-            } else {
-                Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response())
-            }
-        })
+        .and(with_sfu(sfu))
+        .and(with_is_healthy(is_healthy))
+        .and_then(get_health)
 }
 
 /// Filter to support the "GET /v1/info" API for the server and testing.
 fn get_info_api(
     config: &'static config::Config,
-    sfu: Arc<Mutex<Sfu>>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("v1" / "info")
         .and(warp::get())
         .and(with_config(config))
-        .and(with_sfu(sfu))
         .and_then(get_info)
 }
 
 /// Filter to support the "GET /v1/call/$call_id/clients" API for the server and testing.
 fn get_clients_api(
-    config: &'static config::Config,
     sfu: Arc<Mutex<Sfu>>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("v1" / "call" / String / "clients")
         .and(warp::get())
-        .and(with_config(config))
         .and(with_sfu(sfu))
         .and_then(get_clients)
 }
@@ -419,12 +455,10 @@ fn join_api(
 
 /// Filter to support the "DELETE /v1/call/$call_id/client/$demux_id" API for the server and testing.
 fn leave_api(
-    config: &'static config::Config,
     sfu: Arc<Mutex<Sfu>>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("v1" / "call" / String / "client" / u32)
         .and(warp::delete())
-        .and(with_config(config))
         .and(with_sfu(sfu))
         .and_then(leave)
 }
@@ -435,11 +469,11 @@ pub fn signaling_api(
     sfu: Arc<Mutex<Sfu>>,
     is_healthy: Arc<AtomicBool>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    get_health_api(is_healthy)
-        .or(get_info_api(config, sfu.clone()))
-        .or(get_clients_api(config, sfu.clone()))
+    get_health_api(sfu.clone(), is_healthy)
+        .or(get_info_api(config))
+        .or(get_clients_api(sfu.clone()))
         .or(join_api(config, sfu.clone()))
-        .or(leave_api(config, sfu))
+        .or(leave_api(sfu))
 }
 
 pub async fn start(
@@ -587,21 +621,13 @@ mod signaling_server_tests {
 
         let api = signaling_api(config, sfu, is_healthy.clone()).recover(rejection_handler);
 
-        let response = request()
-            .method("GET")
-            .path("/about/health")
-            .reply(&api)
-            .await;
+        let response = request().method("GET").path("/health").reply(&api).await;
 
         assert_eq!(response.status(), StatusCode::OK);
 
         is_healthy.store(false, Ordering::Relaxed);
 
-        let response = request()
-            .method("GET")
-            .path("/about/health")
-            .reply(&api)
-            .await;
+        let response = request().method("GET").path("/health").reply(&api).await;
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
