@@ -36,7 +36,7 @@ base64 = "0.13"
 hex = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 rcgen = "0.8"
-prost = "0.9"
+prost = "0.10"
 
 # For common
 sha2 = "0.9"
@@ -64,7 +64,7 @@ rand_core5 = { package = "rand_core", version = "0.5.1", features = [] }
 x25519-dalek = { version = "1.1" }
 
 # For DTLS and RTP
-zeroize = "1.4.1"
+zeroize = "1.5.4"
 
 # For congestion control
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -73,13 +73,13 @@ async-stream = "0.3"
 pin-project = "1.0"
 
 # For low-level UDP sockets
-nix = { version = "0.20", optional = true }
+nix = { version = "0.23", optional = true }
 
 # For current process memory stats
-psutil = { version = "3.2", default-features = false, features = ["process"] }
+psutil = { version = "3.2.2", default-features = false, features = ["process"] }
 
 [build-dependencies]
-prost-build = "0.9"
+prost-build = "0.10"
 
 [dev-dependencies]
 unzip3 = "1.0"

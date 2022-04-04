@@ -5,7 +5,8 @@
 
 # Use the current rust environment for building.
 FROM rust:1.58.1-buster AS build-stage
-RUN apt-get update
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --no-install-suggests protobuf-compiler
 
 WORKDIR /usr/src
 
