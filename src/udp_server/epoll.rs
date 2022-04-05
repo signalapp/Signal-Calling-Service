@@ -16,6 +16,7 @@ use anyhow::Result;
 use log::*;
 use nix::sys::{epoll::*, socket::*};
 use parking_lot::RwLock;
+use scopeguard::ScopeGuard;
 
 use crate::{
     common::{try_scoped, Duration},
@@ -93,18 +94,25 @@ impl UdpServerState {
             SockFlag::empty(),
             SockProtocol::Udp,
         )?;
+        // Don't pass ownership into a std::net::UdpSocket just yet;
+        // it's not clear whether it's correct to do that before binding.
+        // Instead, use an ad-hoc ScopeGuard.
+        let socket_fd = scopeguard::guard(socket_fd, |fd| match nix::unistd::close(fd) {
+            Ok(()) => {}
+            Err(e) => warn!("error closing failed socket: {}", e),
+        });
         // Allow later sockets to handle connections.
-        setsockopt(socket_fd, sockopt::ReusePort, &true)?;
+        setsockopt(*socket_fd, sockopt::ReusePort, &true)?;
         // Bind the socket to the given local address.
         bind(
-            socket_fd,
+            *socket_fd,
             &SockAddr::new_inet(InetAddr::from_std(local_addr)),
         )?;
-        // Pass ownership into Rust.
+        // Pass ownership from ScopeGuard into a proper Rust UdpSocket.
         // std::net::UdpSocket can only be created and bound in one step, which
         // doesn't allow us to set SO_REUSEPORT.
         // Safety: we have just created this socket FD, so we know it's valid.
-        let result = unsafe { UdpSocket::from_raw_fd(socket_fd) };
+        let result = unsafe { UdpSocket::from_raw_fd(ScopeGuard::into_inner(socket_fd)) };
         // Set a read timeout for a "pseudo-nonblocking" interface.
         // Why? Because epoll might wake up more than one thread to read from a single socket.
         result.set_read_timeout(Some(Duration::from_millis(10).into()))?;

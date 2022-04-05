@@ -15,6 +15,7 @@ license = "AGPL-3.0-only"
 # For error handling
 anyhow = "1.0"
 thiserror = "1.0"
+scopeguard = "1.1"
 
 # For logging and command line operations
 log = "0.4"
