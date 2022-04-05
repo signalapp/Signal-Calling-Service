@@ -297,7 +297,19 @@ async fn get_metrics(sfu: Arc<Mutex<Sfu>>) -> Result<warp::reply::Response, warp
                 .iter()
                 .map(|client| metrics::Client {
                     demux_id: client.demux_id.into(),
-                    user_id: String::from_utf8_lossy(client.user_id.as_slice()).to_string(),
+                    // FIXME: Replace with client.user_id.as_slice().escape_ascii().to_string()
+                    // when escape_ascii is stabilized.
+                    user_id: String::from_utf8(
+                        client
+                            .user_id
+                            .as_slice()
+                            .iter()
+                            .copied()
+                            .map(std::ascii::escape_default)
+                            .flatten()
+                            .collect(),
+                    )
+                    .unwrap(),
                     target_send_bps: client.target_send_rate.as_bps(),
                     video0_incoming_bps: client.video0_incoming_rate.unwrap_or_default().as_bps(),
                     video1_incoming_bps: client.video1_incoming_rate.unwrap_or_default().as_bps(),
