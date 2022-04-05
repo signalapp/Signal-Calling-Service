@@ -5,23 +5,11 @@
 
 //! Implementation of the http server. This version is based on warp.
 //! Supported APIs:
-//!   GET /health
 //!   GET /metrics
-//!   GET /v1/conference/participants
-//!   PUT /v1/conference/participants
-//!   DELETE /v1/conference/participants/endpoint_id
+//!   GET /v2/conference/participants
+//!   PUT /v2/conference/participants
 
-use std::{
-    convert::TryInto,
-    net::IpAddr,
-    str,
-    str::FromStr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::UNIX_EPOCH,
-};
+use std::{convert::TryInto, net::IpAddr, str, str::FromStr, sync::Arc, time::UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use hex::{FromHex, ToHex};
@@ -34,129 +22,43 @@ use tokio::sync::oneshot::Receiver;
 use warp::{http::StatusCode, Filter, Reply};
 
 use crate::{
-    common,
-    common::Instant,
     config, ice,
     sfu::{self, Sfu, SrtpMasterSourceServerPublic},
 };
 
 #[derive(Serialize, Debug)]
-pub struct ParticipantsResponse {
-    #[serde(rename = "conferenceId")]
-    pub era_id: String,
-    #[serde(rename = "maxConferenceSize")]
-    pub max_devices: u32,
-    pub participants: Vec<SfuParticipant>,
-    // TODO: Make this with hex too.
-    pub creator: String,
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-pub struct Candidate {
-    pub port: u16,
-    pub ip: String,
-    #[serde(rename = "type")]
-    pub candidate_type: String,
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-pub struct Fingerprint {
-    pub fingerprint: String,
-    pub hash: String,
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-pub struct Transport {
-    pub candidates: Vec<Candidate>,
-    #[serde(rename = "dhePublicKey")]
-    pub dhe_pub_key: Option<String>,
-    #[serde(rename = "hkdfExtraInfo")]
-    pub hkdf_extra_info: Option<String>,
-    pub fingerprints: Option<Vec<Fingerprint>>,
-    pub ufrag: String,
-    pub pwd: String,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct PayloadParameters {
-    pub minptime: Option<u32>,
-    pub useinbandfec: Option<u32>,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct RtcpFbs {
-    #[serde(rename = "type")]
-    pub fbs_type: String,
-    pub subtype: Option<String>,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct PayloadType {
-    pub id: u8,
-    pub name: String,
-    pub clockrate: u32,
-    pub channels: u32,
-    pub parameters: Option<PayloadParameters>,
-    #[serde(rename = "rtcp-fbs")]
-    pub rtcp_fbs: Option<Vec<RtcpFbs>>,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct HeaderExtension {
-    pub id: u32,
-    pub uri: String,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct SsrcGroup {
-    pub semantics: String,
-    pub sources: Vec<u32>,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct JoinRequest {
-    pub transport: Transport,
-    #[serde(rename = "audioPayloadType")]
-    pub audio_payload_type: PayloadType,
-    #[serde(rename = "videoPayloadType")]
-    pub video_payload_type: PayloadType,
-    #[serde(rename = "dataPayloadType")]
-    pub data_payload_type: PayloadType,
-    #[serde(rename = "audioHeaderExtensions")]
-    pub audio_header_extensions: Vec<HeaderExtension>,
-    #[serde(rename = "videoHeaderExtensions")]
-    pub video_header_extensions: Vec<HeaderExtension>,
-    #[serde(rename = "audioSsrcs")]
-    pub audio_ssrcs: Vec<u32>,
-    #[serde(rename = "audioSsrcGroups")]
-    pub audio_ssrc_groups: Vec<SsrcGroup>,
-    #[serde(rename = "dataSsrcs")]
-    pub data_ssrcs: Vec<u32>,
-    #[serde(rename = "dataSsrcGroups")]
-    pub data_ssrc_groups: Vec<SsrcGroup>,
-    #[serde(rename = "videoSsrcs")]
-    pub video_ssrcs: Vec<u32>,
-    #[serde(rename = "videoSsrcGroups")]
-    pub video_ssrc_groups: Vec<SsrcGroup>,
+#[serde(rename_all = "camelCase")]
+pub struct Participant {
+    pub opaque_user_id: String,
+    pub demux_id: u32,
 }
 
 #[derive(Serialize, Debug)]
-pub struct JoinResponse {
-    #[serde(rename = "endpointId", with = "hex")]
-    pub leave_request_token: String,
-    #[serde(rename = "opaqueUserId")]
-    pub opaque_user_id: String,
-    #[serde(rename = "ssrcPrefix")]
-    pub demux_id: u32,
-    pub transport: Transport,
+#[serde(rename_all = "camelCase")]
+pub struct ParticipantsResponse {
+    pub conference_id: String,
+    pub max_devices: u32,
+    pub participants: Vec<Participant>,
+    pub creator: String,
 }
 
-#[derive(Serialize, Debug, Clone)]
-pub struct SfuParticipant {
-    #[serde(rename = "endpointId")]
-    pub endpoint_id: String,
-    #[serde(rename = "ssrcPrefix")]
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinRequest {
+    pub ice_ufrag: String,
+    pub dhe_public_key: String,
+    pub hkdf_extra_info: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinResponse {
     pub demux_id: u32,
+    pub port: u16,
+    pub ip: String,
+    pub ice_ufrag: String,
+    pub ice_pwd: String,
+    pub dhe_public_key: String,
 }
 
 mod metrics {
@@ -356,7 +258,7 @@ async fn get_participants(
     sfu: Arc<Mutex<Sfu>>,
     authorization_header: String,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    trace!("get():");
+    trace!("get_participants():");
 
     let call_id = match parse_and_authenticate(config, &authorization_header) {
         Ok((_, call_id)) => call_id,
@@ -382,21 +284,27 @@ async fn get_participants(
         let participants = signaling
             .client_ids
             .iter()
-            .map(|(demux_id, active_speaker_id)| SfuParticipant {
-                endpoint_id: active_speaker_id.to_owned(),
+            .map(|(demux_id, active_speaker_id)| Participant {
+                // This conversion will go away when the signaling api is refactored
+                // to return the opaque_user_id directly.
+                opaque_user_id: active_speaker_id
+                    .split_once('-')
+                    .expect("valid active_speaker_id")
+                    .0
+                    .to_string(),
                 demux_id: u32::from(*demux_id),
             })
             .collect();
 
-        let era_id = signaling
+        let conference_id = signaling
             .created
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_millis()
             .to_string();
+
         let response = ParticipantsResponse {
-            // TODO: Consider handling the expectation and returning an internal server error for it.
-            era_id,
+            conference_id,
             max_devices,
             participants,
             creator: signaling.creator_id.as_slice().encode_hex(),
@@ -408,13 +316,13 @@ async fn get_participants(
     }
 }
 
-async fn join(
+async fn join_conference(
     config: &'static config::Config,
     sfu: Arc<Mutex<Sfu>>,
     authorization_header: String,
     join_request: JoinRequest,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    trace!("join():");
+    trace!("join_conference():");
 
     let (user_id, call_id) = match parse_and_authenticate(config, &authorization_header) {
         Ok((user_id, call_id)) => (user_id, call_id),
@@ -428,73 +336,36 @@ async fn join(
         }
     };
 
-    // Evaluate the request with basic assertions.
-    if join_request.audio_header_extensions.len() != 3
-        || join_request.audio_payload_type.id != 102
-        || !join_request.audio_ssrc_groups.is_empty()
-        || join_request.audio_ssrcs.len() != 1
-        || join_request.data_payload_type.id != 101
-        || join_request.data_ssrcs.len() != 1
-        || join_request.video_header_extensions.len() != 3
-        || join_request.video_payload_type.id != 108
-        || join_request.video_ssrc_groups.len() != 4
-        || join_request.video_ssrcs.len() != 6
-    {
+    if join_request.dhe_public_key.is_empty() {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&"Missing required fields in the request.".to_string()),
+            warp::reply::json(&"Empty dhe_public_key in the request.".to_string()),
             StatusCode::NOT_ACCEPTABLE,
         )
         .into_response());
     }
 
-    let client_public = match (
-        join_request.transport.dhe_pub_key,
-        join_request.transport.fingerprints.as_deref(),
-    ) {
-        (Some(dhe_pub_key), _) => match <[u8; 32]>::from_hex(dhe_pub_key) {
-            Ok(public_key) => sfu::SrtpMasterSourceClientPublic::Dhe {
-                public_key,
-                hkdf_extra_info: match join_request.transport.hkdf_extra_info {
-                    None => vec![],
-                    Some(hkdf_extra_info) => match Vec::<u8>::from_hex(hkdf_extra_info) {
-                        Ok(hkdf_extra_info) => hkdf_extra_info,
-                        Err(_) => {
-                            return Ok(warp::reply::with_status(
-                                warp::reply::json(
-                                    &"Invalid hkdf_extra_info in the request.".to_string(),
-                                ),
-                                StatusCode::NOT_ACCEPTABLE,
-                            )
-                            .into_response());
-                        }
-                    },
+    let client_public = match <[u8; 32]>::from_hex(join_request.dhe_public_key) {
+        Ok(public_key) => sfu::SrtpMasterSourceClientPublic::Dhe {
+            public_key,
+            hkdf_extra_info: match join_request.hkdf_extra_info {
+                None => vec![],
+                Some(hkdf_extra_info) => match Vec::<u8>::from_hex(hkdf_extra_info) {
+                    Ok(hkdf_extra_info) => hkdf_extra_info,
+                    Err(_) => {
+                        return Ok(warp::reply::with_status(
+                            warp::reply::json(
+                                &"Invalid hkdf_extra_info in the request.".to_string(),
+                            ),
+                            StatusCode::NOT_ACCEPTABLE,
+                        )
+                        .into_response());
+                    }
                 },
             },
-            Err(_) => {
-                return Ok(warp::reply::with_status(
-                    warp::reply::json(&"Invalid dhe_pub_key in the request.".to_string()),
-                    StatusCode::NOT_ACCEPTABLE,
-                )
-                .into_response());
-            }
         },
-        (None, Some([fingerprint, ..])) => {
-            match common::colon_separated_hexstring_to_array(&fingerprint.fingerprint) {
-                Ok(v) => sfu::SrtpMasterSourceClientPublic::DtlsFingerprint(v),
-                Err(_) => {
-                    return Ok(warp::reply::with_status(
-                        warp::reply::json(&"Invalid DTLS fingerprint in the request".to_string()),
-                        StatusCode::NOT_ACCEPTABLE,
-                    )
-                    .into_response());
-                }
-            }
-        }
-        (None, _) => {
+        Err(_) => {
             return Ok(warp::reply::with_status(
-                warp::reply::json(
-                    &"Must provide either dtls_fingerprint or dhe_pub_key".to_string(),
-                ),
+                warp::reply::json(&"Invalid dhe_public_key in the request.".to_string()),
                 StatusCode::NOT_ACCEPTABLE,
             )
             .into_response());
@@ -512,98 +383,54 @@ async fn join(
     let server_ice_pwd = ice::random_pwd();
 
     let mut sfu = sfu.lock();
-    let server_public = sfu
-        .get_or_create_call_and_add_client(
-            call_id,
-            &user_id,
-            resolution_request_id,
-            endpoint_id.clone(),
-            demux_id,
-            server_ice_ufrag.clone(),
-            server_ice_pwd.clone(),
-            join_request.transport.ufrag,
-            client_public,
-        )
-        .unwrap();
-    let socket_addr = config::get_server_media_address(config);
-    let candidate = Candidate {
-        port: socket_addr.port(),
-        ip: socket_addr.ip().to_string(),
-        candidate_type: "host".to_string(),
-    };
+    match sfu.get_or_create_call_and_add_client(
+        call_id,
+        &user_id,
+        resolution_request_id,
+        endpoint_id,
+        demux_id,
+        server_ice_ufrag.clone(),
+        server_ice_pwd.clone(),
+        join_request.ice_ufrag,
+        client_public,
+    ) {
+        Ok(server_public) => {
+            let media_addr = config::get_server_media_address(config);
 
-    let candidates = vec![candidate];
+            let dhe_public_key = match server_public {
+                SrtpMasterSourceServerPublic::Dhe { public_key, .. } => public_key.encode_hex(),
+                SrtpMasterSourceServerPublic::DtlsFingerprint(_) => {
+                    return Ok(warp::reply::with_status(
+                        warp::reply::json(&"Server did not provide dhe_public_key".to_string()),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                    .into_response());
+                }
+            };
 
-    let (dhe_pub_key, fingerprints) = match server_public {
-        SrtpMasterSourceServerPublic::Dhe { public_key, .. } => {
-            (Some(public_key.encode_hex()), None)
-        }
-        SrtpMasterSourceServerPublic::DtlsFingerprint(fingerprint) => (
-            None,
-            Some(vec![Fingerprint {
-                fingerprint: common::bytes_to_colon_separated_hexstring(&fingerprint),
-                hash: "sha-256".to_string(),
-            }]),
-        ),
-    };
+            let response = JoinResponse {
+                demux_id: demux_id.into(),
+                port: media_addr.port(),
+                ip: media_addr.ip().to_string(),
+                ice_ufrag: server_ice_ufrag,
+                ice_pwd: server_ice_pwd,
+                dhe_public_key,
+            };
 
-    let transport = Transport {
-        candidates,
-        dhe_pub_key,
-        hkdf_extra_info: None,
-        fingerprints,
-        ufrag: server_ice_ufrag,
-        pwd: server_ice_pwd,
-    };
-
-    let response = JoinResponse {
-        demux_id: demux_id.into(),
-        transport,
-        opaque_user_id: user_id_string,
-        leave_request_token: endpoint_id,
-    };
-
-    Ok(warp::reply::with_status(warp::reply::json(&response), StatusCode::OK).into_response())
-}
-
-async fn leave(
-    leave_request_token: String,
-    config: &'static config::Config,
-    sfu: Arc<Mutex<Sfu>>,
-    authorization_header: String,
-) -> Result<warp::reply::Response, warp::Rejection> {
-    trace!("leave():");
-
-    let call_id = match parse_and_authenticate(config, &authorization_header) {
-        Ok((_, call_id)) => call_id,
-        Err(err) => {
-            warn!("leave(): unauthorized {}", err);
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&err.to_string()),
-                StatusCode::UNAUTHORIZED,
+            Ok(
+                warp::reply::with_status(warp::reply::json(&response), StatusCode::OK)
+                    .into_response(),
             )
-            .into_response());
         }
-    };
-
-    // Calculate the demux_id with some simple validation of the endpoint_id.
-    let endpoint_id = leave_request_token;
-    let demux_id = if endpoint_id.chars().count() > 3 && endpoint_id.contains('-') {
-        demux_id_from_endpoint_id(&endpoint_id)
-    } else {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&"Invalid endpoint_id format".to_string()),
-            StatusCode::BAD_REQUEST,
-        )
-        .into_response());
-    };
-
-    sfu.lock()
-        .remove_client_from_call(Instant::now(), call_id, demux_id);
-
-    // TODO: When the function above returns a result, handle that.
-    // TODO: Also, if there was no group call, should we return NOT_FOUND?
-    Ok(StatusCode::NO_CONTENT.into_response())
+        Err(err) => {
+            error!("client failed to join call {}", err.to_string());
+            Ok(warp::reply::with_status(
+                warp::reply::json(&err.to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response())
+        }
+    }
 }
 
 /// A warp filter for providing the config for a route.
@@ -624,55 +451,31 @@ pub async fn start(
     config: &'static config::Config,
     sfu: Arc<Mutex<Sfu>>,
     http_ender_rx: Receiver<()>,
-    is_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
-    // Filter to support: GET /health
-    let health_check_api = warp::path!("about" / "health")
-        .and(warp::get())
-        .map(move || {
-            if is_healthy.load(Ordering::Relaxed) {
-                Ok(StatusCode::OK.into_response())
-            } else {
-                Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response())
-            }
-        });
-
     // Filter to support: GET /metrics
     let metrics_api = warp::path!("metrics")
         .and(warp::get())
         .and(with_sfu(sfu.clone()))
         .and_then(get_metrics);
 
-    // Filter to support: GET /v1/conference/participants
-    let get_participants_api = warp::path!("v1" / "conference" / "participants")
+    // Filter to support: GET /v2/conference/participants
+    let get_participants_api = warp::path!("v2" / "conference" / "participants")
         .and(warp::get())
         .and(with_config(config))
         .and(with_sfu(sfu.clone()))
         .and(warp::header("authorization"))
         .and_then(get_participants);
 
-    // Filter to support: PUT /v1/conference/participants
-    let join_api = warp::path!("v1" / "conference" / "participants")
+    // Filter to support: PUT /v2/conference/participants
+    let join_api = warp::path!("v2" / "conference" / "participants")
         .and(warp::put())
         .and(with_config(config))
         .and(with_sfu(sfu.clone()))
         .and(warp::header("authorization"))
         .and(warp::body::json())
-        .and_then(join);
+        .and_then(join_conference);
 
-    // Filter to support: DELETE v1/conference/participants/endpoint-id 204 Success
-    let leave_api = warp::path!("v1" / "conference" / "participants" / String)
-        .and(warp::delete())
-        .and(with_config(config))
-        .and(with_sfu(sfu))
-        .and(warp::header("authorization"))
-        .and_then(leave);
-
-    let api = health_check_api
-        .or(metrics_api)
-        .or(get_participants_api)
-        .or(join_api)
-        .or(leave_api);
+    let api = metrics_api.or(get_participants_api).or(join_api);
 
     // Add other options to form the final routes to be served.
     // TODO: Disabling the "with(log)" mechanism since it causes the following
@@ -701,6 +504,8 @@ mod http_server_tests {
     use hex::{FromHex, ToHex};
     use lazy_static::lazy_static;
     use rand::{thread_rng, Rng};
+
+    use crate::common;
 
     use super::*;
 

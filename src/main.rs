@@ -155,7 +155,7 @@ fn main() -> Result<()> {
             if config.signaling_ip.is_some() {
                 let _ = signaling_server::start(config, sfu, signaling_ender_rx, is_healthy).await;
             } else {
-                let _ = http_server::start(config, sfu, signaling_ender_rx, is_healthy).await;
+                let _ = http_server::start(config, sfu, signaling_ender_rx).await;
             }
             let _ = signal_canceller_tx.send(()).await;
         });
