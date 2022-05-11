@@ -41,6 +41,8 @@ const SEND_RATE_REALLOCATION_INTERVAL: Duration = Duration::from_millis(1000);
 /// The lower the value, the more CPU we use but the more responsive
 /// active speaker switching becomes.
 const ACTIVE_SPEAKER_CALCULATION_INTERVAL: Duration = Duration::from_millis(300);
+/// This is how often we send stats down to the client
+const STATS_MESSAGE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A wrapper around Vec<u8> to identify a Call.
 /// It comes from signaling, but isn't known by the clients.
@@ -251,6 +253,9 @@ pub struct Call {
     /// The last time an active speaker update was sent to the clients
     active_speaker_update_sent: Instant,
 
+    /// The last time a status update was sent to the clients
+    stats_update_sent: Instant,
+
     /// The last time key frame requests were sent, in general and specifically for certain SSRCs
     key_frame_requests_sent: Instant,
     key_frame_request_sent_by_ssrc: HashMap<rtp::Ssrc, Instant>,
@@ -295,6 +300,8 @@ impl Call {
             active_speaker_ids: None,
             active_speaker_calculated: now - ACTIVE_SPEAKER_CALCULATION_INTERVAL, // easier than using None :)
             active_speaker_update_sent: now,
+
+            stats_update_sent: now, // easier than using None :)
 
             key_frame_requests_sent: now - KEY_FRAME_REQUEST_CALCULATION_INTERVAL, // easier than using None :)
             key_frame_request_sent_by_ssrc: HashMap::new(),
@@ -794,7 +801,8 @@ impl Call {
             self.active_speaker_update_sent = now;
         }
 
-        if update.device_joined_or_left.is_some() || update.speaker.is_some() {
+        let send_stats = now >= self.stats_update_sent + STATS_MESSAGE_INTERVAL;
+        if update.device_joined_or_left.is_some() || update.speaker.is_some() || send_stats {
             let raw_demux_ids: Vec<u32> = self
                 .clients
                 .iter()
@@ -820,6 +828,13 @@ impl Call {
                         })
                         .collect(),
                 });
+                if send_stats {
+                    update.stats = Some(protos::sfu_to_device::Stats {
+                        target_send_rate_kbps: Some(client.target_send_rate.as_kbps() as u32),
+                        ideal_send_rate_kbps: Some(client.ideal_send_rate.as_kbps() as u32),
+                        allocated_send_rate_kbps: Some(client.allocated_send_rate.as_kbps() as u32),
+                    });
+                }
 
                 let mut update_rtp_payload: Vec<u8> = Vec::with_capacity(update.encoded_len());
                 update
@@ -839,6 +854,10 @@ impl Call {
                     &update_rtp_payload,
                 );
                 rtp_to_send.push((client.demux_id, update_rtp))
+            }
+
+            if send_stats {
+                self.stats_update_sent = now;
             }
         }
     }
@@ -3436,9 +3455,35 @@ mod call_tests {
             rtp_to_send
         );
 
-        // Don't resend anything after just 301ms
+        let get_stats = |from_server: &[RtpToSend],
+                         receiver_demux_id: DemuxId|
+         -> Option<protos::sfu_to_device::Stats> {
+            let (_demux_id, rtp) = from_server
+                .iter()
+                .find(|(demux_id, _rtp)| *demux_id == receiver_demux_id)?;
+            let proto = protos::SfuToDevice::decode(rtp.payload()).ok()?;
+            proto.stats
+        };
+
+        // Don't resend anything after just 301ms (except stats)
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(1204));
-        assert_eq!(0, rtp_to_send.len());
+        assert_eq!(2, rtp_to_send.len());
+        assert_eq!(
+            Some(protos::sfu_to_device::Stats {
+                target_send_rate_kbps: Some(600),
+                ideal_send_rate_kbps: Some(0),
+                allocated_send_rate_kbps: Some(0),
+            }),
+            get_stats(&rtp_to_send, demux_id1)
+        );
+        assert_eq!(
+            Some(protos::sfu_to_device::Stats {
+                target_send_rate_kbps: Some(600),
+                ideal_send_rate_kbps: Some(0),
+                allocated_send_rate_kbps: Some(0),
+            }),
+            get_stats(&rtp_to_send, demux_id2)
+        );
 
         // But do resend after 1001ms
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(1904));
@@ -3446,14 +3491,34 @@ mod call_tests {
             vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(4, &expected_update_payload)
+                    create_server_to_client_rtp(5, &expected_update_payload)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(4, &expected_update_payload)
+                    create_server_to_client_rtp(5, &expected_update_payload)
                 )
             ],
             rtp_to_send
+        );
+
+        // And more stats a little later.
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(2205));
+        assert_eq!(2, rtp_to_send.len());
+        assert_eq!(
+            Some(protos::sfu_to_device::Stats {
+                target_send_rate_kbps: Some(600),
+                ideal_send_rate_kbps: Some(0),
+                allocated_send_rate_kbps: Some(0),
+            }),
+            get_stats(&rtp_to_send, demux_id1)
+        );
+        assert_eq!(
+            Some(protos::sfu_to_device::Stats {
+                target_send_rate_kbps: Some(600),
+                ideal_send_rate_kbps: Some(0),
+                allocated_send_rate_kbps: Some(0),
+            }),
+            get_stats(&rtp_to_send, demux_id2)
         );
     }
 
