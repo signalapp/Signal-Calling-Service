@@ -5,8 +5,8 @@
 
 [package]
 name = "calling_server"
-version = "1.3.4"
-authors = ["Peter Thatcher <peter@signal.org>", "Jim Gustafson <jim@signal.org>", "Jordan Rose <jrose@signal.org>", "Alan Evans <alan@signal.org>"]
+version = "1.3.5"
+authors = ["Calling Team <callingteam@signal.org>"]
 edition = "2018"
 description = "Media forwarding server for group calls."
 license = "AGPL-3.0-only"
