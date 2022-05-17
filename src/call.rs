@@ -83,8 +83,8 @@ impl From<&[u8]> for LoggableCallId {
             if data.is_empty() {
                 "<EMPTY>".to_string()
             } else {
-                let last_3_bytes_of_id = data.rchunks(3).next().unwrap();
-                last_3_bytes_of_id.encode_hex::<String>()
+                let first_3_bytes_of_id = data.chunks(3).next().unwrap();
+                first_3_bytes_of_id.encode_hex::<String>()
             }
         };
         LoggableCallId {
@@ -1774,8 +1774,8 @@ mod loggable_call_id_tests {
         let bytes = hex!("000102030405060708090a0b0c0d0e0f");
         let call_id: LoggableCallId = bytes[..].into();
 
-        assert_eq!("0d0e0f", format!("{}", call_id));
-        assert_eq!("0d0e0f", call_id.to_string());
+        assert_eq!("000102", format!("{}", call_id));
+        assert_eq!("000102", call_id.to_string());
     }
 
     #[test]
@@ -1783,8 +1783,8 @@ mod loggable_call_id_tests {
         let bytes = hex!("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f222122232425262728292a2b2c2d2e2f033132333435363738393a3b3c3d3e3f");
         let call_id: LoggableCallId = bytes[..].into();
 
-        assert_eq!("3d3e3f", format!("{}", call_id));
-        assert_eq!("3d3e3f", call_id.to_string());
+        assert_eq!("000102", format!("{}", call_id));
+        assert_eq!("000102", call_id.to_string());
     }
 
     #[test]
@@ -1800,7 +1800,7 @@ mod loggable_call_id_tests {
         let bytes = hex!("0c0d0e0f");
         let call_id: LoggableCallId = bytes[..].into();
 
-        assert_eq!("0d0e0f", format!("{}", call_id));
+        assert_eq!("0c0d0e", format!("{}", call_id));
     }
 
     #[test]

@@ -82,6 +82,17 @@ impl ConnectionId {
     }
 }
 
+impl std::fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "call_id: {}, demux_id: {}",
+            &LoggableCallId::from(&self.call_id),
+            &self.demux_id.as_u32()
+        )
+    }
+}
+
 impl std::fmt::Debug for ConnectionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionId")
@@ -291,7 +302,7 @@ impl Sfu {
             }
 
             info!(
-                "call: {} adding client: {}",
+                "call_id: {} adding demux_id: {}",
                 loggable_call_id,
                 demux_id.as_u32()
             );
@@ -381,7 +392,7 @@ impl Sfu {
 
         if let Some(call) = self.call_by_call_id.get(&connection_id.call_id) {
             info!(
-                "call: {} removing client: {}",
+                "call_id: {} removing demux_id: {}",
                 loggable_call_id,
                 demux_id.as_u32()
             );
@@ -660,7 +671,7 @@ impl Sfu {
                     let stats = call.get_stats();
                     if !stats.clients.is_empty() {
                         diagnostic_string.clear();
-                        let _ = write!(diagnostic_string, "call: {}", stats.loggable_call_id);
+                        let _ = write!(diagnostic_string, "call_id: {}", stats.loggable_call_id);
 
                         for client in stats.clients {
                             let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), target: {}, requested_base: {}, ideal: {}, allocated: {}, padding: {}, max_requested_height: {} }}",
@@ -706,7 +717,7 @@ impl Sfu {
         self.connection_by_id.retain(|connection_id, connection| {
             let mut connection = connection.lock();
             if check_for_inactivity && connection.inactive(now) {
-                info!("dropping connection: {:?}", connection_id);
+                info!("dropping connection: {}", connection_id);
 
                 connection_id_by_ice_request_username
                     .remove_entry(connection.ice_request_username());
@@ -745,7 +756,7 @@ impl Sfu {
                         + Duration::from_secs(config.inactivity_timeout_secs)
                 {
                     // If the call hasn't had any activity recently, remove it.
-                    info!("call: {} removed", call.loggable_call_id());
+                    info!("call_id: {} removed", call.loggable_call_id());
                     false
                 } else {
                     // Keep the call around for a while longer.
@@ -866,9 +877,9 @@ impl rand_core5::CryptoRng for OsRngCompatibleWithDalek {}
 
 #[cfg(test)]
 mod sfu_tests {
-    use std::{net::IpAddr, ops::Add, str::FromStr, sync::Arc};
+    use std::{convert::TryFrom, net::IpAddr, ops::Add, str::FromStr, sync::Arc};
 
-    use hex::ToHex;
+    use hex::{FromHex, ToHex};
     use lazy_static::lazy_static;
     use parking_lot::Mutex;
     use rand::{thread_rng, Rng};
@@ -1358,5 +1369,22 @@ mod sfu_tests {
 
         let result = Sfu::handle_packet(&sfu, sender_addr, &mut buf);
         assert_eq!(result, Err(SfuError::UnknownPacketType(sender_addr)));
+    }
+
+    #[test]
+    fn test_connection_id_logging() {
+        let id =
+            <Vec<u8>>::from_hex("e43483a50016ce820d362a4c3a43d426b7f48582e864bb39c47fb480e1dce066")
+                .unwrap();
+
+        let connection_id = ConnectionId {
+            call_id: CallId::from(id),
+            demux_id: DemuxId::try_from(123456).unwrap(),
+        };
+
+        assert_eq!(
+            "call_id: e43483, demux_id: 123456",
+            format!("{}", connection_id)
+        );
     }
 }
