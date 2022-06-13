@@ -34,6 +34,7 @@ warp = "0.3"
 
 # For general conversions
 base64 = "0.13"
+byteorder = "1"
 hex = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 rcgen = "0.8"

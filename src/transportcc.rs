@@ -11,11 +11,10 @@ use std::{
     ops::{Add, AddAssign},
 };
 
+use byteorder::{ReadBytesExt, BE};
 use log::*;
 
-use crate::common::{
-    BytesReader, DataSize, Duration, Instant, TwoGenerationCache, Writable, Writer, U24,
-};
+use crate::common::{DataSize, Duration, Instant, TwoGenerationCache, Writable, Writer, U24};
 pub use crate::rtp::{expand_seqnum, FullSequenceNumber, TruncatedSequenceNumber};
 
 /// A remote instant, internally represented as a duration since a remote-chosen epoch.
@@ -294,21 +293,20 @@ fn duration_from_ticks(ticks: u64, micros_per_tick: u16) -> Duration {
 }
 
 pub fn read_feedback(
-    payload: &[u8],
+    mut payload: &[u8],
     max_seqnum: &mut FullSequenceNumber,
 ) -> Option<(u8, Vec<(FullSequenceNumber, RemoteInstant)>)> {
-    let mut payload = BytesReader::from_slice(payload);
-    let _ssrc = payload.read_u32_be().ok()?;
-    let base_seqnum = payload.read_u16_be().ok()?;
+    let _ssrc = payload.read_u32::<BE>().ok()?;
+    let base_seqnum = payload.read_u16::<BE>().ok()?;
     let base_seqnum: FullSequenceNumber = expand_seqnum(base_seqnum, max_seqnum);
-    let status_count = payload.read_u16_be().ok()?;
-    let reference_time_ticks = payload.read_u24_be().ok()?;
+    let status_count = payload.read_u16::<BE>().ok()?;
+    let reference_time_ticks = payload.read_u24::<BE>().ok()?;
     let feedback_seqnum = payload.read_u8().ok()?;
 
     let mut status_chunks = Vec::new();
     let mut status_chunks_sum_count = 0;
     while status_chunks_sum_count < (status_count as usize) {
-        let encoded_status_chunk = payload.read_u16_be().ok()?;
+        let encoded_status_chunk = payload.read_u16::<BE>().ok()?;
         let status_chunk = PacketStatusChunk::from_u16(encoded_status_chunk)?;
         status_chunks.push(status_chunk);
         status_chunks_sum_count += status_chunk.len();
@@ -325,7 +323,7 @@ pub fn read_feedback(
                 Some(delta_ticks as i32)
             }
             PacketStatus::ReceivedLargeOrNegativeDelta => {
-                let delta_ticks = payload.read_i16_be().ok()?;
+                let delta_ticks = payload.read_i16::<BE>().ok()?;
                 Some(delta_ticks as i32)
             }
         } {

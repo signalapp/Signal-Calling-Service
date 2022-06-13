@@ -4,9 +4,10 @@
 //
 
 use anyhow::Result;
+use byteorder::{ReadBytesExt, BE, LE};
 use thiserror::Error;
 
-use crate::common::{expand_truncated_counter, Bits, BytesReader, PixelSize, ReadResult};
+use crate::common::{expand_truncated_counter, Bits, PixelSize, ReadSliceExt};
 
 pub type TruncatedPictureId = u16;
 pub type FullPictureId = u64;
@@ -125,8 +126,7 @@ pub enum Vp8Error {
 impl ParsedHeader {
     /// This reads both the "descriptor" and the "header"
     /// See https://datatracker.ietf.org/doc/html/rfc7741#section-4.2
-    pub fn read(payload: &[u8]) -> Result<Self> {
-        let mut payload = BytesReader::from_slice(payload);
+    pub fn read(mut payload: &[u8]) -> Result<Self> {
         let mut header = Self::default();
 
         let byte0 = Byte0::parse(payload.read_u8()?);
@@ -135,12 +135,12 @@ impl ParsedHeader {
             let x_byte = XByte::parse(payload.read_u8()?);
 
             if x_byte.has_picture_id {
-                let mut peek = BytesReader::clone(&payload);
+                let mut peek = payload;
                 if !peek.read_u8()?.ms_bit(0) {
                     // The spec says it could be 7-bit, but WebRTC only sends 15-bit
                     return Err(Vp8Error::SevenBitPictureId.into());
                 }
-                let picture_id_with_leading_bit = payload.read_u16_be()?;
+                let picture_id_with_leading_bit = payload.read_u16::<BE>()?;
                 header.picture_id = Some(picture_id_with_leading_bit & 0b0111_1111_1111_1111);
             }
 
@@ -166,13 +166,13 @@ impl ParsedHeader {
             // The codec bitstream format specifies two different variants of the uncompressed data
             // chunk: a 3-octet version for interframes and a 10-octet version for key frames.
             // The first 3 octets are common to both variants.
-            let mut common_header = payload.read(3)?;
+            let mut common_header = payload.read_slice(3)?;
             let payload0 = PayloadHeader::parse(common_header.read_u8()?);
             header.is_key_frame = payload0.key_frame;
             if header.is_key_frame {
                 // In the case of a key frame, the remaining 7 octets are considered to be part
                 // of the remaining payload in this RTP format.
-                let mut additional_key_frame_header = payload.read(7)?;
+                let mut additional_key_frame_header = payload.read_slice(7)?;
                 header.resolution = Some(ParsedHeader::size_from_additional_key_frame_header(
                     &mut additional_key_frame_header,
                 )?);
@@ -184,11 +184,11 @@ impl ParsedHeader {
 
     /// see https://datatracker.ietf.org/doc/html/rfc6386#section-9.1
     fn size_from_additional_key_frame_header(
-        additional_key_frame_header: &mut BytesReader,
-    ) -> ReadResult<PixelSize> {
-        let _skipped = additional_key_frame_header.read_bytes(3)?;
-        let width_with_scale = additional_key_frame_header.read_u16_le()?;
-        let height_with_scale = additional_key_frame_header.read_u16_le()?;
+        additional_key_frame_header: &mut &[u8],
+    ) -> std::io::Result<PixelSize> {
+        let _skipped = additional_key_frame_header.read_slice(3)?;
+        let width_with_scale = additional_key_frame_header.read_u16::<LE>()?;
+        let height_with_scale = additional_key_frame_header.read_u16::<LE>()?;
         let width = width_with_scale & 0b11_1111_1111_1111;
         let height = height_with_scale & 0b11_1111_1111_1111;
         Ok(PixelSize { width, height })

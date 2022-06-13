@@ -1,25 +1,24 @@
 //
-// Copyright 2021 Signal Messenger, LLC
+// Copyright 2022 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
 //! Common functionality for ice, rtp, rtcp, dtls, or googcc.
 
 mod bits;
-mod bytes_reader;
 mod collections;
 mod counters;
 mod data_rate;
 mod integers;
 mod math;
 mod serialize;
+mod slice;
 mod time;
 
 use std::{cmp::PartialEq, convert::TryInto, fmt::Write};
 
 use anyhow::Result;
 pub use bits::*;
-pub use bytes_reader::*;
 pub use collections::*;
 pub use counters::*;
 pub use data_rate::*;
@@ -28,6 +27,7 @@ pub use integers::*;
 pub use math::*;
 use rand::{thread_rng, Rng};
 pub use serialize::*;
+pub use slice::*;
 pub use time::*;
 
 // It's (value, rest)
