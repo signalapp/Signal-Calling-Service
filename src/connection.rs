@@ -3,15 +3,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::{net::SocketAddr, time::SystemTime};
+use std::net::SocketAddr;
 
 use log::*;
-use rand::{CryptoRng, Rng};
 use thiserror::Error;
 
 use crate::{
     common::{DataRate, DataSize, Duration, Instant},
-    dtls, googcc, ice, rtp,
+    googcc, ice, rtp,
 };
 
 // This is a value sent in each RTCP message that isn't used anywhere, but
@@ -39,10 +38,6 @@ pub enum Error {
     ReceivedIceWithInvalidHmac(Vec<u8>),
     #[error("received ICE with invalid username: {0:?}")]
     ReceivedIceWithInvalidUsername(Vec<u8>),
-    #[error("received RTP packet before DTLS handshake completed")]
-    ReceivedRtpBeforeDtls,
-    #[error("received RTCP packet before DTLS handshake completed")]
-    ReceivedRtcpBeforeDtls,
     #[error("received invalid RTP packet")]
     ReceivedInvalidRtp,
     #[error("received invalid RTCP packet")]
@@ -50,7 +45,7 @@ pub enum Error {
 }
 
 /// The state of a connection to a client.
-/// Combines the ICE, DTLS, and SRTP/SRTCP state.
+/// Combines the ICE and SRTP/SRTCP state.
 /// Takes care of transport auth, crypto, ACKs, NACKs,
 /// retransmissions, congestion control, and IP mobility.
 pub struct Connection {
@@ -62,8 +57,6 @@ pub struct Connection {
     inactivity_timeout: Duration,
 
     ice: Ice,
-    // None if not using DTLS
-    dtls: Option<Dtls>,
     rtp: Rtp,
     congestion_control: CongestionControl,
 
@@ -87,24 +80,13 @@ struct Ice {
     binding_request_received: Option<Instant>,
 }
 
-struct Dtls {
-    // Immutable
-    client_fingerprint: [u8; 32],
-    // The same for all Connections.
-    server_certificate_der: &'static [u8],
-    server_private_key_der: &'static [u8],
-
-    // Mutable
-    handshake_state: dtls::HandshakeState,
-}
-
 struct Rtp {
     // Immutable
     /// The SSRC used for sending transport-CC ACKs.
+    #[cfg_attr(not(test), allow(dead_code))]
     ack_ssrc: rtp::Ssrc,
 
-    // Not set until the DTLS handshake completes
-    endpoint: Option<rtp::Endpoint>,
+    endpoint: rtp::Endpoint,
 
     /// The last time ACKs were sent.
     acks_sent: Option<Instant>,
@@ -129,39 +111,7 @@ struct CongestionControl {
     padding_sent: Instant,
 }
 
-/// The source of the master key material to be passed into rtp::KeysAndSalts::derive*.
-/// It's either from a DTLS handshake or the result of a more simple DHE,
-/// in which case we can simply pass in the value directly.
-pub enum SrtpMasterSource {
-    Value(rtp::MasterKeyMaterial),
-    // TODO: After 90 days of using the above, remove this.
-    DtlsHandshake {
-        client_fingerprint: [u8; 32],
-        server_certificate_der: &'static [u8],
-        server_private_key_der: &'static [u8],
-    },
-}
-
-// The publicly exchanged info needed for either SrtpMasterSource.
-// We don't need it in this file, but it's nice to be lined up with
-// SrtpMasterSource.  This is the info provided from the client.
-#[derive(Debug)]
-pub enum SrtpMasterSourceClientPublic {
-    Dhe {
-        public_key: [u8; 32],
-        hkdf_extra_info: Vec<u8>,
-    },
-    DtlsFingerprint([u8; 32]),
-}
-
-// The publicly exchanged info needed for either SrtpMasterSource.
-// We don't need it in this file, but it's nice to be lined up with
-// SrtpMasterSource.  This is the info provided from the server.
-#[derive(Debug)]
-pub enum SrtpMasterSourceServerPublic {
-    Dhe { public_key: [u8; 32] },
-    DtlsFingerprint([u8; 32]),
-}
+pub type DhePublicKey = [u8; 32];
 
 impl Connection {
     #[allow(clippy::too_many_arguments)]
@@ -169,44 +119,17 @@ impl Connection {
         ice_request_username: Vec<u8>,
         ice_response_username: Vec<u8>,
         ice_pwd: Vec<u8>,
-        srtp_master_source: SrtpMasterSource,
+        srtp_master_key_material: rtp::MasterKeyMaterial,
         ack_ssrc: rtp::Ssrc,
         googcc_config: googcc::Config,
         inactivity_timeout: Duration,
         now: Instant,
     ) -> Self {
-        let (rtp_endpoint, dtls) = match srtp_master_source {
-            SrtpMasterSource::DtlsHandshake {
-                client_fingerprint,
-                server_certificate_der,
-                server_private_key_der,
-            } => (
-                None,
-                Some(Dtls {
-                    client_fingerprint,
-                    server_certificate_der,
-                    server_private_key_der,
-                    handshake_state: dtls::HandshakeState::new(),
-                }),
-            ),
-            SrtpMasterSource::Value(master_key_material) => {
-                let (decrypt, encrypt) =
-                    rtp::KeysAndSalts::derive_client_and_server_from_master_key_material(
-                        &master_key_material,
-                    );
-                (
-                    Some(rtp::Endpoint::new(
-                        decrypt,
-                        encrypt,
-                        now,
-                        RTCP_SENDER_SSRC,
-                        ack_ssrc,
-                    )),
-                    None,
-                )
-            }
-        };
-
+        let (decrypt, encrypt) =
+            rtp::KeysAndSalts::derive_client_and_server_from_master_key_material(
+                &srtp_master_key_material,
+            );
+        let rtp_endpoint = rtp::Endpoint::new(decrypt, encrypt, now, RTCP_SENDER_SSRC, ack_ssrc);
         Self {
             created: now,
 
@@ -219,7 +142,6 @@ impl Connection {
 
                 binding_request_received: None,
             },
-            dtls,
             rtp: Rtp {
                 ack_ssrc,
                 endpoint: rtp_endpoint,
@@ -290,49 +212,7 @@ impl Connection {
         )
     }
 
-    /// Move forward the DTLS handshake based on an incoming DTLS packet.
-    /// May return a DTLS packet to send back to the client.
-    /// If the DTLS handshake completes, the SRTP keys and salts will be derived
-    /// and it will be possible to send and receive SRTP packets.
-    pub fn handle_dtls_packet(
-        &mut self,
-        incoming_packet: &mut [u8],
-        now: Instant,
-        system_now: SystemTime,
-        rng: &mut (impl Rng + CryptoRng),
-    ) -> Option<PacketToSend> {
-        if let Some(dtls) = &mut self.dtls {
-            // When we get a DTLS packet, process it as part of the DTLS handshake.
-            // Once the handshake completes, use the DTLS-SRTP master key.
-            let response_packet = dtls.handshake_state.process_packet(
-                incoming_packet,
-                dtls.server_certificate_der,
-                dtls.server_private_key_der,
-                &dtls.client_fingerprint,
-                system_now,
-                rng,
-            );
-            if let Some(dtls_srtp_master_key) = dtls.handshake_state.srtp_master_key() {
-                let (client, server) =
-                    rtp::KeysAndSalts::derive_from_dtls_srtp_master(dtls_srtp_master_key);
-                let (decrypt, encrypt) = (client, server);
-                self.rtp.endpoint = Some(rtp::Endpoint::new(
-                    decrypt,
-                    encrypt,
-                    now,
-                    RTCP_SENDER_SSRC,
-                    self.rtp.ack_ssrc,
-                ));
-            }
-            response_packet
-        } else {
-            warn!("Received DTLS packet when DTLS was not enabled.");
-            None
-        }
-    }
-
-    // This effectively skips DTLS.  For now, we use it for tests.
-    // In the future, we can use it to use a DHE other than DTLS.
+    // This effectively overrides the DHE, which is more convenient for tests.
     #[cfg(test)]
     fn set_srtp_keys(
         &mut self,
@@ -340,13 +220,8 @@ impl Connection {
         encrypt: rtp::KeysAndSalts,
         now: Instant,
     ) {
-        self.rtp.endpoint = Some(rtp::Endpoint::new(
-            decrypt,
-            encrypt,
-            now,
-            RTCP_SENDER_SSRC,
-            self.rtp.ack_ssrc,
-        ));
+        self.rtp.endpoint =
+            rtp::Endpoint::new(decrypt, encrypt, now, RTCP_SENDER_SSRC, self.rtp.ack_ssrc);
     }
 
     /// Decrypts an incoming RTP packet and returns it.
@@ -357,11 +232,7 @@ impl Connection {
         incoming_packet: &'packet mut [u8],
         now: Instant,
     ) -> Result<rtp::Packet<&'packet mut [u8]>, Error> {
-        let rtp_endpoint = self
-            .rtp
-            .endpoint
-            .as_mut()
-            .ok_or(Error::ReceivedRtpBeforeDtls)?;
+        let rtp_endpoint = &mut self.rtp.endpoint;
         rtp_endpoint
             .receive_rtp(incoming_packet, now)
             .ok_or(Error::ReceivedInvalidRtp)
@@ -379,11 +250,7 @@ impl Connection {
         incoming_packet: &mut [u8],
         now: Instant,
     ) -> Result<HandleRtcpResult, Error> {
-        let rtp_endpoint = self
-            .rtp
-            .endpoint
-            .as_mut()
-            .ok_or(Error::ReceivedRtcpBeforeDtls)?;
+        let rtp_endpoint = &mut self.rtp.endpoint;
         let rtcp = rtp_endpoint
             .receive_rtcp(incoming_packet, now)
             .ok_or(Error::ReceivedInvalidRtcp)?;
@@ -450,9 +317,8 @@ impl Connection {
         rtp_to_send: &mut Vec<(PacketToSend, SocketAddr)>,
         now: Instant,
     ) {
-        if let (Some(outgoing_addr), Some(rtp_endpoint)) =
-            (self.outgoing_addr, self.rtp.endpoint.as_mut())
-        {
+        let rtp_endpoint = &mut self.rtp.endpoint;
+        if let Some(outgoing_addr) = self.outgoing_addr {
             if let Some(outgoing_rtp) = rtp_endpoint.send_rtp(outgoing_rtp, now) {
                 rtp_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
             }
@@ -462,8 +328,7 @@ impl Connection {
 
     /// Creates an encrypted key frame request to be sent to
     /// Connection::outgoing_addr().
-    /// Will return None if either the DTLS handshake hasn't completed
-    /// or SRTCP encryption fails.
+    /// Will return None if SRTCP encryption fails.
     // TODO: Use Result instead of Option
     pub fn send_key_frame_request(
         &mut self,
@@ -474,7 +339,7 @@ impl Connection {
         // So we use (packet, addr) for convenience.
     ) -> Option<(PacketToSend, SocketAddr)> {
         let outgoing_addr = self.outgoing_addr?;
-        let rtp_endpoint = self.rtp.endpoint.as_mut()?;
+        let rtp_endpoint = &mut self.rtp.endpoint;
         let rtcp_packet = rtp_endpoint.send_pli(key_frame_request.ssrc)?;
         Some((rtcp_packet, outgoing_addr))
     }
@@ -496,9 +361,8 @@ impl Connection {
             }
         }
 
-        if let (Some(outgoing_addr), Some(rtp_endpoint)) =
-            (self.outgoing_addr, self.rtp.endpoint.as_mut())
-        {
+        let rtp_endpoint = &mut self.rtp.endpoint;
+        if let Some(outgoing_addr) = self.outgoing_addr {
             for ack_packet in rtp_endpoint.send_acks() {
                 packets_to_send.push((ack_packet, outgoing_addr));
             }
@@ -523,9 +387,8 @@ impl Connection {
             }
         }
 
-        if let (Some(outgoing_addr), Some(rtp_endpoint)) =
-            (self.outgoing_addr, self.rtp.endpoint.as_mut())
-        {
+        let rtp_endpoint = &mut self.rtp.endpoint;
+        if let Some(outgoing_addr) = self.outgoing_addr {
             for nack_packet in rtp_endpoint.send_nacks(now) {
                 packets_to_send.push((nack_packet, outgoing_addr));
             }
@@ -564,7 +427,6 @@ impl Connection {
     ) {
         if self.congestion_control.padding_interval.is_none()
             || self.congestion_control.padding_ssrc.is_none()
-            || self.rtp.endpoint.is_none()
             || self.outgoing_addr.is_none()
         {
             // If we can't/shouldn't send padding yet, update the "sent" time
@@ -575,7 +437,7 @@ impl Connection {
         }
         let padding_interval = self.congestion_control.padding_interval.unwrap();
         let padding_ssrc = self.congestion_control.padding_ssrc.unwrap();
-        let rtp_endpoint = self.rtp.endpoint.as_mut().unwrap();
+        let rtp_endpoint = &mut self.rtp.endpoint;
         let outgoing_addr = self.outgoing_addr.unwrap();
 
         let missed: Duration = now.saturating_duration_since(self.congestion_control.padding_sent);
@@ -624,7 +486,7 @@ mod connection_tests {
             ice_request_username.to_vec(),
             ice_response_username.to_vec(),
             ice_pwd.to_vec(),
-            SrtpMasterSource::Value(zeroize::Zeroizing::new([0u8; 56])),
+            zeroize::Zeroizing::new([0u8; 56]),
             ack_ssrc,
             googcc_config,
             inactivity_timeout,

@@ -23,7 +23,7 @@ use warp::{http::StatusCode, Filter, Reply};
 
 use crate::{
     config, ice,
-    sfu::{self, Sfu, SrtpMasterSourceServerPublic},
+    sfu::{self, Sfu},
 };
 
 #[derive(Serialize, Debug)]
@@ -344,25 +344,8 @@ async fn join_conference(
         .into_response());
     }
 
-    let client_public = match <[u8; 32]>::from_hex(join_request.dhe_public_key) {
-        Ok(public_key) => sfu::SrtpMasterSourceClientPublic::Dhe {
-            public_key,
-            hkdf_extra_info: match join_request.hkdf_extra_info {
-                None => vec![],
-                Some(hkdf_extra_info) => match Vec::<u8>::from_hex(hkdf_extra_info) {
-                    Ok(hkdf_extra_info) => hkdf_extra_info,
-                    Err(_) => {
-                        return Ok(warp::reply::with_status(
-                            warp::reply::json(
-                                &"Invalid hkdf_extra_info in the request.".to_string(),
-                            ),
-                            StatusCode::NOT_ACCEPTABLE,
-                        )
-                        .into_response());
-                    }
-                },
-            },
-        },
+    let client_dhe_public_key = match <[u8; 32]>::from_hex(join_request.dhe_public_key) {
+        Ok(client_dhe_public_key) => client_dhe_public_key,
         Err(_) => {
             return Ok(warp::reply::with_status(
                 warp::reply::json(&"Invalid dhe_public_key in the request.".to_string()),
@@ -370,6 +353,20 @@ async fn join_conference(
             )
             .into_response());
         }
+    };
+
+    let client_hkdf_extra_info = match join_request.hkdf_extra_info {
+        None => vec![],
+        Some(client_hkdf_extra_info) => match Vec::<u8>::from_hex(client_hkdf_extra_info) {
+            Ok(client_hkdf_extra_info) => client_hkdf_extra_info,
+            Err(_) => {
+                return Ok(warp::reply::with_status(
+                    warp::reply::json(&"Invalid hkdf_extra_info in the request.".to_string()),
+                    StatusCode::NOT_ACCEPTABLE,
+                )
+                .into_response());
+            }
+        },
     };
 
     // Generate ids for the client.
@@ -392,21 +389,11 @@ async fn join_conference(
         server_ice_ufrag.clone(),
         server_ice_pwd.clone(),
         join_request.ice_ufrag,
-        client_public,
+        client_dhe_public_key,
+        client_hkdf_extra_info,
     ) {
-        Ok(server_public) => {
+        Ok(server_dhe_public_key) => {
             let media_addr = config::get_server_media_address(config);
-
-            let dhe_public_key = match server_public {
-                SrtpMasterSourceServerPublic::Dhe { public_key, .. } => public_key.encode_hex(),
-                SrtpMasterSourceServerPublic::DtlsFingerprint(_) => {
-                    return Ok(warp::reply::with_status(
-                        warp::reply::json(&"Server did not provide dhe_public_key".to_string()),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    )
-                    .into_response());
-                }
-            };
 
             let response = JoinResponse {
                 demux_id: demux_id.into(),
@@ -414,7 +401,7 @@ async fn join_conference(
                 ip: media_addr.ip().to_string(),
                 ice_ufrag: server_ice_ufrag,
                 ice_pwd: server_ice_pwd,
-                dhe_public_key,
+                dhe_public_key: server_dhe_public_key.encode_hex(),
             };
 
             Ok(

@@ -65,8 +65,6 @@ const RTX_SSRC_OFFSET: Ssrc = 1;
 
 pub type Key = Zeroizing<[u8; SRTP_KEY_LEN]>;
 pub type Salt = [u8; SRTP_SALT_LEN];
-// Not needed when using DTLS-SRTP
-// pub type KeyPlusSalt = [u8; SRTP_KEY_LEN + SRTP_SALT_LEN];
 pub type Iv = [u8; SRTP_IV_LEN];
 // In the order [client_key, client_salt, server_key, server_salt]
 pub const MASTER_KEY_MATERIAL_LEN: usize =
@@ -86,35 +84,6 @@ pub struct KeysAndSalts {
 }
 
 impl KeysAndSalts {
-    // Returns (client, server)
-    pub fn derive_from_dtls_srtp_master(dtls_srtp_master: &[u8]) -> (KeysAndSalts, KeysAndSalts) {
-        assert!(
-            dtls_srtp_master.len() >= SRTP_KEY_LEN + SRTP_KEY_LEN + SRTP_SALT_LEN + SRTP_SALT_LEN
-        );
-        let client_key: Key = Zeroizing::new(dtls_srtp_master[..SRTP_KEY_LEN].try_into().unwrap());
-        let server_key: Key = Zeroizing::new(
-            dtls_srtp_master[SRTP_KEY_LEN..][..SRTP_KEY_LEN]
-                .try_into()
-                .unwrap(),
-        );
-        let client_salt: Salt = dtls_srtp_master[SRTP_KEY_LEN..][SRTP_KEY_LEN..][..SRTP_SALT_LEN]
-            .try_into()
-            .unwrap();
-        let server_salt: Salt = dtls_srtp_master[SRTP_KEY_LEN..][SRTP_KEY_LEN..][SRTP_SALT_LEN..]
-            [..SRTP_SALT_LEN]
-            .try_into()
-            .unwrap();
-        let client = Self::derive_from_master(&KeyAndSalt {
-            key: client_key,
-            salt: client_salt,
-        });
-        let server = Self::derive_from_master(&KeyAndSalt {
-            key: server_key,
-            salt: server_salt,
-        });
-        (client, server)
-    }
-
     // Returns (client, server)
     pub fn derive_client_and_server_from_master_key_material(
         master_key_material: &MasterKeyMaterial,
@@ -2219,9 +2188,11 @@ mod test {
 
     #[test]
     fn test_endpoint_nack_rtx() {
-        let dtls_srtp_master = vec![0u8; 100];
+        let srtp_master_key_material = zeroize::Zeroizing::new([0u8; 56]);
         let (sender_key, receiver_key) =
-            KeysAndSalts::derive_from_dtls_srtp_master(&dtls_srtp_master);
+            KeysAndSalts::derive_client_and_server_from_master_key_material(
+                &srtp_master_key_material,
+            );
         let now = Instant::now();
         let at = |millis| now + Duration::from_millis(millis);
         let mut sender = Endpoint::new(receiver_key.clone(), sender_key.clone(), now, 1, 2);
@@ -2415,9 +2386,11 @@ mod test {
 
     #[test]
     fn test_drop_incoming_rtp_when_seqnum_reused() {
-        let dtls_srtp_master = vec![0u8; 100];
+        let srtp_master_key_material = zeroize::Zeroizing::new([0u8; 56]);
         let (sender_key, receiver_key) =
-            KeysAndSalts::derive_from_dtls_srtp_master(&dtls_srtp_master);
+            KeysAndSalts::derive_client_and_server_from_master_key_material(
+                &srtp_master_key_material,
+            );
         let now = Instant::now();
         let at = |millis| now + Duration::from_millis(millis);
         let mut sender = Endpoint::new(receiver_key.clone(), sender_key.clone(), now, 1, 2);

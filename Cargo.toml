@@ -48,14 +48,8 @@ crc = "1.8"
 hmac = "0.11"
 sha-1 = "0.9"
 
-# For DTLS
-aes = "0.7"
-aes-gcm = "0.9"
+# For metrics
 rand = "0.8"
-p256 = { version = "0.8", features = ["ecdh", "ecdsa", "pkcs8"] }
-ecdsa = { version = "0.11", features = ["sign"] }
-# Already needed by p256. But we also need it for certificate parsing.
-der = "0.3"
 
 # For SRTP key derivation using DHE
 hkdf = "0.11"
@@ -65,7 +59,9 @@ rand_core = { version = "0.6.3", features = [] }
 rand_core5 = { package = "rand_core", version = "0.5.1", features = [] }
 x25519-dalek = { version = "1.1" }
 
-# For DTLS and RTP
+# For (S)RTP
+aes = "0.7"
+aes-gcm = "0.9"
 zeroize = "1.5.4"
 
 # For congestion control

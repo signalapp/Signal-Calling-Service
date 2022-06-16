@@ -52,8 +52,3 @@ path = "fuzz_targets/rtp.rs"
 test = false
 doc = false
 
-[[bin]]
-name = "dtls"
-path = "fuzz_targets/dtls.rs"
-test = false
-doc = false

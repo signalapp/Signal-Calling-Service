@@ -19,8 +19,6 @@ use calling_server::{
 };
 use env_logger::Env;
 use parking_lot::Mutex;
-use rand::Rng;
-use rcgen::{Certificate, CertificateParams, DnType};
 use structopt::StructOpt;
 use tokio::{
     runtime,
@@ -30,21 +28,7 @@ use tokio::{
 
 lazy_static! {
     // Load the config and treat it as a read-only static value.
-    static ref CONFIG: config::Config = {
-        let mut config = config::Config::from_args();
-
-        // Generate the server's x.509 certificate and key.
-        let mut params = CertificateParams::new(vec![]);
-        params.distinguished_name.push(DnType::CommonName, "WebRTC");
-        params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-        params.serial_number = Some(rand::thread_rng().gen::<u64>());
-        let cert = Certificate::from_params(params).unwrap();
-
-        config.server_certificate_der = cert.serialize_der().expect("certificate should exist");
-        config.server_private_key_der = cert.serialize_private_key_der();
-
-        config
-    };
+    static ref CONFIG: config::Config = config::Config::from_args();
 }
 
 #[rustfmt::skip]

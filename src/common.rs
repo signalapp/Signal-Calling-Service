@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-//! Common functionality for ice, rtp, rtcp, dtls, or googcc.
+//! Common functionality for ice, rtp, rtcp, or googcc.
 
 mod bits;
 mod collections;
@@ -15,14 +15,12 @@ mod serialize;
 mod slice;
 mod time;
 
-use std::{cmp::PartialEq, convert::TryInto, fmt::Write};
+use std::{cmp::PartialEq, convert::TryInto};
 
-use anyhow::Result;
 pub use bits::*;
 pub use collections::*;
 pub use counters::*;
 pub use data_rate::*;
-use hex::FromHex;
 pub use integers::*;
 pub use math::*;
 use rand::{thread_rng, Rng};
@@ -34,85 +32,9 @@ pub use time::*;
 // TODO: Change to Result
 pub type ReadOption<'a, T> = Option<(T, &'a [u8])>;
 
-pub fn read_u16_len_prefixed_u16s(input: &[u8]) -> ReadOption<Vec<u16>> {
-    let (bytes, rest) = read_u16_len_prefixed(input)?;
-    let (values, _) = read_n(bytes, bytes.len() / 2, read_u16)?;
-    Some((values, rest))
-}
-
-pub fn read_u24_len_prefixed(input: &[u8]) -> ReadOption<&[u8]> {
-    let (len, rest) = read_u24(input)?;
-    let (bytes, rest) = read_bytes(rest, len.into())?;
-    Some((bytes, rest))
-}
-
-pub fn read_u16_len_prefixed(input: &[u8]) -> ReadOption<&[u8]> {
-    let (len, rest) = read_u16(input)?;
-    let (bytes, rest) = read_bytes(rest, len as usize)?;
-    Some((bytes, rest))
-}
-
-pub fn read_u8_len_prefixed(input: &[u8]) -> ReadOption<&[u8]> {
-    let (len, rest) = read_u8(input)?;
-    let (bytes, rest) = read_bytes(rest, len as usize)?;
-    Some((bytes, rest))
-}
-
-pub fn read_u48(input: &[u8]) -> ReadOption<U48> {
-    let (bytes, rest) = read_bytes(input, 6)?;
-    Some((parse_u48(bytes), rest))
-}
-
-pub fn read_u32(input: &[u8]) -> ReadOption<u32> {
-    let (bytes, rest) = read_bytes(input, 4)?;
-    Some((parse_u32(bytes), rest))
-}
-
-pub fn read_u24(input: &[u8]) -> ReadOption<U24> {
-    let (bytes, rest) = read_bytes(input, 3)?;
-    Some((parse_u24(bytes), rest))
-}
-
 pub fn read_u16(input: &[u8]) -> ReadOption<u16> {
     let (bytes, rest) = read_bytes(input, 2)?;
     Some((parse_u16(bytes), rest))
-}
-
-pub fn read_i16(input: &[u8]) -> ReadOption<i16> {
-    let (bytes, rest) = read_bytes(input, 2)?;
-    Some((parse_i16(bytes), rest))
-}
-
-pub fn read_u8(input: &[u8]) -> ReadOption<u8> {
-    let (bytes, rest) = read_bytes(input, 1)?;
-    Some((bytes[0], rest))
-}
-
-pub fn read_n<'a, T>(
-    mut input: &'a [u8],
-    n: usize,
-    read_one: impl Fn(&'a [u8]) -> ReadOption<'a, T>,
-) -> ReadOption<'a, Vec<T>> {
-    let mut values = Vec::with_capacity(n);
-    for _ in 0..n {
-        let (val, rest) = read_one(input)?;
-        values.push(val);
-        input = rest;
-    }
-    Some((values, input))
-}
-
-pub fn read_as_many_as_possible<'a, T>(
-    mut input: &'a [u8],
-    read_one: impl Fn(&'a [u8]) -> ReadOption<'a, T>,
-) -> ReadOption<'a, Vec<T>> {
-    let mut values = vec![];
-    while !input.is_empty() {
-        let (val, rest) = read_one(input)?;
-        values.push(val);
-        input = rest;
-    }
-    Some((values, input))
 }
 
 // Returns (read, rest)
@@ -120,14 +42,6 @@ pub fn read_bytes(input: &[u8], len: usize) -> ReadOption<&[u8]> {
     let bytes = input.get(0..len)?;
     let rest = &input[len..];
     Some((bytes, rest))
-}
-
-pub fn read_from_end(input: &[u8], len: usize) -> ReadOption<&[u8]> {
-    if input.len() < len {
-        return None;
-    }
-    let (before, after) = read_bytes(input, input.len() - len)?;
-    Some((after, before))
 }
 
 pub fn parse_u16(bytes: &[u8]) -> u16 {
@@ -225,53 +139,7 @@ pub fn random_base64_string_of_length_4() -> String {
     random_base64_string_of_length!(4)
 }
 
-/// Encodes a slice of bytes as a hexadecimal fingerprint string.
-///
-/// ```
-/// use calling_server::common::bytes_to_colon_separated_hexstring;
-///
-/// assert_eq!(bytes_to_colon_separated_hexstring(&[]), "");
-/// assert_eq!(bytes_to_colon_separated_hexstring(&[0x01, 0xAB, 0xCD]), "01:AB:CD");
-/// ```
-pub fn bytes_to_colon_separated_hexstring(bytes: &[u8]) -> String {
-    let mut result = String::with_capacity(bytes.len() * 3);
-    for byte in bytes {
-        write!(&mut result, "{:02X}:", byte).expect("Should be safe to write to String");
-    }
-    if !result.is_empty() {
-        // Remove the extra colon.
-        result.pop();
-    }
-    result
-}
-
-/// Decodes hexadecimal fingerprint string to a u8 array of 32 bytes.
-///
-/// ```
-/// use calling_server::common::colon_separated_hexstring_to_array;
-///
-/// assert_eq!(colon_separated_hexstring_to_array(
-///     "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00").unwrap(),
-///     [0u8; 32]);
-/// assert_eq!(colon_separated_hexstring_to_array(
-///     "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:").unwrap(),
-///     [0u8; 32]);
-/// assert!(colon_separated_hexstring_to_array("").is_err());
-/// assert!(colon_separated_hexstring_to_array(":").is_err());
-/// assert!(colon_separated_hexstring_to_array("01").is_err());
-/// assert!(colon_separated_hexstring_to_array("01:AB:CD").is_err());
-/// assert!(colon_separated_hexstring_to_array("01:AB:CD:").is_err());
-/// assert!(colon_separated_hexstring_to_array("1:A:B").is_err());
-/// assert!(colon_separated_hexstring_to_array("01:AB:B").is_err());
-/// assert!(colon_separated_hexstring_to_array("01:AB:B:").is_err());
-/// ```
-pub fn colon_separated_hexstring_to_array(string: &str) -> Result<[u8; 32]> {
-    let string = string.replace(":", "");
-    let result = <[u8; 32]>::from_hex(string)?;
-    Ok(result)
-}
-
-/// Allows using `?` syntax in a scope and collecting failures in a `Result`.
+// Allows using `?` syntax in a scope and collecting failures in a `Result`.
 pub fn try_scoped<T>(call: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
     call()
 }

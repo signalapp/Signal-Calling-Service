@@ -5,26 +5,9 @@
 
 //! Allows the serialization of datastructures to Vec<u8>.
 
-use std::convert::TryFrom;
-
 use sha2::{Digest, Sha256};
 
 use crate::common::integers::{U24, U48};
-
-pub fn write_u8_len_prefixed(val: impl Writer) -> impl Writer {
-    let len_prefix = u8::try_from(val.written_len()).expect("Length exceeds 8 bits");
-    ([len_prefix], val)
-}
-
-pub fn write_u16_len_prefixed(val: impl Writer) -> impl Writer {
-    let len_prefix = u16::try_from(val.written_len()).expect("Length exceeds 16 bits");
-    (len_prefix, val)
-}
-
-pub fn write_u24_len_prefixed(val: impl Writer) -> impl Writer {
-    let len_prefix = U24::try_from(val.written_len() as u32).expect("The length exceeded 24 bits");
-    (len_prefix, val)
-}
 
 pub trait Writer {
     fn written_len(&self) -> usize;
@@ -226,6 +209,7 @@ impl<T: Writer + ?Sized> Writer for &T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::TryFrom;
 
     #[test]
     fn u16() {
@@ -416,56 +400,6 @@ mod tests {
         assert_eq!(
             "521e73b5adde4db9a2ddf9c8cc263a327dfecf9e54f78114deb286ed65574a21",
             hex::encode(vec.to_sha256().finalize())
-        );
-    }
-
-    #[test]
-    fn prefix_with_length_as_u8() {
-        assert_eq!(
-            "0600647e8a6925",
-            hex::encode(write_u8_len_prefixed((100u16, 2_123_000_101u32)).to_vec())
-        );
-    }
-
-    #[test]
-    fn prefix_with_length_as_u8_max() {
-        let data: &[u8] = &[1u8; u8::MAX as usize];
-        assert!(hex::encode(write_u8_len_prefixed(data).to_vec()).starts_with("ff0101"));
-    }
-
-    #[test]
-    #[should_panic(expected = "Length exceeds 8 bits")]
-    fn prefix_with_length_as_u8_max_plus_1_panics() {
-        let data: &[u8] = &[1u8; u8::MAX as usize + 1];
-        write_u8_len_prefixed(data);
-    }
-
-    #[test]
-    fn prefix_with_length_as_u16() {
-        assert_eq!(
-            "000600647e8a6925",
-            hex::encode(write_u16_len_prefixed((100u16, 2_123_000_101u32)).to_vec())
-        );
-    }
-
-    #[test]
-    fn prefix_with_length_as_u16_max() {
-        let data: &[u8] = &[1u8; u16::MAX as usize];
-        assert!(hex::encode(write_u16_len_prefixed(data).to_vec()).starts_with("ffff0101"));
-    }
-
-    #[test]
-    #[should_panic(expected = "Length exceeds 16 bits")]
-    fn prefix_with_length_as_u16_max_plus_1_panics() {
-        let data: &[u8] = &[1u8; u16::MAX as usize + 1];
-        write_u16_len_prefixed(data);
-    }
-
-    #[test]
-    fn prefix_with_length_as_u24() {
-        assert_eq!(
-            "00000600647e8a6925",
-            hex::encode(write_u24_len_prefixed((100u16, 2_123_000_101u32)).to_vec())
         );
     }
 }

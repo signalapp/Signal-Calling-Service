@@ -97,14 +97,6 @@ pub struct Config {
 
     #[structopt(flatten)]
     pub metrics: MetricsOptions,
-
-    // For DTLS, not a command line argument, storage for the der private key.
-    #[structopt(skip)]
-    pub server_private_key_der: Vec<u8>,
-
-    // For DTLS, not a command line argument, storage for the der certificate.
-    #[structopt(skip)]
-    pub server_certificate_der: Vec<u8>,
 }
 
 #[derive(StructOpt, Clone, Debug, Default)]
@@ -167,7 +159,5 @@ pub(crate) fn default_test_config() -> Config {
         inactivity_check_interval_secs: 5,
         inactivity_timeout_secs: 30,
         metrics: Default::default(),
-        server_private_key_der: vec![],
-        server_certificate_der: vec![],
     }
 }
