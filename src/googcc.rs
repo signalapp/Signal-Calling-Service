@@ -79,15 +79,6 @@ pub struct Request {
     pub ideal: DataRate,
 }
 
-impl Request {
-    // Give some headroom above the requested.ideal because if we don't,
-    // small fluctations in the ideal cause forwarded video to
-    // fluctuate between two layers in an annoying way.
-    fn ideal_with_headroom(&self) -> DataRate {
-        (self.ideal * 1.1) + DataRate::from_kbps(100)
-    }
-}
-
 pub struct CongestionController {
     requests_sender: Sender<Request>,
     acks_sender1: Sender<Vec<Ack>>,
@@ -213,15 +204,17 @@ fn calculate_target_send_rates(
                 .now_or_never()
                 .flatten() {
                 let previously_requested = std::mem::replace(&mut requested, request);
-                let previous_ideal_limit = previously_requested.ideal_with_headroom();
-                let ideal_limit = requested.ideal_with_headroom();
-                let previously_limited_by_ideal = (previous_ideal_limit == target_send_rate
-                    || previous_ideal_limit < config.min_target_send_rate);
-                let limited_by_ideal = ideal_limit <= target_send_rate;
+                // We pick a value that is a common threshold for a client requesting very little,
+                // such as one video at the lowest resolution.  Anything smaller than that is
+                // considered low enough that googcc can't operate well (at least until we add probing)
+                // So when we transition out of such a state, we reset googcc.
+                let tiny_send_rate: DataRate = DataRate::from_kbps(150);
+                let previous_ideal_was_tiny = previously_requested.ideal <= tiny_send_rate;
+                let current_ideal_is_tiny = requested.ideal <= tiny_send_rate;
                 let initial_target_send_rate = max(config.initial_target_send_rate, requested.base * 0.5);
                 let target_below_initial = target_send_rate < initial_target_send_rate;
-                if (previously_limited_by_ideal && !limited_by_ideal && target_below_initial) {
-                    // We were previously limited by the ideal send rate,
+                if (previous_ideal_was_tiny && !current_ideal_is_tiny && target_below_initial) {
+                    // We were previously limited by a tiny ideal send rate,
                     // but are no longer, and we're below the initial send
                     // rate, so it's like we've started all over.
                     // Might as well just jump up to the initial rate.
@@ -335,17 +328,9 @@ fn calculate_target_send_rates(
                 }
             };
 
-            // Apply clamping to any change, including a change because of
-            // a request.ideal_send_rate.
-            let ideal_limit = requested.ideal_with_headroom();
-            if changed_target_send_rate.is_some() || target_send_rate > ideal_limit || reset_to_initial {
-                // Note: Make sure to apply the config.clamp after the requested.ideal_send_rate limit
-                // so we don't go below the config.min.  If we let the rate really hit zero
-                // because of a requested.ideal_send_rate of 0, then
-                // we'll never send anything, and thus never get an ack, and thus never
-                // recalculate the target send rate, and never go above 0.
-                target_send_rate = config.clamp_target_send_rate(min(ideal_limit,
-                    changed_target_send_rate.unwrap_or(target_send_rate)));
+            // Apply clamping to any change, including a change because of resetting to initial.
+            if changed_target_send_rate.is_some() || reset_to_initial {
+                target_send_rate = config.clamp_target_send_rate(changed_target_send_rate.unwrap_or(target_send_rate));
                 target_send_rate_updated = now;
                 yield target_send_rate
             }
@@ -1021,20 +1006,18 @@ mod calculate_target_send_rates_tests {
         let interval = Duration::from_millis(1000);
 
         let (ideal_send_rate_bps, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
-            // Practically no limit
-            (10_000_000, DelayDirection::Steady, 1_001_000),
-            // Limit below target
-            (500_000, DelayDirection::Decreasing, 650_000),
-            // Limit below target
-            (400_000, DelayDirection::Steady, 540_000),
-            // Limit low, but the decrease is even lower
-            (300_000, DelayDirection::Increasing, 270_000),
-            // Limit below increased target
-            (100_000, DelayDirection::Steady, 210_000),
-            // Limit below even min.
-            (50_000, DelayDirection::Increasing, 200_000),
-            // Practically no limit; Jump up to initial.
-            (10_000_000, DelayDirection::Decreasing, 1_000_000),
+            // Ideal is tiny, but that doesn't prevent normal behavior
+            (100_000, DelayDirection::Steady, Some(1_001_000)),
+            (100_000, DelayDirection::Decreasing, None),
+            (100_000, DelayDirection::Steady, Some(1_002_000)),
+            (100_000, DelayDirection::Steady, Some(1_082_160)),
+            (100_000, DelayDirection::Increasing, Some(541_080)),
+            // Ideal switches from tiny to not tiny, so reset to initial.
+            (10_000_000, DelayDirection::Steady, Some(1_001_000)),
+            // Then normal behavior
+            (10_000_000, DelayDirection::Steady, Some(1_081_080)),
+            (10_000_000, DelayDirection::Decreasing, None),
+            (10_000_000, DelayDirection::Increasing, Some(540_540)),
         ]
         .iter()
         .copied()
@@ -1055,6 +1038,7 @@ mod calculate_target_send_rates_tests {
             instants_at_regular_intervals(start_time + interval, interval)
                 .zip(futures::stream::iter(directions)),
         );
+        let expected_bps: Vec<u64> = expected_bps.into_iter().flatten().collect();
 
         assert_eq!(
             &expected_bps,
@@ -1069,7 +1053,7 @@ mod calculate_target_send_rates_tests {
     #[test]
     fn ideal_send_rate_with_acked_rate() {
         let config = Config {
-            initial_target_send_rate: DataRate::from_bps(1_000_000),
+            initial_target_send_rate: DataRate::from_bps(500_000),
             min_target_send_rate: DataRate::from_bps(200_000),
             ..config()
         };
@@ -1077,20 +1061,18 @@ mod calculate_target_send_rates_tests {
         let interval = Duration::from_millis(1000);
 
         let (ideal_send_rate_bps, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
-            // Practically no limit
-            (10_000_000, DelayDirection::Steady, 1_000_000),
-            // Limit below target
-            (500_000, DelayDirection::Decreasing, 650_000),
-            // Limit below target
-            (400_000, DelayDirection::Steady, 540_000),
-            // Limit low, and the decrease isn't lower
-            (300_000, DelayDirection::Increasing, 425_000),
-            // Limit below increased target
-            (100_000, DelayDirection::Steady, 210_000),
-            // Limit below even min.
-            (50_000, DelayDirection::Increasing, 200_000),
-            // Practically no limit; Jump up to initial.
-            (10_000_000, DelayDirection::Decreasing, 1_000_000),
+            // Ideal is tiny, but that doesn't prevent normal behavior
+            (100_000, DelayDirection::Steady, Some(501_000)),
+            (100_000, DelayDirection::Decreasing, None),
+            (100_000, DelayDirection::Steady, Some(502_000)),
+            (100_000, DelayDirection::Steady, Some(542_160)),
+            (100_000, DelayDirection::Increasing, Some(425_000)),
+            // Ideal switches from tiny to not tiny, so reset to initial.
+            (10_000_000, DelayDirection::Steady, Some(500_000)),
+            // Then normal behavior
+            (10_000_000, DelayDirection::Steady, Some(508_727)),
+            (10_000_000, DelayDirection::Decreasing, None),
+            (10_000_000, DelayDirection::Increasing, Some(425_000)),
         ]
         .iter()
         .copied()
@@ -1111,6 +1093,7 @@ mod calculate_target_send_rates_tests {
             instants_at_regular_intervals(start_time + interval, interval)
                 .zip(futures::stream::iter(directions)),
         );
+        let expected_bps: Vec<u64> = expected_bps.into_iter().flatten().collect();
 
         assert_eq!(
             &expected_bps,
@@ -1125,7 +1108,7 @@ mod calculate_target_send_rates_tests {
     #[test]
     fn ideal_send_rate_with_base_requested_rate() {
         let config = Config {
-            initial_target_send_rate: DataRate::from_bps(1_000_000),
+            initial_target_send_rate: DataRate::from_bps(500_000),
             min_target_send_rate: DataRate::from_bps(200_000),
             ..config()
         };
@@ -1133,19 +1116,18 @@ mod calculate_target_send_rates_tests {
         let interval = Duration::from_millis(1000);
 
         let (ideal_send_rate_bps, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
-            // Pratically no limit
-            (10_000_000, DelayDirection::Steady, 1_001_000),
-            // Limit below target
-            (500_000, DelayDirection::Decreasing, 650_000),
-            // Limit below target
-            (400_000, DelayDirection::Steady, 540_000),
-            // Limit low, but the decrease is even lower
-            (300_000, DelayDirection::Increasing, 270_000),
-            // Limited again by ideal rate
-            (100_000, DelayDirection::Steady, 210_000),
-            // Pratically no limit; Jump up to half of base requested rate
-            // plus one round of increase.
-            (10_000_000, DelayDirection::Steady, 1_739_999),
+            // Ideal is tiny, but that doesn't prevent normal behavior
+            (100_000, DelayDirection::Steady, Some(501_000)),
+            (100_000, DelayDirection::Decreasing, None),
+            (100_000, DelayDirection::Steady, Some(502_000)),
+            (100_000, DelayDirection::Steady, Some(582_319)),
+            (100_000, DelayDirection::Increasing, Some(291_159)),
+            // Ideal switches from tiny to not tiny, so reset to half of base requested rate
+            (10_000_000, DelayDirection::Steady, Some(1_501_000)),
+            // Then normal behavior
+            (10_000_000, DelayDirection::Steady, Some(1_741_159)),
+            (10_000_000, DelayDirection::Decreasing, None),
+            (10_000_000, DelayDirection::Increasing, Some(870_579)),
         ]
         .iter()
         .copied()
@@ -1166,6 +1148,7 @@ mod calculate_target_send_rates_tests {
             instants_at_regular_intervals(start_time + interval, interval)
                 .zip(futures::stream::iter(directions)),
         );
+        let expected_bps: Vec<u64> = expected_bps.into_iter().flatten().collect();
 
         assert_eq!(
             &expected_bps,
