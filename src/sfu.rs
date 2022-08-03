@@ -7,7 +7,7 @@
 
 use core::ops::DerefMut;
 use std::{
-    collections::HashMap, convert::TryInto, fmt::Write, net::SocketAddr, sync::Arc,
+    cmp::min, collections::HashMap, convert::TryInto, fmt::Write, net::SocketAddr, sync::Arc,
     time::SystemTime,
 };
 
@@ -22,13 +22,13 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::{
     call::{self, Call, LoggableCallId},
-    common::{DataRate, Duration, Instant, TwoGenerationCacheWithManualRemoveOld},
+    common::{DataRate, DataSize, Duration, Instant, TwoGenerationCacheWithManualRemoveOld},
     config,
     connection::{self, Connection, HandleRtcpResult, PacketToSend},
     googcc, ice,
     ice::BindingRequest,
     metrics::{Histogram, Timer},
-    rtp,
+    pacer, rtp,
 };
 pub use crate::{
     call::{CallId, DemuxId, UserId},
@@ -102,9 +102,14 @@ impl std::fmt::Debug for ConnectionId {
     }
 }
 
+pub type ConnectionHandler = dyn Fn(Arc<Mutex<Connection>>) + Send + 'static;
 pub struct Sfu {
     /// Configuration structure originally from the command line or environment.
     pub config: &'static config::Config,
+
+    // If set, called each time a connection is added
+    new_connection_handler: Option<Box<ConnectionHandler>>,
+
     /// Mapping of Calls by their unique CallId. Set by configuration/signaling.
     call_by_call_id: HashMap<CallId, Arc<Mutex<Call>>>,
     /// Mapping of Connection by their unique ConnectionId, which is really (CallId, DemuxId)
@@ -138,6 +143,8 @@ impl Sfu {
     pub fn new(now: Instant, config: &'static config::Config) -> Result<Self> {
         Ok(Self {
             config,
+            // To enable, call set_new_connection_handler
+            new_connection_handler: None,
             call_by_call_id: HashMap::new(),
             connection_by_id: HashMap::new(),
             connection_id_by_ice_request_username: HashMap::new(),
@@ -148,6 +155,10 @@ impl Sfu {
             activity_checked: now,
             diagnostics_logged: now,
         })
+    }
+
+    pub fn set_new_connection_handler(&mut self, new_connection_handler: Box<ConnectionHandler>) {
+        self.new_connection_handler = Some(new_connection_handler);
     }
 
     /// Return a snapshot of all calls tracked by the Sfu.
@@ -334,23 +345,26 @@ impl Sfu {
             .expect("Expand SRTP master key material");
 
         let inactivity_timeout = Duration::from_secs(self.config.inactivity_timeout_secs);
-        self.connection_by_id.insert(
-            connection_id.clone(),
-            Arc::new(Mutex::new(Connection::new(
-                ice_request_username.clone(),
-                ice_response_username,
-                ice_pwd,
-                srtp_master_key_material,
-                ack_ssrc,
-                googcc::Config {
-                    initial_target_send_rate,
-                    min_target_send_rate,
-                    max_target_send_rate,
-                },
-                inactivity_timeout,
-                now,
-            ))),
-        );
+
+        let connection = Arc::new(Mutex::new(Connection::new(
+            ice_request_username.clone(),
+            ice_response_username,
+            ice_pwd,
+            srtp_master_key_material,
+            ack_ssrc,
+            googcc::Config {
+                initial_target_send_rate,
+                min_target_send_rate,
+                max_target_send_rate,
+            },
+            inactivity_timeout,
+            now,
+        )));
+        self.connection_by_id
+            .insert(connection_id.clone(), connection.clone());
+        if let Some(new_connection_handler) = self.new_connection_handler.as_ref() {
+            new_connection_handler(connection);
+        };
         self.connection_id_by_ice_request_username
             .insert(ice_request_username, connection_id);
         // Entries are inserted into self.connection_id_by_address as we received ICE binding
@@ -485,7 +499,7 @@ impl Sfu {
                 {
                     let mut outgoing_connection = outgoing_connection.lock();
                     time_scope_us!("calling.sfu.handle_packet.rtp.in_outgoing_connection_lock");
-                    outgoing_connection.send_rtp(
+                    outgoing_connection.send_or_enqueue_rtp(
                         outgoing_rtp,
                         &mut packets_to_send,
                         Instant::now(),
@@ -622,7 +636,7 @@ impl Sfu {
                         let _ = write!(diagnostic_string, "call_id: {}", stats.loggable_call_id);
 
                         for client in stats.clients {
-                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), target: {}, requested_base: {}, ideal: {}, allocated: {}, padding: {}, max_requested_height: {} }}",
+                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), target: {}, requested_base: {}, ideal: {}, allocated: {}, queue_drain: {}, max_requested_height: {} }}",
                                   client.demux_id.as_u32(),
                                   client.video0_incoming_height.unwrap_or_default().as_u16(),
                                   client.video1_incoming_height.unwrap_or_default().as_u16(),
@@ -630,11 +644,11 @@ impl Sfu {
                                   client.video0_incoming_rate.unwrap_or_default().as_kbps(),
                                   client.video1_incoming_rate.unwrap_or_default().as_kbps(),
                                   client.video2_incoming_rate.unwrap_or_default().as_kbps(),
-                                  client.requested_base_rate.as_kbps(),
                                   client.target_send_rate.as_kbps(),
+                                  client.requested_base_rate.as_kbps(),
                                   client.ideal_send_rate.as_kbps(),
                                   client.allocated_send_rate.as_kbps(),
-                                  client.padding_send_rate.as_kbps(),
+                                  client.outgoing_queue_drain_rate.as_kbps(),
                                   client.max_requested_height.unwrap_or_default().as_u16(),
                             );
                         }
@@ -662,6 +676,7 @@ impl Sfu {
         let remove_inactive_calls_timer = start_timer_us!("calling.sfu.tick.remove_inactive_calls");
 
         let mut expired_demux_ids_by_call_id: HashMap<CallId, Vec<DemuxId>> = HashMap::new();
+        let mut outgoing_queue_sizes: Vec<(DemuxId, DataSize)> = Vec::new();
         self.connection_by_id.retain(|connection_id, connection| {
             let mut connection = connection.lock();
             if check_for_inactivity && connection.inactive(now) {
@@ -678,16 +693,23 @@ impl Sfu {
                     .entry(connection_id.call_id.clone())
                     .or_default()
                     .push(connection_id.demux_id);
+
+                // This prevents an Arc cycle where connection -> scheduler -> connection.
+                connection.set_dequeue_scheduler(None);
                 false
             } else {
                 // Don't remove the connection; it's still active!
                 connection.tick(&mut packets_to_send, now);
+                outgoing_queue_sizes
+                    .push((connection_id.demux_id, connection.outgoing_queue_size()));
                 true
             }
         });
 
         let mut call_tick_results = vec![];
         // Iterate all calls, maybe dropping some that are inactive.
+        let outgoing_queue_drain_duration =
+            Duration::from_millis(self.config.outgoing_queue_drain_ms);
         self.call_by_call_id.retain(|call_id, call| {
             let mut call = call.lock();
 
@@ -711,6 +733,17 @@ impl Sfu {
                     true
                 }
             } else {
+                for (demux_id, outgoing_queue_size) in &outgoing_queue_sizes {
+                    // Note: this works even if the duration is zero.
+                    // Normally, we shouldn't ever be configured with 0 drain duration
+                    // But perhaps allowing it to mean "as fast as possible"?
+                    // would be an interesting thing to be able to do.
+                    let outgoing_queue_drain_rate =
+                        *outgoing_queue_size / outgoing_queue_drain_duration;
+                    // Ignore the error because it can only mean the client is gone, in which case it doesn't matter.
+                    let _ =
+                        call.set_outgoing_queue_drain_rate(*demux_id, outgoing_queue_drain_rate);
+                }
                 // Don't remove the call; there are still clients!
                 let (outgoing_rtp, outgoing_key_frame_requests) = call.tick(now);
                 let send_rate_allocation_infos =
@@ -742,14 +775,21 @@ impl Sfu {
                 outgoing_connection_id.demux_id = send_rate_allocation_info.demux_id;
                 if let Some(connection) = self.connection_by_id.get_mut(&outgoing_connection_id) {
                     let mut connection = connection.lock();
-                    connection.set_padding_send_rate(
-                        send_rate_allocation_info.padding_send_rate,
-                        send_rate_allocation_info.padding_ssrc,
+                    connection.configure_congestion_control(
+                        googcc::Request {
+                            base: send_rate_allocation_info.requested_base_rate,
+                            ideal: send_rate_allocation_info.ideal_send_rate,
+                        },
+                        pacer::Config {
+                            media_send_rate: send_rate_allocation_info.target_send_rate,
+                            padding_send_rate: min(
+                                send_rate_allocation_info.ideal_send_rate,
+                                send_rate_allocation_info.target_send_rate,
+                            ),
+                            padding_ssrc: send_rate_allocation_info.padding_ssrc,
+                        },
+                        now,
                     );
-                    connection.send_request_to_congestion_controller(googcc::Request {
-                        base: send_rate_allocation_info.requested_base_rate,
-                        ideal: send_rate_allocation_info.ideal_send_rate,
-                    });
                 }
             }
 
@@ -775,7 +815,11 @@ impl Sfu {
                     self.connection_by_id.get_mut(&outgoing_connection_id)
                 {
                     let mut outgoing_connection = outgoing_connection.lock();
-                    outgoing_connection.send_rtp(outgoing_rtp, &mut packets_to_send, now);
+                    outgoing_connection.send_or_enqueue_rtp(
+                        outgoing_rtp,
+                        &mut packets_to_send,
+                        now,
+                    );
                 }
             }
         }

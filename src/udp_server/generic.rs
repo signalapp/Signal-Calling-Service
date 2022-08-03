@@ -86,18 +86,21 @@ impl UdpServerState {
             if let Some((size, sender_addr)) = received_packet {
                 let packets_to_send = handle_packet(sender_addr, &mut buf[..size]);
                 for (buf, addr) in packets_to_send {
-                    trace!("sending packet of {} bytes to {}", buf.len(), addr);
                     time_scope!(
                         "calling.udp.generic.send_packet",
                         TimingOptions::nanosecond_1000_per_minute()
                     );
                     sampling_histogram!("calling.generic.send_packet.size_bytes", || buf.len());
-
-                    if let Err(err) = self.socket.send_to(&buf, addr) {
-                        warn!("send_to failed: {}", err);
-                    }
+                    self.send_packet(&buf, addr);
                 }
             }
+        }
+    }
+
+    pub fn send_packet(&self, buf: &[u8], addr: SocketAddr) {
+        trace!("sending packet of {} bytes to {}", buf.len(), addr);
+        if let Err(err) = self.socket.send_to(buf, addr) {
+            warn!("send_to failed: {}", err);
         }
     }
 
@@ -108,11 +111,7 @@ impl UdpServerState {
         _persistent_tick_state: &mut TickState,
     ) -> Result<()> {
         for (buf, addr) in tick_update.packets_to_send {
-            trace!("sending packet of {} bytes to {}", buf.len(), addr);
-
-            if let Err(err) = self.socket.send_to(&buf, addr) {
-                warn!("send_to failed: {}", err);
-            }
+            self.send_packet(&buf, addr);
         }
         Ok(())
     }

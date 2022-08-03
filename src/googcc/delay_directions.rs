@@ -964,7 +964,7 @@ fn calculate_delay_directions_from_slopes(
                     {
                         direction = DelayDirection::Increasing;
                         increasing_count = 0;
-                        increasing_duration = Some(Duration::default());
+                        increasing_duration = Some(Duration::ZERO);
                     } else {
                         // Yield the existing direction and wait for more "increasing" signals.
                     }

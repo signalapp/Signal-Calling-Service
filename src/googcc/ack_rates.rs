@@ -24,19 +24,19 @@ fn accumulate_acked_sizes(
         pin_mut!(acks);
         if let Some(mut ack1) = acks.next().await {
             let mut accumulated_size = ack1.size;
-            let mut accumulated_duration = Duration::default();
+            let mut accumulated_duration = Duration::ZERO;
             let mut target_ack_group_duration = initial_ack_group_duration;
             while let Some(ack2) = acks.next().await {
                 if ack2.arrival < ack1.arrival {
                     // Reset when we hit out-of-order packets
-                    accumulated_size = DataSize::default();
-                    accumulated_duration = Duration::default();
+                    accumulated_size = DataSize::ZERO;
+                    accumulated_duration = Duration::ZERO;
                 } else {
                     let arrival_delta = ack2.arrival.saturating_duration_since(ack1.arrival);
                     accumulated_duration += arrival_delta;
                     if arrival_delta > target_ack_group_duration {
                         // Reset if it's been too long since we've received an ACK
-                        accumulated_size = DataSize::default();
+                        accumulated_size = DataSize::ZERO;
                         accumulated_duration = Duration::from_micros(
                             accumulated_duration.as_micros() as u64
                                 % target_ack_group_duration.as_micros() as u64,

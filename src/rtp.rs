@@ -399,6 +399,10 @@ impl<T> Packet<T> {
         self.seqnum_in_payload.unwrap_or(self.seqnum_in_header)
     }
 
+    pub fn tcc_seqnum(&self) -> Option<tcc::FullSequenceNumber> {
+        self.tcc_seqnum
+    }
+
     fn payload_range(&self) -> Range<usize> {
         if self.is_rtx() {
             (self.payload_range_in_header.start + 2)..self.payload_range_in_header.end
@@ -1536,16 +1540,21 @@ impl Endpoint {
         mut outgoing: Packet<Vec<u8>>,
         now: Instant,
     ) -> Option<Packet<Vec<u8>>> {
+        // Remember the packet sent for RTX before we encrypt it.
+        if is_rtxable_payload_type(outgoing.payload_type()) {
+            self.rtx_sender.remember_sent(outgoing.to_owned(), now);
+        }
+        // Don't remember the packet sent for TCC until after we actually send it.
+        // (see remember_sent_for_tcc)
+        outgoing.encrypt_in_place(&self.encrypt.rtp.key, &self.encrypt.rtp.salt)?;
+        Some(outgoing)
+    }
+
+    pub fn remember_sent_for_tcc(&mut self, outgoing: &Packet<Vec<u8>>, now: Instant) {
         if let Some(tcc_seqnum) = outgoing.tcc_seqnum {
             self.tcc_sender
                 .remember_sent(tcc_seqnum, outgoing.size(), now);
         }
-        // Remember the packet sent before we encrypt it.
-        if is_rtxable_payload_type(outgoing.payload_type()) {
-            self.rtx_sender.remember_sent(outgoing.to_owned(), now);
-        }
-        outgoing.encrypt_in_place(&self.encrypt.rtp.key, &self.encrypt.rtp.salt)?;
-        Some(outgoing)
     }
 
     // Returns serialized RTCP packets containing ACKs, not just ACK payloads.

@@ -65,7 +65,7 @@ impl Config {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Request {
     // If we're below this, try to ramp up to it quickly.
     pub base: DataRate,
@@ -182,7 +182,7 @@ fn calculate_target_send_rates(
     stream! {
         let mut requested = Request {
             // Basically use the config.initial_target_send_rate instead.
-            base: DataRate::default(),
+            base: DataRate::ZERO,
             // Basically uncapped until we receive a request.
             ideal: config.max_target_send_rate,
         };
@@ -252,7 +252,7 @@ fn calculate_target_send_rates(
                         // This is a strange thing where the first "steady" we have after an
                         // increase/decrease basically only increases the rate a little or not at
                         // all. This is because we don't know how long it's been steady.
-                        Duration::default()
+                        Duration::ZERO
                     } else {
                         now.saturating_duration_since(target_send_rate_updated)
                     };

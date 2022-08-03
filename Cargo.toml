@@ -67,6 +67,7 @@ zeroize = "1.5.4"
 # For congestion control
 tokio-stream = { version = "0.1", features = ["sync"] }
 async-stream = "0.3"
+flume = "0.10.14"
 # For congestion-control-specific helpers
 pin-project = "1.0"
 

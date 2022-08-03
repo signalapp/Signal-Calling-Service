@@ -18,7 +18,7 @@ pub struct DataSize {
 
 impl Default for DataSize {
     fn default() -> Self {
-        Self::from_bits(0)
+        Self::ZERO
     }
 }
 
@@ -38,11 +38,12 @@ impl std::fmt::Debug for DataSize {
 }
 
 impl DataSize {
+    pub const ZERO: Self = Self::from_bits(0);
     const BITS_PER_BYTE: u64 = 8;
     const BITS_PER_KILO_BIT: u64 = 1000;
     const BITS_PER_MEGA_BIT: u64 = Self::BITS_PER_KILO_BIT * Self::BITS_PER_KILO_BIT;
 
-    pub fn from_bits(bits: u64) -> Self {
+    pub const fn from_bits(bits: u64) -> Self {
         Self { bits }
     }
 
@@ -131,7 +132,7 @@ impl Div<f64> for DataSize {
 
 #[cfg(test)]
 mod data_size_tests {
-    use super::DataSize;
+    use super::{DataRate, DataSize, Duration};
 
     #[test]
     fn default() {
@@ -243,6 +244,22 @@ mod data_size_tests {
     }
 
     #[test]
+    fn division_by_duration() {
+        assert_eq!(
+            DataRate::from_bps(30),
+            DataSize::from_bits(60) / Duration::from_secs(2)
+        );
+        assert_eq!(
+            DataRate::from_bps(u64::MAX),
+            DataSize::from_bytes(60) / Duration::ZERO
+        );
+        assert_eq!(
+            DataRate::from_bps(0),
+            DataSize::from_bytes(0) / Duration::ZERO
+        );
+    }
+
+    #[test]
     fn sum() {
         let data_sizes = vec![
             DataSize::from_bits(1),
@@ -260,12 +277,14 @@ pub struct DataRate {
 
 impl Default for DataRate {
     fn default() -> Self {
-        Self::from_bps(0)
+        Self::ZERO
     }
 }
 
 impl DataRate {
-    pub fn per_second(size_per_second: DataSize) -> Self {
+    pub const ZERO: Self = Self::per_second(DataSize::ZERO);
+
+    pub const fn per_second(size_per_second: DataSize) -> Self {
         Self { size_per_second }
     }
 
@@ -462,7 +481,7 @@ mod data_rate_tests {
 
     #[test]
     fn display_rounds_down_to_1_decimal_point() {
-        assert_eq!("0 bps", format!("{}", DataRate::default()));
+        assert_eq!("0 bps", format!("{}", DataRate::ZERO));
         assert_eq!("1 bps", format!("{}", DataRate::from_bps(1)));
         assert_eq!("999 bps", format!("{}", DataRate::from_bps(999)));
         assert_eq!("1.0 Kbps", format!("{}", DataRate::from_bps(1_000)));

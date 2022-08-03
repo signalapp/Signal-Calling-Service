@@ -28,7 +28,7 @@ mod generic;
 use generic::*;
 
 use crate::{
-    common::{Duration, Instant},
+    common::{Duration, Instant, ThreadPool},
     config,
     sfu::{Sfu, SfuError},
 };
@@ -51,6 +51,7 @@ pub async fn start(
 
     let udp_handler_state = UdpServerState::new(local_addr, num_udp_threads, tick_interval)?;
     let udp_handler_state_for_tick = udp_handler_state.clone();
+    let udp_handler_state_for_dequeue = udp_handler_state.clone();
 
     let sfu_for_tick = sfu.clone();
 
@@ -58,6 +59,35 @@ pub async fn start(
         "udp_server ready: {:?}; starting {} threads",
         local_addr, num_udp_threads
     );
+
+    let thread_pool = ThreadPool::new(num_udp_threads);
+
+    sfu.lock()
+        .set_new_connection_handler(Box::new(move |connection| {
+            let thread_pool_for_dequeue = thread_pool.clone();
+            let connection_for_dequeue = connection.clone();
+            let udp_handler_state_for_dequeue = udp_handler_state_for_dequeue.clone();
+            connection
+                .lock()
+                // Note: this creates a reference cycle, but that cycle is broken
+                // by the SFU when it removes the connection from its tables
+                // by calling .set_dequeue_scheduler(None).
+                .set_dequeue_scheduler(Some(Box::new(move |time_to_dequeue| {
+                    let connection_for_dequeue = connection_for_dequeue.clone();
+                    let udp_handler_state_for_dequeue = udp_handler_state_for_dequeue.clone();
+                    thread_pool_for_dequeue.spawn_blocking_at(
+                        time_to_dequeue,
+                        Box::new(move || {
+                            if let Some((buf, addr)) = connection_for_dequeue
+                                .lock()
+                                .dequeue_outgoing_rtp(Instant::now())
+                            {
+                                udp_handler_state_for_dequeue.send_packet(&buf, addr);
+                            }
+                        }),
+                    );
+                })));
+        }));
 
     // Spawn (blocking) threads for the UDP server.
     let udp_packet_handles = udp_handler_state.start_threads(move |sender_addr, data| {

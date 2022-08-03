@@ -42,6 +42,7 @@ fn print_config(config: &'static config::Config) {
     info!("  {:38}{}", "max_clients_per_call:", config.max_clients_per_call);
     info!("  {:38}{} ({})", "initial_target_send_rate_kbps:", config.initial_target_send_rate_kbps, DataRate::from_kbps(config.initial_target_send_rate_kbps));
     info!("  {:38}{}", "tick_interval_ms:", config.tick_interval_ms);
+    info!("  {:38}{}", "outgoing_queue_drain_ms:", config.outgoing_queue_drain_ms);
     info!("  {:38}{:?}", "diagnostics_interval_secs:", config.diagnostics_interval_secs);
     info!("  {:38}{}", "active_speaker_message_interval_ms:", config.active_speaker_message_interval_ms);
     info!("  {:38}{}", "inactivity_check_interval_secs:", config.inactivity_check_interval_secs);

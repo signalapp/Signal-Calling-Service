@@ -268,8 +268,8 @@ pub struct Call {
 #[derive(Debug, PartialEq, Eq)]
 pub struct SendRateAllocationInfo {
     pub demux_id: DemuxId,
-    pub padding_send_rate: DataRate,
     pub padding_ssrc: Option<rtp::Ssrc>,
+    pub target_send_rate: DataRate,
     pub requested_base_rate: DataRate,
     pub ideal_send_rate: DataRate,
 }
@@ -607,13 +607,25 @@ impl Call {
         Ok(())
     }
 
+    pub fn set_outgoing_queue_drain_rate(
+        &mut self,
+        receiver_demux_id: DemuxId,
+        outgoing_queue_drain_rate: DataRate,
+    ) -> Result<(), Error> {
+        let receiver = self
+            .find_client_mut(receiver_demux_id)
+            .ok_or(Error::UnknownDemuxId(receiver_demux_id))?;
+        receiver.outgoing_queue_drain_rate = outgoing_queue_drain_rate;
+        Ok(())
+    }
+
     pub fn get_send_rate_allocation_info(
         &self,
     ) -> impl Iterator<Item = SendRateAllocationInfo> + '_ {
         self.clients.iter().map(|client| SendRateAllocationInfo {
             demux_id: client.demux_id,
-            padding_send_rate: client.padding_send_rate,
             padding_ssrc: client.padding_ssrc,
+            target_send_rate: client.target_send_rate,
             requested_base_rate: client.requested_base_rate,
             ideal_send_rate: client.ideal_send_rate,
         })
@@ -699,8 +711,12 @@ impl Call {
             requested_base_rate(&allocatable_videos, receiver.requested_max_send_rate);
         let ideal_send_rate =
             ideal_send_rate(&allocatable_videos, receiver.requested_max_send_rate);
-        let allocated_video_by_sender_demux_id =
-            allocate_send_rate(new_target_send_rate, ideal_send_rate, allocatable_videos);
+        let allocated_video_by_sender_demux_id = allocate_send_rate(
+            new_target_send_rate,
+            ideal_send_rate,
+            receiver.outgoing_queue_drain_rate,
+            allocatable_videos,
+        );
         let allocated_send_rate = allocated_video_by_sender_demux_id
             .values()
             .map(|allocated| allocated.rate)
@@ -724,14 +740,10 @@ impl Call {
             forwarder.set_desired_ssrc(desired_incoming_ssrc);
         }
 
-        let padding_send_rate =
-            min(ideal_send_rate, new_target_send_rate).saturating_sub(allocated_send_rate);
-
         receiver.target_send_rate = new_target_send_rate;
         receiver.requested_base_rate = requested_base_rate;
         receiver.ideal_send_rate = ideal_send_rate;
         receiver.allocated_send_rate = allocated_send_rate;
-        receiver.padding_send_rate = padding_send_rate;
         receiver.send_rate_allocated = now;
     }
 
@@ -985,6 +997,8 @@ struct Client {
 
     // Updated by Call::set_target_send_rate
     target_send_rate: DataRate,
+    // Updated by Call::set_outgoing_queue_drain_rate
+    outgoing_queue_drain_rate: DataRate,
     requested_max_send_rate: DataRate,
     send_rate_allocated: Instant,
 
@@ -996,7 +1010,6 @@ struct Client {
     requested_base_rate: DataRate,
     ideal_send_rate: DataRate,
     allocated_send_rate: DataRate,
-    padding_send_rate: DataRate,
 
     // Updated by Call::update_padding_ssrc()
     padding_ssrc: Option<rtp::Ssrc>,
@@ -1040,13 +1053,13 @@ impl Client {
             requested_height_by_demux_id: HashMap::new(),
 
             target_send_rate: DataRate::default(),
+            outgoing_queue_drain_rate: DataRate::default(),
             requested_max_send_rate,
             send_rate_allocated: now,
 
             requested_base_rate: DataRate::default(),
             ideal_send_rate: DataRate::default(),
             allocated_send_rate: DataRate::default(),
-            padding_send_rate: DataRate::default(),
 
             padding_ssrc: None,
 
@@ -1171,7 +1184,7 @@ impl Client {
             target_send_rate: self.target_send_rate,
             ideal_send_rate: self.ideal_send_rate,
             allocated_send_rate: self.allocated_send_rate,
-            padding_send_rate: self.padding_send_rate,
+            outgoing_queue_drain_rate: self.outgoing_queue_drain_rate,
             max_requested_height: self.requested_height_by_demux_id.values().max().copied(),
         }
     }
@@ -1235,7 +1248,7 @@ impl IncomingDataRateTracker {
         let duration = if let Some((oldest, _)) = self.history.back() {
             now.saturating_duration_since(*oldest)
         } else {
-            Duration::default()
+            Duration::ZERO
         };
         self.rate = if duration >= Self::MIN_DURATION {
             Some(self.accumulated_size / duration)
@@ -1339,11 +1352,18 @@ fn requested_base_rate(videos: &[AllocatableVideo], max_requested_send_rate: Dat
 fn allocate_send_rate(
     target_send_rate: DataRate,
     ideal_send_rate: DataRate,
+    outgoing_queue_drain_rate: DataRate,
     mut videos: Vec<AllocatableVideo>,
 ) -> HashMap<DemuxId, AllocatedVideo> {
-    let allocatable_rate = min(target_send_rate, ideal_send_rate);
+    // We leave some target send rate unallocated to allow the queue to drain.
+    // But if the ideal rate is lower than the target rate, there is room
+    // between the ideal rate and the target rate to drain the queue.
+    let allocatable_rate = min(
+        target_send_rate.saturating_sub(outgoing_queue_drain_rate),
+        ideal_send_rate,
+    );
     let mut allocated_by_sender_demux_id: HashMap<DemuxId, AllocatedVideo> = HashMap::new();
-    let mut allocated_rate = DataRate::default();
+    let mut allocated_rate = DataRate::ZERO;
 
     // Biggest first and then (for the same size), most recently interesting first
     videos.sort_by_key(|video| std::cmp::Reverse((video.requested_height, video.interesting)));
@@ -1759,7 +1779,7 @@ pub struct ClientStats {
     pub requested_base_rate: DataRate,
     pub ideal_send_rate: DataRate,
     pub allocated_send_rate: DataRate,
-    pub padding_send_rate: DataRate,
+    pub outgoing_queue_drain_rate: DataRate,
     pub max_requested_height: Option<VideoHeight>,
 }
 
@@ -2193,24 +2213,30 @@ mod call_tests {
 
         fn allocate(
             target_send_rate_kbps: u64,
+            outgoing_queue_drain_rate_kbps: u64,
             videos: &[&AllocatableVideo],
             max_requested_send_rate_kbps: u64,
         ) -> (u64, Vec<(u32, usize, u64)>) {
             let videos: Vec<AllocatableVideo> = videos.iter().copied().cloned().collect();
             let target_send_rate = DataRate::from_kbps(target_send_rate_kbps);
+            let outgoing_queue_drain_rate = DataRate::from_kbps(outgoing_queue_drain_rate_kbps);
             let max_requested_send_rate = DataRate::from_kbps(max_requested_send_rate_kbps);
             let ideal_send_rate = ideal_send_rate(&videos, max_requested_send_rate);
-            let mut allocated: Vec<_> =
-                allocate_send_rate(target_send_rate, ideal_send_rate, videos)
-                    .iter()
-                    .map(|(demux_id, allocated)| {
-                        (
-                            u32::from(*demux_id),
-                            allocated.layer_index,
-                            allocated.rate.as_kbps(),
-                        )
-                    })
-                    .collect();
+            let mut allocated: Vec<_> = allocate_send_rate(
+                target_send_rate,
+                ideal_send_rate,
+                outgoing_queue_drain_rate,
+                videos,
+            )
+            .iter()
+            .map(|(demux_id, allocated)| {
+                (
+                    u32::from(*demux_id),
+                    allocated.layer_index,
+                    allocated.rate.as_kbps(),
+                )
+            })
+            .collect();
             allocated.sort_unstable();
             (ideal_send_rate.as_kbps(), allocated)
         }
@@ -2228,31 +2254,72 @@ mod call_tests {
         let no_max = 100000;
 
         // Can't send and nothing to receive
-        assert_eq!((0, vec![]), allocate(0, &[], no_max));
+        assert_eq!((0, vec![]), allocate(0, 0, &[], no_max));
+        assert_eq!((0, vec![]), allocate(0, 200, &[], no_max));
 
         // Can send but nothing to receive
-        assert_eq!((0, vec![]), allocate(1000, &[], no_max));
-        assert_eq!((0, vec![]), allocate(1000, &[&video0], no_max));
+        assert_eq!((0, vec![]), allocate(1000, 0, &[], no_max));
+        assert_eq!((0, vec![]), allocate(1000, 200, &[], no_max));
+        assert_eq!((0, vec![]), allocate(1000, 0, &[&video0], no_max));
+        assert_eq!((0, vec![]), allocate(1000, 200, &[&video0], no_max));
 
         // Can send and receive but nothing requested.
-        assert_eq!((0, vec![]), allocate(1000, &[&video1], no_max));
+        assert_eq!((0, vec![]), allocate(1000, 0, &[&video1], no_max));
+        assert_eq!((0, vec![]), allocate(1000, 200, &[&video1], no_max));
 
         // Can receive and requested, but nothing to send.
         assert_eq!(
             (200, vec![]),
-            allocate(0, &[&request(VideoHeight::from(1080), &video1)], no_max)
+            allocate(0, 0, &[&request(VideoHeight::from(1080), &video1)], no_max)
+        );
+        assert_eq!(
+            (200, vec![]),
+            allocate(
+                0,
+                200,
+                &[&request(VideoHeight::from(1080), &video1)],
+                no_max
+            )
         );
 
         // Finally can send, receive, and have requested
         assert_eq!(
             (200, vec![(1, 0, 200)]),
-            allocate(1000, &[&request(VideoHeight::from(1080), &video1)], no_max)
+            allocate(
+                1000,
+                0,
+                &[&request(VideoHeight::from(1080), &video1)],
+                no_max
+            )
+        );
+        assert_eq!(
+            (200, vec![(1, 0, 200)]),
+            allocate(
+                1000,
+                200,
+                &[&request(VideoHeight::from(1080), &video1)],
+                no_max
+            )
         );
 
         // Verify we fill lower layers first, starting with highest resolution requested.
         assert_eq!(
+            (3000, vec![]),
+            allocate(
+                200,
+                200,
+                &[
+                    &request(VideoHeight::from(180), &video1),
+                    &request(VideoHeight::from(360), &video2),
+                    &request(VideoHeight::from(720), &video3)
+                ],
+                no_max
+            )
+        );
+        assert_eq!(
             (3000, vec![(3, 0, 200)]),
             allocate(
+                400,
                 200,
                 &[
                     &request(VideoHeight::from(180), &video1),
@@ -2266,6 +2333,7 @@ mod call_tests {
             (3000, vec![(2, 0, 200), (3, 0, 200)]),
             allocate(
                 400,
+                0,
                 &[
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
@@ -2278,6 +2346,7 @@ mod call_tests {
             (3000, vec![(1, 0, 200), (2, 0, 200), (3, 0, 200)]),
             allocate(
                 600,
+                0,
                 &[
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
@@ -2290,6 +2359,7 @@ mod call_tests {
             (3000, vec![(1, 0, 200), (2, 0, 200), (3, 1, 800)]),
             allocate(
                 1200,
+                0,
                 &[
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
@@ -2302,6 +2372,7 @@ mod call_tests {
             (3000, vec![(1, 0, 200), (2, 1, 800), (3, 1, 800)]),
             allocate(
                 1800,
+                0,
                 &[
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
@@ -2314,6 +2385,7 @@ mod call_tests {
             (3000, vec![(1, 0, 200), (2, 1, 800), (3, 2, 2000)]),
             allocate(
                 3000,
+                0,
                 &[
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
@@ -2328,6 +2400,7 @@ mod call_tests {
             (1200, vec![(1, 0, 200), (2, 0, 200), (3, 1, 800)]),
             allocate(
                 3000,
+                0,
                 &[
                     &request(VideoHeight::from(180), &video1),
                     &request(VideoHeight::from(360), &video2),
@@ -2342,6 +2415,7 @@ mod call_tests {
             (3000, vec![(1, 0, 200), (2, 1, 800), (3, 2, 2000)]),
             allocate(
                 5000,
+                0,
                 &[
                     &request(VideoHeight::from(1080), &video1),
                     &request(VideoHeight::from(1081), &video2),
@@ -2356,6 +2430,7 @@ mod call_tests {
             (600, vec![(1, 0, 200), (2, 0, 200), (3, 0, 200)]),
             allocate(
                 5000,
+                0,
                 &[
                     &request(VideoHeight::from(1), &video1),
                     &request(VideoHeight::from(2), &video2),
@@ -2370,6 +2445,7 @@ mod call_tests {
             (3000, vec![(1, 0, 200)]),
             allocate(
                 200,
+                0,
                 &[
                     &request(VideoHeight::from(1080), &interesting(1, &video1)),
                     &request(VideoHeight::from(1080), &interesting(2, &video2)),
@@ -2382,6 +2458,7 @@ mod call_tests {
             (3000, vec![(1, 0, 200), (2, 0, 200)]),
             allocate(
                 400,
+                0,
                 &[
                     &request(VideoHeight::from(1080), &interesting(1, &video1)),
                     &request(VideoHeight::from(1080), &interesting(2, &video2)),
@@ -2394,6 +2471,7 @@ mod call_tests {
             (5000, vec![(1, 0, 200), (2, 0, 200), (4, 0, 200)]),
             allocate(
                 600,
+                0,
                 &[
                     &request(VideoHeight::from(1080), &interesting(1, &video1)),
                     &request(VideoHeight::from(1080), &interesting(2, &video2)),
@@ -2410,6 +2488,7 @@ mod call_tests {
             ),
             allocate(
                 800,
+                0,
                 &[
                     &request(VideoHeight::from(1080), &interesting(1, &video1)),
                     &request(VideoHeight::from(1080), &interesting(2, &video2)),
@@ -2423,6 +2502,7 @@ mod call_tests {
             (4000, vec![(3, 0, 200), (4, 1, 800)]),
             allocate(
                 1000,
+                0,
                 &[
                     &request(VideoHeight::from(1080), &interesting(3, &video4)),
                     &request(VideoHeight::from(1080), &interesting(4, &video3)),
@@ -2434,6 +2514,7 @@ mod call_tests {
             (4000, vec![(3, 1, 800), (4, 2, 2000)]),
             allocate(
                 2800,
+                0,
                 &[
                     &request(VideoHeight::from(1080), &interesting(3, &video4)),
                     &request(VideoHeight::from(1080), &interesting(4, &video3)),
@@ -2445,6 +2526,7 @@ mod call_tests {
             (4000, vec![(3, 2, 2000), (4, 2, 2000)]),
             allocate(
                 10000,
+                0,
                 &[
                     &request(VideoHeight::from(1080), &interesting(3, &video4)),
                     &request(VideoHeight::from(1080), &interesting(4, &video3)),
@@ -2458,6 +2540,7 @@ mod call_tests {
             (600, vec![(3, 0, 200)]),
             allocate(
                 200,
+                0,
                 &[
                     &request(VideoHeight::from(1), &interesting(1, &video1)),
                     &request(VideoHeight::from(2), &interesting(2, &video2)),
@@ -2470,6 +2553,7 @@ mod call_tests {
             (600, vec![(2, 0, 200), (3, 0, 200)]),
             allocate(
                 400,
+                0,
                 &[
                     &request(VideoHeight::from(1), &interesting(1, &video1)),
                     &request(VideoHeight::from(2), &interesting(2, &video2)),
@@ -2482,6 +2566,7 @@ mod call_tests {
             (600, vec![(1, 0, 200), (2, 0, 200), (3, 0, 200)]),
             allocate(
                 600,
+                0,
                 &[
                     &request(VideoHeight::from(1), &interesting(1, &video1)),
                     &request(VideoHeight::from(2), &interesting(2, &video2)),
@@ -2507,6 +2592,7 @@ mod call_tests {
             (0, vec![]),
             allocate(
                 2000,
+                0,
                 &[&request(VideoHeight::from(0), &screenshare),],
                 no_max
             )
@@ -2515,6 +2601,7 @@ mod call_tests {
             (1500, vec![(4, 0, 100)]),
             allocate(
                 600,
+                0,
                 &[&request(VideoHeight::from(1), &screenshare),],
                 no_max
             )
@@ -2523,6 +2610,7 @@ mod call_tests {
             (1500, vec![(4, 1, 1500)]),
             allocate(
                 2000,
+                0,
                 &[&request(VideoHeight::from(1), &screenshare),],
                 no_max
             )
@@ -3247,22 +3335,22 @@ mod call_tests {
             vec![
                 SendRateAllocationInfo {
                     demux_id: sender_demux_id,
-                    padding_send_rate: DataRate::default(),
                     padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(receiver1_demux_id)),
+                    target_send_rate: DataRate::from_kbps(600),
                     requested_base_rate: DataRate::default(),
                     ideal_send_rate: DataRate::from_bps(0),
                 },
                 SendRateAllocationInfo {
                     demux_id: receiver1_demux_id,
-                    padding_send_rate: DataRate::from_bps(585261),
                     padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(sender_demux_id)),
+                    target_send_rate: DataRate::from_kbps(600),
                     requested_base_rate: DataRate::from_bps(14739),
                     ideal_send_rate: DataRate::from_bps(1002048),
                 },
                 SendRateAllocationInfo {
                     demux_id: receiver2_demux_id,
-                    padding_send_rate: DataRate::default(),
                     padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(sender_demux_id)),
+                    target_send_rate: DataRate::from_kbps(600),
                     requested_base_rate: DataRate::from_bps(14739),
                     ideal_send_rate: DataRate::from_bps(14739),
                 }

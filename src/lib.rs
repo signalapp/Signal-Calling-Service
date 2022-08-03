@@ -15,6 +15,7 @@ pub mod googcc;
 pub mod http_server;
 pub mod ice;
 pub mod metrics_server;
+pub mod pacer;
 pub mod protos;
 pub mod rtp;
 pub mod sfu;

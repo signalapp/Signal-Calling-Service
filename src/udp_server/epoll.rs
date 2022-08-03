@@ -289,97 +289,100 @@ impl UdpServerState {
                 drop(connections_lock);
 
                 let packets_to_send = handle_packet(sender_addr, &mut buf[..size]);
-
                 for (buf, addr) in packets_to_send {
-                    trace!("sending packet of {} bytes to {}", buf.len(), addr);
-                    time_scope!(
-                        "calling.udp.epoll.send_packet",
-                        TimingOptions::nanosecond_1000_per_minute()
-                    );
-                    sampling_histogram!("calling.epoll.send_packet.size_bytes", || buf.len());
+                    self.send_packet(&buf, addr)
+                }
+            }
+        }
+    }
 
-                    let connections_lock = self.all_connections.read();
-                    match connections_lock.get_by_addr(&addr) {
-                        ConnectionState::Connected(socket) => {
-                            if let Err(err) = socket.send(&buf) {
-                                if err.kind() == io::ErrorKind::ConnectionRefused {
-                                    // This can happen when someone leaves a call
-                                    // because e.g. their router stops forwarding packets.
-                                    // This is normal with UDP; technically this error happened
-                                    // with the *previous* packet and we're just finding out now.
-                                    trace!("send() failed: {}", err);
+    pub fn send_packet(&self, buf: &[u8], addr: SocketAddr) {
+        trace!("sending packet of {} bytes to {}", buf.len(), addr);
+        time_scope!(
+            "calling.udp.epoll.send_packet",
+            TimingOptions::nanosecond_1000_per_minute()
+        );
+        sampling_histogram!("calling.epoll.send_packet.size_bytes", || buf.len());
 
-                                    // Drop the read lock...
-                                    drop(connections_lock);
-                                    // ...and connect with a write lock...
-                                    let mut write_lock = self.all_connections.write();
-                                    // ...and mark the connection as closed.
-                                    // If we changed state (such as already going to Closed)
-                                    // in between the locks, mark_closed is still safe to call:
-                                    // - If the connection is still open, we want to close it.
-                                    // - If the connection is closed, closing it again doesn't hurt.
-                                    // - If the connection has been removed entirely, closing it does nothing.
-                                    // - If the connection has been removed and the address gets reused,
-                                    // we'll close a connection that doesn't belong here anymore.
-                                    // That's very unlikely because it means we've had at least two ticks,
-                                    // and it'll (hopefully) heal itself in another two.
-                                    write_lock.mark_closed(&addr);
-                                } else {
+        let connections_lock = self.all_connections.read();
+        match connections_lock.get_by_addr(&addr) {
+            ConnectionState::Connected(socket) => {
+                if let Err(err) = socket.send(buf) {
+                    if err.kind() == io::ErrorKind::ConnectionRefused {
+                        // This can happen when someone leaves a call
+                        // because e.g. their router stops forwarding packets.
+                        // This is normal with UDP; technically this error happened
+                        // with the *previous* packet and we're just finding out now.
+                        trace!("send() failed: {}", err);
+
+                        // Drop the read lock...
+                        drop(connections_lock);
+                        // ...and connect with a write lock...
+                        let mut write_lock = self.all_connections.write();
+                        // ...and mark the connection as closed.
+                        // If we changed state (such as already going to Closed)
+                        // in between the locks, mark_closed is still safe to call:
+                        // - If the connection is still open, we want to close it.
+                        // - If the connection is closed, closing it again doesn't hurt.
+                        // - If the connection has been removed entirely, closing it does nothing.
+                        // - If the connection has been removed and the address gets reused,
+                        // we'll close a connection that doesn't belong here anymore.
+                        // That's very unlikely because it means we've had at least two ticks,
+                        // and it'll (hopefully) heal itself in another two.
+                        write_lock.mark_closed(&addr);
+                    } else {
+                        warn!("send() failed: {}", err);
+                    }
+                }
+            }
+            ConnectionState::Closed => {
+                trace!("dropping packet (connection already closed)")
+            }
+            ConnectionState::NotYetConnected => {
+                // Drop the read lock...
+                drop(connections_lock);
+                // ...and connect with a write lock...
+                let mut write_lock = self.all_connections.write();
+
+                // ...and check if another thread beat us to it.
+                match write_lock.get_by_addr(&addr) {
+                    ConnectionState::Connected(socket) => {
+                        if let Err(err) = socket.send(buf) {
+                            if err.kind() == io::ErrorKind::ConnectionRefused {
+                                // This can happen when someone leaves a call
+                                // because e.g. their router stops forwarding packets.
+                                // This is normal with UDP; technically this error happened
+                                // with the *previous* packet and we're just finding out now.
+                                trace!("send() failed: {}", err);
+
+                                // ...and mark the connection as closed.
+                                write_lock.mark_closed(&addr);
+                            } else {
+                                warn!("send() failed: {}", err);
+                            }
+                        }
+                    }
+                    ConnectionState::Closed => {
+                        trace!("dropping packet (connection already closed)")
+                    }
+                    ConnectionState::NotYetConnected => {
+                        trace!("connecting to {:?}", addr);
+                        match try_scoped(|| {
+                            let client_socket =
+                                Self::open_socket_with_reusable_port(&self.local_addr)?;
+                            client_socket.connect(addr)?;
+                            self.add_socket_to_poll_for_reads(&client_socket)?;
+                            Ok(client_socket)
+                        }) {
+                            Ok(client_socket) => {
+                                let client_socket =
+                                    write_lock.get_or_insert_connected(client_socket, addr);
+                                if let Err(err) = client_socket.send(buf) {
                                     warn!("send() failed: {}", err);
                                 }
                             }
-                        }
-                        ConnectionState::Closed => {
-                            trace!("dropping packet (connection already closed)")
-                        }
-                        ConnectionState::NotYetConnected => {
-                            // Drop the read lock...
-                            drop(connections_lock);
-                            // ...and connect with a write lock...
-                            let mut write_lock = self.all_connections.write();
-
-                            // ...and check if another thread beat us to it.
-                            match write_lock.get_by_addr(&addr) {
-                                ConnectionState::Connected(socket) => {
-                                    if let Err(err) = socket.send(&buf) {
-                                        if err.kind() == io::ErrorKind::ConnectionRefused {
-                                            // This can happen when someone leaves a call
-                                            // because e.g. their router stops forwarding packets.
-                                            // This is normal with UDP; technically this error happened
-                                            // with the *previous* packet and we're just finding out now.
-                                            trace!("send() failed: {}", err);
-
-                                            // ...and mark the connection as closed.
-                                            write_lock.mark_closed(&addr);
-                                        } else {
-                                            warn!("send() failed: {}", err);
-                                        }
-                                    }
-                                }
-                                ConnectionState::Closed => {
-                                    trace!("dropping packet (connection already closed)")
-                                }
-                                ConnectionState::NotYetConnected => {
-                                    trace!("connecting to {:?}", addr);
-                                    match try_scoped(|| {
-                                        let client_socket =
-                                            Self::open_socket_with_reusable_port(&self.local_addr)?;
-                                        client_socket.connect(addr)?;
-                                        self.add_socket_to_poll_for_reads(&client_socket)?;
-                                        Ok(client_socket)
-                                    }) {
-                                        Ok(client_socket) => {
-                                            let client_socket = write_lock
-                                                .get_or_insert_connected(client_socket, addr);
-                                            if let Err(err) = client_socket.send(&buf) {
-                                                warn!("send() failed: {}", err);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("failed to connect to peer: {}", e);
-                                        }
-                                    }
-                                }
+                            Err(e) => {
+                                error!("failed to connect to peer: {}", e);
                             }
                         }
                     }

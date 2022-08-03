@@ -13,6 +13,7 @@ mod integers;
 mod math;
 mod serialize;
 mod slice;
+mod thread_pool;
 mod time;
 
 use std::{cmp::PartialEq, convert::TryInto};
@@ -26,6 +27,7 @@ pub use math::*;
 use rand::{thread_rng, Rng};
 pub use serialize::*;
 pub use slice::*;
+pub use thread_pool::*;
 pub use time::*;
 
 // It's (value, rest)

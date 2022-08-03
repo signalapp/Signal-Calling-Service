@@ -74,6 +74,14 @@ pub struct Config {
     #[structopt(long, default_value = "100")]
     pub tick_interval_ms: u64,
 
+    /// How quickly we want to drain each outgoing queue.
+    /// This affects the rate we allocate for draining the queue.
+    /// It will push out other, lower-priority, streams to prioritize draining.
+    /// The lower the value here, the higher the rate and the
+    /// higher priority put on draining the outgoing queue.
+    #[structopt(long, default_value = "500")]
+    pub outgoing_queue_drain_ms: u64,
+
     /// Optional interval used to post diagnostics to the log. If not defined
     /// then no periodic information about calls will be posted to the log.
     #[structopt(long, env = "DIAGNOSTICS_INTERVAL_SECS")]
@@ -154,6 +162,7 @@ pub(crate) fn default_test_config() -> Config {
         max_target_send_rate_kbps: 30000,
         default_requested_max_send_rate_kbps: 20000,
         tick_interval_ms: 100,
+        outgoing_queue_drain_ms: 500,
         diagnostics_interval_secs: None,
         active_speaker_message_interval_ms: 1000,
         inactivity_check_interval_secs: 5,

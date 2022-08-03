@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(Some(long), sum.checked_sub(short));
         assert_eq!(None, short.checked_sub(sum));
         assert_eq!(long, sum.saturating_sub(short));
-        assert_eq!(Duration::default(), short.saturating_sub(sum));
+        assert_eq!(Duration::ZERO, short.saturating_sub(sum));
         assert_eq!(sum, [short, long].iter().sum());
         assert_eq!(sum, vec![short, long].into_iter().sum());
 
@@ -307,7 +307,7 @@ mod tests {
         assert_eq!(Some(duration), soon.checked_duration_since(now));
         assert_eq!(None, now.checked_duration_since(soon));
         assert_eq!(duration, soon.saturating_duration_since(now));
-        assert_eq!(Duration::default(), now.saturating_duration_since(soon));
+        assert_eq!(Duration::ZERO, now.saturating_duration_since(soon));
 
         let mut manual_sum = now;
         manual_sum += duration;
