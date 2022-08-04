@@ -43,9 +43,6 @@ pub struct Config {
     #[structopt(long, default_value = "8")]
     pub max_clients_per_call: u32,
 
-    #[structopt(long)]
-    pub udp_threads: Option<usize>,
-
     /// The initial bitrate target for sending. In a 16-person call with
     /// each base layer at 50kbps you'd need 800kbps to send them all.
     #[structopt(long, default_value = "800")]
@@ -156,7 +153,6 @@ pub(crate) fn default_test_config() -> Config {
         signaling_port: 8080,
         ice_candidate_port: 10000,
         max_clients_per_call: 8,
-        udp_threads: Some(1),
         initial_target_send_rate_kbps: 1500,
         min_target_send_rate_kbps: 100,
         max_target_send_rate_kbps: 30000,

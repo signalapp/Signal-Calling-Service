@@ -39,17 +39,13 @@ pub async fn start(
     udp_ender_rx: Receiver<()>,
     is_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
-    let num_udp_threads = config.udp_threads.unwrap_or_else(|| {
-        // Default to N - 1 CPUs, keeping one clear for the HTTP server.
-        // But clamp to 15 so we don't run out of memory or another contended resource.
-        num_cpus::get().clamp(2, 16) - 1
-    });
+    let num_threads = num_cpus::get();
 
     let tick_interval = Duration::from_millis(config.tick_interval_ms);
 
     let local_addr = SocketAddr::new(config.binding_ip.parse()?, config.ice_candidate_port);
 
-    let udp_handler_state = UdpServerState::new(local_addr, num_udp_threads, tick_interval)?;
+    let udp_handler_state = UdpServerState::new(local_addr, num_threads, tick_interval)?;
     let udp_handler_state_for_tick = udp_handler_state.clone();
     let udp_handler_state_for_dequeue = udp_handler_state.clone();
 
@@ -57,10 +53,10 @@ pub async fn start(
 
     info!(
         "udp_server ready: {:?}; starting {} threads",
-        local_addr, num_udp_threads
+        local_addr, num_threads
     );
 
-    let thread_pool = ThreadPool::new(num_udp_threads);
+    let thread_pool = ThreadPool::new(num_threads);
 
     sfu.lock()
         .set_new_connection_handler(Box::new(move |connection| {
