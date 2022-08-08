@@ -830,24 +830,38 @@ pub fn parse_and_forward_rtp_for_fuzzing(data: Vec<u8>) -> Option<Vec<u8>> {
     Some(outgoing.into_serialized())
 }
 
-#[allow(clippy::identity_op)]
-fn rtp_iv(ssrc: Ssrc, seqnum: FullSequenceNumber, salt: &Salt) -> Iv {
-    let ssrc = ssrc.to_be_bytes();
-    let seqnum = seqnum.to_be_bytes();
+pub fn rtp_iv(ssrc: u32, seqnum: u64, salt: &[u8; 12]) -> [u8; 12] {
+    // We're trying to XOR the following 12-byte value (from RFC 7714 section 8.1) with the salt.
+    //     0  0  0  0  0  0  0  0  0  0  1  1
+    //     0  1  2  3  4  5  6  7  8  9  0  1
+    //   +--+--+--+--+--+--+--+--+--+--+--+--+
+    //   |00|00|    SSRC   |     ROC   | SEQ |
+    //   +--+--+--+--+--+--+--+--+--+--+--+--+
+
+    // This is bytes 0-7. Notice that the ROC part of the seqnum gets split.
+    let mut combined_lower = ssrc as u64;
+    combined_lower <<= 16;
+    combined_lower |= (seqnum >> 32) & 0xFFFF;
+    let salt_lower = u64::from_be_bytes(salt[..8].try_into().unwrap());
+    let result_lower = (salt_lower ^ combined_lower).to_be_bytes();
+
+    // This is bytes 8-11.
+    let salt_upper = u32::from_be_bytes(salt[8..].try_into().unwrap());
+    let result_upper = (salt_upper ^ (seqnum as u32)).to_be_bytes();
+
     [
-        0 ^ salt[0],
-        0 ^ salt[1],
-        ssrc[0] ^ salt[2],
-        ssrc[1] ^ salt[3],
-        ssrc[2] ^ salt[4],
-        ssrc[3] ^ salt[5],
-        // Treat as a u48.  In other words, the ROC then the truncated seqnum
-        seqnum[2] ^ salt[6],
-        seqnum[3] ^ salt[7],
-        seqnum[4] ^ salt[8],
-        seqnum[5] ^ salt[9],
-        seqnum[6] ^ salt[10],
-        seqnum[7] ^ salt[11],
+        result_lower[0],
+        result_lower[1],
+        result_lower[2],
+        result_lower[3],
+        result_lower[4],
+        result_lower[5],
+        result_lower[6],
+        result_lower[7],
+        result_upper[0],
+        result_upper[1],
+        result_upper[2],
+        result_upper[3],
     ]
 }
 
@@ -1731,6 +1745,8 @@ impl SequenceNumberReuseDetector {
 mod test {
     use super::*;
 
+    use rand::{thread_rng, Rng};
+
     const VP8_RTX_PAYLOAD_TYPE: PayloadType = 118;
 
     #[test]
@@ -2446,5 +2462,47 @@ mod test {
         assert!(received200b.is_none());
         assert!(received1c.is_none());
         assert!(received2c.is_none());
+    }
+
+    #[test]
+    fn test_rtp_iv() {
+        // This was the original implementation of rtp_iv, which very closely matches RFC 7714
+        // but generated poor assembly.
+        #[allow(clippy::identity_op)]
+        fn reference(ssrc: Ssrc, seqnum: FullSequenceNumber, salt: &Salt) -> Iv {
+            let ssrc = ssrc.to_be_bytes();
+            let seqnum = seqnum.to_be_bytes();
+            [
+                0 ^ salt[0],
+                0 ^ salt[1],
+                ssrc[0] ^ salt[2],
+                ssrc[1] ^ salt[3],
+                ssrc[2] ^ salt[4],
+                ssrc[3] ^ salt[5],
+                // Treat as a u48.  In other words, the ROC then the truncated seqnum
+                seqnum[2] ^ salt[6],
+                seqnum[3] ^ salt[7],
+                seqnum[4] ^ salt[8],
+                seqnum[5] ^ salt[9],
+                seqnum[6] ^ salt[10],
+                seqnum[7] ^ salt[11],
+            ]
+        }
+
+        let mut rng = thread_rng();
+        for _ in 0..100 {
+            let ssrc = rng.gen();
+            let seqnum = rng.gen::<u64>() & 0x0000_FFFF_FFFF_FFFF; // 48 bits only
+            let salt = rng.gen();
+
+            assert_eq!(
+                reference(ssrc, seqnum, &salt),
+                rtp_iv(ssrc, seqnum, &salt),
+                "{:x} {:x} {}",
+                ssrc,
+                seqnum,
+                hex::encode(&salt),
+            );
+        }
     }
 }
