@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::Result;
 use log::*;
-use nix::sys::{epoll::*, socket::*};
+use nix::sys::epoll::*;
 use parking_lot::RwLock;
 use scopeguard::ScopeGuard;
 
@@ -86,6 +86,8 @@ impl UdpServerState {
     ///
     /// This allows multiple sockets to bind to the same address.
     fn open_socket_with_reusable_port(local_addr: &SocketAddr) -> Result<UdpSocket> {
+        use nix::sys::socket::*;
+
         // Open an IPv4 UDP socket in blocking mode.
         let socket_fd = socket(
             AddressFamily::Inet,
@@ -103,10 +105,7 @@ impl UdpServerState {
         // Allow later sockets to handle connections.
         setsockopt(*socket_fd, sockopt::ReusePort, &true)?;
         // Bind the socket to the given local address.
-        bind(
-            *socket_fd,
-            &SockAddr::new_inet(InetAddr::from_std(local_addr)),
-        )?;
+        bind(*socket_fd, &SockaddrStorage::from(*local_addr))?;
         // Pass ownership from ScopeGuard into a proper Rust UdpSocket.
         // std::net::UdpSocket can only be created and bound in one step, which
         // doesn't allow us to set SO_REUSEPORT.

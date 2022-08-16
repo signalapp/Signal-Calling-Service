@@ -159,7 +159,7 @@ dependencies = [
  "lazy_static",
  "log",
  "mock_instant",
- "nix",
+ "nix 0.25.0",
  "num_cpus",
  "parking_lot",
  "pin-project",
@@ -867,6 +867,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e322c04a9e3440c327fca7b6c8a63e6890a32fa2ad689db972425f07e0d22abb"
+dependencies = [
+ "autocfg",
+ "bitflags",
+ "cfg-if",
+ "libc",
+ "memoffset",
+ "pin-utils",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1082,7 +1096,7 @@ dependencies = [
  "cfg-if",
  "darwin-libproc",
  "mach",
- "nix",
+ "nix 0.23.1",
  "once_cell",
  "thiserror",
 ]

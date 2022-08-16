@@ -70,7 +70,7 @@ flume = "0.10.14"
 pin-project = "1.0"
 
 # For low-level UDP sockets
-nix = { version = "0.23", optional = true }
+nix = { version = "0.25", optional = true }
 
 # For current process memory stats
 psutil = { version = "3.2.2", default-features = false, features = ["process"] }
