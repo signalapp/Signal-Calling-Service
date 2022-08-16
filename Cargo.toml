@@ -30,7 +30,7 @@ futures = "0.3"
 num_cpus = "1.13"
 
 # For http
-warp = "0.3"
+warp = { version = "0.3", default-features = false }
 
 # For general conversions
 base64 = "0.13"
