@@ -37,7 +37,6 @@ base64 = "0.13"
 byteorder = "1"
 hex = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
-rcgen = "0.9"
 prost = "0.11"
 
 # For common
@@ -65,7 +64,6 @@ aes-gcm = "0.10"
 zeroize = "1.5"
 
 # For congestion control
-tokio-stream = { version = "0.1", features = ["sync"] }
 async-stream = "0.3"
 flume = "0.10.14"
 # For congestion-control-specific helpers
