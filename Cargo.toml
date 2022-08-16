@@ -7,7 +7,7 @@
 name = "calling_server"
 version = "1.4.0"
 authors = ["Calling Team <callingteam@signal.org>"]
-edition = "2018"
+edition = "2021"
 description = "Media forwarding server for group calls."
 license = "AGPL-3.0-only"
 
@@ -19,12 +19,12 @@ scopeguard = "1.1"
 
 # For logging and command line operations
 log = "0.4"
-env_logger = "0.8"
+env_logger = "0.9"
 structopt = "0.3"
 
 # For runtime and threading
 tokio = { version = "1", features = ["full"] }
-parking_lot = "0.11"
+parking_lot = "0.12"
 lazy_static = "1.4"
 futures = "0.3"
 num_cpus = "1.13"
@@ -37,32 +37,32 @@ base64 = "0.13"
 byteorder = "1"
 hex = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
-rcgen = "0.8"
-prost = "0.10"
+rcgen = "0.9"
+prost = "0.11"
 
 # For common
-sha2 = "0.9"
+sha2 = "0.10"
 
 # For ICE
-crc = "1.8"
-hmac = "0.11"
-sha-1 = "0.9"
+crc = "3.0"
+hmac = "0.12"
+sha-1 = "0.10"
 
 # For metrics
 rand = "0.8"
 
 # For SRTP key derivation using DHE
-hkdf = "0.11"
+hkdf = "0.12"
 # x25519-dalek is only compatible with rand/rand_core 0.5, so we need to pull these
 # in to make a source of OsRng that's compatible with both x25519-dalek and ecdsa.
-rand_core = { version = "0.6.3", features = [] }
+rand_core = { version = "0.6", features = [] }
 rand_core5 = { package = "rand_core", version = "0.5.1", features = [] }
 x25519-dalek = { version = "1.1" }
 
 # For (S)RTP
-aes = "0.7"
-aes-gcm = "0.9"
-zeroize = "1.5.4"
+aes = "0.8"
+aes-gcm = "0.10"
+zeroize = "1.5"
 
 # For congestion control
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -78,7 +78,7 @@ nix = { version = "0.23", optional = true }
 psutil = { version = "3.2.2", default-features = false, features = ["process"] }
 
 [build-dependencies]
-prost-build = "0.10"
+prost-build = "0.11"
 
 [dev-dependencies]
 unzip3 = "1.0"

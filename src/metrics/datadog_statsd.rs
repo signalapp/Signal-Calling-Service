@@ -406,7 +406,7 @@ mod test {
         }
     }
 
-    impl<'a> EventSink for MockUdpPort {
+    impl EventSink for MockUdpPort {
         fn send(&mut self, data: String) {
             self.packets.borrow_mut().push(data);
         }

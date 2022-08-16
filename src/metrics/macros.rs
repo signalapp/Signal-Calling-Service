@@ -136,8 +136,8 @@ impl Metrics {
 macro_rules! reporter {
     ($name:expr, $options:expr) => {{
         lazy_static::lazy_static! {
-            pub static ref __REPORTER: std::sync::Arc<crate::metrics::NumericValueReporter> =
-                crate::metrics::__METRICS.create_and_register_timer($name, $options);
+            pub static ref __REPORTER: std::sync::Arc<$crate::metrics::NumericValueReporter> =
+                $crate::metrics::__METRICS.create_and_register_timer($name, $options);
         };
         &__REPORTER
     }};
@@ -147,8 +147,8 @@ macro_rules! reporter {
 macro_rules! event_reporter {
     ($name:expr) => {{
         lazy_static::lazy_static! {
-            pub static ref __REPORTER: std::sync::Arc<crate::metrics::EventCountReporter> =
-                crate::metrics::__METRICS.create_and_register_event($name);
+            pub static ref __REPORTER: std::sync::Arc<$crate::metrics::EventCountReporter> =
+                $crate::metrics::__METRICS.create_and_register_event($name);
         };
         &__REPORTER
     }};
@@ -182,7 +182,7 @@ macro_rules! time_scope_us {
     ($name:expr) => {
         time_scope!(
             $name,
-            crate::metrics::TimingOptions::microsecond_1000_per_minute()
+            $crate::metrics::TimingOptions::microsecond_1000_per_minute()
         );
     };
 }
@@ -193,7 +193,7 @@ macro_rules! start_timer_us {
     ($name:expr) => {{
         start_timer!(
             $name,
-            crate::metrics::TimingOptions::microsecond_1000_per_minute()
+            $crate::metrics::TimingOptions::microsecond_1000_per_minute()
         )
     }};
 }
@@ -211,7 +211,7 @@ macro_rules! event {
 #[macro_export]
 macro_rules! metrics {
     () => {{
-        &crate::metrics::__METRICS
+        &$crate::metrics::__METRICS
     }};
 }
 

@@ -144,7 +144,7 @@ pub async fn start(
     });
 
     // Wait for any task to complete and cancel the rest.
-    let _ = tokio::select!(
+    tokio::select!(
         _ = udp_packet_handles => {},
         _ = tick_handle => {},
         _ = udp_ender_rx => {},

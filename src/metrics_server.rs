@@ -34,7 +34,7 @@ pub async fn start(
             metrics!().disable();
             info!("metrics server not started because not configured, metrics disabled");
 
-            let _ = tokio::select!(
+            tokio::select!(
                 _ = shutdown_signal_rx => {},
             );
 
@@ -70,7 +70,7 @@ pub async fn start(
                 }
             });
 
-            let _ = tokio::select!(
+            tokio::select!(
                 _ = tick_handle => {},
                 _ = shutdown_signal_rx => {},
             );

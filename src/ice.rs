@@ -10,8 +10,8 @@ use std::{
     ops::{Deref, Range},
 };
 
-use crc::crc32;
-use hmac::{crypto_mac::MacError, Hmac, Mac, NewMac};
+use crc::{Crc, CRC_32_ISO_HDLC};
+use hmac::{digest::MacError, Hmac, Mac};
 use log::*;
 use sha1::Sha1;
 use thiserror::Error;
@@ -28,6 +28,8 @@ const ATTR_HEADER_LEN: usize = 4;
 const BINDING_REQUEST_ID: [u8; 2] = [0x00, 0x01];
 const BINDING_RESPONSE_ID: [u8; 2] = [0x01, 0x01];
 const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+
+const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 struct AttributeId {}
 
@@ -208,7 +210,7 @@ impl<'a> BindingRequest<'a> {
 
     pub fn verify_hmac(&self, pwd: &[u8]) -> Result<VerifiedBindingRequest, MacError> {
         Self::calculate_hmac(self.packet, &self.ranges, pwd)
-            .verify(self.hmac())
+            .verify_slice(self.hmac())
             .map(|_| VerifiedBindingRequest::new(self))
     }
 
@@ -266,7 +268,7 @@ impl<'a> VerifiedBindingRequest<'a> {
             .into_bytes();
         packet[ranges.hmac.clone()].copy_from_slice(&hmac);
         let fingerprint = FINGERPRINT_XOR_VALUE
-            ^ crc32::checksum_ieee(&packet[..(ranges.fingerprint.start - ATTR_HEADER_LEN)]);
+            ^ CRC32.checksum(&packet[..(ranges.fingerprint.start - ATTR_HEADER_LEN)]);
         packet[ranges.fingerprint.clone()].copy_from_slice(&fingerprint.to_be_bytes());
     }
 }
@@ -352,10 +354,8 @@ fn create_packet(
     write_value_in_attr(&mut packet, hmaced_attrs_len, &hmac_value);
 
     write_len_in_header(&mut packet, attrs_len);
-    let fingerprint_value = {
-        FINGERPRINT_XOR_VALUE
-            ^ crc32::checksum_ieee(&packet[..header_len + fingerprinted_attrs_len])
-    };
+    let fingerprint_value =
+        FINGERPRINT_XOR_VALUE ^ CRC32.checksum(&packet[..header_len + fingerprinted_attrs_len]);
     write_value_in_attr(
         &mut packet,
         fingerprinted_attrs_len,
@@ -381,6 +381,14 @@ mod tests {
     use hex_literal::hex;
 
     use super::*;
+
+    #[test]
+    fn check_crc32() {
+        let packet = hex!("3e21c9b1b27f576e3a4b516b8298451f");
+
+        // Make sure the crc algorithm is the same as the legacy checksum_ieee().
+        assert_eq!(CRC32.checksum(&packet[..]), 4010254265);
+    }
 
     #[test]
     fn test_join_username() {

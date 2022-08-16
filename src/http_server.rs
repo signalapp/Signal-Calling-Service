@@ -207,8 +207,7 @@ async fn get_metrics(sfu: Arc<Mutex<Sfu>>) -> Result<warp::reply::Response, warp
                             .as_slice()
                             .iter()
                             .copied()
-                            .map(std::ascii::escape_default)
-                            .flatten()
+                            .flat_map(std::ascii::escape_default)
                             .collect(),
                     )
                     .unwrap(),
@@ -716,12 +715,12 @@ mod http_server_tests {
 
         // Version 1: "username:1a:2b:1:"
         let result = parse_and_authenticate(config, "Basic dXNlcm5hbWU6MWE6MmI6MTo=");
-        assert!(!result.is_err());
+        assert!(result.is_ok());
         assert!(result.unwrap() == (vec![26].into(), vec![43].into()));
 
         // Version 2: "username:2:1a:2b:1:2:3"
         let result = parse_and_authenticate(config, "Basic dXNlcm5hbWU6MjoxYToyYjoxOjI6Mw==");
-        assert!(!result.is_err());
+        assert!(result.is_ok());
         assert!(result.unwrap() == (vec![26].into(), vec![43].into()));
     }
 }

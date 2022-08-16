@@ -133,7 +133,7 @@ fn main() -> Result<()> {
     let signal_canceller_tx_clone_for_metrics = signal_canceller_tx.clone();
     let is_healthy_clone_for_udp = is_healthy.clone();
 
-    let _ = threaded_rt.block_on(async {
+    threaded_rt.block_on(async {
         // Start the signaling server, either the signaling_server for production
         // or the http_server for testing.
         let signaling_server_handle = tokio::spawn(async move {
@@ -165,7 +165,7 @@ fn main() -> Result<()> {
 
         // Wait for any signals to be detected, or cancel due to one of the
         // servers not being able to be started (the channel is buffered).
-        let _ = wait_for_signal(signal_canceller_rx).await;
+        wait_for_signal(signal_canceller_rx).await;
 
         // Gracefully exit the servers if needed.
         let _ = signaling_ender_tx.send(());

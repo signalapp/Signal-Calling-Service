@@ -13,8 +13,11 @@ use std::{
     ops::{Range, RangeInclusive},
 };
 
-use aes::{cipher::generic_array::GenericArray, Aes128, BlockEncrypt, NewBlockCipher};
-use aes_gcm::{AeadInPlace, Aes128Gcm, NewAead};
+use aes::{
+    cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit},
+    Aes128,
+};
+use aes_gcm::{AeadInPlace, Aes128Gcm};
 use byteorder::{ReadBytesExt, BE};
 use log::*;
 use zeroize::Zeroizing;
@@ -900,7 +903,7 @@ impl<'packet> ControlPacket<'packet> {
                 Self::prepare_for_crypto(serialized, sender_ssrc, srtcp_index, key, salt)?;
             let nonce = GenericArray::from_slice(&nonce);
             let tag = GenericArray::from_slice(tag);
-            let _ = cipher
+            cipher
                 .decrypt_in_place_detached(nonce, &aad, ciphertext, tag)
                 .ok()?;
         } else {
