@@ -24,12 +24,6 @@ pub(super) struct UdpServerState {
     num_threads: usize,
 }
 
-/// The persistent state from tick to tick for the generic server.
-///
-/// The generic server does not need to carry any state from tick to tick.
-#[derive(Default)]
-pub(super) struct TickState;
-
 impl UdpServerState {
     /// Sets up the server state by binding a socket to `local_addr`.
     pub fn new(
@@ -105,11 +99,7 @@ impl UdpServerState {
     }
 
     /// Process the results of [`sfu::Sfu::tick`].
-    pub fn tick(
-        &self,
-        tick_update: sfu::TickOutput,
-        _persistent_tick_state: &mut TickState,
-    ) -> Result<()> {
+    pub fn tick(&self, tick_update: sfu::TickOutput) -> Result<()> {
         for (buf, addr) in tick_update.packets_to_send {
             self.send_packet(&buf, addr);
         }

@@ -19,7 +19,7 @@ use parking_lot::RwLock;
 use scopeguard::ScopeGuard;
 
 use crate::{
-    common::{try_scoped, Duration},
+    common::{try_scoped, Duration, Instant},
     metrics::TimingOptions,
     sfu,
 };
@@ -29,6 +29,13 @@ use crate::{
 /// A higher number saves calls into the kernel, but claims more events for a single thread to
 /// process.
 const MAX_EPOLL_EVENTS: usize = 16;
+
+/// How long before an IP address can be reused, if it was previously used by a now-closed
+/// connection.
+///
+/// A higher number prevents delayed sends from "reviving" a closed connection for longer,
+/// but could result in the server ignoring someone who reconnected.
+const CLOSED_SOCKET_EXPIRATION_IN_TICKS: u32 = 10;
 
 /// The shared state for an epoll-based UDP server.
 ///
@@ -49,14 +56,6 @@ pub(super) struct UdpServerState {
     all_epoll_fds: Vec<RawFd>,
     all_connections: RwLock<ConnectionMap>,
     tick_interval: Duration,
-}
-
-/// The persistent state from tick to tick for the epoll-based server.
-///
-/// This tracks clients that have left the call on the previous tick.
-#[derive(Default)]
-pub(super) struct TickState {
-    clients_that_left_previously: Vec<SocketAddr>,
 }
 
 impl UdpServerState {
@@ -239,7 +238,7 @@ impl UdpServerState {
                                         // we'll close a connection that doesn't belong here anymore.
                                         // That's very unlikely because it means we've had at least two ticks,
                                         // and it'll (hopefully) heal itself in another two.
-                                        write_lock.mark_closed(&addr);
+                                        write_lock.mark_closed(&addr, Instant::now());
                                         // No need to read more from this socket.
                                         continue;
                                     }
@@ -329,13 +328,13 @@ impl UdpServerState {
                         // we'll close a connection that doesn't belong here anymore.
                         // That's very unlikely because it means we've had at least two ticks,
                         // and it'll (hopefully) heal itself in another two.
-                        write_lock.mark_closed(&addr);
+                        write_lock.mark_closed(&addr, Instant::now());
                     } else {
                         warn!("send() failed: {}", err);
                     }
                 }
             }
-            ConnectionState::Closed => {
+            ConnectionState::Closed(_) => {
                 trace!("dropping packet (connection already closed)")
             }
             ConnectionState::NotYetConnected => {
@@ -356,13 +355,13 @@ impl UdpServerState {
                                 trace!("send() failed: {}", err);
 
                                 // ...and mark the connection as closed.
-                                write_lock.mark_closed(&addr);
+                                write_lock.mark_closed(&addr, Instant::now());
                             } else {
                                 warn!("send() failed: {}", err);
                             }
                         }
                     }
-                    ConnectionState::Closed => {
+                    ConnectionState::Closed(_) => {
                         trace!("dropping packet (connection already closed)")
                     }
                     ConnectionState::NotYetConnected => {
@@ -394,11 +393,7 @@ impl UdpServerState {
     /// Process the results of [`sfu::SfuServer::tick`].
     ///
     /// This includes cleaning up connections for clients that have left.
-    pub fn tick(
-        &self,
-        mut tick_update: sfu::TickOutput,
-        persistent_tick_state: &mut TickState,
-    ) -> Result<()> {
+    pub fn tick(&self, mut tick_update: sfu::TickOutput) -> Result<()> {
         for (buf, addr) in tick_update.packets_to_send {
             trace!("sending tick packet of {} bytes to {}", buf.len(), addr);
 
@@ -420,7 +415,7 @@ impl UdpServerState {
                         }
                     }
                 }
-                ConnectionState::Closed => {
+                ConnectionState::Closed(_) => {
                     trace!("dropping packet (connection already closed)")
                 }
                 ConnectionState::NotYetConnected => {
@@ -429,12 +424,23 @@ impl UdpServerState {
             }
         }
 
-        // Clean up any clients that have already left.
-        if !tick_update.expired_client_addrs.is_empty()
-            || !persistent_tick_state
-                .clients_that_left_previously
-                .is_empty()
+        // Collect the addresses of any sockets that have been closed for several ticks.
+        // We can now free up those table entries.
+        // (We scan ahead of time to avoid taking the write lock if there aren't any.)
+        let now = Instant::now();
+        let expiration = now - (CLOSED_SOCKET_EXPIRATION_IN_TICKS * self.tick_interval);
+        let mut expired_socket_addrs = vec![];
         {
+            let connections_lock = self.all_connections.read();
+            for (addr, close_timestamp) in connections_lock.closed_connection_iter() {
+                if close_timestamp <= &expiration {
+                    expired_socket_addrs.push(*addr);
+                }
+            }
+        }
+
+        // Clean up any clients that have already left.
+        if !tick_update.expired_client_addrs.is_empty() || !expired_socket_addrs.is_empty() {
             match self
                 .all_connections
                 .try_write_for(self.tick_interval.into())
@@ -446,25 +452,21 @@ impl UdpServerState {
                     );
                 }
                 Some(mut socket_lock) => {
-                    // Clean up clients from the last tick.
-                    // This two-phase cleanup makes the following scenario unlikely...
+                    // Clean up sockets closed on previous ticks.
+                    // This two-phase cleanup makes the following scenario unlikely:
                     // 1. UDP handler produces packets for socket X.
                     // 2. The UDP handler is pre-empted.
                     // 3. The tick handler runs and removes socket X.
                     // 4. The UDP handler resumes and tries to send to socket X.
                     // 5. The UDP handler thinks it needs to make a new connection.
-                    // ...but not impossible, since the tick handler could run *twice* in step 3.
-                    // In that case the new connection would be leaked.
-                    for addr in persistent_tick_state.clients_that_left_previously.iter() {
+                    for addr in expired_socket_addrs.iter() {
                         socket_lock.remove_closed(addr);
                     }
 
                     // Mark clients to be cleaned up next tick.
                     for addr in tick_update.expired_client_addrs.iter() {
-                        socket_lock.mark_closed(addr);
+                        socket_lock.mark_closed(addr, now);
                     }
-                    persistent_tick_state.clients_that_left_previously =
-                        tick_update.expired_client_addrs;
                 }
             }
         }
@@ -488,10 +490,9 @@ struct ConnectionMap<T = UdpSocket> {
     /// with a socket.
     by_fd: HashMap<RawFd, T>,
 
-    /// The secondary map from peer addresses to file descriptors.
-    ///
-    /// A value may be [`ConnectionMap::TOMBSTONE_FD`], in which case it represents a recently-closed connection.
-    by_peer_addr: HashMap<SocketAddr, RawFd>,
+    /// The secondary map from peer addresses to file descriptors, or the timestamp when the
+    /// connection to that socket was closed.
+    by_peer_addr: HashMap<SocketAddr, ConnectionState<RawFd>>,
 }
 
 /// Represents the state of a connection in a [ConnectionMap].
@@ -502,13 +503,10 @@ enum ConnectionState<T> {
     /// The given socket is connected to the peer in question.
     Connected(T),
     /// There was a connection to this peer but that connection has been closed.
-    Closed,
+    Closed(Instant),
 }
 
 impl<T: AsRawFd> ConnectionMap<T> {
-    /// A placeholder for `self.by_peer_addr` to represent a closed connection.
-    const TOMBSTONE_FD: RawFd = -1;
-
     fn new() -> Self {
         Self {
             by_fd: HashMap::new(),
@@ -524,14 +522,21 @@ impl<T: AsRawFd> ConnectionMap<T> {
         let fd = socket.as_raw_fd();
         match self.by_peer_addr.entry(peer_addr) {
             hash_map::Entry::Occupied(mut entry) => {
-                if *entry.get() != Self::TOMBSTONE_FD {
-                    // This address is already connected to a different socket.
-                    return &self.by_fd[entry.get()];
+                match entry.get() {
+                    ConnectionState::NotYetConnected => {
+                        unreachable!("should not be in the table at all")
+                    }
+                    ConnectionState::Connected(existing_fd) => {
+                        // This address is already connected to a different socket.
+                        return &self.by_fd[existing_fd];
+                    }
+                    ConnectionState::Closed(_) => {
+                        entry.insert(ConnectionState::Connected(fd));
+                    }
                 }
-                entry.insert(fd);
             }
             hash_map::Entry::Vacant(entry) => {
-                entry.insert(fd);
+                entry.insert(ConnectionState::Connected(fd));
             }
         }
         let inserted_socket = match self.by_fd.entry(fd) {
@@ -546,10 +551,14 @@ impl<T: AsRawFd> ConnectionMap<T> {
     /// Gets the connection for `peer_addr`, which can be in any of the states represented by
     /// [ConnectionState].
     fn get_by_addr(&self, peer_addr: &SocketAddr) -> ConnectionState<&T> {
-        match self.by_peer_addr.get(peer_addr) {
-            None => ConnectionState::NotYetConnected,
-            Some(&Self::TOMBSTONE_FD) => ConnectionState::Closed,
-            Some(fd) => ConnectionState::Connected(&self.by_fd[fd]),
+        match self
+            .by_peer_addr
+            .get(peer_addr)
+            .unwrap_or(&ConnectionState::NotYetConnected)
+        {
+            ConnectionState::NotYetConnected => ConnectionState::NotYetConnected,
+            ConnectionState::Connected(fd) => ConnectionState::Connected(&self.by_fd[fd]),
+            ConnectionState::Closed(instant) => ConnectionState::Closed(*instant),
         }
     }
 
@@ -562,15 +571,32 @@ impl<T: AsRawFd> ConnectionMap<T> {
     ///
     /// The socket associated with that connection will be removed from the map. If there was no
     /// connection for the given peer, or if it was already closed, returns `None`.
-    fn mark_closed(&mut self, peer_addr: &SocketAddr) -> Option<T> {
+    fn mark_closed(&mut self, peer_addr: &SocketAddr, now: Instant) -> Option<T> {
         let entry = self.by_peer_addr.get_mut(peer_addr)?;
-        // Not strictly necessary, but a small perf optimization for when
-        // mark_closed is called more than once.
-        if *entry == Self::TOMBSTONE_FD {
-            return None;
+        match entry {
+            ConnectionState::NotYetConnected => {
+                unreachable!("should not be in the table at all")
+            }
+            ConnectionState::Connected(fd) => {
+                let socket = self.by_fd.remove(fd);
+                *entry = ConnectionState::Closed(now);
+                socket
+            }
+            ConnectionState::Closed(_) => None,
         }
-        let fd = std::mem::replace(entry, Self::TOMBSTONE_FD);
-        self.by_fd.remove(&fd)
+    }
+
+    /// Returns an iterator over the closed connections only.
+    fn closed_connection_iter(&self) -> impl Iterator<Item = (&SocketAddr, &Instant)> {
+        self.by_peer_addr
+            .iter()
+            .filter_map(|(addr, entry)| match entry {
+                ConnectionState::NotYetConnected => {
+                    unreachable!("should not be in the table at all")
+                }
+                ConnectionState::Connected(_fd) => None,
+                ConnectionState::Closed(instant) => Some((addr, instant)),
+            })
     }
 
     /// Removes the entry for `peer_addr` from the map, which must have previously been marked
@@ -585,11 +611,15 @@ impl<T: AsRawFd> ConnectionMap<T> {
             None => {
                 warn!("no connection record to remove for this address");
             }
-            Some((_, Self::TOMBSTONE_FD)) => {}
-            Some((addr, fd)) => {
-                // There's already a new connection to this address. Put the entry back.
-                self.by_peer_addr.insert(addr, fd);
+            Some((_, ConnectionState::NotYetConnected)) => {
+                unreachable!("should not be in the table at all");
             }
+            Some((addr, ConnectionState::Connected(fd))) => {
+                // There's already a new connection to this address. Put the entry back.
+                self.by_peer_addr
+                    .insert(addr, ConnectionState::Connected(fd));
+            }
+            Some((_, ConnectionState::Closed(_))) => {}
         }
     }
 }
@@ -619,7 +649,7 @@ mod tests {
             map.get_by_addr(&addr),
             ConnectionState::NotYetConnected
         ));
-        assert!(map.mark_closed(&addr).is_none());
+        assert!(map.mark_closed(&addr, Instant::now()).is_none());
         map.remove_closed(&addr); // just don't panic
     }
 
@@ -646,11 +676,14 @@ mod tests {
         }
 
         // Mark closed.
-        let socket = map.mark_closed(&addr).expect("present");
+        let now = Instant::now();
+        let socket = map.mark_closed(&addr, now).expect("present");
         assert_eq!(socket.id, id);
 
         assert!(map.get_by_fd(fd).is_none());
-        assert!(matches!(map.get_by_addr(&addr), ConnectionState::Closed));
+        assert!(
+            matches!(map.get_by_addr(&addr), ConnectionState::Closed(instant) if instant == now)
+        );
 
         // Remove closed.
         map.remove_closed(&addr);
@@ -700,7 +733,7 @@ mod tests {
         let socket_ref = map.get_or_insert_connected(socket, addr);
         assert_eq!(socket_ref.id, id);
 
-        map.mark_closed(&addr);
+        map.mark_closed(&addr, Instant::now());
         // But don't remove it!
 
         let new_socket = FakeSocket { fd, id: id + 1 };

@@ -122,7 +122,6 @@ pub async fn start(
 
     // Spawn a normal (cooperative) task to run some regular maintenance on an interval.
     let tick_handle = tokio::spawn(async move {
-        let mut tick_state = Default::default();
         loop {
             time_scope_us!("calling.udp_server.tick");
             // Use sleep() instead of interval() so that we never wait *less* than one interval
@@ -133,7 +132,7 @@ pub async fn start(
             let tick_output = { sfu_for_tick.lock().tick(Instant::now()) };
 
             // Process outside the scope of the lock on the sfu.
-            match udp_handler_state_for_tick.tick(tick_output, &mut tick_state) {
+            match udp_handler_state_for_tick.tick(tick_output) {
                 Ok(()) => {}
                 Err(err) => {
                     error!("{}", err);
