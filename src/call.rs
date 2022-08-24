@@ -479,6 +479,10 @@ impl Call {
                         .max_kbps
                         .map(|kbps| DataRate::from_kbps(kbps as u64))
                         .unwrap_or(default_requested_max_send_rate);
+                    sender.active_speaker_height = video_request_proto
+                        .active_speaker_height
+                        .map(|height| height as u16)
+                        .unwrap_or(0);
                     sender.video_request_proto = Some(video_request_proto);
                     // We reallocate immediately to make a more pleasant expereience for the user
                     // (no extra delay for selecting a higher resolution or requesting a new max send rate)
@@ -564,16 +568,15 @@ impl Call {
             sender.incoming_video2.rate_tracker.update(now);
         }
 
-        let mut active_speaker_just_changed = false;
+        let mut new_active_speaker: Option<DemuxId> = None;
         if now > self.active_speaker_calculated + ACTIVE_SPEAKER_CALCULATION_INTERVAL {
             time_scope_us!("calling.call.tick.calculate_active_speaker");
 
             self.active_speaker_calculated = now;
-            let new_active_speaker = self.calculate_active_speaker(now);
+            new_active_speaker = self.calculate_active_speaker(now);
             if new_active_speaker.is_some() {
                 trace!("  active speaker changed");
                 trace!("  send rtp packet with active speaker change to all clients in the sender's call");
-                active_speaker_just_changed = true;
                 // update proto is sent down below
             }
         }
@@ -585,10 +588,48 @@ impl Call {
 
         // Do this after reallocation so it has the latest info about what is being forwarded.
         let mut rtp_to_send = vec![];
-        self.send_update_proto_to_all_clients(active_speaker_just_changed, &mut rtp_to_send, now);
+        self.send_update_proto_to_all_clients(new_active_speaker.is_some(), &mut rtp_to_send, now);
 
         // Reallocation can change what key frames to send, so we should do this after reallocating.
-        let key_frame_requests_to_send = self.send_key_frame_requests_if_its_been_too_long(now);
+        let mut key_frame_requests_to_send = self.send_key_frame_requests_if_its_been_too_long(now);
+
+        if let Some(active_speaker_id) = new_active_speaker {
+            let max_requested_active_speaker_height = self
+                .clients
+                .iter()
+                // Don't request key frames for yourself
+                .filter(|client| client.demux_id != active_speaker_id)
+                .map(|client| client.active_speaker_height)
+                .max()
+                .unwrap_or(0);
+
+            let active_speaker = self
+                .find_client(active_speaker_id)
+                .expect("active speaker is a client");
+
+            if let Some(active_speaker_layer0_height) = active_speaker.incoming_video0.height {
+                if max_requested_active_speaker_height > active_speaker_layer0_height.as_u16() {
+                    key_frame_requests_to_send.extend_from_slice(&[
+                        (
+                            active_speaker_id,
+                            rtp::KeyFrameRequest {
+                                ssrc: LayerId::Video1.to_ssrc(active_speaker_id),
+                            },
+                        ),
+                        (
+                            active_speaker_id,
+                            rtp::KeyFrameRequest {
+                                ssrc: LayerId::Video2.to_ssrc(active_speaker_id),
+                            },
+                        ),
+                    ]);
+                } else {
+                    // The smallest layer is good enough for everyone
+                }
+            } else {
+                trace!("No video from the active speaker. Not requesting key frames.");
+            }
+        }
 
         (rtp_to_send, key_frame_requests_to_send)
     }
@@ -672,6 +713,11 @@ impl Call {
             .find_client(receiver_demux_id)
             .expect("Client exists before trying to allocate target send rate");
 
+        let active_speaker_demux_id = self
+            .active_speaker_ids
+            .as_ref()
+            .map(|(demux_id, _)| demux_id);
+
         // We have to collect these because we can't get a mutable ref to the receiver while getting
         // immutable refs to the senders.
         let allocatable_videos: Vec<AllocatableVideo> = self
@@ -682,6 +728,21 @@ impl Call {
                     // Don't send video to yourself
                     return None;
                 }
+
+                let mut requested_height = receiver
+                    .requested_height_by_demux_id
+                    .get(&sender.demux_id)
+                    .copied()
+                    .unwrap_or_else(|| VideoHeight::from(1));
+
+                // Override the requested height for the active speaker to support early requests
+                // from the SFU for higher video layers before the client's UI updates.
+                if Some(&sender.demux_id) == active_speaker_demux_id
+                    && receiver.active_speaker_height > requested_height.as_u16()
+                {
+                    requested_height = VideoHeight::from(receiver.active_speaker_height);
+                }
+
                 Some(AllocatableVideo {
                     sender_demux_id: sender.demux_id,
                     layers: [
@@ -689,11 +750,7 @@ impl Call {
                         sender.incoming_video1.as_allocatable_layer(),
                         sender.incoming_video2.as_allocatable_layer(),
                     ],
-                    requested_height: receiver
-                        .requested_height_by_demux_id
-                        .get(&sender.demux_id)
-                        .copied()
-                        .unwrap_or_else(|| VideoHeight::from(1)),
+                    requested_height,
                     interesting: sender.became_active_speaker,
                 })
             })
@@ -994,6 +1051,7 @@ struct Client {
     // Updated by incoming video requests
     video_request_proto: Option<protos::device_to_sfu::VideoRequestMessage>,
     requested_height_by_demux_id: HashMap<DemuxId, VideoHeight>,
+    active_speaker_height: u16,
 
     // Updated by Call::set_target_send_rate
     target_send_rate: DataRate,
@@ -1051,6 +1109,7 @@ impl Client {
 
             video_request_proto: None,
             requested_height_by_demux_id: HashMap::new(),
+            active_speaker_height: 0,
 
             target_send_rate: DataRate::default(),
             outgoing_queue_drain_rate: DataRate::default(),
@@ -2824,6 +2883,31 @@ mod call_tests {
         )
     }
 
+    fn create_active_speaker_height_rtp(
+        demux_id_without_shifting: u32,
+        request_height: u16,
+        active_speaker_height: u16,
+    ) -> rtp::Packet<Vec<u8>> {
+        let request = protos::device_to_sfu::video_request_message::VideoRequest {
+            short_device_id: None,
+            height: Some(request_height as u32),
+            demux_id: Some(demux_id_from_unshifted(demux_id_without_shifting).as_u32()),
+        };
+
+        create_server_to_client_rtp(
+            1,
+            encode_proto(protos::DeviceToSfu {
+                video_request: Some(protos::device_to_sfu::VideoRequestMessage {
+                    requests: vec![request],
+                    active_speaker_height: Some(active_speaker_height as u32),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .as_slice(),
+        )
+    }
+
     fn create_max_receive_rate_request(max_receive_rate: DataRate) -> rtp::Packet<Vec<u8>> {
         create_server_to_client_rtp(
             1,
@@ -3608,6 +3692,130 @@ mod call_tests {
             }),
             get_stats(&rtp_to_send, demux_id2)
         );
+    }
+
+    #[test]
+    fn send_key_frame_request_on_active_speaker_change() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+        let demux_id1 = add_client(&mut call, "1", 1, at(1));
+        let demux_id2 = add_client(&mut call, "2", 2, at(2));
+        // If there is no audio activity from anyone, we choose the first client as the active speaker
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(301));
+
+        let active_speaker_id = "1_active_speaker_id";
+        assert_eq!(
+            Some((demux_id1, active_speaker_id.to_owned())),
+            call.active_speaker_ids
+        );
+
+        // There are no outgoing key frame requests when the active speaker changed because the
+        // active speaker height hasn't been specified by any clients.
+        assert_eq!(0, outgoing_key_frame_requests.len());
+
+        let mut resolution_request = create_active_speaker_height_rtp(1, 120, 480);
+
+        call.handle_rtp(demux_id1, resolution_request.borrow_mut(), at(302))
+            .unwrap();
+
+        // Receiving low resolution video from demux_id2 which is smaller in height than the
+        // active speaker is displayed at (on demux_id1's device).
+        let mut rtp = create_video_rtp(
+            demux_id2,
+            LayerId::Video0,
+            101,
+            11,
+            1,
+            Some(PixelSize {
+                width: 320,
+                height: 240,
+            }),
+        );
+        call.handle_rtp(demux_id2, rtp.borrow_mut(), at(303))
+            .unwrap();
+
+        // Switch to demux_id2 as active speaker and send out an update.
+        for seqnum in 1..100 {
+            let mut rtp = create_audio_rtp(demux_id2, seqnum);
+            // We can't just send 100 every time or that becomes the noise floor
+            rtp.audio_level = Some(seqnum as u8);
+            let _rtp_to_send = call.handle_rtp(demux_id2, rtp.borrow_mut(), at(302 + seqnum));
+        }
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(603));
+
+        let active_speaker_id = "2_active_speaker_id";
+        assert_eq!(
+            Some((demux_id2, active_speaker_id.to_owned())),
+            call.active_speaker_ids
+        );
+
+        // Request key frames from demux_id2 since they're now the active speaker, and demux_id1
+        // will start viewing them in a larger view soon.
+        assert_eq!(
+            outgoing_key_frame_requests,
+            &[
+                (
+                    demux_id2,
+                    rtp::KeyFrameRequest {
+                        ssrc: LayerId::Video1.to_ssrc(demux_id2),
+                    }
+                ),
+                (
+                    demux_id2,
+                    rtp::KeyFrameRequest {
+                        ssrc: LayerId::Video2.to_ssrc(demux_id2),
+                    }
+                )
+            ]
+        );
+
+        let mut resolution_request = create_active_speaker_height_rtp(1, 120, 200);
+
+        call.handle_rtp(demux_id2, resolution_request.borrow_mut(), at(604))
+            .unwrap();
+
+        // The lowest layer video received from demux_id1 is larger than the active speaker is
+        // viewed at on demux_id2's device.
+        let mut rtp = create_video_rtp(
+            demux_id1,
+            LayerId::Video0,
+            101,
+            11,
+            1,
+            Some(PixelSize {
+                width: 320,
+                height: 240,
+            }),
+        );
+        call.handle_rtp(demux_id1, rtp.borrow_mut(), at(605))
+            .unwrap();
+
+        // Switch to demux_id1 as active speaker and send out an update.
+        for seqnum in 1..100 {
+            let mut rtp = create_audio_rtp(demux_id1, seqnum);
+            // We can't just send 100 every time or that becomes the noise floor
+            rtp.audio_level = Some(seqnum as u8);
+            let _rtp_to_send = call.handle_rtp(demux_id1, rtp.borrow_mut(), at(605 + seqnum));
+
+            let mut rtp = create_audio_rtp(demux_id2, seqnum);
+            rtp.audio_level = Some(0);
+            let _rtp_to_send = call.handle_rtp(demux_id2, rtp.borrow_mut(), at(605 + seqnum));
+        }
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(906));
+
+        let active_speaker_id = "1_active_speaker_id";
+        assert_eq!(
+            Some((demux_id1, active_speaker_id.to_owned())),
+            call.active_speaker_ids
+        );
+
+        // The lowest layer is good enough for demux_id2 already, so no key frame requests are sent
+        // there. demux_id1 isn't sent any key frame requests either despite having a larger active
+        // speaker height because a client doesn't need to request key frames for themselves.
+        assert_eq!(0, outgoing_key_frame_requests.len());
     }
 
     #[test]
