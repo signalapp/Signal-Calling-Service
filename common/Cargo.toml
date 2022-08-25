@@ -1,0 +1,24 @@
+#
+# Copyright 2019-2021 Signal Messenger, LLC
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+
+[package]
+name = "calling_common"
+version = "0.0.0"
+authors = ["Calling Team <callingteam@signal.org>"]
+edition = "2021"
+description = "Common calling library."
+license = "AGPL-3.0-only"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.13"
+flume = "0.10.14"
+rand = "0.8"
+sha2 = "0.10"
+thiserror = "1.0"
+
+[dev-dependencies]
+hex = { version = "0.4", features = ["serde"] }
+hex-literal = "0.3.2"

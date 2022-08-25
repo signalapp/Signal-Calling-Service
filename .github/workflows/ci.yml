@@ -38,7 +38,7 @@ jobs:
       # Use the latest compiler for this; without a lockfile,
       # the Minimum Supported Rust Version of dependencies might be higher.
       run: cargo +stable clippy --all-targets -- -D warnings
-      working-directory: fuzz
+      working-directory: backend/fuzz
       env:
         RUSTFLAGS: --cfg fuzzing
     - name: Test

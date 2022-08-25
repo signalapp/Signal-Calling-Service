@@ -1,6 +1,8 @@
 # Calling Service
 
-Forwards media from 1 group call device to N group call devices.
+## Backend
+
+Media forwarding server for group calls. Forwards media from 1 to N devices.
 
 # Thanks
 
@@ -17,6 +19,6 @@ The U.S. Government Department of Commerce, Bureau of Industry and Security (BIS
 
 ## License
 
-Copyright 2019-2021 Signal Messenger, LLC<br/>
+Copyright 2019-2022 Signal Messenger, LLC<br/>
 
 Licensed under [AGPLv3](https://www.gnu.org/licenses/agpl-3.0.html) only.

@@ -1,3 +1,13 @@
-target
-.git
+.DS_Store
+.dockerignore
 .github
+.git
+.gitignore
+.idea
+bin
+target
+BUILDING.md
+LICENSE
+README.md
+backend/fuzz
+backend/Dockerfile

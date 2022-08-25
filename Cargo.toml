@@ -1,102 +1,16 @@
 #
-# Copyright 2019-2021 Signal Messenger, LLC
+# Copyright 2019-2022 Signal Messenger, LLC
 # SPDX-License-Identifier: AGPL-3.0-only
 #
 
-[package]
-name = "calling_server"
-version = "1.4.3"
-authors = ["Calling Team <callingteam@signal.org>"]
-edition = "2021"
-description = "Media forwarding server for group calls."
-license = "AGPL-3.0-only"
-
-[dependencies]
-# For error handling
-anyhow = "1.0"
-thiserror = "1.0"
-scopeguard = "1.1"
-
-# For logging and command line operations
-log = "0.4"
-env_logger = "0.9"
-structopt = "0.3"
-
-# For runtime and threading
-tokio = { version = "1", features = ["full"] }
-parking_lot = "0.12"
-lazy_static = "1.4"
-futures = "0.3"
-num_cpus = "1.13"
-
-# For http
-warp = { version = "0.3", default-features = false }
-
-# For general conversions
-base64 = "0.13"
-byteorder = "1"
-hex = { version = "0.4", features = ["serde"] }
-serde = { version = "1.0", features = ["derive"] }
-prost = "0.11"
-
-# For common
-sha2 = "0.10"
-
-# For ICE
-crc = "3.0"
-hmac = "0.12"
-sha-1 = "0.10"
-
-# For metrics
-rand = "0.8"
-
-# For SRTP key derivation using DHE
-hkdf = "0.12"
-# x25519-dalek is only compatible with rand/rand_core 0.5, so we need to pull these
-# in to make a source of OsRng that's compatible with both x25519-dalek and ecdsa.
-rand_core = { version = "0.6", features = [] }
-rand_core5 = { package = "rand_core", version = "0.5.1", features = [] }
-x25519-dalek = { version = "1.1" }
-
-# For (S)RTP
-aes = "0.8"
-aes-gcm = "0.10"
-zeroize = "1.5"
-
-# For congestion control
-async-stream = "0.3"
-flume = "0.10.14"
-# For congestion-control-specific helpers
-pin-project = "1.0"
-
-# For low-level UDP sockets
-nix = { version = "0.25", optional = true }
-
-# For current process memory stats
-psutil = { version = "3.2.2", default-features = false, features = ["process"] }
-
-[build-dependencies]
-prost-build = "0.11"
-
-[dev-dependencies]
-unzip3 = "1.0"
-
-# For simulating passage of time in timing tests
-mock_instant = { version = "0.2" }
-hex-literal = "0.3.2"
-
-# For matching WebRTC's randomness
-rand_distr = "0.4.1"
-
-# For testing warp responses
-serde_json = "1.0"
+[workspace]
+members = [
+    "backend",
+    "common",
+]
 
 [profile.release]
 debug = 1
 panic = "abort"
 lto = "fat"
 codegen-units = 1
-
-[features]
-default = ["epoll"]
-epoll = ["nix"]

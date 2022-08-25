@@ -1,0 +1,57 @@
+
+[package]
+name = "calling_backend-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2018"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+anyhow = "1.0"
+hex-literal = "0.3.2"
+libfuzzer-sys = "0.4"
+rand = "0.8"
+
+[dependencies.calling_common]
+path = "../../common"
+
+[dependencies.calling_backend]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "ice"
+path = "fuzz_targets/ice.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "vp8"
+path = "fuzz_targets/vp8.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rtcp"
+path = "fuzz_targets/rtcp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "transportcc"
+path = "fuzz_targets/transportcc.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rtp"
+path = "fuzz_targets/rtp.rs"
+test = false
+doc = false
+

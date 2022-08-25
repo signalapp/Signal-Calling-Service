@@ -139,7 +139,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec8a7b6a70fde80372154c65702f00a0f56f3e1c36abbc6c440484be248856db"
 
 [[package]]
-name = "calling_server"
+name = "calling_backend"
 version = "1.4.3"
 dependencies = [
  "aes",
@@ -148,9 +148,9 @@ dependencies = [
  "async-stream",
  "base64",
  "byteorder",
+ "calling_common",
  "crc",
  "env_logger",
- "flume",
  "futures",
  "hex",
  "hex-literal",
@@ -182,6 +182,20 @@ dependencies = [
  "warp",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "calling_common"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "flume",
+ "hex",
+ "hex-literal",
+ "rand",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

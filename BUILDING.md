@@ -1,19 +1,19 @@
-# Building the Calling Server
+# Building the Calling Backend
 
 ## For Development & Debugging
 
-    cargo run
+    cargo run --bin calling_backend
 
 You can specify a variety of command line arguments. See the [config.rs file](/src/config.rs) file for
 more details or run:
 
-    cargo run -- --help
+    cargo run --bin calling_backend -- --help
 
-A common example for debugging would be:
+An example for debugging would be:
 
-    cargo run -- --binding-ip 192.168.1.100 --ice-candidate-ip 192.168.1.100 --diagnostics-interval-secs 1
+    cargo run --bin calling_backend -- --binding-ip 192.168.1.100 --ice-candidate-ip 192.168.1.100 --diagnostics-interval-secs 1
 
-where ```--binding-ip``` sets the IP address that the servers will listen on and ```--ice-candidate-ip```
+where ```--binding-ip``` sets the IP address that the backend will listen on and ```--ice-candidate-ip```
 is the IP address that will accept media packets from clients. Use the IP addresses specific to your
 environment. ```--diagnostics-interval-secs``` sets the metrics gathering interval, here to be every
 second.
@@ -33,25 +33,25 @@ or
 
 Release builds and all performance testing should use the ```--release``` build option:
 
-    cargo run --release
+    cargo run --bin calling_backend --release
 
 For best performance, the target CPU should also be specified. In this example, ```native``` is used
 to instruct the compiler to optimize for the CPU that is performing the build itself:
 
-    RUSTFLAGS="-C target-cpu=native" cargo run --release
+    RUSTFLAGS="-C target-cpu=native" cargo run --bin calling_backend --release
 
 ## For Deployment
 
 Signal uses the provided Dockerfile to build images for deployment. This uses a multi-stage process,
-creating a builder image, a minimal image for delivery, and a runnable image for testing.
+creating a stage for building, the binary for delivery, and a runnable image for testing.
 
-### Building the Docker Image
+### Building the Docker Images
 
 Images currently run on AWS EC2 instances supporting the Intel Skylake architecture. When building
-the image, we can target that specific CPU (or choose any other that matches the platform where the
+the images, we can target that specific CPU (or choose any other that matches the platform where the
 container will be run):
 
-    docker build --build-arg rust_flags=-Ctarget-cpu=skylake -t signal-calling-server .
+    docker build -f backend/Dockerfile --build-arg rust_flags=-Ctarget-cpu=skylake -t signal-calling-backend .
 
 The ```build-arg``` can also be omitted to maintain maximum compatibility.
 
@@ -62,42 +62,24 @@ _Note: At the time of this writing, the skylake-avx512 target is not compatible 
 The deployment is specific to the type of service or registry being used. For testing, the
 image can be saved and copied somewhere for running. To save:
 
-    docker save signal-calling-server:latest | gzip > signal-calling-server-latest.tar.gz
+    docker save signal-calling-backend:latest | gzip > signal-calling-backend-latest.tar.gz
 
 ### Running the Docker Container
 
 To run the container, the following docker command can be used:
 
-    docker run -d --rm -p 8080:8080 -p 10000:10000/udp signal-calling-server:latest
+    docker run -d --rm -p 8080:8080 -p 10000:10000/udp signal-calling-backend:latest
 
 - ```-d``` runs the container in detached mode (can be omitted for easier testing)
 - ```--rm``` will clean up the container when it is stopped
 - ```-p 8080:8080``` connects the TCP port 8080 to the same one on the host
 - ```-p 10000:10000/udp``` connects the UDP port 10000 to the same one on the host
 
-#### Configuration Options
-
-Certain configuration options can be passed when running the container. Currently, any of the
-following can be specified:
-- ICE_CANDIDATE_IP
-- SIGNALING_IP
-- DIAGNOSTICS_INTERVAL_SECS
-
-For example:
-
-    docker run --rm -p 8080:8080 -p 10000:10000/udp \
-        -e ICE_CANDIDATE_IP=192.168.1.100 \
-        -e DIAGNOSTICS_INTERVAL_SECS=1 \
-        signal-calling-server:latest
-
-The host will listen on port 8080 for requests and publish 192.168.1.100:10000 to clients for media
-access. Packets to that address will be routed to the running container.
-
 ### Binary Deployment
 
 The docker file can also be used to obtain a binary file:
 
-    docker build --build-arg rust_flags=-Ctarget-cpu=skylake -t signal-calling-server --target export-stage -o bin .
+    docker build -f backend/Dockerfile --build-arg rust_flags=-Ctarget-cpu=skylake -t signal-calling-backend --target export-stage -o bin .
 
-This will build the calling_server binary executable for Linux and copy it to the ./bin directory of
+This will build the calling_backend binary executable for Linux and copy it to the ./bin directory of
 the host. The command will stop at the export-stage and not create the runnable docker image.
