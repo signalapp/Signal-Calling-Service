@@ -1,0 +1,67 @@
+#
+# Copyright 2022 Signal Messenger, LLC
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+
+[package]
+name = "calling_frontend"
+version = "0.3.2"
+authors = ["Calling Team <callingteam@signal.org>"]
+edition = "2021"
+description = "Frontend server for group calls."
+license = "AGPL-3.0-only"
+
+[dependencies]
+calling_common = { path = "../common" }
+
+# For error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# For logging and command line operations
+log = "0.4"
+env_logger = "0.9"
+clap = { version = "3.0", features = ["derive"] }
+yaml-rust = "0.4"
+
+# For runtime and threading
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
+lazy_static = "1.4"
+futures = "0.3"
+async-trait = "0.1.53"
+
+# For general conversions
+base64 = "0.13"
+hex = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+0_16"] }
+
+# For common and authentication
+rand = "0.8"
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2.4.0"
+
+# For http client and server
+hyper = { version = "0.14", features = ["full"] }
+axum = { version = "0.5", features = ["headers"] }
+tower = "0.4"
+mime = "0.3"
+
+# For storage access to DynamoDB
+aws-types = { version = "0.46", features = ["hardcoded-credentials"] }
+aws-smithy-types = "0.46"
+aws-config = "0.46"
+aws-sdk-dynamodb = "0.16"
+http = "0.2"
+
+# For metrics
+parking_lot = "0.12"
+psutil = { version = "3.2.2", default-features = false, features = ["process"] }
+
+[dev-dependencies]
+mockall = "0.11.0"
+mock_instant = { version = "0.2" }
+tokio-stream = "0.1"
