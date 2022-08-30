@@ -35,7 +35,9 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
         args: --no-default-features -- -D warnings
     - name: Clippy (fuzz targets)
-      run: cargo clippy --all-targets -- -D warnings
+      # Use the latest compiler for this; without a lockfile,
+      # the Minimum Supported Rust Version of dependencies might be higher.
+      run: cargo +stable clippy --all-targets -- -D warnings
       working-directory: fuzz
       env:
         RUSTFLAGS: --cfg fuzzing
