@@ -377,6 +377,12 @@ impl Call {
             self.client_added_or_removed = now;
             self.reallocate_target_send_rates(now);
             self.update_padding_ssrcs();
+
+            for client in &mut self.clients {
+                client.audio_forwarder_by_sender_demux_id.remove(&demux_id);
+                client.video_forwarder_by_sender_demux_id.remove(&demux_id);
+                client.data_forwarder_by_sender_demux_id.remove(&demux_id);
+            }
         }
     }
 
