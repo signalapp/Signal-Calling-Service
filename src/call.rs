@@ -360,7 +360,7 @@ impl Call {
         ));
         // An update message to clients about clients will be sent at the next tick().
         self.client_added_or_removed = now;
-        self.allocate_target_send_rate(demux_id, self.initial_target_send_rate, now);
+        self.allocate_video_layers(demux_id, self.initial_target_send_rate, now);
         // We may have to update the padding SSRCs because there can't be any padding SSRCs until two people join
         self.update_padding_ssrcs();
     }
@@ -384,6 +384,7 @@ impl Call {
                 client.audio_forwarder_by_sender_demux_id.remove(&demux_id);
                 client.video_forwarder_by_sender_demux_id.remove(&demux_id);
                 client.data_forwarder_by_sender_demux_id.remove(&demux_id);
+                // Entries are removed from allocated_height_by_sender_demux_id in allocate_video_layers.
             }
         }
     }
@@ -495,7 +496,7 @@ impl Call {
                     // We reallocate immediately to make a more pleasant expereience for the user
                     // (no extra delay for selecting a higher resolution or requesting a new max send rate)
                     let target_send_rate = sender.target_send_rate;
-                    self.allocate_target_send_rate(sender_demux_id, target_send_rate, now);
+                    self.allocate_video_layers(sender_demux_id, target_send_rate, now);
                 }
             }
             // There's nothing to forward
@@ -694,7 +695,7 @@ impl Call {
             .collect();
 
         for (receiver_demux_id, target_send_rate) in receivers {
-            self.allocate_target_send_rate(receiver_demux_id, target_send_rate, now);
+            self.allocate_video_layers(receiver_demux_id, target_send_rate, now);
         }
     }
 
@@ -705,13 +706,13 @@ impl Call {
             .map(|client| (client.demux_id, client.target_send_rate))
             .collect();
         for (receiver_demux_id, target_send_rate) in receivers {
-            self.allocate_target_send_rate(receiver_demux_id, target_send_rate, now);
+            self.allocate_video_layers(receiver_demux_id, target_send_rate, now);
         }
     }
 
-    /// Adjust the target send rate for the given client according to what congestion control has
-    /// calculated.
-    fn allocate_target_send_rate(
+    /// Determines which video layers should be forwarded from other clients to
+    /// `receiver_demux_id` based on what congestion control calculated.
+    fn allocate_video_layers(
         &mut self,
         receiver_demux_id: DemuxId,
         new_target_send_rate: DataRate,
@@ -787,10 +788,16 @@ impl Call {
             .map(|allocated| allocated.rate)
             .sum();
 
+        receiver.allocated_height_by_sender_demux_id.clear();
+
         for sender_demux_id in sender_demux_ids {
             let desired_incoming_ssrc = allocated_video_by_sender_demux_id
                 .get(&sender_demux_id)
                 .map(|allocated_video| {
+                    receiver
+                        .allocated_height_by_sender_demux_id
+                        .insert(sender_demux_id, allocated_video.height);
+
                     let layer_id =
                         LayerId::from_video_layer_index(allocated_video.layer_index).unwrap();
                     layer_id.to_ssrc(allocated_video.sender_demux_id)
@@ -887,23 +894,33 @@ impl Call {
                 .collect();
 
             for client in &mut self.clients {
+                let (demux_ids_with_video, allocated_heights) = client
+                    .video_forwarder_by_sender_demux_id
+                    .iter()
+                    .filter_map(|(demux_id, forwarder)| {
+                        // We don't want the clients to draw an empty box when a key frame might be coming soon,
+                        // so we count it as forwarding if we're still waiting for a key frame.
+                        if forwarder.forwarding_ssrc().is_some()
+                            || forwarder.needs_key_frame().is_some()
+                        {
+                            Some((
+                                demux_id.as_u32(),
+                                client
+                                    .allocated_height_by_sender_demux_id
+                                    .get(demux_id)
+                                    .unwrap_or(&VideoHeight::from(0))
+                                    .as_u16() as u32,
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .unzip();
+
                 update.current_devices = Some(protos::sfu_to_device::CurrentDevices {
                     all_demux_ids: raw_demux_ids.clone(),
-                    demux_ids_with_video: client
-                        .video_forwarder_by_sender_demux_id
-                        .iter()
-                        .filter_map(|(demux_id, forwarder)| {
-                            // We don't want the clients to draw an empty box when a key frame might be coming soon,
-                            // so we count it as forwarding if we're still waiting for a key frame.
-                            if forwarder.forwarding_ssrc().is_some()
-                                || forwarder.needs_key_frame().is_some()
-                            {
-                                Some(demux_id.as_u32())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect(),
+                    demux_ids_with_video,
+                    allocated_heights,
                 });
                 if send_stats {
                     update.stats = Some(protos::sfu_to_device::Stats {
@@ -1089,6 +1106,7 @@ struct Client {
     audio_forwarder_by_sender_demux_id: HashMap<DemuxId, SingleSsrcRtpForwarder>,
     video_forwarder_by_sender_demux_id: HashMap<DemuxId, Vp8SimulcastRtpForwarder>,
     data_forwarder_by_sender_demux_id: HashMap<DemuxId, SingleSsrcRtpForwarder>,
+    allocated_height_by_sender_demux_id: HashMap<DemuxId, VideoHeight>,
 
     // Update with each proto send from server to client
     next_server_to_client_data_rtp_seqnum: rtp::FullSequenceNumber,
@@ -1135,6 +1153,7 @@ impl Client {
             audio_forwarder_by_sender_demux_id: HashMap::new(),
             video_forwarder_by_sender_demux_id: HashMap::new(),
             data_forwarder_by_sender_demux_id: HashMap::new(),
+            allocated_height_by_sender_demux_id: HashMap::new(),
 
             next_server_to_client_data_rtp_seqnum: 1,
         }
@@ -1384,9 +1403,10 @@ struct AllocatableVideo {
 struct AllocatedVideo {
     sender_demux_id: DemuxId,
     layer_index: usize,
-    // This is a convenience to include this.
-    // It could be derived from AllocatedVideo + layer_index
+    // It is a convenience to include the following fields.
+    // They could be derived from AllocatableVideo + layer_index.
     rate: DataRate,
+    height: VideoHeight,
 }
 
 fn ideal_video_layer_index(video: &AllocatableVideo) -> Option<usize> {
@@ -1524,6 +1544,7 @@ fn allocate_send_rate(
                     sender_demux_id: video.sender_demux_id,
                     layer_index,
                     rate: layer.incoming_rate,
+                    height: layer.incoming_height,
                 },
             );
             allocated_rate = increased_allocated_rate;
@@ -2878,6 +2899,7 @@ mod call_tests {
             current_devices: Some(protos::sfu_to_device::CurrentDevices {
                 demux_ids_with_video: vec![],
                 all_demux_ids: all_demux_ids.iter().map(|id| id.as_u32()).collect(),
+                allocated_heights: vec![],
             }),
             ..Default::default()
         }
@@ -3980,6 +4002,144 @@ mod call_tests {
         assert_eq!(
             Some(vec![demux_id2]),
             get_forwarding_video_demux_ids(&from_server, demux_id3)
+        );
+    }
+
+    #[test]
+    fn allocated_height_updates() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+        let get_demux_ids_and_heights = |from_server: &[RtpToSend],
+                                         receiver_demux_id: DemuxId|
+         -> Option<Vec<(DemuxId, u32)>> {
+            let (_demux_id, rtp) = from_server
+                .iter()
+                .find(|(demux_id, _rtp)| *demux_id == receiver_demux_id)?;
+            let proto = protos::SfuToDevice::decode(rtp.payload()).ok()?;
+            let current_devices = proto.current_devices?;
+            let mut demux_ids_and_heights: Vec<(DemuxId, u32)> = current_devices
+                .demux_ids_with_video
+                .iter()
+                .zip(current_devices.allocated_heights.iter())
+                .map(|(demux_id, height)| (DemuxId::try_from(*demux_id).unwrap(), *height))
+                .collect();
+            demux_ids_and_heights.sort();
+            Some(demux_ids_and_heights)
+        };
+
+        let mut call = create_call(b"call_id", now, system_now);
+        let demux_id1 = add_client(&mut call, "1", 1, at(1));
+        let demux_id2 = add_client(&mut call, "2", 2, at(2));
+
+        let mut resolution_request = create_resolution_request_rtp(1, 240, IdentifiedBy::DemuxId);
+        call.handle_rtp(demux_id1, resolution_request.borrow_mut(), at(3))
+            .unwrap();
+
+        let mut resolution_request = create_resolution_request_rtp(2, 240, IdentifiedBy::DemuxId);
+        call.handle_rtp(demux_id2, resolution_request.borrow_mut(), at(4))
+            .unwrap();
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(5));
+
+        // No heights are allocated yet because no video is being sent yet.
+        assert_eq!(
+            Some(vec![]),
+            get_demux_ids_and_heights(&from_server, demux_id1)
+        );
+        assert_eq!(
+            Some(vec![]),
+            get_demux_ids_and_heights(&from_server, demux_id2)
+        );
+
+        // Switch to demux_id2 as active speaker and send out an update.
+        for seqnum in 1..100 {
+            let mut rtp = create_audio_rtp(demux_id2, seqnum);
+            // We can't just send 100 every time or that becomes the noise floor
+            rtp.audio_level = Some(seqnum as u8);
+            let _rtp_to_send = call.handle_rtp(demux_id2, rtp.borrow_mut(), at(305 + seqnum));
+        }
+        let (_from_server, _outgoing_key_frame_requests) = call.tick(at(605));
+
+        // Send some video from demux_id2 so that there's video to forward.
+        for seqnum in 0..10 {
+            let mut to_server = create_video_rtp(
+                demux_id2,
+                LayerId::Video0,
+                1,
+                1,
+                seqnum * 2,
+                Some(PixelSize {
+                    width: 320,
+                    height: 240,
+                }),
+            );
+            call.handle_rtp(demux_id2, to_server.borrow_mut(), at(606))
+                .unwrap();
+
+            let mut to_server = create_video_rtp(
+                demux_id2,
+                LayerId::Video1,
+                2,
+                1,
+                (seqnum + 1) * 2,
+                Some(PixelSize {
+                    width: 640,
+                    height: 480,
+                }),
+            );
+            call.handle_rtp(demux_id2, to_server.borrow_mut(), at(606))
+                .unwrap();
+        }
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(1607));
+        assert_eq!(
+            Some(vec![(demux_id2, 240)]),
+            get_demux_ids_and_heights(&from_server, demux_id1)
+        );
+        assert_eq!(
+            Some(vec![]),
+            get_demux_ids_and_heights(&from_server, demux_id2)
+        );
+
+        // The active speaker's height increases in demux_id1's UI, so allocate the higher video layer.
+        let mut resolution_request = create_active_speaker_height_rtp(1, 240, 480);
+        call.handle_rtp(demux_id1, resolution_request.borrow_mut(), at(1608))
+            .unwrap();
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(2709));
+        assert_eq!(
+            Some(vec![(demux_id2, 480)]),
+            get_demux_ids_and_heights(&from_server, demux_id1)
+        );
+        assert_eq!(
+            Some(vec![]),
+            get_demux_ids_and_heights(&from_server, demux_id2)
+        );
+
+        // demux_id2 leaves, so there's no height allocated for demux_id1 anymore.
+        call.handle_rtp(demux_id2, create_leave_rtp().borrow_mut(), at(3710))
+            .unwrap();
+
+        let mut empty_resolution_request = create_server_to_client_rtp(
+            1,
+            encode_proto(protos::DeviceToSfu {
+                video_request: Some(protos::device_to_sfu::VideoRequestMessage {
+                    requests: vec![],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .as_slice(),
+        );
+        call.handle_rtp(demux_id1, empty_resolution_request.borrow_mut(), at(4711))
+            .unwrap();
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(5712));
+
+        assert_eq!(
+            Some(vec![]),
+            get_demux_ids_and_heights(&from_server, demux_id1)
         );
     }
 
