@@ -19,8 +19,10 @@ use thiserror::Error;
 
 use crate::{
     audio,
-    common::{DataRate, DataSize, Duration, Instant, VideoHeight},
-    protos, rtp, vp8,
+    common::{DataRate, DataSize, Duration, Instant, PixelSize, VideoHeight},
+    protos,
+    rtp::{self, VideoRotation},
+    vp8,
 };
 
 pub const CLIENT_SERVER_DATA_SSRC: rtp::Ssrc = 1;
@@ -1049,6 +1051,7 @@ struct Client {
     incoming_video0: IncomingVideoState,
     incoming_video1: IncomingVideoState,
     incoming_video2: IncomingVideoState,
+    video_rotation: VideoRotation,
 
     // Updated by incoming audio packets
     incoming_audio_levels: audio::LevelsTracker,
@@ -1109,6 +1112,7 @@ impl Client {
             incoming_video0: IncomingVideoState::default(),
             incoming_video1: IncomingVideoState::default(),
             incoming_video2: IncomingVideoState::default(),
+            video_rotation: VideoRotation::None,
 
             incoming_audio_levels: audio::LevelsTracker::default(),
             became_active_speaker: None,
@@ -1153,21 +1157,35 @@ impl Client {
         };
 
         incoming_video.rate_tracker.push(incoming_rtp.size(), now);
-        let incoming_vp8_height = incoming_vp8
-            .resolution
-            .map(|res| VideoHeight::from(res.height));
-        if incoming_vp8_height.is_some() && incoming_video.height != incoming_vp8_height {
-            incoming_video.height = incoming_vp8_height;
+
+        let old_resolution = incoming_video.original_resolution;
+        if let Some(resolution) = incoming_vp8.resolution {
+            incoming_video.original_resolution = Some(resolution);
+        }
+        let new_resolution = incoming_video.original_resolution;
+
+        // Note: Rotation may be sent in a separate packet than the resolution since it is sent in
+        // the last packet for a key frame.
+        let old_rotation = self.video_rotation;
+        if let Some(rotation) = incoming_rtp.video_rotation {
+            self.video_rotation = rotation;
+        }
+
+        if old_resolution != new_resolution || old_rotation != self.video_rotation {
+            self.incoming_video0.apply_rotation(self.video_rotation);
+            self.incoming_video1.apply_rotation(self.video_rotation);
+            self.incoming_video2.apply_rotation(self.video_rotation);
+
             // Clear any higher resolutions.
             // This will be a little inefficient if we get a resolution change for layer 1 before
             // layer 0, but we can't really tell if resolutions between layers match or not.
             match incoming_layer_id {
                 Some(LayerId::Video0) => {
-                    self.incoming_video1.height = None;
-                    self.incoming_video2.height = None;
+                    self.incoming_video1.clear_resolution();
+                    self.incoming_video2.clear_resolution();
                 }
                 Some(LayerId::Video1) => {
-                    self.incoming_video2.height = None;
+                    self.incoming_video2.clear_resolution();
                 }
                 Some(LayerId::Video2) => {}
                 _ => unreachable!("checked above"),
@@ -1258,12 +1276,32 @@ impl Client {
 #[derive(Default)]
 struct IncomingVideoState {
     rate_tracker: IncomingDataRateTracker,
+    /// The resolution of the video, ignoring rotation.
+    original_resolution: Option<PixelSize>,
+    /// The height of the video, taking rotation into account.
     height: Option<VideoHeight>,
 }
 
 impl IncomingVideoState {
     pub fn rate(&self) -> Option<DataRate> {
         self.rate_tracker.rate()
+    }
+
+    fn apply_rotation(&mut self, rotation: VideoRotation) {
+        if let Some(resolution) = self.original_resolution {
+            let height = match rotation {
+                rtp::VideoRotation::None | rtp::VideoRotation::Clockwise180 => resolution.height,
+                rtp::VideoRotation::Clockwise90 | rtp::VideoRotation::Clockwise270 => {
+                    resolution.width
+                }
+            };
+            self.height = Some(VideoHeight::from(height));
+        }
+    }
+
+    fn clear_resolution(&mut self) {
+        self.original_resolution = None;
+        self.height = None;
     }
 
     fn as_allocatable_layer(&self) -> AllocatableVideoLayer {

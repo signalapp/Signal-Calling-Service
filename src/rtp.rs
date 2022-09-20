@@ -40,6 +40,7 @@ const RTP_SSRC_RANGE: Range<usize> = 8..12;
 const RTP_EXTENSIONS_HEADER_LEN: usize = 4;
 const RTP_ONE_BYTE_EXTENSIONS_PROFILE: u16 = 0xBEDE;
 const RTP_EXT_ID_TCC_SEQNUM: u8 = 1; // Really u4
+const RTP_EXT_ID_VIDEO_ORIENTATION: u8 = 4; // Really u4
 const RTP_EXT_ID_AUDIO_LEVEL: u8 = 5; // Really u4
 const RTCP_PAYLOAD_TYPES: RangeInclusive<u8> = 64..=95;
 const RTCP_HEADER_LEN: usize = 8;
@@ -167,6 +168,35 @@ pub type FullTimestamp = u64;
 pub type TruncatedTimestamp = u32;
 pub type Ssrc = u32;
 
+/// The rotation specified by the sender to apply to a video frame
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VideoRotation {
+    None = 0,
+    Clockwise90 = 90,
+    Clockwise180 = 180,
+    Clockwise270 = 270,
+}
+
+impl From<u8> for VideoRotation {
+    fn from(b: u8) -> Self {
+        // Parse the 2 bit granularity rotation (the lowest two bits) from the
+        // Coordination of Video Orientation information according to
+        // https://portal.3gpp.org/desktopmodules/Specifications/SpecificationDetails.aspx?specificationId=1404
+        //
+        //    0 1 2 3 4 5 6 7
+        //   +-+-+-+-+-+-+-+-+
+        //   |0 0 0 0 C F R R|
+        //   +-+-+-+-+-+-+-+-+
+        match b & 0x3 {
+            0b00 => VideoRotation::None,
+            0b01 => VideoRotation::Clockwise90,
+            0b10 => VideoRotation::Clockwise180,
+            0b11 => VideoRotation::Clockwise270,
+            _ => unreachable!("Two bit value is in 0..3"),
+        }
+    }
+}
+
 // pub for tests
 #[derive(Debug, Eq, PartialEq)]
 pub struct Header {
@@ -175,6 +205,7 @@ pub struct Header {
     seqnum: TruncatedSequenceNumber,
     timestamp: TruncatedTimestamp,
     pub ssrc: Ssrc,
+    video_rotation: Option<VideoRotation>,
     audio_level: Option<audio::Level>,
     tcc_seqnum: Option<TruncatedSequenceNumber>,
     // We parse the range as well in order to replace it easily.
@@ -205,6 +236,7 @@ impl Header {
 
         let mut tcc_seqnum = None;
         let mut tcc_seqnum_range = None;
+        let mut video_rotation = None;
         let mut audio_level = None;
 
         let extensions_start = RTP_MIN_HEADER_LEN + csrcs_len;
@@ -262,6 +294,9 @@ impl Header {
                         tcc_seqnum = Some(u16::from_be_bytes([b0, b1]));
                         tcc_seqnum_range = Some(extension_val_range);
                     }
+                    (RTP_EXT_ID_VIDEO_ORIENTATION, &[b0]) => {
+                        video_rotation = Some(VideoRotation::from(b0))
+                    }
                     (RTP_EXT_ID_AUDIO_LEVEL, [negative_audio_level_with_voice_activity]) => {
                         audio_level =
                             // The spec says to use 127 here, but the clients are all decimating their values
@@ -293,6 +328,7 @@ impl Header {
             seqnum,
             timestamp,
             ssrc,
+            video_rotation,
             audio_level,
             tcc_seqnum,
             tcc_seqnum_range,
@@ -359,6 +395,7 @@ pub struct Packet<T> {
     // Set if and only if the Packet is RTX.
     seqnum_in_payload: Option<FullSequenceNumber>,
     pub timestamp: TruncatedTimestamp,
+    pub video_rotation: Option<VideoRotation>,
     pub audio_level: Option<audio::Level>,
     tcc_seqnum: Option<tcc::FullSequenceNumber>,
 
@@ -444,6 +481,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             seqnum_in_header: self.seqnum_in_header,
             seqnum_in_payload: self.seqnum_in_payload,
             timestamp: self.timestamp,
+            video_rotation: self.video_rotation,
             audio_level: self.audio_level,
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
@@ -462,6 +500,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             seqnum_in_header: self.seqnum_in_header,
             seqnum_in_payload: self.seqnum_in_payload,
             timestamp: self.timestamp,
+            video_rotation: self.video_rotation,
             audio_level: self.audio_level,
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
@@ -633,6 +672,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
             seqnum_in_header: self.seqnum_in_header,
             seqnum_in_payload: self.seqnum_in_payload,
             timestamp: self.timestamp,
+            video_rotation: self.video_rotation,
             audio_level: self.audio_level,
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
@@ -734,6 +774,7 @@ impl Packet<Vec<u8>> {
             seqnum_in_header: seqnum,
             seqnum_in_payload: None,
             timestamp,
+            video_rotation: None,
             audio_level: None,
             tcc_seqnum,
             // This only matters for tests.
@@ -800,6 +841,7 @@ pub fn parse_and_forward_rtp_for_fuzzing(data: Vec<u8>) -> Option<Vec<u8>> {
         seqnum_in_header: Default::default(),
         seqnum_in_payload: None,
         timestamp: header.timestamp,
+        video_rotation: header.video_rotation,
         audio_level: header.audio_level,
         tcc_seqnum: Default::default(),
         tcc_seqnum_range: header.tcc_seqnum_range,
@@ -1422,6 +1464,7 @@ impl Endpoint {
             seqnum_in_header,
             seqnum_in_payload: None,
             timestamp: header.timestamp,
+            video_rotation: header.video_rotation,
             audio_level: header.audio_level,
             tcc_seqnum,
             tcc_seqnum_range: header.tcc_seqnum_range,
@@ -1816,6 +1859,7 @@ mod test {
                 seqnum: 2,
                 timestamp: 3,
                 ssrc: 4,
+                video_rotation: None,
                 audio_level: None,
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
@@ -1849,6 +1893,7 @@ mod test {
                 seqnum: 2,
                 timestamp: 3,
                 ssrc: 4,
+                video_rotation: None,
                 audio_level: None,
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(17..19),
@@ -1908,6 +1953,7 @@ mod test {
                 seqnum: 2,
                 timestamp: 3,
                 ssrc: 4,
+                video_rotation: None,
                 audio_level: Some(87),
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(17..19),
@@ -1928,6 +1974,7 @@ mod test {
                 seqnum: 2,
                 timestamp: 3,
                 ssrc: 4,
+                video_rotation: None,
                 audio_level: Some(87),
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(19..21),
@@ -1950,9 +1997,71 @@ mod test {
                 seqnum: 2,
                 timestamp: 3,
                 ssrc: 4,
+                video_rotation: None,
                 audio_level: Some(87),
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(19..21),
+                payload_range,
+            }),
+            Header::parse(&packet)
+        );
+    }
+
+    #[test]
+    fn test_parse_rtp_header_with_orientation() {
+        let extensions = write_extension(RTP_EXT_ID_VIDEO_ORIENTATION, [0x1u8]);
+        let (packet, payload_range) = Packet::write_serialized(false, 1, 2, 3, 4, extensions, &[]);
+        assert_eq!(
+            Some(Header {
+                marker: false,
+                payload_type: 1,
+                seqnum: 2,
+                timestamp: 3,
+                ssrc: 4,
+                video_rotation: Some(VideoRotation::Clockwise90),
+                audio_level: None,
+                tcc_seqnum: None,
+                tcc_seqnum_range: None,
+                payload_range,
+            }),
+            Header::parse(&packet)
+        );
+
+        let extensions = write_extension(RTP_EXT_ID_VIDEO_ORIENTATION, [0x2u8]);
+        let (packet, payload_range) = Packet::write_serialized(false, 1, 2, 3, 4, extensions, &[]);
+        assert_eq!(
+            Some(Header {
+                marker: false,
+                payload_type: 1,
+                seqnum: 2,
+                timestamp: 3,
+                ssrc: 4,
+                video_rotation: Some(VideoRotation::Clockwise180),
+                audio_level: None,
+                tcc_seqnum: None,
+                tcc_seqnum_range: None,
+                payload_range,
+            }),
+            Header::parse(&packet)
+        );
+
+        // Try once more with extra tail padding.
+        let extensions = (
+            write_extension(RTP_EXT_ID_VIDEO_ORIENTATION, [0x3u8]),
+            [0u8, 0u8, 0u8, 0u8],
+        );
+        let (packet, payload_range) = Packet::write_serialized(false, 1, 2, 3, 4, extensions, &[]);
+        assert_eq!(
+            Some(Header {
+                marker: false,
+                payload_type: 1,
+                seqnum: 2,
+                timestamp: 3,
+                ssrc: 4,
+                video_rotation: Some(VideoRotation::Clockwise270),
+                audio_level: None,
+                tcc_seqnum: None,
+                tcc_seqnum_range: None,
                 payload_range,
             }),
             Header::parse(&packet)
