@@ -4,6 +4,10 @@
 
 Media forwarding server for group calls. Forwards media from 1 to N devices.
 
+## Frontend
+
+Signaling server for group calls that helps direct client requests to appropriate backends.
+
 # Thanks
 
 We thank WebRTC for the "googcc" congestion control algorithm (see googcc.rs for more details).

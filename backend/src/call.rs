@@ -18,7 +18,11 @@ use log::*;
 use prost::Message;
 use thiserror::Error;
 
-use crate::{audio, protos, rtp::{self, VideoRotation}, vp8};
+use crate::{
+    audio, protos,
+    rtp::{self, VideoRotation},
+    vp8,
+};
 
 pub const CLIENT_SERVER_DATA_SSRC: rtp::Ssrc = 1;
 pub const CLIENT_SERVER_DATA_PAYLOAD_TYPE: rtp::PayloadType = 101;

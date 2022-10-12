@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-mod v1;
 mod v2;
 
 use std::{
@@ -20,7 +19,7 @@ use axum::{
     handler::Handler,
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{delete, get},
+    routing::get,
     Extension, Router,
 };
 use http::{header, Request, StatusCode};
@@ -117,14 +116,11 @@ async fn metrics<B>(
 
     let latency = start.elapsed();
 
-    let version;
-    if path.starts_with("/v1/") {
-        version = "v1";
-    } else if path.starts_with("/v2/") {
-        version = "v2";
+    let version = if path.starts_with("/v2/") {
+        "v2"
     } else {
-        version = "unknown";
-    }
+        "unknown"
+    };
 
     let mut api_metrics = frontend.api_metrics.lock();
 
@@ -254,14 +250,6 @@ fn app(frontend: Arc<Frontend>) -> Router {
 
     let routes = Router::new()
         .route(
-            "/v1/conference/participants",
-            get(v1::get_participants).put(v1::join),
-        )
-        .route(
-            "/v1/conference/participants/:endpoint_id",
-            delete(v1::leave),
-        )
-        .route(
             "/v2/conference/participants",
             get(v2::get_participants).put(v2::join),
         )
@@ -279,8 +267,6 @@ fn app(frontend: Arc<Frontend>) -> Router {
 }
 
 pub async fn start(frontend: Arc<Frontend>, ender_rx: Receiver<()>) -> Result<()> {
-    // TODO: Fix if address is already in use, be sure it brings down the whole server.
-
     let addr = SocketAddr::new(
         IpAddr::from_str(&frontend.config.server_ip)?,
         frontend.config.server_port,

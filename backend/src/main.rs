@@ -15,9 +15,9 @@ use calling_backend::{
     config, http_server, metrics_server, sfu::Sfu, signaling_server, udp_server,
 };
 use calling_common::{DataRate, Duration, Instant};
+use clap::Parser;
 use env_logger::Env;
 use parking_lot::Mutex;
-use structopt::StructOpt;
 use tokio::{
     runtime,
     signal::unix::{signal, SignalKind},
@@ -26,7 +26,7 @@ use tokio::{
 
 lazy_static! {
     // Load the config and treat it as a read-only static value.
-    static ref CONFIG: config::Config = config::Config::from_args();
+    static ref CONFIG: config::Config = config::Config::parse();
 }
 
 #[rustfmt::skip]

@@ -1,15 +1,19 @@
-# Building the Calling Backend
+# Building
 
 ## For Development & Debugging
 
     cargo run --bin calling_backend
 
-You can specify a variety of command line arguments. See the [config.rs file](/src/config.rs) file for
-more details or run:
+or
 
-    cargo run --bin calling_backend -- --help
+    cargo run --bin calling_frontend
 
-An example for debugging would be:
+You must specify a variety of command line arguments. See [backend config.rs file](/backend/src/config.rs) or
+[frontend config.rs file](/frontend/src/config.rs) for more details or run either with the `--help` option.
+
+## Debugging with the Backend
+
+An example for debugging the backend would be:
 
     cargo run --bin calling_backend -- --binding-ip 192.168.1.100 --ice-candidate-ip 192.168.1.100 --diagnostics-interval-secs 1
 
@@ -42,44 +46,20 @@ to instruct the compiler to optimize for the CPU that is performing the build it
 
 ## For Deployment
 
-Signal uses the provided Dockerfile to build images for deployment. This uses a multi-stage process,
-creating a stage for building, the binary for delivery, and a runnable image for testing.
+Signal uses Docker files to build images for deployment. This uses a multi-stage process,
+creating a stage for building and a runnable image.
 
 ### Building the Docker Images
 
-Images currently run on AWS EC2 instances supporting the Intel Skylake architecture. When building
-the images, we can target that specific CPU (or choose any other that matches the platform where the
-container will be run):
+When building the images, we can target that specific CPU (or choose any other that matches the platform where the
+container will be run, such as the Intel Skylake architecture):
 
     docker build -f backend/Dockerfile --build-arg rust_flags=-Ctarget-cpu=skylake -t signal-calling-backend .
+
+or
+
+    docker build -f frontend/Dockerfile --build-arg rust_flags=-Ctarget-cpu=skylake -t signal-calling-frontend .
 
 The ```build-arg``` can also be omitted to maintain maximum compatibility.
 
 _Note: At the time of this writing, the skylake-avx512 target is not compatible with some dependencies._
-
-### Deploying the Docker Image
-
-The deployment is specific to the type of service or registry being used. For testing, the
-image can be saved and copied somewhere for running. To save:
-
-    docker save signal-calling-backend:latest | gzip > signal-calling-backend-latest.tar.gz
-
-### Running the Docker Container
-
-To run the container, the following docker command can be used:
-
-    docker run -d --rm -p 8080:8080 -p 10000:10000/udp signal-calling-backend:latest
-
-- ```-d``` runs the container in detached mode (can be omitted for easier testing)
-- ```--rm``` will clean up the container when it is stopped
-- ```-p 8080:8080``` connects the TCP port 8080 to the same one on the host
-- ```-p 10000:10000/udp``` connects the UDP port 10000 to the same one on the host
-
-### Binary Deployment
-
-The docker file can also be used to obtain a binary file:
-
-    docker build -f backend/Dockerfile --build-arg rust_flags=-Ctarget-cpu=skylake -t signal-calling-backend --target export-stage -o bin .
-
-This will build the calling_backend binary executable for Linux and copy it to the ./bin directory of
-the host. The command will stop at the export-stage and not create the runnable docker image.

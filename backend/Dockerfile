@@ -3,10 +3,19 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
 
-# Use the current rust environment for building.
-FROM rust:1.58.1-buster AS build-stage
+ARG debian_ver=bullseye
+
+FROM debian:${debian_ver} AS build-stage
+
+# Update system packages.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends --no-install-suggests protobuf-compiler
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends --no-install-suggests curl build-essential ca-certificates protobuf-compiler \
+    && update-ca-certificates
+
+# Install Rust.
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Take in a build argument to specify RUSTFLAGS environment, usually a target-cpu.
 ARG rust_flags
@@ -30,19 +39,26 @@ RUN cargo build --bin calling_backend --release
 COPY . .
 RUN cargo build --bin calling_backend --release
 
-# Export the calling_backend executable if the '-o' option is specified.
-FROM scratch AS export-stage
+# Create a minimal container to deploy and run the calling backend.
+FROM debian:${debian_ver}-slim AS run-stage
 
-COPY --from=build-stage /usr/src/calling-service/target/release/calling_backend calling_backend
+# Update system packages.
+RUN apt-get update \
+    && apt-get upgrade -y \
+    # Install curl for ip detection.
+    && apt-get install -y --no-install-recommends --no-install-suggests curl \
+    # Install jq for parsing gcp metadata.
+    && apt-get install -y --no-install-recommends --no-install-suggests jq \
+    # Cleanup unnecessary stuff.
+    && rm -rf /var/lib/apt/lists/*
 
-# Create a minimal container to deploy and run the calling_backend.
-FROM debian:buster-slim AS run-stage
+COPY --from=build-stage /usr/src/calling-service/target/release/calling_backend /usr/local/bin/
+COPY backend/docker-entrypoint.sh /usr/local/bin/
+
+USER nobody:nogroup
 
 # Expose http and udp server access ports to this container.
 EXPOSE 8080
 EXPOSE 10000/udp
 
-COPY --from=build-stage /usr/src/calling-service/target/release/calling_backend .
-USER 1000
-
-ENTRYPOINT ["./calling_backend"]
+ENTRYPOINT ["docker-entrypoint.sh"]

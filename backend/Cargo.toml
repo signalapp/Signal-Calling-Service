@@ -5,7 +5,7 @@
 
 [package]
 name = "calling_backend"
-version = "1.4.3"
+version = "1.5.0"
 authors = ["Calling Team <callingteam@signal.org>"]
 edition = "2021"
 description = "Media forwarding server for group calls."
@@ -22,7 +22,7 @@ scopeguard = "1.1"
 # For logging and command line operations
 log = "0.4"
 env_logger = "0.9"
-structopt = "0.3"
+clap = { version = "3.0", features = ["derive"] }
 
 # For runtime and threading
 tokio = { version = "1", features = ["full"] }

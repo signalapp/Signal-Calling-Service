@@ -33,6 +33,12 @@ pub type UserId = String;
 #[derive(Clone, Deserialize, Serialize, Eq, PartialEq)]
 pub struct GroupId(String);
 
+impl From<String> for GroupId {
+    fn from(group_id_string: String) -> Self {
+        Self(group_id_string)
+    }
+}
+
 impl From<&str> for GroupId {
     fn from(group_id: &str) -> Self {
         Self(group_id.to_string())
@@ -121,8 +127,6 @@ pub struct JoinResponseWrapper {
     pub ice_ufrag: String,
     pub ice_pwd: String,
     pub dhe_public_key: String,
-    // Needed for the v1 api.
-    pub client_id: String,
 }
 
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
@@ -382,7 +386,6 @@ impl Frontend {
             ice_ufrag: backend_join_response.ice_ufrag,
             ice_pwd: backend_join_response.ice_pwd,
             dhe_public_key: backend_dhe_public_key,
-            client_id,
         })
     }
 

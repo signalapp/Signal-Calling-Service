@@ -117,6 +117,8 @@ pub trait Backend: Sync + Send {
 
 pub struct BackendHttpClient {
     http_client: HttpClient<HttpConnector>,
+    /// URL used when invoking the get_info() API so that the request goes through
+    /// a load balancer.
     base_url: String,
 }
 
@@ -124,16 +126,9 @@ impl BackendHttpClient {
     pub fn from_config(config: &'static config::Config) -> Self {
         let client = HttpClient::builder().build_http();
 
-        // Build the base_url string for the backend client. This is used when invoking
-        // the get_info() API so that the request goes through the load balancer for the region.
-        let base_url = config
-            .calling_server_url_template
-            .replace("<region>", &config.region)
-            .replace("<version>", &config.calling_server_version);
-
         Self {
             http_client: client,
-            base_url,
+            base_url: config.calling_server_url.clone(),
         }
     }
 }

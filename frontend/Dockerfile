@@ -3,10 +3,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
 
-# Use Debian stretch for now to ensure GLIBC < 2.28.
-FROM debian:stretch-20220316 AS build-stage
+ARG debian_ver=bullseye
+
+FROM debian:${debian_ver} AS build-stage
+
+# Update system packages.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends --no-install-suggests build-essential curl ca-certificates \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends --no-install-suggests curl build-essential ca-certificates protobuf-compiler \
     && update-ca-certificates
 
 # Install Rust.
@@ -35,22 +39,27 @@ RUN cargo build --bin calling_frontend --release
 COPY . .
 RUN cargo build --bin calling_frontend --release
 
-# Export the calling_frontend executable if the '-o' option is specified.
-FROM scratch AS export-stage
+# Create a minimal container to deploy and run the calling frontend.
+FROM debian:${debian_ver}-slim AS run-stage
 
-COPY --from=build-stage /usr/src/calling-service/target/release/calling_frontend calling_frontend
-
-# Create a minimal container to deploy and run the calling_frontend.
-FROM debian:stretch-slim AS run-stage
-
+# Update system packages.
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends --no-install-suggests ca-certificates \
-    && update-ca-certificates
+    && update-ca-certificates \
+    # Install curl for ip detection.
+    && apt-get install -y --no-install-recommends --no-install-suggests curl \
+    # Install jq for parsing gcp metadata.
+    && apt-get install -y --no-install-recommends --no-install-suggests jq \
+    # Cleanup unnecessary stuff.
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build-stage /usr/src/calling-service/target/release/calling_frontend /usr/local/bin/
+COPY frontend/docker-entrypoint.sh /usr/local/bin/
+
+USER nobody:nogroup
 
 # Expose http server access ports to this container.
-EXPOSE 8090
+EXPOSE 8080
 
-COPY --from=build-stage /usr/src/calling-service/target/release/calling_frontend .
-USER 1000
-
-ENTRYPOINT ["./calling_frontend"]
+ENTRYPOINT ["docker-entrypoint.sh"]

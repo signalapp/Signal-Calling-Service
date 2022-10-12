@@ -1,7 +1,7 @@
 This directory contains fuzz targets used with `cargo fuzz`.
 
 ```
-// In the top-level source directory
+// In the backend source directory
 cargo install cargo-fuzz
 cargo fuzz list
 cargo +nightly fuzz run <fuzz-target>

@@ -3,19 +3,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     model::{AttributeValue, Select},
     types::SdkError,
     Client, Config, Endpoint,
 };
+use aws_smithy_async::rt::sleep::default_async_sleep;
 use aws_smithy_types::retry::RetryConfigBuilder;
 use aws_types::{region::Region, Credentials};
+use calling_common::Duration;
 use http::Uri;
+use hyper::client::HttpConnector;
+use hyper::{Body, Method, Request};
 use log::*;
 use serde::{Deserialize, Serialize};
 use serde_dynamo::{from_item, to_item};
+use std::{env, path::PathBuf};
+use tokio::{io::AsyncWriteExt, sync::oneshot::Receiver};
 
 #[cfg(test)]
 use mockall::{automock, predicate::*};
@@ -23,6 +29,7 @@ use mockall::{automock, predicate::*};
 use crate::{
     config,
     frontend::{GroupId, UserId},
+    metrics::Timer,
 };
 
 const GROUP_CONFERENCE_ID_STRING: &str = "groupConferenceId";
@@ -85,49 +92,68 @@ pub struct DynamoDb {
 }
 
 impl DynamoDb {
-    pub async fn new(config: &'static config::Config) -> Self {
+    pub async fn new(config: &'static config::Config) -> Result<(Self, IdentityFetcher)> {
+        let sleep_impl =
+            default_async_sleep().ok_or_else(|| anyhow!("failed to create sleep_impl"))?;
+
+        let identity_fetcher;
+
         let client = match &config.storage_endpoint {
-            None => {
+            Some(endpoint) => {
+                const KEY: &str = "DUMMY_KEY";
+                const PASSWORD: &str = "DUMMY_PASSWORD";
+
+                info!("Using endpoint for DynamodDB testing: {}", endpoint);
+
+                // Create an identity fetcher with a dummy token path, which isn't used
+                // for testing.
+                identity_fetcher = IdentityFetcher::new(config, "/tmp/token");
+
+                let aws_config = Config::builder()
+                    .credentials_provider(Credentials::from_keys(KEY, PASSWORD, None))
+                    .endpoint_resolver(Endpoint::immutable(Uri::from_static(endpoint)))
+                    .sleep_impl(sleep_impl)
+                    .region(Region::new(&config.storage_region))
+                    .build();
+                Client::from_conf(aws_config)
+            }
+            _ => {
                 info!(
                     "Using region for DynamodDB access: {}",
                     config.storage_region.as_str()
                 );
+
+                // Get the location of the identity token file from the environment variable,
+                // the same location that the client will try to get it from for credentials.
+                let identity_token_path = env::var("AWS_WEB_IDENTITY_TOKEN_FILE")?;
+                identity_fetcher = IdentityFetcher::new(config, &identity_token_path);
+
+                // Fetch an identity token once before connecting for the first time.
+                identity_fetcher.fetch_token().await?;
 
                 let retry_config = RetryConfigBuilder::new()
                     .max_attempts(4)
                     .initial_backoff(std::time::Duration::from_millis(100))
                     .build();
 
-                let aws_config = Config::builder()
-                    .credentials_provider(Credentials::from_keys(
-                        &config.storage_key,
-                        &config.storage_password,
-                        None,
-                    ))
+                let aws_config = aws_config::from_env()
+                    .sleep_impl(sleep_impl)
                     .retry_config(retry_config)
                     .region(Region::new(&config.storage_region))
-                    .build();
-                Client::from_conf(aws_config)
-            }
-            Some(endpoint) => {
-                info!("Using endpoint for DynamodDB testing: {}", endpoint);
-                let aws_config = Config::builder()
-                    .credentials_provider(Credentials::from_keys(
-                        &config.storage_key,
-                        &config.storage_password,
-                        None,
-                    ))
-                    .endpoint_resolver(Endpoint::immutable(Uri::from_static(endpoint)))
-                    .region(Region::new(&config.storage_region))
-                    .build();
-                Client::from_conf(aws_config)
+                    .load()
+                    .await;
+
+                Client::new(&aws_config)
             }
         };
 
-        Self {
-            client,
-            table_name: config.storage_table.to_string(),
-        }
+        Ok((
+            Self {
+                client,
+                table_name: config.storage_table.to_string(),
+            },
+            identity_fetcher,
+        ))
     }
 }
 
@@ -177,8 +203,6 @@ impl Storage for DynamoDb {
             Err(SdkError::ServiceError { err: e, raw: _ })
                 if e.is_conditional_check_failed_exception() =>
             {
-                // TODO: This log replicates behavior of the old server, remove if not useful.
-                info!("Conditional check failed, call now already exists");
                 Ok(self
                     .get_call_record(&call.group_id)
                     .await
@@ -220,8 +244,6 @@ impl Storage for DynamoDb {
             Err(SdkError::ServiceError { err: e, raw: _ })
                 if e.is_conditional_check_failed_exception() =>
             {
-                // TODO: This log replicates behavior of the old server, remove if not useful.
-                info!("Item already removed or replaced: {:.6}", call_id);
                 Ok(())
             }
             Err(err) => Err(StorageError::UnexpectedError(err.into())),
@@ -257,5 +279,81 @@ impl Storage for DynamoDb {
         }
 
         Ok(vec![])
+    }
+}
+
+/// Supports the DynamoDB storage implementation by periodically refreshing an identity
+/// token file at the location given by `identity_token_path`.
+pub struct IdentityFetcher {
+    client: hyper::Client<HttpConnector>,
+    fetch_interval: Duration,
+    identity_token_path: PathBuf,
+    identity_token_url: Option<String>,
+}
+
+impl IdentityFetcher {
+    fn new(config: &'static config::Config, identity_token_path: &str) -> Self {
+        IdentityFetcher {
+            client: hyper::client::Client::builder().build_http(),
+            fetch_interval: Duration::from_millis(config.identity_fetcher_interval_ms),
+            identity_token_path: PathBuf::from(identity_token_path),
+            identity_token_url: config.identity_token_url.to_owned(),
+        }
+    }
+
+    async fn fetch_token(&self) -> Result<()> {
+        if let Some(url) = &self.identity_token_url {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(url)
+                .header("Metadata-Flavor", "Google")
+                .body(Body::empty())?;
+
+            debug!("Fetching identity token from {}", url);
+
+            let body = self.client.request(request).await?;
+            let body = hyper::body::to_bytes(body).await?;
+            let temp_name = self.identity_token_path.with_extension("bak");
+            let mut temp_file = tokio::fs::File::create(&temp_name).await?;
+            temp_file.write_all(&body).await?;
+            tokio::fs::rename(temp_name, &self.identity_token_path).await?;
+
+            debug!(
+                "Successfully wrote identity token to {:?}",
+                &self.identity_token_path
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn start(self, ender_rx: Receiver<()>) -> Result<()> {
+        // Periodically fetch a new web identity from GCP.
+        let fetcher_handle = tokio::spawn(async move {
+            loop {
+                // Use sleep() instead of interval() so that we never wait *less* than one
+                // interval to do the next tick.
+                tokio::time::sleep(self.fetch_interval.into()).await;
+
+                let timer = start_timer_us!("calling.frontend.identity_fetcher.timed");
+
+                let result = &self.fetch_token().await;
+                if let Err(e) = result {
+                    event!("calling.frontend.identity_fetcher.error");
+                    error!("Failed to fetch identity token : {:?}", e);
+                }
+                timer.stop();
+            }
+        });
+
+        info!("fetcher ready");
+
+        // Wait for any task to complete and cancel the rest.
+        tokio::select!(
+            _ = fetcher_handle => {},
+            _ = ender_rx => {},
+        );
+
+        info!("fetcher shutdown");
+        Ok(())
     }
 }

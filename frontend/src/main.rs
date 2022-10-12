@@ -9,7 +9,7 @@ extern crate lazy_static;
 #[macro_use]
 extern crate log;
 
-use std::{fs::File, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::Result;
 use calling_common::Duration;
@@ -28,14 +28,7 @@ use tokio::{
 
 lazy_static! {
     // Load the config and treat it as a read-only static value.
-    static ref CONFIG: config::Config = {
-        let arg_config = config::ArgConfig::parse();
-
-        let f = File::open(&arg_config.yaml).expect("yaml file can be opened");
-        let yaml_config = serde_yaml::from_reader(f).expect("yaml file can be parsed");
-
-        config::Config::merge(arg_config, yaml_config)
-    };
+    static ref CONFIG: config::Config = config::Config::parse();
 }
 
 #[rustfmt::skip]
@@ -48,10 +41,9 @@ fn print_config(config: &'static config::Config) {
     info!("  {:38}{}", "region:", config.region);
     info!("  {:38}{}", "version:", config.version);
     info!("  {:38}{}", "regional_url_template:", config.regional_url_template);
-    info!("  {:38}{}", "calling_server_url_template:", config.calling_server_url_template);
-    info!("  {:38}{}", "calling_server_version_param:", config.calling_server_version);
+    info!("  {:38}{}", "calling_server_url:", config.calling_server_url);
     info!("  {:38}{}", "storage_table:", config.storage_table);
-    info!("  {:38}{}", "storage_region:", config.storage_region);
+    info!("  {:38}{:?}", "identity_url:", config.identity_token_url);
     info!("  {:38}{:?}", "storage_endpoint:", config.storage_endpoint);
     info!("  {:38}{}", "metrics_datadog:",
           match &config.metrics_datadog_host {
@@ -120,23 +112,26 @@ fn main() -> Result<()> {
     // for each core on the system.
     let threaded_rt = runtime::Runtime::new()?;
 
-    // Create an authenticator.
-    let authenticator = Authenticator::from_hex_key(&config.authentication_key)?;
-
     let (api_ender_tx, api_ender_rx) = oneshot::channel();
     let (cleaner_ender_tx, cleaner_ender_rx) = oneshot::channel();
     let (metrics_ender_tx, metrics_ender_rx) = oneshot::channel();
+    let (identity_fetcher_ender_tx, identity_fetcher_ender_rx) = oneshot::channel();
     let (signal_canceller_tx, signal_canceller_rx) = mpsc::channel(1);
 
     let signal_canceller_tx_clone_for_cleaner = signal_canceller_tx.clone();
     let signal_canceller_tx_clone_for_metrics = signal_canceller_tx.clone();
+    let signal_canceller_tx_clone_for_identity_fetcher = signal_canceller_tx.clone();
+
+    // Create frontend entities that might fail.
+    let authenticator = Authenticator::from_hex_key(&config.authentication_key)?;
+    let (storage, identity_fetcher) = threaded_rt.block_on(DynamoDb::new(config))?;
 
     threaded_rt.block_on(async {
         // Create the shared Frontend state.
         let frontend: Arc<Frontend> = Arc::new(Frontend {
             config,
             authenticator,
-            storage: Box::new(DynamoDb::new(config).await),
+            storage: Box::new(storage),
             backend: Box::new(BackendHttpClient::from_config(config)),
             id_generator: Box::new(FrontendIdGenerator),
             api_metrics: Mutex::new(Default::default()),
@@ -163,6 +158,14 @@ fn main() -> Result<()> {
             let _ = signal_canceller_tx_clone_for_metrics.send(()).await;
         });
 
+        // Start the identity token fetcher.
+        let fetcher_handle = tokio::spawn(async move {
+            let _ = identity_fetcher.start(identity_fetcher_ender_rx).await;
+            let _ = signal_canceller_tx_clone_for_identity_fetcher
+                .send(())
+                .await;
+        });
+
         // Wait for any signals to be detected, or cancel due to one of the
         // servers not being able to be started (the channel is buffered).
         wait_for_signal(signal_canceller_rx).await;
@@ -171,9 +174,10 @@ fn main() -> Result<()> {
         let _ = api_ender_tx.send(());
         let _ = cleaner_ender_tx.send(());
         let _ = metrics_ender_tx.send(());
+        let _ = identity_fetcher_ender_tx.send(());
 
         // Wait for the servers to exit.
-        let _ = tokio::join!(api_handle, cleaner_handle, metrics_handle,);
+        let _ = tokio::join!(api_handle, cleaner_handle, metrics_handle, fetcher_handle);
     });
 
     info!("shutting down the runtime");

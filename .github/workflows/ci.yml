@@ -18,6 +18,7 @@ jobs:
         override: true
         profile: minimal
         components: rustfmt, clippy
+    - run: shellcheck **/*.sh
     - name: Environment
       run: rustup --version && cargo --version
     - name: Build
