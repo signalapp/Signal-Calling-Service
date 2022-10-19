@@ -385,6 +385,9 @@ impl Call {
                 client.data_forwarder_by_sender_demux_id.remove(&demux_id);
                 // Entries are removed from allocated_height_by_sender_demux_id in allocate_video_layers.
             }
+
+            self.key_frame_request_sent_by_ssrc
+                .retain(|ssrc, _timestamp| DemuxId::from_ssrc(*ssrc) != demux_id);
         }
     }
 
@@ -1025,6 +1028,8 @@ impl Call {
                     // If we sent a key frame for this SSRC recently, wait to resend one.
                     None
                 } else {
+                    self.key_frame_request_sent_by_ssrc
+                        .insert(desired_incoming_ssrc, now);
                     Some((
                         DemuxId::from_ssrc(desired_incoming_ssrc),
                         rtp::KeyFrameRequest {
@@ -4174,5 +4179,184 @@ mod call_tests {
             )],
             rtp_to_send
         );
+    }
+
+    #[test]
+    fn repeated_key_frame_requests() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+        let get_forwarding_video_demux_ids =
+            |from_server: &[RtpToSend], receiver_demux_id: DemuxId| -> Option<Vec<DemuxId>> {
+                let (_demux_id, rtp) = from_server
+                    .iter()
+                    .find(|(demux_id, _rtp)| *demux_id == receiver_demux_id)?;
+                let proto = protos::SfuToDevice::decode(rtp.payload()).ok()?;
+                let mut demux_ids: Vec<DemuxId> = proto
+                    .current_devices?
+                    .demux_ids_with_video
+                    .iter()
+                    .map(|demux_id| DemuxId::try_from(*demux_id).unwrap())
+                    .collect();
+                demux_ids.sort();
+                Some(demux_ids)
+            };
+
+        let mut call = create_call(b"call_id", now, system_now);
+        let demux_id1 = add_client(&mut call, "1", 1, at(1));
+        let demux_id2 = add_client(&mut call, "2", 2, at(2));
+        let demux_id3 = add_client(&mut call, "3", 3, at(3));
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(4));
+        // Nothing to forward yet
+        assert_eq!(
+            Some(vec![]),
+            get_forwarding_video_demux_ids(&from_server, demux_id1)
+        );
+        assert_eq!(
+            Some(vec![]),
+            get_forwarding_video_demux_ids(&from_server, demux_id2)
+        );
+        assert_eq!(
+            Some(vec![]),
+            get_forwarding_video_demux_ids(&from_server, demux_id3)
+        );
+
+        // Send some video from client2 and client3 so the incoming rate goes up.
+        for seqnum in 0..10 {
+            let mut to_server = create_video_rtp(
+                demux_id2,
+                LayerId::Video0,
+                1,
+                1,
+                seqnum,
+                Some(PixelSize {
+                    width: 640,
+                    height: 480,
+                }),
+            );
+            call.handle_rtp(demux_id2, to_server.borrow_mut(), at(5))
+                .unwrap();
+
+            let mut to_server = create_video_rtp(
+                demux_id3,
+                LayerId::Video0,
+                1,
+                1,
+                seqnum,
+                Some(PixelSize {
+                    width: 640,
+                    height: 480,
+                }),
+            );
+            call.handle_rtp(demux_id3, to_server.borrow_mut(), at(5))
+                .unwrap();
+        }
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(1006));
+        assert_eq!(
+            Some(vec![demux_id2, demux_id3]),
+            get_forwarding_video_demux_ids(&from_server, demux_id1)
+        );
+        assert_eq!(
+            Some(vec![demux_id3]),
+            get_forwarding_video_demux_ids(&from_server, demux_id2)
+        );
+        assert_eq!(
+            Some(vec![demux_id2]),
+            get_forwarding_video_demux_ids(&from_server, demux_id3)
+        );
+
+        // Initial key frame requests
+        let mut outgoing_key_frame_requests =
+            call.send_key_frame_requests_if_its_been_too_long(at(2000));
+        outgoing_key_frame_requests.sort_unstable_by_key(|r| r.0);
+
+        let expected_key_frame_requests = &[
+            (
+                demux_id2,
+                rtp::KeyFrameRequest {
+                    ssrc: LayerId::Video0.to_ssrc(demux_id2),
+                },
+            ),
+            (
+                demux_id3,
+                rtp::KeyFrameRequest {
+                    ssrc: LayerId::Video0.to_ssrc(demux_id3),
+                },
+            ),
+        ];
+
+        assert_eq!(outgoing_key_frame_requests, expected_key_frame_requests);
+
+        // No repeat requests within 200ms.
+        let outgoing_key_frame_requests =
+            call.send_key_frame_requests_if_its_been_too_long(at(2100));
+        assert_eq!(outgoing_key_frame_requests, &[]);
+
+        // No change after.
+        let mut outgoing_key_frame_requests =
+            call.send_key_frame_requests_if_its_been_too_long(at(2200));
+        outgoing_key_frame_requests.sort_unstable_by_key(|r| r.0);
+
+        assert_eq!(outgoing_key_frame_requests, expected_key_frame_requests);
+
+        // Send a keyframe for demux_id2 only.
+        let mut to_server = create_video_rtp(
+            demux_id2,
+            LayerId::Video0,
+            1,
+            1,
+            100,
+            Some(PixelSize {
+                width: 640,
+                height: 480,
+            }),
+        );
+        call.handle_rtp(demux_id2, to_server.borrow_mut(), at(2300))
+            .unwrap();
+
+        let outgoing_key_frame_requests =
+            call.send_key_frame_requests_if_its_been_too_long(at(3000));
+
+        assert_eq!(
+            outgoing_key_frame_requests,
+            &expected_key_frame_requests[1..]
+        );
+
+        // Re-request demux_id2 immediately after.
+        // It's too soon for any new requests.
+        let outgoing_key_frame_requests = call.handle_key_frame_requests(
+            demux_id1,
+            &[rtp::KeyFrameRequest {
+                ssrc: LayerId::Video0.to_ssrc(demux_id2),
+            }],
+            at(3001),
+        );
+        assert_eq!(outgoing_key_frame_requests, &[]);
+
+        // Even once we recompute requests, we've recently requested demux_id3.
+        let outgoing_key_frame_requests =
+            call.send_key_frame_requests_if_its_been_too_long(at(3100));
+        assert_eq!(
+            outgoing_key_frame_requests,
+            &expected_key_frame_requests[..1]
+        );
+
+        // ...and now we've recently requested demux_id2.
+        let outgoing_key_frame_requests =
+            call.send_key_frame_requests_if_its_been_too_long(at(3200));
+        assert_eq!(
+            outgoing_key_frame_requests,
+            &expected_key_frame_requests[1..]
+        );
+
+        // Only if we wait more than 200ms will we get both again.
+        let mut outgoing_key_frame_requests =
+            call.send_key_frame_requests_if_its_been_too_long(at(3500));
+        outgoing_key_frame_requests.sort_unstable_by_key(|r| r.0);
+        assert_eq!(outgoing_key_frame_requests, expected_key_frame_requests);
     }
 }
