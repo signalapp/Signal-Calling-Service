@@ -21,7 +21,7 @@ use aes_gcm::{AeadInPlace, Aes128Gcm};
 use byteorder::{ReadBytesExt, BE};
 use calling_common::{
     expand_truncated_counter, parse_u16, parse_u32, read_u16, round_up_to_multiple_of, Bits,
-    CheckedSplitAt, DataSize, Duration, Instant, KeySortedCache, TwoGenerationCache, Writer,
+    CheckedSplitAt, DataSize, Duration, Instant, KeySortedCache, TwoGenerationCache, Writer, U24,
 };
 use log::*;
 use zeroize::Zeroizing;
@@ -60,6 +60,7 @@ pub const RTCP_FORMAT_TRANSPORT_CC: u8 = 15;
 pub const RTCP_TYPE_SPECIFIC_FEEDBACK: u8 = 206;
 pub const RTCP_FORMAT_PLI: u8 = 1;
 const RTCP_FORMAT_LOSS_NOTIFICATION: u8 = 15;
+const OPUS_PAYLOAD_TYPE: PayloadType = 102;
 pub const VP8_PAYLOAD_TYPE: PayloadType = 108;
 const RTX_PAYLOAD_TYPE_OFFSET: PayloadType = 10;
 const RTX_SSRC_OFFSET: Ssrc = 1;
@@ -346,6 +347,10 @@ pub fn expand_timestamp(
     max_timestamp: &mut FullTimestamp,
 ) -> FullSequenceNumber {
     expand_truncated_counter(timestamp, max_timestamp, 32)
+}
+
+fn is_media_payload_type(pt: PayloadType) -> bool {
+    pt == OPUS_PAYLOAD_TYPE || pt == VP8_PAYLOAD_TYPE
 }
 
 fn is_rtx_payload_type(pt: PayloadType) -> bool {
@@ -1335,6 +1340,103 @@ impl RtxSender {
     }
 }
 
+const SEQNUM_GAP_THRESHOLD: u32 = 500;
+
+struct ReceiverReportSender {
+    max_seqnum: Option<u32>,
+    max_seqnum_in_last: Option<u32>,
+    cumulative_loss: u32,
+    cumulative_loss_in_last: u32,
+}
+
+impl ReceiverReportSender {
+    fn new() -> Self {
+        Self {
+            max_seqnum: None,
+            max_seqnum_in_last: None,
+            cumulative_loss: 0,
+            cumulative_loss_in_last: 0,
+        }
+    }
+
+    fn remember_received(&mut self, seqnum: FullSequenceNumber) {
+        let seqnum = seqnum as u32;
+        if let Some(max_seqnum) = self.max_seqnum {
+            if seqnum > max_seqnum {
+                if seqnum - max_seqnum > SEQNUM_GAP_THRESHOLD {
+                    // Ignore seqnum gap caused by stream restart.
+                    self.cumulative_loss = 0;
+                    self.cumulative_loss_in_last = 0;
+                    self.max_seqnum = Some(seqnum);
+                    self.max_seqnum_in_last = Some(seqnum - 1);
+                    return;
+                }
+
+                let seqnums_in_gap = seqnum - max_seqnum - 1;
+                self.cumulative_loss = self.cumulative_loss.saturating_add(seqnums_in_gap);
+                self.max_seqnum = Some(seqnum);
+            } else {
+                self.cumulative_loss = self.cumulative_loss.saturating_sub(1);
+            }
+        } else {
+            self.max_seqnum = Some(seqnum);
+            // When we get the first seqnum, make it so we've expected 1 seqnum since "last"
+            // even though there hasn't been a last yet.
+            self.max_seqnum_in_last = Some(seqnum.saturating_sub(1));
+        }
+    }
+
+    fn write_receiver_report_block(&mut self, ssrc: Ssrc) -> Option<Vec<u8>> {
+        if let (Some(max_seqnum), Some(max_seqnum_in_last)) =
+            (self.max_seqnum, self.max_seqnum_in_last)
+        {
+            let expected_since_last = (max_seqnum.saturating_sub(max_seqnum_in_last)) as u32;
+            let lost_since_last = self
+                .cumulative_loss
+                .saturating_sub(self.cumulative_loss_in_last);
+            let fraction_lost_since_last = if expected_since_last == 0 {
+                0
+            } else {
+                (256 * lost_since_last / expected_since_last) as u8
+            };
+
+            // Negative cumulative loss isn't supported because it can cause problems with WebRTC
+            // https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/modules/rtp_rtcp/source/receive_statistics_impl.h;l=91-94;drc=18649971ab02d2f3fc8f360aee2e3c573652b7bd
+            const MAX_I24: u32 = (1 << 23) - 1;
+            let cumulative_loss_i24 =
+                U24::try_from(std::cmp::min(self.cumulative_loss, MAX_I24)).unwrap();
+
+            self.max_seqnum_in_last = self.max_seqnum;
+            // cumulative_loss_in_last is used to figure out how many packets have been lost since
+            // the last report. We can't update it based off lost_since_last since cumulative_loss
+            // can decrease (given duplicate packets), and lost_since_last wouldn't account for
+            // that.
+            self.cumulative_loss_in_last = self.cumulative_loss;
+
+            // Not used yet.
+            let interarrival_jitter: u32 = 0;
+            let last_sender_report_timestamp: u32 = 0;
+            let delay_since_last_sender_report: u32 = 0;
+
+            Some(
+                (
+                    ssrc,
+                    [fraction_lost_since_last],
+                    cumulative_loss_i24,
+                    max_seqnum,
+                    interarrival_jitter,
+                    last_sender_report_timestamp,
+                    delay_since_last_sender_report,
+                )
+                    .to_vec(),
+            )
+        } else {
+            // We haven't received a packet yet, so we can't send a receiver report.
+            None
+        }
+    }
+}
+
 // Keeps some state to make it easier to process incoming packets.
 // In particular, it:
 // 1. Holds and uses the SRTP keys to encrypt/decrypt.
@@ -1370,6 +1472,7 @@ struct IncomingSsrcState {
     max_seqnum: FullSequenceNumber,
     seqnum_reuse_detector: SequenceNumberReuseDetector,
     nack_sender: NackSender,
+    receiver_report_sender: ReceiverReportSender,
 }
 
 // This is almost the same as ControlPacket.
@@ -1515,6 +1618,14 @@ impl Endpoint {
             ssrc_state.nack_sender.remember_received(incoming.seqnum());
         }
 
+        if is_media_payload_type(incoming.payload_type()) {
+            let ssrc_state = self.get_incoming_ssrc_state_mut(incoming.ssrc());
+
+            ssrc_state
+                .receiver_report_sender
+                .remember_received(incoming.seqnum());
+        }
+
         if let Some(tcc_seqnum) = incoming.tcc_seqnum {
             self.tcc_receiver.remember_received(tcc_seqnum, now);
         }
@@ -1531,6 +1642,7 @@ impl Endpoint {
                 // A 1KB RTCP payload with 4 bytes each would allow only 250
                 // in the worst case scenario.
                 nack_sender: NackSender::new(250),
+                receiver_report_sender: ReceiverReportSender::new(),
             })
     }
 
@@ -1675,12 +1787,26 @@ impl Endpoint {
         self.send_rtcp(RTCP_TYPE_SPECIFIC_FEEDBACK, RTCP_FORMAT_PLI, pli_ssrc)
     }
 
+    pub fn send_receiver_report(&mut self) -> Option<Vec<u8>> {
+        let blocks: Vec<Vec<u8>> = self
+            .state_by_incoming_ssrc
+            .iter_mut()
+            .filter_map(|(ssrc, state)| {
+                state
+                    .receiver_report_sender
+                    .write_receiver_report_block(*ssrc)
+            })
+            .collect();
+        let count = blocks.len() as u8;
+        self.send_rtcp(RTCP_TYPE_RECEIVER_REPORT, count, blocks)
+    }
+
     // Returns a new, encrypted RTCP packet.
     // TODO: Use Result instead of Option.
-    fn send_rtcp(&mut self, pt: u8, format: u8, payload: impl Writer) -> Option<Vec<u8>> {
+    fn send_rtcp(&mut self, pt: u8, count_or_format: u8, payload: impl Writer) -> Option<Vec<u8>> {
         Self::send_rtcp_and_increment_index(
             pt,
-            format,
+            count_or_format,
             self.rtcp_sender_ssrc,
             payload,
             &mut self.next_outgoing_srtcp_index,
@@ -1691,7 +1817,7 @@ impl Endpoint {
 
     fn send_rtcp_and_increment_index(
         pt: u8,
-        format: u8,
+        count_or_format: u8,
         sender_ssrc: Ssrc,
         payload: impl Writer,
         next_outgoing_srtcp_index: &mut u32,
@@ -1700,7 +1826,7 @@ impl Endpoint {
     ) -> Option<Vec<u8>> {
         let serialized = ControlPacket::serialize_and_encrypt(
             pt,
-            format,
+            count_or_format,
             sender_ssrc,
             payload,
             *next_outgoing_srtcp_index,
@@ -2613,5 +2739,107 @@ mod test {
                 hex::encode(&salt),
             );
         }
+    }
+
+    #[test]
+    fn test_receiver_report_sender() {
+        let mut receiver_report_sender = ReceiverReportSender::new();
+
+        fn expected_bytes(
+            ssrc: Ssrc,
+            fraction_lost_since_last: u8,
+            cumulative_loss: u32,
+            max_seqnum: u32,
+        ) -> Vec<u8> {
+            let interarrival_jitter: u32 = 0;
+            let last_sender_report_timestamp: u32 = 0;
+            let delay_since_last_sender_report: u32 = 0;
+
+            (
+                ssrc,
+                [fraction_lost_since_last],
+                U24::try_from(cumulative_loss).unwrap(),
+                max_seqnum,
+                (
+                    interarrival_jitter,
+                    last_sender_report_timestamp,
+                    delay_since_last_sender_report,
+                ),
+            )
+                .to_vec()
+        }
+
+        let ssrc = 123456;
+
+        // We don't send a report before receiving anything.
+        assert_eq!(
+            None,
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        // Receiving all packets in order means no loss.
+        for seqnum in 1000..=1004 {
+            receiver_report_sender.remember_received(seqnum);
+        }
+
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 0, 1004)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        // Even if packets are received out of order, if there are no gaps, then there's no loss.
+        for seqnum in &[1009, 1005, 1007, 1008, 1010, 1006] {
+            receiver_report_sender.remember_received(*seqnum);
+        }
+
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 0, 1010)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        // Now we lose 1011..=1019
+        receiver_report_sender.remember_received(1020);
+
+        // ... which means that we lost 9 packets (230 / 256).
+        assert_eq!(
+            Some(expected_bytes(ssrc, 230, 9, 1020)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        // Receiving duplicate packets reduces the cumulative loss
+        for _ in 0..4 {
+            receiver_report_sender.remember_received(1020);
+        }
+
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 5, 1020)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        for _ in 0..10 {
+            receiver_report_sender.remember_received(1020);
+        }
+
+        // ... but we don't support negative loss.
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 0, 1020)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        // Increase loss again
+        receiver_report_sender.remember_received(1050);
+
+        assert_eq!(
+            Some(expected_bytes(ssrc, 247, 29, 1050)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        receiver_report_sender.remember_received(3050);
+
+        // ... to show that a large gap in seqnums causes the statistics to be reset.
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 0, 3050)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
     }
 }

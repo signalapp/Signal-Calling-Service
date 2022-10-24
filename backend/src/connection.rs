@@ -32,6 +32,8 @@ const NACK_CALCULATION_INTERVAL: Duration = Duration::from_millis(20);
 // tick interval ever decreases.
 const ACK_CALCULATION_INTERVAL: Duration = Duration::from_millis(100);
 
+const RECEIVER_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
 pub type PacketToSend = Vec<u8>;
 
 #[derive(Error, Debug, Eq, PartialEq)]
@@ -95,6 +97,9 @@ struct Rtp {
 
     /// The last time NACKs were sent.
     nacks_sent: Option<Instant>,
+
+    /// The last time an RTCP Receiver Report was sent.
+    receiver_report_sent: Option<Instant>,
 }
 
 struct CongestionControl {
@@ -138,6 +143,7 @@ impl Connection {
                 endpoint: rtp_endpoint,
                 acks_sent: None,
                 nacks_sent: None,
+                receiver_report_sent: None,
             },
             congestion_control: CongestionControl {
                 pacer: Pacer::new(pacer::Config {
@@ -292,6 +298,7 @@ impl Connection {
     pub fn tick(&mut self, packets_to_send: &mut Vec<(PacketToSend, SocketAddr)>, now: Instant) {
         self.send_acks_if_its_been_too_long(packets_to_send, now);
         self.send_nacks_if_its_been_too_long(packets_to_send, now);
+        self.send_receiver_report_if_its_been_too_long(packets_to_send, now);
     }
 
     /// If an ICE binding request has been received, a Connection is inactive if it's been more
@@ -416,6 +423,27 @@ impl Connection {
             }
 
             self.rtp.nacks_sent = Some(now);
+        }
+    }
+
+    fn send_receiver_report_if_its_been_too_long(
+        &mut self,
+        packets_to_send: &mut Vec<(PacketToSend, SocketAddr)>,
+        now: Instant,
+    ) {
+        if let Some(receiver_report_sent) = self.rtp.receiver_report_sent {
+            if now < receiver_report_sent + RECEIVER_REPORT_INTERVAL {
+                // We sent a RR recently. Wait to resend/recalculate it.
+                return;
+            }
+        }
+
+        if let Some(outgoing_addr) = self.outgoing_addr {
+            if let Some(receiver_report_packet) = self.rtp.endpoint.send_receiver_report() {
+                packets_to_send.push((receiver_report_packet, outgoing_addr));
+            }
+
+            self.rtp.receiver_report_sent = Some(now);
         }
     }
 
@@ -967,9 +995,9 @@ mod connection_tests {
         handle_ice_binding_request(&mut connection, client_addr, 1, true, at(5)).unwrap();
         assert_eq!(Some(client_addr), connection.outgoing_addr());
 
-        // Now we can send ACKs and NACKs
+        // Now we can send ACKs, NACKs, and receiver reports.
         connection.tick(&mut packets_to_send, at(6));
-        assert_eq!(2, packets_to_send.len());
+        assert_eq!(3, packets_to_send.len());
 
         let expected_acks = vec![
             (101u64, tcc::RemoteInstant::from_millis(1)),
@@ -991,12 +1019,12 @@ mod connection_tests {
         assert_eq!(expected_nacks, actual_nacks);
         assert_eq!(0, actual_acks.len());
 
-        // We resend NACKs but not acks
+        // We resend NACKs but not acks or receiver reports.
         connection.tick(&mut packets_to_send, at(1000));
-        assert_eq!(3, packets_to_send.len());
-        assert_eq!(client_addr, packets_to_send[2].1);
+        assert_eq!(4, packets_to_send.len());
+        assert_eq!(client_addr, packets_to_send[3].1);
         let (actual_acks, actual_nacks) =
-            decrypt_rtcp(&mut packets_to_send[2].0, &encrypt).unwrap();
+            decrypt_rtcp(&mut packets_to_send[3].0, &encrypt).unwrap();
         assert_eq!(expected_nacks, actual_nacks);
         assert_eq!(0, actual_acks.len());
 
@@ -1008,7 +1036,7 @@ mod connection_tests {
             )
             .unwrap();
         connection.tick(&mut packets_to_send, at(1000));
-        assert_eq!(3, packets_to_send.len());
+        assert_eq!(4, packets_to_send.len());
     }
 
     #[test]
