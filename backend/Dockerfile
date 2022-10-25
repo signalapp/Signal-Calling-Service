@@ -24,7 +24,7 @@ ENV RUSTFLAGS=$rust_flags
 WORKDIR /usr/src/calling-service
 
 # Create a stub version of the project to cache dependencies.
-RUN cargo new common
+RUN cargo new common --lib
 RUN cargo new backend
 RUN cargo new frontend
 
