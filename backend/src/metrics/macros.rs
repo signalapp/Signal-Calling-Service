@@ -10,8 +10,7 @@ use std::{
         Arc,
     },
 };
-
-use lazy_static::*;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
 use crate::metrics::{
@@ -39,9 +38,8 @@ pub struct Report {
     pub events: Vec<EventReport>,
 }
 
-lazy_static! {
-    pub static ref __METRICS: Metrics = Metrics::new_enabled();
-}
+pub static __METRICS: Lazy<Metrics> = Lazy::new(|| Metrics::new_enabled());
+
 
 impl Metrics {
     fn new_enabled() -> Metrics {
@@ -135,21 +133,22 @@ impl Metrics {
 #[macro_export]
 macro_rules! reporter {
     ($name:expr, $options:expr) => {{
-        lazy_static::lazy_static! {
-            pub static ref __REPORTER: std::sync::Arc<$crate::metrics::NumericValueReporter> =
-                $crate::metrics::__METRICS.create_and_register_timer($name, $options);
-        };
-        &__REPORTER
+        
+        static __REPORTER: once_cell::sync::OnceCell<std::sync::Arc<$crate::metrics::NumericValueReporter>> = once_cell::sync::OnceCell::new();
+
+        __REPORTER.get_or_init(|| $crate::metrics::__METRICS.create_and_register_timer($name, $options))
+
+        // &__REPORTER
     }};
 }
 
 #[macro_export]
 macro_rules! event_reporter {
     ($name:expr) => {{
-        lazy_static::lazy_static! {
-            pub static ref __REPORTER: std::sync::Arc<$crate::metrics::EventCountReporter> =
-                $crate::metrics::__METRICS.create_and_register_event($name);
-        };
+        
+        static __REPORTER: once_cell::sync::Lazy<std::sync::Arc<$crate::metrics::EventCountReporter>> =
+        once_cell::sync::Lazy::new(|| $crate::metrics::__METRICS.create_and_register_event($name));
+        
         &__REPORTER
     }};
 }

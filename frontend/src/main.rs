@@ -4,9 +4,6 @@
 //
 
 #[macro_use]
-extern crate lazy_static;
-
-#[macro_use]
 extern crate log;
 
 use std::sync::Arc;
@@ -26,10 +23,11 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-lazy_static! {
-    // Load the config and treat it as a read-only static value.
-    static ref CONFIG: config::Config = config::Config::parse();
-}
+use once_cell::sync::Lazy;
+
+// Load the config and treat it as a read-only static value.
+static CONFIG: Lazy<config::Config> = Lazy::new(|| config::Config::parse());
+
 
 #[rustfmt::skip]
 fn print_config(config: &'static config::Config) {
