@@ -488,10 +488,12 @@ mod http_server_tests {
     use std::time::Instant;
 
     use hex::{FromHex, ToHex};
-    use lazy_static::lazy_static;
+    use once_cell::sync::Lazy;
     use rand::{thread_rng, Rng};
 
     use calling_common::random_hex_string;
+
+    static CONFIG: Lazy<config::Config> = Lazy::new(config::default_test_config);
 
     use super::*;
 
@@ -657,9 +659,6 @@ mod http_server_tests {
 
     #[tokio::test]
     async fn test_authenticate() {
-        lazy_static! {
-            static ref CONFIG: config::Config = config::default_test_config();
-        }
         let config = &CONFIG;
 
         let result = authenticate(config, "1:2");
@@ -708,9 +707,6 @@ mod http_server_tests {
 
     #[tokio::test]
     async fn test_parse_and_authenticate() {
-        lazy_static! {
-            static ref CONFIG: config::Config = config::default_test_config();
-        }
         let config = &CONFIG;
 
         // Version 1: "username:1a:2b:1:"

@@ -892,7 +892,7 @@ mod sfu_tests {
     use std::{convert::TryFrom, net::IpAddr, ops::Add, str::FromStr, sync::Arc};
 
     use hex::{FromHex, ToHex};
-    use lazy_static::lazy_static;
+    use once_cell::sync::Lazy;
     use parking_lot::Mutex;
     use rand::{thread_rng, Rng};
 
@@ -924,9 +924,7 @@ mod sfu_tests {
         config
     }
 
-    lazy_static! {
-        static ref DEFAULT_CONFIG: config::Config = config::default_test_config();
-    }
+    static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(config::default_test_config);
 
     fn new_sfu(now: Instant, config: &'static config::Config) -> Arc<Mutex<Sfu>> {
         Arc::new(Mutex::new(
@@ -1211,10 +1209,9 @@ mod sfu_tests {
 
     const TICK_PERIOD_MS: u64 = 100;
     const INACTIVITY_TIMEOUT_SECS: u64 = 30;
-    lazy_static! {
-        static ref CUSTOM_CONFIG: config::Config =
-            custom_config(TICK_PERIOD_MS, INACTIVITY_TIMEOUT_SECS);
-    }
+
+    static CUSTOM_CONFIG: Lazy<config::Config> =
+        Lazy::new(|| custom_config(TICK_PERIOD_MS, INACTIVITY_TIMEOUT_SECS));
 
     #[tokio::test]
     async fn test_remove_clients() {

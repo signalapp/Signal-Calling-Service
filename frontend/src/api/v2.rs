@@ -172,9 +172,9 @@ mod api_server_v2_tests {
     use hmac::Mac;
     use http::{header, Request};
     use hyper::Body;
-    use lazy_static::lazy_static;
     use mockall::predicate::*;
     use mockall::Sequence;
+    use once_cell::sync::Lazy;
     use tower::ServiceExt;
 
     use crate::{
@@ -205,15 +205,13 @@ mod api_server_v2_tests {
     const BACKEND_ICE_PWD: &str = "backend-password";
     const BACKEND_DHE_PUBLIC_KEY: &str = "24c41251f82b1f3481cce4bdaab8976a";
 
-    lazy_static! {
-        static ref CONFIG: config::Config = {
-            let mut config = config::default_test_config();
-            config.authentication_key = AUTH_KEY.to_string();
-            config.region = LOCAL_REGION.to_string();
-            config.regional_url_template = "https://<region>.test.com".to_string();
-            config
-        };
-    }
+    static CONFIG: Lazy<config::Config> = Lazy::new(|| {
+        let mut config = config::default_test_config();
+        config.authentication_key = AUTH_KEY.to_string();
+        config.region = LOCAL_REGION.to_string();
+        config.regional_url_template = "https://<region>.test.com".to_string();
+        config
+    });
 
     fn generate_signed_v2_password(
         user_id_hex: &str,

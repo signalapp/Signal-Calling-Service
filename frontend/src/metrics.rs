@@ -26,6 +26,7 @@ use std::{
 
 use anyhow::Result;
 use log::*;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use psutil::process::Process;
 use tokio::sync::oneshot::Receiver;
@@ -230,9 +231,8 @@ fn get_value_metrics() -> Vec<(&'static str, f32)> {
 fn get_process_metrics() -> Vec<(&'static str, f32)> {
     let mut value_metrics = Vec::new();
 
-    lazy_static::lazy_static! {
-        static ref CURRENT_PROCESS: Mutex<Process> = Mutex::new(Process::current().expect("Can't get current process"));
-    }
+    static CURRENT_PROCESS: Lazy<Mutex<Process>> =
+        Lazy::new(|| Mutex::new(Process::current().expect("Can't get current process")));
 
     let mut current_process = CURRENT_PROCESS.lock();
 

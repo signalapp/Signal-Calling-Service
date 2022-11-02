@@ -469,7 +469,7 @@ pub async fn start(
 mod signaling_server_tests {
     use std::convert::TryInto;
 
-    use lazy_static::lazy_static;
+    use once_cell::sync::Lazy;
     use tokio::sync::oneshot;
     use warp::test::request;
 
@@ -487,16 +487,14 @@ mod signaling_server_tests {
         "b25387a93fd65599bacae4a8f8726e9e818ecf0bec3360593fe542cdb8e611a3-7715148009648537058";
     const UFRAG: &str = "Ouub";
 
-    lazy_static! {
-        static ref DEFAULT_CONFIG: config::Config = config::default_test_config();
+    static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(config::default_test_config);
 
-        // Load a config with no signaling_ip set.
-        static ref BAD_IP_CONFIG: config::Config = {
-            let mut config = config::default_test_config();
-            config.signaling_ip = None;
-            config
-        };
-    }
+    // Load a config with no signaling_ip set.
+    static BAD_IP_CONFIG: Lazy<config::Config> = Lazy::new(|| {
+        let mut config = config::default_test_config();
+        config.signaling_ip = None;
+        config
+    });
 
     fn new_sfu(now: Instant, config: &'static config::Config) -> Arc<Mutex<Sfu>> {
         Arc::new(Mutex::new(
