@@ -41,7 +41,6 @@ pub struct Report {
 
 pub static __METRICS: Lazy<Metrics> = Lazy::new(|| Metrics::new_enabled());
 
-
 impl Metrics {
     fn new_enabled() -> Metrics {
         Metrics {
@@ -134,8 +133,11 @@ impl Metrics {
 #[macro_export]
 macro_rules! reporter {
     ($name:expr, $options:expr) => {{
-        pub static __REPORTER: once_cell::sync::Lazy<std::sync::Arc<$crate::metrics::NumericValueReporter>> =
-                once_cell::sync::Lazy::new(|| $crate::metrics::__METRICS.create_and_register_timer($name, $options));
+        pub static __REPORTER: once_cell::sync::Lazy<
+            std::sync::Arc<$crate::metrics::NumericValueReporter>,
+        > = once_cell::sync::Lazy::new(|| {
+            $crate::metrics::__METRICS.create_and_register_timer($name, $options)
+        });
 
         &__REPORTER
     }};
@@ -144,9 +146,12 @@ macro_rules! reporter {
 #[macro_export]
 macro_rules! event_reporter {
     ($name:expr) => {{
-        pub static __REPORTER: once_cell::sync::Lazy<std::sync::Arc<$crate::metrics::EventCountReporter>> =
-                once_cell::sync::Lazy::new(|| $crate::metrics::__METRICS.create_and_register_event($name));
-                
+        pub static __REPORTER: once_cell::sync::Lazy<
+            std::sync::Arc<$crate::metrics::EventCountReporter>,
+        > = once_cell::sync::Lazy::new(|| {
+            $crate::metrics::__METRICS.create_and_register_event($name)
+        });
+
         &__REPORTER
     }};
 }

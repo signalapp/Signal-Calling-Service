@@ -23,10 +23,12 @@ log = "0.4"
 env_logger = "0.9"
 clap = { version = "3.0", features = ["derive"] }
 
+# for Initializing global static during runtime
+once_cell = "1.16.0"
+
 # For runtime and threading
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros"] }
-# lazy_static = "1.4"
-once_cell = "1.16.0"
+
 futures = "0.3"
 async-trait = "0.1.53"
 
