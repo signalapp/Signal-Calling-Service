@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::Result;
 use log::*;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use psutil::process::Process;
 use tokio::sync::oneshot::Receiver;
@@ -26,6 +27,9 @@ use crate::{
 use once_cell::sync::Lazy;
 
 static CURRENT_PROCESS: Lazy<Mutex<Process>> = Lazy::new(|| Mutex::new(Process::current().expect("Can't get current process")));
+
+static CURRENT_PROCESS: Lazy<Mutex<Process>> =
+    Lazy::new(|| Mutex::new(Process::current().expect("Can't get current process")));
 
 pub async fn start(
     config: &'static config::Config,

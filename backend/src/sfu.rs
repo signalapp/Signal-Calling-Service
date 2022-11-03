@@ -1191,10 +1191,9 @@ mod sfu_tests {
 
     const TICK_PERIOD_MS: u64 = 100;
     const INACTIVITY_TIMEOUT_SECS: u64 = 30;
-    
+
     static CUSTOM_CONFIG: Lazy<config::Config> =
-            Lazy::new(|| custom_config(TICK_PERIOD_MS, INACTIVITY_TIMEOUT_SECS));
-    
+        Lazy::new(|| custom_config(TICK_PERIOD_MS, INACTIVITY_TIMEOUT_SECS));
 
     #[tokio::test]
     async fn test_remove_clients() {

@@ -16,6 +16,7 @@ use calling_frontend::{
 };
 use clap::Parser;
 use env_logger::Env;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use tokio::{
     runtime,
@@ -23,11 +24,8 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-use once_cell::sync::Lazy;
-
 // Load the config and treat it as a read-only static value.
 static CONFIG: Lazy<config::Config> = Lazy::new(|| config::Config::parse());
-
 
 #[rustfmt::skip]
 fn print_config(config: &'static config::Config) {

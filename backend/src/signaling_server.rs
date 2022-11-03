@@ -489,11 +489,11 @@ mod signaling_server_tests {
 
     static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(|| config::default_test_config());
 
-        // Load a config with no signaling_ip set.
+    // Load a config with no signaling_ip set.
     static BAD_IP_CONFIG: Lazy<config::Config> = Lazy::new(|| {
-            let mut config = config::default_test_config();
-            config.signaling_ip = None;
-            config
+        let mut config = config::default_test_config();
+        config.signaling_ip = None;
+        config
     });
 
     fn new_sfu(now: Instant, config: &'static config::Config) -> Arc<Mutex<Sfu>> {
