@@ -184,6 +184,7 @@ impl Sfu {
     pub fn get_stats(&self) -> SfuStats {
         let mut histograms = HashMap::new();
         let mut values = HashMap::new();
+
         let mut all_clients = 0;
         let mut calls_above_one = 0;
         let mut clients_in_calls_above_one = 0;
@@ -230,6 +231,23 @@ impl Sfu {
         values.insert(
             "calling.sfu.calls.above_one.clients.count",
             clients_in_calls_above_one as f32,
+        );
+
+        let mut remembered_packet_count = Histogram::default();
+        let mut remembered_packet_bytes = Histogram::default();
+        for connection in self.connection_by_id.values() {
+            let connection = connection.lock();
+            let stats = connection.rtp_endpoint_stats();
+            remembered_packet_count.push(stats.remembered_packet_count);
+            remembered_packet_bytes.push(stats.remembered_packet_bytes);
+        }
+        histograms.insert(
+            "calling.sfu.connections.remembered_packets.count",
+            remembered_packet_count,
+        );
+        histograms.insert(
+            "calling.sfu.connections.remembered_packets.size_bytes",
+            remembered_packet_bytes,
         );
 
         SfuStats { histograms, values }

@@ -451,6 +451,10 @@ impl Connection {
         self.congestion_control.pacer.queued_size()
     }
 
+    pub fn rtp_endpoint_stats(&self) -> rtp::EndpointStats {
+        self.rtp.endpoint.stats()
+    }
+
     pub fn configure_congestion_control(
         &mut self,
         googcc_request: googcc::Request,

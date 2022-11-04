@@ -1338,6 +1338,18 @@ impl RtxSender {
             &PADDING_PAYLOAD[..],
         )
     }
+
+    fn remembered_packet_stats(&self) -> (usize, usize) {
+        let mut count = 0usize;
+        let mut sum_of_packets = 0usize;
+        self.previously_sent_by_seqnum
+            .iter()
+            .for_each(|(_, packet)| {
+                count += 1;
+                sum_of_packets += packet.serialized().len()
+            });
+        (count, sum_of_packets)
+    }
 }
 
 const SEQNUM_GAP_THRESHOLD: u32 = 500;
@@ -1488,6 +1500,11 @@ pub struct ProcessedControlPacket {
 pub struct Nack {
     pub ssrc: Ssrc,
     pub seqnums: Vec<TruncatedSequenceNumber>,
+}
+
+pub struct EndpointStats {
+    pub remembered_packet_count: usize,
+    pub remembered_packet_bytes: usize,
 }
 
 impl Endpoint {
@@ -1835,6 +1852,15 @@ impl Endpoint {
         )?;
         *next_outgoing_srtcp_index += 1;
         Some(serialized)
+    }
+
+    pub fn stats(&self) -> EndpointStats {
+        let (remembered_packet_count, remembered_packet_bytes) =
+            self.rtx_sender.remembered_packet_stats();
+        EndpointStats {
+            remembered_packet_count,
+            remembered_packet_bytes,
+        }
     }
 }
 

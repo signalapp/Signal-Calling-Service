@@ -60,6 +60,10 @@ where
     pub fn generation1_len(&self) -> usize {
         self.0.generation1.len()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.0.generation0.iter().chain(self.0.generation1.iter())
+    }
 }
 
 pub struct TwoGenerationCacheWithManualRemoveOld<K, V>
