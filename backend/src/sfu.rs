@@ -906,7 +906,7 @@ mod sfu_tests {
         config
     }
 
-    static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(|| config::default_test_config());
+    static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(config::default_test_config);
 
     fn new_sfu(now: Instant, config: &'static config::Config) -> Arc<Mutex<Sfu>> {
         Arc::new(Mutex::new(

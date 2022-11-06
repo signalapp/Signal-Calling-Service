@@ -39,7 +39,7 @@ pub struct Report {
     pub events: Vec<EventReport>,
 }
 
-pub static __METRICS: Lazy<Metrics> = Lazy::new(|| Metrics::new_enabled());
+pub static __METRICS: Lazy<Metrics> = Lazy::new(Metrics::new_enabled);
 
 impl Metrics {
     fn new_enabled() -> Metrics {

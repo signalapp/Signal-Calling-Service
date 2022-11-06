@@ -24,7 +24,7 @@ use tokio::{
 };
 
 // Load the config and treat it as a read-only static value.
-static CONFIG: Lazy<config::Config> = Lazy::new(|| config::Config::parse());
+static CONFIG: Lazy<config::Config> = Lazy::new(config::Config::parse);
 
 #[rustfmt::skip]
 fn print_config(config: &'static config::Config) {

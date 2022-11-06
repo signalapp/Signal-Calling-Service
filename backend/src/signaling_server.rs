@@ -487,7 +487,7 @@ mod signaling_server_tests {
         "b25387a93fd65599bacae4a8f8726e9e818ecf0bec3360593fe542cdb8e611a3-7715148009648537058";
     const UFRAG: &str = "Ouub";
 
-    static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(|| config::default_test_config());
+    static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(config::default_test_config);
 
     // Load a config with no signaling_ip set.
     static BAD_IP_CONFIG: Lazy<config::Config> = Lazy::new(|| {

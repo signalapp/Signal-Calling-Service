@@ -493,7 +493,7 @@ mod http_server_tests {
 
     use calling_common::random_hex_string;
 
-    static CONFIG: Lazy<config::Config> = Lazy::new(|| config::default_test_config());
+    static CONFIG: Lazy<config::Config> = Lazy::new(config::default_test_config);
 
     use super::*;
 
