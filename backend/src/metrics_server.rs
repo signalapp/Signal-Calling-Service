@@ -52,20 +52,25 @@ pub async fn start(
                         datadog.gauge(metric_name, value as f64, &None);
                     }
 
+                    {
+                        time_scope_us!("calling.sfu.get_stats");
+                        // Note that we are including the time waiting for the lock in this stat.
+
+                        let stats = sfu.lock().get_stats();
+                        for (name, histogram) in stats.histograms {
+                            datadog.send_count_histogram(name, &histogram, &None);
+                        }
+                        for (name, value) in stats.values {
+                            datadog.gauge(name, value as f64, &None);
+                        }
+                    }
+
                     let report = metrics!().report();
                     for report in report.histograms {
                         datadog.send_timer_histogram(&report, &None);
                     }
                     for report in report.events {
                         datadog.count(report.name(), report.event_count() as f64, &None);
-                    }
-
-                    let stats = sfu.lock().get_stats();
-                    for (name, histogram) in stats.histograms {
-                        datadog.send_count_histogram(name, &histogram, &None);
-                    }
-                    for (name, value) in stats.values {
-                        datadog.gauge(name, value as f64, &None);
                     }
                 }
             });
