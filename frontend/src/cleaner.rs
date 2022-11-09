@@ -8,6 +8,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use calling_common::Duration;
 use log::*;
+use rand::{thread_rng, Rng};
 use tokio::sync::oneshot::Receiver;
 
 use crate::{
@@ -21,9 +22,13 @@ pub async fn start(frontend: Arc<Frontend>, ender_rx: Receiver<()>) -> Result<()
     // Spawn a normal (cooperative) task to cleanup calls from storage periodically.
     let cleaner_handle = tokio::spawn(async move {
         loop {
+            // Add up to 5% delay on the cleanup interval
+            // so that instances started simultaneously don't try to clean simultaneously.
+            let jitter = (cleanup_interval / 100) * thread_rng().gen_range(0..=5);
+
             // Use sleep() instead of interval() so that we never wait *less* than one
             // interval to do the next tick.
-            tokio::time::sleep(cleanup_interval.into()).await;
+            tokio::time::sleep((cleanup_interval + jitter).into()).await;
 
             let cleaner_timer = start_timer_us!("calling.frontend.cleaner.timed");
 
