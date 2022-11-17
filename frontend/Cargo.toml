@@ -63,4 +63,3 @@ psutil = { version = "3.2.2", default-features = false, features = ["process"] }
 [dev-dependencies]
 mockall = "0.11.0"
 mock_instant = { version = "0.2" }
-tokio-stream = "0.1"

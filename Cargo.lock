@@ -580,7 +580,6 @@ dependencies = [
  "subtle",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tower",
 ]
 
