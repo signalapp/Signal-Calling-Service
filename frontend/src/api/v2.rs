@@ -55,6 +55,7 @@ pub struct JoinResponse {
     pub ice_ufrag: String,
     pub ice_pwd: String,
     pub dhe_public_key: String,
+    pub call_creator: String,
 }
 
 fn temporary_redirect(uri: &str) -> Result<axum::response::Response, StatusCode> {
@@ -157,6 +158,7 @@ pub async fn join(
         ice_ufrag: response.ice_ufrag,
         ice_pwd: response.ice_pwd,
         dhe_public_key: response.dhe_public_key,
+        call_creator: call.creator,
     })
     .into_response())
 }
@@ -669,6 +671,7 @@ mod api_server_v2_tests {
             join_response.dhe_public_key,
             BACKEND_DHE_PUBLIC_KEY.to_string()
         );
+        assert_eq!(&join_response.call_creator, USER_ID_1);
     }
 
     /// Invoke the "PUT /v2/conference/participants" to join in the case where there is a call.
@@ -753,6 +756,7 @@ mod api_server_v2_tests {
             join_response.dhe_public_key,
             BACKEND_DHE_PUBLIC_KEY.to_string()
         );
+        assert_eq!(&join_response.call_creator, USER_ID_1);
     }
 
     /// Invoke the "PUT /v2/conference/participants" to join in the case where the call is
