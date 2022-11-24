@@ -13,11 +13,7 @@ jobs:
     - name: Install protoc
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
     - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        override: true
-        profile: minimal
-        components: rustfmt, clippy
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal --component rustfmt,clippy
     - run: shellcheck **/*.sh
     - name: Environment
       run: rustup --version && cargo --version
@@ -25,16 +21,10 @@ jobs:
       run: cargo build
     - name: Format
       run: cargo fmt -- --check
-    - uses: actions-rs/clippy-check@v1
-      with:
-        name: Clippy
-        token: ${{ secrets.GITHUB_TOKEN }}
-        args: --all-targets -- -D warnings
-    - uses: actions-rs/clippy-check@v1
-      with:
-        name: Clippy (generic UDP)
-        token: ${{ secrets.GITHUB_TOKEN }}
-        args: --no-default-features -- -D warnings
+    - name: Clippy
+      run: cargo clippy --all-targets -- -D warnings
+    - name: Clippy (generic UDP)
+      run: cargo clippy --no-default-features -- -D warnings
     - name: Clippy (fuzz targets)
       # Use the latest compiler for this; without a lockfile,
       # the Minimum Supported Rust Version of dependencies might be higher.
