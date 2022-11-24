@@ -4,6 +4,6 @@ quiet = false
 
 [advisories]
 ignore = [
-    # Ignore advisory for time; the issue depends on modifying the environment across threads. It's not impossible but it's very unlikely in our use cases.
-    "RUSTSEC-2020-0071",
+    # Ignore Windows-only advisory for atty
+    "RUSTSEC-2021-0145",
 ]
