@@ -76,6 +76,8 @@ nix = { version = "0.25", optional = true }
 # For current process memory stats
 psutil = { version = "3.2.2", default-features = false, features = ["process"] }
 
+accounting-allocator = "0.1"
+
 [build-dependencies]
 prost-build = "0.11"
 

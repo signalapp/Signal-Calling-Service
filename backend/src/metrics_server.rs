@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use accounting_allocator::{AccountingAlloc, AllocCounts};
 use anyhow::Result;
 use log::*;
 use once_cell::sync::Lazy;
@@ -24,6 +25,9 @@ use crate::{
     },
     sfu::Sfu,
 };
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: AccountingAlloc = AccountingAlloc::new();
 
 static CURRENT_PROCESS: Lazy<Mutex<Process>> =
     Lazy::new(|| Mutex::new(Process::current().expect("Can't get current process")));
@@ -47,6 +51,7 @@ pub async fn start(
         Some(mut datadog) => {
             let tick_handle = tokio::spawn(async move {
                 let mut tick_interval = tokio::time::interval(Duration::from_secs(60));
+                let mut last_alloc = 0;
 
                 loop {
                     tick_interval.tick().await;
@@ -76,6 +81,19 @@ pub async fn start(
                     for report in report.events {
                         datadog.count(report.name(), report.event_count() as f64, &None);
                     }
+
+                    let AllocCounts { alloc, dealloc } = GLOBAL_ALLOCATOR.count();
+                    datadog.count(
+                        "calling.system.memory.new_alloc_bytes",
+                        (alloc - last_alloc) as f64,
+                        &None,
+                    );
+                    datadog.gauge(
+                        "calling.system.memory.net_alloc_bytes",
+                        (alloc - dealloc) as f64,
+                        &None,
+                    );
+                    last_alloc = alloc;
                 }
             });
 
