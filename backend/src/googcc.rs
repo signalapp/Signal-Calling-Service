@@ -8,6 +8,7 @@
 use std::{
     cmp::{max, min},
     pin::Pin,
+    sync::Arc,
     task::Poll,
 };
 
@@ -18,6 +19,7 @@ use futures::{
     stream::{Stream, StreamExt},
     FutureExt,
 };
+use parking_lot::Mutex;
 
 use crate::transportcc::Ack;
 
@@ -78,7 +80,7 @@ pub struct Request {
 }
 
 pub struct CongestionController {
-    requests_sender: Sender<Request>,
+    current_request: Arc<Mutex<Option<Request>>>,
     acks_sender1: Sender<Vec<Ack>>,
     acks_sender2: Sender<Vec<Ack>>,
     acks_sender3: Sender<Vec<Ack>>,
@@ -87,7 +89,7 @@ pub struct CongestionController {
 
 impl CongestionController {
     pub fn new(config: Config, now: Instant) -> Self {
-        //                                       Acks                                       Requests
+        //                                       Acks                                    Latest Request
         //                                        |                                            |
         //             +--------------------------+--------------------------+                 |
         //             |                          |                          |                 |
@@ -112,7 +114,8 @@ impl CongestionController {
         //                        +----v----------v--------v----+                              |
         //                        | calculate_target_send_rates <------------------------------+
         //                        +-----------------------------+
-        let (requests_sender, requests) = unbounded_channel_that_must_not_fail();
+        let current_request: Arc<Mutex<Option<Request>>> = Arc::default();
+        let current_request_for_stream = current_request.clone();
         let (acks_sender1, ack_reports1) = unbounded_channel_that_must_not_fail();
         let (acks_sender2, ack_reports2) = unbounded_channel_that_must_not_fail();
         let (acks_sender3, ack_reports3) = unbounded_channel_that_must_not_fail();
@@ -123,14 +126,20 @@ impl CongestionController {
         let target_send_rates = calculate_target_send_rates(
             config,
             now,
-            requests,
+            futures::stream::poll_fn(move |_| {
+                if let Some(request) = current_request_for_stream.lock().take() {
+                    Poll::Ready(Some(request))
+                } else {
+                    Poll::Pending
+                }
+            }),
             feedback_rtts.latest_only(),
             acked_rates.latest_only(),
             delay_directions.latest_only(),
         );
 
         Self {
-            requests_sender,
+            current_request,
             acks_sender1,
             acks_sender2,
             acks_sender3,
@@ -139,7 +148,7 @@ impl CongestionController {
     }
 
     pub fn request(&mut self, request: Request) {
-        self.requests_sender.send(request);
+        *self.current_request.lock() = Some(request);
     }
 
     pub fn recalculate_target_send_rate(&mut self, mut acks: Vec<Ack>) -> Option<DataRate> {
