@@ -8,18 +8,14 @@
 use std::{
     cmp::{max, min},
     pin::Pin,
-    sync::Arc,
     task::Poll,
 };
 
-use async_stream::stream;
 use calling_common::{exponential_moving_average, DataRate, DataSize, Duration, Instant, Square};
 use futures::{
-    pin_mut,
     stream::{Stream, StreamExt},
     FutureExt,
 };
-use parking_lot::Mutex;
 
 use crate::transportcc::Ack;
 
@@ -80,11 +76,14 @@ pub struct Request {
 }
 
 pub struct CongestionController {
-    current_request: Arc<Mutex<Option<Request>>>,
+    current_request: Option<Request>,
     acks_sender1: Sender<Vec<Ack>>,
     acks_sender2: Sender<Vec<Ack>>,
     acks_sender3: Sender<Vec<Ack>>,
-    target_send_rates: Pin<Box<dyn Stream<Item = DataRate> + Send>>,
+    feedback_rtts: Pin<Box<dyn Stream<Item = Duration> + Send>>,
+    acked_rates: Pin<Box<dyn Stream<Item = DataRate> + Send>>,
+    delay_directions: Pin<Box<dyn Stream<Item = (Instant, DelayDirection)> + Send>>,
+    calculator: TargetCalculator,
 }
 
 impl CongestionController {
@@ -114,41 +113,30 @@ impl CongestionController {
         //                        +----v----------v--------v----+                              |
         //                        | calculate_target_send_rates <------------------------------+
         //                        +-----------------------------+
-        let current_request: Arc<Mutex<Option<Request>>> = Arc::default();
-        let current_request_for_stream = current_request.clone();
         let (acks_sender1, ack_reports1) = unbounded_channel_that_must_not_fail();
         let (acks_sender2, ack_reports2) = unbounded_channel_that_must_not_fail();
         let (acks_sender3, ack_reports3) = unbounded_channel_that_must_not_fail();
-        let feedback_rtts = estimate_feedback_rtts(ack_reports1);
-        let acked_rates = estimate_acked_rates(ack_reports2.flat_map(futures::stream::iter));
+        let feedback_rtts = estimate_feedback_rtts(ack_reports1).latest_only();
+        let acked_rates =
+            estimate_acked_rates(ack_reports2.flat_map(futures::stream::iter)).latest_only();
         let delay_directions =
-            calculate_delay_directions(ack_reports3.flat_map(futures::stream::iter));
-        let target_send_rates = calculate_target_send_rates(
-            config,
-            now,
-            futures::stream::poll_fn(move |_| {
-                if let Some(request) = current_request_for_stream.lock().take() {
-                    Poll::Ready(Some(request))
-                } else {
-                    Poll::Pending
-                }
-            }),
-            feedback_rtts.latest_only(),
-            acked_rates.latest_only(),
-            delay_directions.latest_only(),
-        );
+            calculate_delay_directions(ack_reports3.flat_map(futures::stream::iter)).latest_only();
+        let calculator = TargetCalculator::new(config, now);
 
         Self {
-            current_request,
+            current_request: None,
             acks_sender1,
             acks_sender2,
             acks_sender3,
-            target_send_rates: Box::pin(target_send_rates.latest_only()),
+            feedback_rtts: Box::pin(feedback_rtts),
+            acked_rates: Box::pin(acked_rates),
+            delay_directions: Box::pin(delay_directions),
+            calculator,
         }
     }
 
     pub fn request(&mut self, request: Request) {
-        *self.current_request.lock() = Some(request);
+        self.current_request = Some(request);
     }
 
     pub fn recalculate_target_send_rate(&mut self, mut acks: Vec<Ack>) -> Option<DataRate> {
@@ -161,87 +149,108 @@ impl CongestionController {
         self.acks_sender1.send(acks.clone());
         self.acks_sender2.send(acks.clone());
         self.acks_sender3.send(acks);
-        self.target_send_rates
+
+        let rtt = self
+            .feedback_rtts
             .next()
             .now_or_never()
-            .map(|next| next.expect("stream should never end"))
+            .map(|next| next.expect("stream should never end"));
+        let acked_rate = self
+            .acked_rates
+            .next()
+            .now_or_never()
+            .map(|next| next.expect("stream should never end"));
+
+        let delay_direction = self
+            .delay_directions
+            .next()
+            .now_or_never()
+            .map(|next| next.expect("stream should never end"));
+
+        self.calculator
+            .next(&mut self.current_request, delay_direction, rtt, acked_rate)
     }
 }
 
-// Yields target send rates
-fn calculate_target_send_rates(
+struct TargetCalculator {
+    acked_rate: Option<DataRate>,
+    acked_rate_when_overusing: RateAverager,
     config: Config,
-    start_time: Instant,
-    requests: impl Stream<Item = Request>,
-    feedback_rtts: impl Stream<Item = Duration>,
-    acked_rates: impl Stream<Item = DataRate>,
-    delay_directions: impl Stream<Item = (Instant, DelayDirection)>,
-) -> impl Stream<Item = DataRate> {
-    let multiplicative_increase_per_second: f64 = 0.08;
-    let min_multiplicative_increase = DataRate::from_kbps(1);
-    let additive_increase_per_rtt = DataSize::from_bytes(1200);
-    let additive_increase_rtt_pad = Duration::from_millis(100);
-    let min_additive_increase_per_second = DataRate::from_kbps(4);
-    let min_rtt_for_decrease = Duration::from_millis(10);
-    let max_rtt_for_decrease = Duration::from_millis(200);
-    let decrease_from_acked_rate_multiplier = 0.85;
+    previous_direction: Option<DelayDirection>,
+    requested: Request,
+    rtt: Duration,
+    target_send_rate: DataRate,
+    target_send_rate_updated: Instant,
+}
 
-    stream! {
-        let mut requested = Request {
-            // Basically use the config.initial_target_send_rate instead.
-            base: DataRate::ZERO,
-            // Basically uncapped until we receive a request.
-            ideal: config.max_target_send_rate,
-        };
-        let mut rtt = Duration::from_millis(100); // This shouldn't ever be used.
-        let mut acked_rate = None;
-        let mut previous_direction = None;
-        let mut acked_rate_when_overusing = RateAverager::new();
-        let mut target_send_rate = config.initial_target_send_rate;
-        let mut target_send_rate_updated = start_time;
+impl TargetCalculator {
+    fn new(config: Config, start_time: Instant) -> Self {
+        Self {
+            acked_rate: None,
+            acked_rate_when_overusing: RateAverager::new(),
+            previous_direction: None,
+            requested: Request {
+                // Basically use the config.initial_target_send_rate instead.
+                base: DataRate::ZERO,
+                // Basically uncapped until we receive a request.
+                ideal: config.max_target_send_rate,
+            },
+            rtt: Duration::from_millis(100),
+            target_send_rate: config.initial_target_send_rate,
+            target_send_rate_updated: start_time,
+            config,
+        }
+    }
 
-        pin_mut!(requests);
-        pin_mut!(feedback_rtts);
-        pin_mut!(acked_rates);
-        pin_mut!(delay_directions);
-        while let Some((now, direction)) = delay_directions.next().await {
+    fn next(
+        &mut self,
+        request: &mut Option<Request>,
+        delay_directions: Option<(Instant, DelayDirection)>,
+        rtt: Option<Duration>,
+        acked_rate: Option<DataRate>,
+    ) -> Option<DataRate> {
+        const MULTIPLICATIVE_INCREASE_PER_SECOND: f64 = 0.08;
+        const MIN_MULTIPLICATIVE_INCREASE: DataRate = DataRate::from_kbps(1);
+        const ADDITIVE_INCREASE_PER_RTT: DataSize = DataSize::from_bytes(1200);
+        const ADDITIVE_INCREASE_RTT_PAD: Duration = Duration::from_millis(100);
+        const MIN_ADDITIVE_INCREASE_PER_SECOND: DataRate = DataRate::from_kbps(4);
+        const MIN_RTT_FOR_DECREASE: Duration = Duration::from_millis(10);
+        const MAX_RTT_FOR_DECREASE: Duration = Duration::from_millis(200);
+        const DECREASE_FROM_ACKED_RATE_MULTIPLIER: f64 = 0.85;
+
+        if let Some(rtt) = rtt {
+            self.rtt = rtt;
+        }
+
+        if let Some(acked_rate) = acked_rate {
+            self.acked_rate = Some(acked_rate);
+        }
+
+        if let Some((now, direction)) = delay_directions {
             let mut reset_to_initial = false;
-            if let Some(request) = requests
-                .next()
-                .now_or_never()
-                .flatten() {
-                let previously_requested = std::mem::replace(&mut requested, request);
+            if let Some(request) = request.take() {
+                let previously_requested = std::mem::replace(&mut self.requested, request);
                 // We pick a value that is a common threshold for a client requesting very little,
                 // such as one video at the lowest resolution.  Anything smaller than that is
                 // considered low enough that googcc can't operate well (at least until we add probing)
                 // So when we transition out of such a state, we reset googcc.
                 let tiny_send_rate: DataRate = DataRate::from_kbps(150);
                 let previous_ideal_was_tiny = previously_requested.ideal <= tiny_send_rate;
-                let current_ideal_is_tiny = requested.ideal <= tiny_send_rate;
-                let initial_target_send_rate = max(config.initial_target_send_rate, requested.base * 0.5);
-                let target_below_initial = target_send_rate < initial_target_send_rate;
-                if (previous_ideal_was_tiny && !current_ideal_is_tiny && target_below_initial) {
+                let current_ideal_is_tiny = self.requested.ideal <= tiny_send_rate;
+                let initial_target_send_rate = max(
+                    self.config.initial_target_send_rate,
+                    self.requested.base * 0.5,
+                );
+                let target_below_initial = self.target_send_rate < initial_target_send_rate;
+                if previous_ideal_was_tiny && !current_ideal_is_tiny && target_below_initial {
                     // We were previously limited by a tiny ideal send rate,
                     // but are no longer, and we're below the initial send
                     // rate, so it's like we've started all over.
                     // Might as well just jump up to the initial rate.
-                    target_send_rate = initial_target_send_rate;
+                    self.target_send_rate = initial_target_send_rate;
                     reset_to_initial = true;
                 }
             }
-
-            // Allow either of these streams to still be pending, in which case we use the
-            // value recorded from the last loop.
-            rtt = feedback_rtts
-                .next()
-                .now_or_never()
-                .map(|next| next.expect("stream should not end before delay_directions"))
-                .unwrap_or(rtt);
-            acked_rate = acked_rates
-                .next()
-                .now_or_never()
-                .map(|next| next.expect("stream should not end before delay_directions"))
-                .or(acked_rate);
 
             let changed_target_send_rate: Option<DataRate> = match direction {
                 DelayDirection::Decreasing => {
@@ -251,76 +260,83 @@ fn calculate_target_send_rates(
                 }
                 DelayDirection::Steady => {
                     // While delay is steady, increase the target rate.
-                    if let Some(acked_rate) = acked_rate {
-                        acked_rate_when_overusing.reset_if_sample_out_of_bounds(acked_rate);
+                    if let Some(acked_rate) = self.acked_rate {
+                        self.acked_rate_when_overusing
+                            .reset_if_sample_out_of_bounds(acked_rate);
                     }
 
-                    let increase_duration = if previous_direction != Some(DelayDirection::Steady) {
-                        // This is a strange thing where the first "steady" we have after an
-                        // increase/decrease basically only increases the rate a little or not at
-                        // all. This is because we don't know how long it's been steady.
-                        Duration::ZERO
-                    } else {
-                        now.saturating_duration_since(target_send_rate_updated)
-                    };
+                    let increase_duration =
+                        if self.previous_direction != Some(DelayDirection::Steady) {
+                            // This is a strange thing where the first "steady" we have after an
+                            // increase/decrease basically only increases the rate a little or not at
+                            // all. This is because we don't know how long it's been steady.
+                            Duration::ZERO
+                        } else {
+                            now.saturating_duration_since(self.target_send_rate_updated)
+                        };
                     // If we don't have a good average acked_rate when overusing,
                     // use a faster increase (8%-16% per second)
                     // Otherwise, use a slower increase (1200 bytes per RTT).
                     let should_do_multiplicative_increase =
-                        acked_rate_when_overusing.average().is_none();
+                        self.acked_rate_when_overusing.average().is_none();
                     let increase = if should_do_multiplicative_increase {
-                        let multiplicative_increase_per_second = if target_send_rate < requested.base {
-                            // If we're below the requested base rate, increase more aggressively
-                            multiplicative_increase_per_second * 2.0
-                        } else {
-                            multiplicative_increase_per_second
-                        };
+                        let multiplicative_increase_per_second =
+                            if self.target_send_rate < self.requested.base {
+                                // If we're below the requested base rate, increase more aggressively
+                                MULTIPLICATIVE_INCREASE_PER_SECOND * 2.0
+                            } else {
+                                MULTIPLICATIVE_INCREASE_PER_SECOND
+                            };
                         let multiplier = (1.0 + multiplicative_increase_per_second)
                             .powf(increase_duration.as_secs_f64().min(1.0))
                             - 1.0;
-                        max(min_multiplicative_increase, target_send_rate * multiplier)
+                        max(
+                            MIN_MULTIPLICATIVE_INCREASE,
+                            self.target_send_rate * multiplier,
+                        )
                     } else {
-                        let padded_rtt = rtt + additive_increase_rtt_pad;
+                        let padded_rtt = self.rtt + ADDITIVE_INCREASE_RTT_PAD;
                         let increase_per_second = max(
-                            min_additive_increase_per_second,
-                            additive_increase_per_rtt / padded_rtt,
+                            MIN_ADDITIVE_INCREASE_PER_SECOND,
+                            ADDITIVE_INCREASE_PER_RTT / padded_rtt,
                         );
                         increase_per_second * increase_duration.as_secs_f64()
                     };
-                    let mut increased_rate = target_send_rate + increase;
+                    let mut increased_rate = self.target_send_rate + increase;
                     // If we have an acked_rate, never increase over 150% of it.
-                    if let Some(acked_rate) = acked_rate {
+                    if let Some(acked_rate) = self.acked_rate {
                         let acked_rate_based_limit = (acked_rate * 1.5) + DataRate::from_kbps(10);
                         increased_rate = min(acked_rate_based_limit, increased_rate);
                     }
                     // Don't end up decreasing when we were supposed to increase.
-                    let increased_rate = max(target_send_rate, increased_rate);
+                    let increased_rate = max(self.target_send_rate, increased_rate);
                     Some(increased_rate)
                 }
                 DelayDirection::Increasing => {
                     // If the delay is increasing, decrease the rate.
-                    if let Some(acked_rate) = acked_rate {
+                    if let Some(acked_rate) = self.acked_rate {
                         // We have an acked rate, so reduce based on that.
                         if (now
-                            >= target_send_rate_updated
-                                + rtt.clamp(min_rtt_for_decrease, max_rtt_for_decrease))
-                            || (acked_rate <= target_send_rate * 0.5)
+                            >= self.target_send_rate_updated
+                                + self.rtt.clamp(MIN_RTT_FOR_DECREASE, MAX_RTT_FOR_DECREASE))
+                            || (acked_rate <= self.target_send_rate * 0.5)
                         {
                             let mut decreased_rate =
-                                acked_rate * decrease_from_acked_rate_multiplier;
-                            if decreased_rate > target_send_rate {
+                                acked_rate * DECREASE_FROM_ACKED_RATE_MULTIPLIER;
+                            if decreased_rate > self.target_send_rate {
                                 if let Some(average_acked_rate_when_overusing) =
-                                    acked_rate_when_overusing.average()
+                                    self.acked_rate_when_overusing.average()
                                 {
                                     decreased_rate = average_acked_rate_when_overusing
-                                        * decrease_from_acked_rate_multiplier;
+                                        * DECREASE_FROM_ACKED_RATE_MULTIPLIER;
                                 }
                             }
-                            acked_rate_when_overusing.reset_if_sample_out_of_bounds(acked_rate);
-                            acked_rate_when_overusing.add_sample(acked_rate);
+                            self.acked_rate_when_overusing
+                                .reset_if_sample_out_of_bounds(acked_rate);
+                            self.acked_rate_when_overusing.add_sample(acked_rate);
 
                             // Don't accidentally increase the estimated rate!
-                            let decreased_rate = min(target_send_rate, decreased_rate);
+                            let decreased_rate = min(self.target_send_rate, decreased_rate);
                             Some(decreased_rate)
                         } else {
                             // Wait until the next period that we're increasing to decrease (or until the acked_rate drops).
@@ -329,31 +345,77 @@ fn calculate_target_send_rates(
                         }
                     } else {
                         // We're increasing before we even have an acked rate.  Aggressively reduce.
-                        let decreased_rate = target_send_rate / 2.0;
+                        let decreased_rate = self.target_send_rate / 2.0;
                         Some(decreased_rate)
                     }
                 }
             };
 
             // Apply clamping to any change, including a change because of resetting to initial.
-            if changed_target_send_rate.is_some() || reset_to_initial {
-                target_send_rate = config.clamp_target_send_rate(changed_target_send_rate.unwrap_or(target_send_rate));
-                target_send_rate_updated = now;
-                yield target_send_rate
-            }
+            self.previous_direction = Some(direction);
 
-            previous_direction = Some(direction);
+            if changed_target_send_rate.is_some() || reset_to_initial {
+                self.target_send_rate = self.config.clamp_target_send_rate(
+                    changed_target_send_rate.unwrap_or(self.target_send_rate),
+                );
+                self.target_send_rate_updated = now;
+                return Some(self.target_send_rate);
+            }
         }
+        None
     }
 }
 
 #[cfg(test)]
 mod calculate_target_send_rates_tests {
+    use async_stream::stream;
     use futures::future::ready;
+    use futures::pin_mut;
     use unzip3::Unzip3;
 
     use super::*;
 
+    // stream based api was kept to retain tests, after otherwise refactoring into TargetCalculator::next()
+    fn calculate_target_send_rates(
+        config: Config,
+        start_time: Instant,
+        requests: impl Stream<Item = Request>,
+        feedback_rtts: impl Stream<Item = Duration>,
+        acked_rates: impl Stream<Item = DataRate>,
+        delay_directions: impl Stream<Item = (Instant, DelayDirection)>,
+    ) -> impl Stream<Item = DataRate> {
+        stream! {
+
+            pin_mut!(requests);
+            pin_mut!(feedback_rtts);
+            pin_mut!(acked_rates);
+            pin_mut!(delay_directions);
+
+            let mut calculator = TargetCalculator::new(config, start_time);
+
+            while let Some((now, direction)) = delay_directions.next().await {
+                let mut request = requests
+                    .next()
+                    .now_or_never()
+                    .flatten();
+
+                // Allow either of these streams to still be pending, in which case we use the
+                // value recorded from the last loop.
+                let rtt = feedback_rtts
+                    .next()
+                    .now_or_never()
+                    .map(|next| next.expect("stream should not end before delay_directions"));
+                let acked_rate = acked_rates
+                    .next()
+                    .now_or_never()
+                    .map(|next| next.expect("stream should not end before delay_directions"));
+
+                if let Some(target_send_rate) = calculator.next(&mut request, Some((now, direction)), rtt, acked_rate) {
+                    yield target_send_rate
+                }
+            }
+        }
+    }
     fn instants_at_regular_intervals(
         start: Instant,
         interval: Duration,

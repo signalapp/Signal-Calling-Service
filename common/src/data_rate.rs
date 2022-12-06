@@ -51,15 +51,15 @@ impl DataSize {
         self.bits
     }
 
-    pub fn as_bytes(&self) -> u64 {
+    pub const fn as_bytes(&self) -> u64 {
         self.bits / Self::BITS_PER_BYTE
     }
 
-    pub fn from_bytes(bytes: u64) -> Self {
+    pub const fn from_bytes(bytes: u64) -> Self {
         Self::from_bits(bytes * Self::BITS_PER_BYTE)
     }
 
-    pub fn from_kilobits(kbits: u64) -> Self {
+    pub const fn from_kilobits(kbits: u64) -> Self {
         Self::from_bits(kbits * Self::BITS_PER_KILO_BIT)
     }
 
@@ -288,11 +288,11 @@ impl DataRate {
         Self { size_per_second }
     }
 
-    pub fn from_bps(bps: u64) -> Self {
+    pub const fn from_bps(bps: u64) -> Self {
         Self::per_second(DataSize::from_bits(bps))
     }
 
-    pub fn from_kbps(kbps: u64) -> Self {
+    pub const fn from_kbps(kbps: u64) -> Self {
         Self::per_second(DataSize::from_kilobits(kbps))
     }
 
