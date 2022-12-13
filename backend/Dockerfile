@@ -26,10 +26,12 @@ WORKDIR /usr/src/calling-service
 # Create a stub version of the project to cache dependencies.
 RUN cargo new common --lib
 RUN cargo new backend
+RUN cargo new docker/bootstrap
 RUN cargo new frontend
 
 COPY Cargo.toml Cargo.lock rust-toolchain ./
 COPY common/Cargo.toml ./common/
+COPY docker/bootstrap/Cargo.toml ./docker/bootstrap/
 COPY backend/Cargo.toml ./backend/
 
 # Do the initial stub build.

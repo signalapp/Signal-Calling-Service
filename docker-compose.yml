@@ -1,0 +1,170 @@
+#
+# Copyright 2019-2022 Signal Messenger, LLC
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+
+# This Docker Compose file is used for running and testing a local deployment of the Calling Service.
+#
+# Prerequisites
+# If you plan to actually connect and carry out a group call, you need to do the following in this file:
+#   - Set the CALLING_AUTH_KEY to a valid key unless you have removed its use from the code.
+#   - Set the calling-backend IPs to that of your local host
+#
+# To use:
+#   $ docker compose build
+#   $ docker compose up
+#
+# Now you can access the Calling Service.
+#
+# Option 1:
+#   1) Point a tool like Postman to http://<host ip>:8090/v2/conference/participants
+#   2) Be sure to set the Basic Auth Password to a valid signature token
+#     - You can also modify the code to ignore the auth check
+#   3) Repeat for the other APIs
+#
+# Option 2:
+#   1) Go to this URL to find the ngrok http address that points to your frontend: http://localhost:4551
+#   2) Modify Desktop code to ignore TLS certificate errors. Add this line in calling.ts, CallingClass.initialize:
+#      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+#
+#      Or, if you are running from source, you can do this:
+#      $ NODE_TLS_REJECT_UNAUTHORIZED=0 yarn start
+#
+#   3) Build the Desktop with `yarn generate` (assuming you already did the `yarn install` parts before.
+#   4) Run the Desktop client.
+#   5) In the client's Developer Tools console, enter this:
+#      window.Signal.Services.calling.sfuUrl = "<ngrok http address>";
+#      Then press Enter.
+#   6) Now when your client connects to a group call, it should be using this environment!
+#
+# Option 3:
+#   TBD: Use the gctc (Group Call Test Client)
+#
+
+version: '3.8'
+
+services:
+
+  dynamodb:
+    image: "amazon/dynamodb-local:latest"
+    container_name: dynamodb
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    ports:
+      - "8000:8000"
+    working_dir: /home/dynamodblocal
+    command:
+      # Use -inMemory for performance and because the data is temporary.
+      -jar DynamoDBLocal.jar -inMemory
+
+  # Sets up the table for the Calling Frontend. This sets up a table here:
+  #   region: us-west-1
+  #   table name: Conferences
+  bootstrap:
+    depends_on:
+      - dynamodb
+    build: ./docker/bootstrap
+    container_name: bootstrap
+    environment:
+      AWS_ACCESS_KEY_ID: 'DUMMY_KEY'
+      AWS_SECRET_ACCESS_KEY: 'DUMMY_PASSWORD'
+
+  calling-frontend:
+    depends_on:
+      - dynamodb
+      - bootstrap
+      - calling-backend
+    build:
+      args:
+        rust_flags: -Ctarget-cpu=native
+      dockerfile: frontend/Dockerfile
+      context: .
+    container_name: calling-frontend
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 5G
+    ports:
+      # Note: The frontend can be accessed via port 8090 externally.
+      - "8090:8080"
+    entrypoint: calling_frontend
+    command:
+      - --region
+      - "us-west-1"
+      - --authentication-key
+      # Set the auth key to the one you want, but do not commit with it!
+      - "deaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddead"
+      - --version
+      - "1"
+      - --max-clients-per-call
+      - "50"
+      - --cleanup-interval-ms
+      - "10000"
+      - --regional-url-template
+      - "http://calling-frontend:8080"
+      - --calling-server-url
+      - "http://calling-backend:8080"
+      - --storage-table
+      - "Conferences"
+      - --storage-endpoint
+      - "http://dynamodb:8000"
+      - --storage-region
+      - "us-west-1"
+
+  calling-backend:
+    build:
+      args:
+        rust_flags: -Ctarget-cpu=native
+      dockerfile: backend/Dockerfile
+      context: .
+    container_name: calling-backend
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 5G
+    ports:
+      - "8080:8080"
+      - "10000:10000/udp"
+    entrypoint: calling_backend
+    command:
+      # Set these IPs to your host's IP if you need to access it externally.
+      - --ice-candidate-ip
+      - "127.0.0.1"
+      - --signaling-ip
+      - "127.0.0.1"
+      - --inactivity-timeout-secs
+      - "60"
+      - --diagnostics-interval-secs
+      - "10"
+
+  # Go here on the host to find out the ngrok tunnel URL: http://localhost:4551
+  ngrok-frontend:
+    depends_on:
+      - calling-frontend
+    image: shkoliar/ngrok:latest
+    ports:
+      - 4551:4551
+    links:
+      - calling-frontend
+    environment:
+      - DOMAIN=calling-frontend
+      - PORT=8080
+
+networks:
+  default:
+    name: test-network
