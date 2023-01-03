@@ -37,9 +37,12 @@ fn print_config(config: &'static config::Config) {
     info!("  {:38}{}", "region:", config.region);
     info!("  {:38}{}", "version:", config.version);
     info!("  {:38}{}", "regional_url_template:", config.regional_url_template);
-    info!("  {:38}{}", "calling_server_url:", config.calling_server_url);
+    info!("  {:38}{:?}", "calling_server_url:", config.calling_server_url);
+    info!("  {:38}{:?}", "backend_list_instances_url:", config.backend_list_instances_url);
+    info!("  {:38}{:?}", "backend_ip:", config.backend_ip);
     info!("  {:38}{}", "storage_table:", config.storage_table);
     info!("  {:38}{:?}", "identity_url:", config.identity_token_url);
+    info!("  {:38}{:?}", "oauth2_url:", config.oauth2_token_url);
     info!("  {:38}{:?}", "storage_endpoint:", config.storage_endpoint);
     info!("  {:38}{}", "metrics_datadog:",
           match &config.metrics_datadog_host {
@@ -121,6 +124,7 @@ fn main() -> Result<()> {
     // Create frontend entities that might fail.
     let authenticator = Authenticator::from_hex_key(&config.authentication_key)?;
     let (storage, identity_fetcher) = threaded_rt.block_on(DynamoDb::new(config))?;
+    let backend = threaded_rt.block_on(BackendHttpClient::from_config(config))?;
 
     threaded_rt.block_on(async {
         // Create the shared Frontend state.
@@ -128,7 +132,7 @@ fn main() -> Result<()> {
             config,
             authenticator,
             storage: Box::new(storage),
-            backend: Box::new(BackendHttpClient::from_config(config)),
+            backend: Box::new(backend),
             id_generator: Box::new(FrontendIdGenerator),
             api_metrics: Mutex::new(Default::default()),
         });

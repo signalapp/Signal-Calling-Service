@@ -12,4 +12,6 @@ pub mod backend;
 pub mod cleaner;
 pub mod config;
 pub mod frontend;
+pub mod gcp_apis;
+pub mod load_balancer;
 pub mod storage;

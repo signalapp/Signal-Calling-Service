@@ -5,7 +5,7 @@
 
 //! Implementation of the SFU signaling server. This version is based on warp.
 //! Supported REST APIs:
-//!   GET /about/health
+//!   GET /health
 //!   GET /v1/info
 //!   GET /v1/call/$call_id/clients
 //!   POST /v1/call/$call_id/client/$demux_id (join)
@@ -17,9 +17,10 @@ use std::{
     net::IpAddr,
     str::{self, FromStr},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
@@ -28,16 +29,19 @@ use hex::{FromHex, ToHex};
 use log::*;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot::Receiver;
+use tokio::sync::oneshot::{self, Receiver};
 use warp::{http::StatusCode, Filter, Reply};
 
 use crate::{call, config, ice, sfu, sfu::Sfu};
+
+const SYSTEM_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub call_count: usize,
     pub client_count: usize,
+    pub cpu_idle_pct: u8,
 }
 
 #[derive(Serialize, Debug)]
@@ -126,6 +130,7 @@ pub fn parse_user_id_and_resolution_request_id_from_endpoint_id(
 async fn get_health(
     sfu: Arc<Mutex<Sfu>>,
     is_healthy: Arc<AtomicBool>,
+    cpu_idle_pct: Arc<AtomicU8>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     trace!("get_health():");
 
@@ -145,6 +150,7 @@ async fn get_health(
         let response = HealthResponse {
             call_count: calls.len(),
             client_count,
+            cpu_idle_pct: cpu_idle_pct.load(Ordering::Relaxed),
         };
 
         Ok(warp::reply::with_status(warp::reply::json(&response), StatusCode::OK).into_response())
@@ -281,7 +287,7 @@ async fn join(
             Ok(warp::reply::json(&response).into_response())
         }
         Err(err) => {
-            error!("client failed to join call {}", err.to_string());
+            error!("client failed to join call {}", err);
             if err == sfu::SfuError::DuplicateDemuxIdDetected {
                 // Invalid argument because the demux_id is a duplicate.
                 Err(warp::reject::custom(InvalidArgument {
@@ -359,6 +365,13 @@ fn with_is_healthy(
     warp::any().map(move || is_healthy.clone())
 }
 
+/// A warp filter that provides the cpu_idle_pct to a route.
+fn with_cpu_idle_pct(
+    cpu_idle_pct: Arc<AtomicU8>,
+) -> impl Filter<Extract = (Arc<AtomicU8>,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || cpu_idle_pct.clone())
+}
+
 /// A warp filter that provides the config to a route.
 fn with_config(
     config: &'static config::Config,
@@ -373,15 +386,17 @@ fn with_sfu(
     warp::any().map(move || sfu.clone())
 }
 
-/// Filter to support the "GET /about/health" API for the server and testing.
+/// Filter to support the "GET /health" API for the server and testing.
 fn get_health_api(
     sfu: Arc<Mutex<Sfu>>,
     is_healthy: Arc<AtomicBool>,
+    cpu_idle_pct: Arc<AtomicU8>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("health")
         .and(warp::get())
         .and(with_sfu(sfu))
         .and(with_is_healthy(is_healthy))
+        .and(with_cpu_idle_pct(cpu_idle_pct))
         .and_then(get_health)
 }
 
@@ -433,8 +448,9 @@ pub fn signaling_api(
     config: &'static config::Config,
     sfu: Arc<Mutex<Sfu>>,
     is_healthy: Arc<AtomicBool>,
+    cpu_idle_pct: Arc<AtomicU8>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    get_health_api(sfu.clone(), is_healthy)
+    get_health_api(sfu.clone(), is_healthy, cpu_idle_pct)
         .or(get_info_api(config))
         .or(get_clients_api(sfu.clone()))
         .or(join_api(config, sfu.clone()))
@@ -447,7 +463,12 @@ pub async fn start(
     ender_rx: Receiver<()>,
     is_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
-    let api = signaling_api(config, sfu, is_healthy)
+    let cpu_idle_pct = Arc::new(AtomicU8::new(0));
+    let (monitor_ender_tx, monitor_ender_rx) = oneshot::channel();
+
+    start_monitor(monitor_ender_rx, cpu_idle_pct.clone());
+
+    let api = signaling_api(config, sfu, is_healthy, cpu_idle_pct)
         .with(warp::log("calling_service"))
         .recover(rejection_handler);
 
@@ -462,7 +483,36 @@ pub async fn start(
     server.await;
 
     info!("signaling_server shutdown");
+    let _ = monitor_ender_tx.send(());
     Ok(())
+}
+
+fn start_monitor(mut ender_rx: Receiver<()>, cpu_idle_pct: Arc<AtomicU8>) {
+    tokio::spawn(async move {
+        match psutil::cpu::CpuPercentCollector::new() {
+            Err(err) => {
+                error!("cpu percent collector new failed {}", err);
+                // can't do anything else, leave idle at initial value
+            }
+            Ok(mut cpu_percent_collector) => {
+                let mut tick_interval = tokio::time::interval(SYSTEM_MONITOR_INTERVAL);
+                loop {
+                    tokio::select!(
+                        _ = tick_interval.tick() => {
+                            match cpu_percent_collector.cpu_percent() {
+                                Err(err) => error!("cpu percent collector collect failed {}", err),
+                                Ok(busy_cpu_percent) => cpu_idle_pct.store(100u8.saturating_sub(busy_cpu_percent as u8), Ordering::Relaxed),
+                            };
+                         },
+                        _ = &mut ender_rx => {
+                            info!("monitor task ended");
+                            break;
+                        }
+                    );
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -578,8 +628,10 @@ mod signaling_server_tests {
         let config = &DEFAULT_CONFIG;
         let sfu = new_sfu(Instant::now(), config);
         let is_healthy = Arc::new(AtomicBool::new(true));
+        let cpu_idle_pct = Arc::new(AtomicU8::new(100));
 
-        let api = signaling_api(config, sfu, is_healthy.clone()).recover(rejection_handler);
+        let api =
+            signaling_api(config, sfu, is_healthy.clone(), cpu_idle_pct).recover(rejection_handler);
 
         let response = request().method("GET").path("/health").reply(&api).await;
 
@@ -597,8 +649,9 @@ mod signaling_server_tests {
         let config = &DEFAULT_CONFIG;
         let sfu = new_sfu(Instant::now(), config);
         let is_healthy = Arc::new(AtomicBool::new(true));
+        let cpu_idle_pct = Arc::new(AtomicU8::new(100));
 
-        let api = signaling_api(config, sfu, is_healthy).recover(rejection_handler);
+        let api = signaling_api(config, sfu, is_healthy, cpu_idle_pct).recover(rejection_handler);
 
         let response = request().method("GET").path("/v1/info").reply(&api).await;
 
@@ -615,8 +668,9 @@ mod signaling_server_tests {
         let config = &BAD_IP_CONFIG;
         let sfu = new_sfu(Instant::now(), config);
         let is_healthy = Arc::new(AtomicBool::new(true));
+        let cpu_idle_pct = Arc::new(AtomicU8::new(100));
 
-        let api = signaling_api(config, sfu, is_healthy).recover(rejection_handler);
+        let api = signaling_api(config, sfu, is_healthy, cpu_idle_pct).recover(rejection_handler);
 
         let response = request().method("GET").path("/v1/info").reply(&api).await;
 
@@ -628,8 +682,10 @@ mod signaling_server_tests {
         let config = &DEFAULT_CONFIG;
         let sfu = new_sfu(Instant::now(), config);
         let is_healthy = Arc::new(AtomicBool::new(true));
+        let cpu_idle_pct = Arc::new(AtomicU8::new(100));
 
-        let api = signaling_api(config, sfu.clone(), is_healthy).recover(rejection_handler);
+        let api =
+            signaling_api(config, sfu.clone(), is_healthy, cpu_idle_pct).recover(rejection_handler);
 
         let response = request()
             .method("GET")
@@ -722,8 +778,10 @@ mod signaling_server_tests {
         let config = &DEFAULT_CONFIG;
         let sfu = new_sfu(Instant::now(), config);
         let is_healthy = Arc::new(AtomicBool::new(true));
+        let cpu_idle_pct = Arc::new(AtomicU8::new(100));
 
-        let api = signaling_api(config, sfu.clone(), is_healthy).recover(rejection_handler);
+        let api =
+            signaling_api(config, sfu.clone(), is_healthy, cpu_idle_pct).recover(rejection_handler);
 
         // Join with a invalid DemuxId.
         let response = request()
@@ -867,8 +925,10 @@ mod signaling_server_tests {
         let config = &DEFAULT_CONFIG;
         let sfu = new_sfu(Instant::now(), config);
         let is_healthy = Arc::new(AtomicBool::new(true));
+        let cpu_idle_pct = Arc::new(AtomicU8::new(100));
 
-        let api = signaling_api(config, sfu.clone(), is_healthy).recover(rejection_handler);
+        let api =
+            signaling_api(config, sfu.clone(), is_healthy, cpu_idle_pct).recover(rejection_handler);
 
         // Join with client 16 and verify.
         add_client_to_sfu(

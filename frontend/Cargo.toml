@@ -43,6 +43,7 @@ subtle = "2.4.0"
 
 # For http client and server
 hyper = { version = "0.14", features = ["full"] }
+hyper-rustls = { version = "0.23", features = ["webpki-roots"] }
 axum = { version = "0.5", features = ["headers"] }
 tower = "0.4"
 mime = "0.3"

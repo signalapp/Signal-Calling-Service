@@ -267,6 +267,10 @@ impl Frontend {
                 Frontend::log_error("get_client_ids_in_call", err);
                 Err(FrontendError::InternalError)
             }
+            Err(BackendError::Timeout(err)) => {
+                Frontend::log_error("get_client_ids_in_call", Error::new(err));
+                Err(FrontendError::InternalError)
+            }
         }
     }
 
@@ -293,7 +297,7 @@ impl Frontend {
 
         // There is no existing call, so we'll try to create one. First, access
         // a backend server through load balancing and get its IP address.
-        let info_response = self.backend.get_info().await.map_err(|err| {
+        let backend_ip = self.backend.select_ip().await.map_err(|err| {
             Frontend::log_error("get_or_create_call_record", err.into());
             FrontendError::InternalError
         })?;
@@ -301,7 +305,7 @@ impl Frontend {
         let call_record = CallRecord {
             group_id: user_authorization.group_id.clone(),
             call_id: self.id_generator.get_random_call_id(16),
-            backend_ip: info_response.backend_direct_ip,
+            backend_ip,
             backend_region: self.config.region.to_string(),
             creator: user_authorization.user_id.to_string(),
         };

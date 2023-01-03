@@ -575,14 +575,10 @@ mod api_server_v2_tests {
 
         // Create additional expectations.
         backend
-            .expect_get_info()
+            .expect_select_ip()
             .once()
-            // Result<InfoResponse, BackendError>
-            .returning(|| {
-                Ok(backend::InfoResponse {
-                    backend_direct_ip: "127.0.0.1".to_string(),
-                })
-            });
+            // Result<String, BackendError>
+            .returning(|| Ok("127.0.0.1".to_string()));
 
         id_generator
             .expect_get_random_call_id()

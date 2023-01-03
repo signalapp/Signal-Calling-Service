@@ -3,11 +3,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use clap;
+use clap::ArgGroup;
+use std::net::Ipv4Addr;
 
 /// Configuration options from command line arguments.
 #[derive(Default, clap::Parser, Debug, Clone)]
 #[clap(name = "calling_frontend")]
+#[clap(group(ArgGroup::new("backend").required(true).multiple(true).args(&["calling-server-url", "backend-list-instances-url", "backend-ip"])))]
+#[clap(group(ArgGroup::new("new_backend").required(false).args(&["backend-list-instances-url", "backend-ip"])))]
 pub struct Config {
     /// The IP address to bind to for the server.
     #[clap(long, default_value = "0.0.0.0")]
@@ -45,8 +48,20 @@ pub struct Config {
     pub regional_url_template: String,
 
     /// The URL of the calling server to access for the backend.
+    #[clap(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub calling_server_url: Option<String>,
+
+    /// The URL instance group of calling backends.
+    #[clap(long, value_parser = clap::builder::NonEmptyStringValueParser::new(), requires = "oauth2-token-url")]
+    pub backend_list_instances_url: Option<String>,
+
+    /// Where to fetch oauth2 tokens from for fetching backend instance list.
     #[clap(long)]
-    pub calling_server_url: String,
+    pub oauth2_token_url: Option<String>,
+
+    // Static list of calling backend IPs
+    #[clap(long)]
+    pub backend_ip: Option<Vec<Ipv4Addr>>,
 
     /// Interval for fetching a new identity token for storage support via DynamodDB.
     #[clap(long, default_value = "600000")]
@@ -89,7 +104,10 @@ pub fn default_test_config() -> Config {
         region: "us-west1".to_string(),
         version: "1".to_string(),
         regional_url_template: "".to_string(),
-        calling_server_url: "http://127.0.0.1:8080".to_string(),
+        calling_server_url: Some("http://127.0.0.1:8080".to_string()),
+        backend_list_instances_url: None,
+        oauth2_token_url: None,
+        backend_ip: None,
         storage_table: "CallRecords".to_string(),
         storage_region: "us-east-1".to_string(),
         storage_endpoint: Some("localhost:9010".to_string()),

@@ -13,12 +13,16 @@ use hyper::{
     client::HttpConnector,
     {Body, Client as HttpClient},
 };
+use log::*;
 use serde::{Deserialize, Serialize};
+use tokio::time::{error::Elapsed, timeout, Duration};
 
 #[cfg(test)]
 use mockall::{automock, predicate::*};
 
-use crate::{config, frontend::DemuxId};
+use crate::{config, frontend::DemuxId, load_balancer::LoadBalancer};
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A wrapper around a SocketAddr used when directly accessing the Calling Server.
 #[derive(Debug, PartialEq)]
@@ -95,11 +99,14 @@ pub enum BackendError {
     CallNotFound,
     #[error(transparent)]
     UnexpectedError(#[from] anyhow::Error),
+    #[error(transparent)]
+    Timeout(#[from] Elapsed),
 }
 
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Backend: Sync + Send {
+    async fn select_ip(&self) -> Result<String, BackendError>;
     async fn get_info(&self) -> Result<InfoResponse, BackendError>;
     async fn get_clients(
         &self,
@@ -118,34 +125,78 @@ pub trait Backend: Sync + Send {
 pub struct BackendHttpClient {
     http_client: HttpClient<HttpConnector>,
     /// URL used when invoking the get_info() API so that the request goes through
-    /// a load balancer.
-    base_url: String,
+    /// an external load balancer.
+    base_url: Option<String>,
+    /// internal load balancing provided from this crate
+    load_balancer: Option<LoadBalancer>,
 }
 
 impl BackendHttpClient {
-    pub fn from_config(config: &'static config::Config) -> Self {
-        let client = HttpClient::builder().build_http();
+    pub async fn from_config(config: &'static config::Config) -> anyhow::Result<Self> {
+        let http_client = HttpClient::builder().build_http();
+        let base_url = config.calling_server_url.as_ref().cloned();
+        let load_balancer = match (
+            config.backend_list_instances_url.as_ref(),
+            config.oauth2_token_url.as_ref(),
+            config.backend_ip.as_ref(),
+        ) {
+            (None, _, None) => None,
+            (Some(url), Some(identity_url), None) => {
+                Some(LoadBalancer::new_with_instance_url(url.clone(), identity_url.clone()).await?)
+            }
+            (Some(_), None, None) => {
+                return Err(anyhow!(
+                    "must supply oauth2-token-url with backend-list-instances-url"
+                ))
+            }
+            (None, _, Some(ips)) => Some(LoadBalancer::new_with_ips(ips.to_vec()).await?),
+            (_, _, _) => {
+                return Err(anyhow!(
+                "no more than one of backend-ip and backend-list-instances-url may be configured"
+            ))
+            }
+        };
 
-        Self {
-            http_client: client,
-            base_url: config.calling_server_url.clone(),
-        }
+        Ok(Self {
+            http_client,
+            base_url,
+            load_balancer,
+        })
     }
 }
 
 #[async_trait]
 impl Backend for BackendHttpClient {
+    async fn select_ip(&self) -> Result<String, BackendError> {
+        if let Some(load_balancer) = &self.load_balancer {
+            if let Ok(ip) = load_balancer.select_ip().await {
+                return Ok(ip);
+            }
+        }
+        let result = self.get_info().await.map(|i| i.backend_direct_ip);
+        if self.load_balancer.is_some() && self.base_url.is_some() && result.is_ok() {
+            info!("load_balancer failed, base_url fallback successful");
+        }
+
+        return result;
+    }
+
     async fn get_info(&self) -> Result<InfoResponse, BackendError> {
-        let base_v1_info_uri_string = format!("{}/v1/info", self.base_url);
+        let base_v1_info_uri_string = match &self.base_url {
+            None => {
+                return Err(BackendError::UnexpectedError(anyhow!(
+                    "calling_server_url not set but fallback attempted"
+                )))
+            }
+            Some(url) => format!("{}/v1/info", url),
+        };
 
         let uri = base_v1_info_uri_string
             .parse()
             .context("failed to parse info uri for backend")?;
 
-        let response = self
-            .http_client
-            .get(uri)
-            .await
+        let response = timeout(DEFAULT_TIMEOUT, self.http_client.get(uri))
+            .await?
             .context("failed to make backend request `get info`")?;
 
         match response.status() {
@@ -182,10 +233,12 @@ impl Backend for BackendHttpClient {
             .parse()
             .context("failed to parse get clients uri for backend")?;
 
-        let response = self.http_client.get(uri).await.context(format!(
-            "failed to make backend request `get clients` to `{}`",
-            backend_address.ip()
-        ))?;
+        let response = timeout(DEFAULT_TIMEOUT, self.http_client.get(uri))
+            .await?
+            .context(format!(
+                "failed to make backend request `get clients` to `{}`",
+                backend_address.ip()
+            ))?;
 
         match response.status() {
             StatusCode::OK => {
@@ -231,10 +284,12 @@ impl Backend for BackendHttpClient {
             .body(Body::from(request_body))
             .context("failed to form the join request")?;
 
-        let response = self.http_client.request(request).await.context(format!(
-            "failed to make backend request `post client` to `{}`",
-            backend_address.ip()
-        ))?;
+        let response = timeout(DEFAULT_TIMEOUT, self.http_client.request(request))
+            .await?
+            .context(format!(
+                "failed to make backend request `post client` to `{}`",
+                backend_address.ip()
+            ))?;
 
         match response.status() {
             StatusCode::OK => {
