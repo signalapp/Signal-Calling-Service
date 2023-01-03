@@ -272,7 +272,7 @@ pub async fn start(frontend: Arc<Frontend>, ender_rx: Receiver<()>) -> Result<()
         frontend.config.server_port,
     );
 
-    let server = axum::Server::bind(&addr)
+    let server = axum::Server::try_bind(&addr)?
         .serve(app(frontend).into_make_service())
         .with_graceful_shutdown(async {
             let _ = ender_rx.await;

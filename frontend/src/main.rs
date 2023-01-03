@@ -138,7 +138,9 @@ fn main() -> Result<()> {
 
         // Start the api server.
         let api_handle = tokio::spawn(async move {
-            let _ = api::start(frontend, api_ender_rx).await;
+            if let Err(err) = api::start(frontend, api_ender_rx).await {
+                error!("api start error: {}", err);
+            }
             let _ = signal_canceller_tx.send(()).await;
         });
 
