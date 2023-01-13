@@ -132,11 +132,15 @@ fn main() -> Result<()> {
         // Start the signaling server, either the signaling_server for production
         // or the http_server for testing.
         let signaling_server_handle = tokio::spawn(async move {
-            if config.signaling_ip.is_some() {
-                let _ = signaling_server::start(config, sfu, signaling_ender_rx, is_healthy).await;
+            let start_result = if config.signaling_ip.is_some() {
+                signaling_server::start(config, sfu, signaling_ender_rx, is_healthy).await
             } else {
-                let _ = http_server::start(config, sfu, signaling_ender_rx).await;
+                http_server::start(config, sfu, signaling_ender_rx).await
+            };
+            if let Err(err) = start_result {
+                error!("server start error: {}", err);
             }
+
             let _ = signal_canceller_tx.send(()).await;
         });
 

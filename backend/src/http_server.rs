@@ -3,15 +3,30 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-//! Implementation of the http server. This version is based on warp.
+//! Implementation of the http server. This version is based on axum.
 //! Supported APIs:
 //!   GET /metrics
 //!   GET /v2/conference/participants
 //!   PUT /v2/conference/participants
 
-use std::{convert::TryInto, net::IpAddr, str, str::FromStr, sync::Arc, time::UNIX_EPOCH};
+use std::{
+    convert::TryInto,
+    net::{IpAddr, SocketAddr},
+    str,
+    str::FromStr,
+    sync::Arc,
+    time::UNIX_EPOCH,
+};
 
 use anyhow::{anyhow, Result};
+use axum::{
+    headers::{self, authorization::Basic, Authorization},
+    http::StatusCode,
+    middleware,
+    response::IntoResponse,
+    routing::get,
+    Extension, Json, Router, TypedHeader,
+};
 use hex::{FromHex, ToHex};
 use log::*;
 use parking_lot::Mutex;
@@ -19,10 +34,11 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot::Receiver;
-use warp::{http::StatusCode, Filter, Reply};
+use tower::ServiceBuilder;
 
 use crate::{
     config, ice,
+    middleware::log_response,
     sfu::{self, Sfu},
 };
 
@@ -148,39 +164,17 @@ fn authenticate(
     Ok((user_id, call_id))
 }
 
-/// Parses an authorization header using the basic authentication scheme. Returns
-/// a tuple of the credentials (username, password).
-fn parse_basic_authorization_header(authorization_header: &str) -> Result<(String, String)> {
-    // Get the credentials from the Basic authorization header.
-    if let ["Basic", base_64_encoded_values] =
-        authorization_header.splitn(2, ' ').collect::<Vec<_>>()[..]
-    {
-        // Decode the credentials to utf-8 format.
-        let decoded_values = base64::decode(base_64_encoded_values)?;
-        let credentials = std::str::from_utf8(&decoded_values)?;
-
-        // Split the credentials into the username and password.
-        if let [username, password] = credentials.splitn(2, ':').collect::<Vec<_>>()[..] {
-            Ok((username.to_string(), password.to_string()))
-        } else {
-            // Malformed token.
-            Err(anyhow!("Authorization header not valid"))
-        }
-    } else {
-        // Malformed header.
-        Err(anyhow!("Could not parse authorization header"))
-    }
-}
-
 fn parse_and_authenticate(
     config: &'static config::Config,
-    authorization_header: &str,
+    authorization_header: &Authorization<Basic>,
 ) -> Result<(sfu::UserId, sfu::CallId)> {
-    let (_, password) = parse_basic_authorization_header(authorization_header)?;
-    authenticate(config, &password)
+    let password = authorization_header.password();
+    authenticate(config, password)
 }
 
-async fn get_metrics(sfu: Arc<Mutex<Sfu>>) -> Result<warp::reply::Response, warp::Rejection> {
+async fn get_metrics(
+    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
+) -> Result<impl IntoResponse, StatusCode> {
     trace!("get_metrics():");
 
     let calls = sfu.lock().get_calls_snapshot(); // SFU lock released here.
@@ -249,25 +243,21 @@ async fn get_metrics(sfu: Arc<Mutex<Sfu>>) -> Result<warp::reply::Response, warp
         calls,
     };
 
-    Ok(warp::reply::with_status(warp::reply::json(&response), StatusCode::OK).into_response())
+    Ok(Json(response))
 }
 
 async fn get_participants(
-    config: &'static config::Config,
-    sfu: Arc<Mutex<Sfu>>,
-    authorization_header: String,
-) -> Result<warp::reply::Response, warp::Rejection> {
+    Extension(config): Extension<&'static config::Config>,
+    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
+    TypedHeader(authorization_header): TypedHeader<headers::Authorization<Basic>>,
+) -> Result<impl IntoResponse, StatusCode> {
     trace!("get_participants():");
 
     let call_id = match parse_and_authenticate(config, &authorization_header) {
         Ok((_, call_id)) => call_id,
         Err(err) => {
             warn!("get(): unauthorized {}", err);
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&err.to_string()),
-                StatusCode::UNAUTHORIZED,
-            )
-            .into_response());
+            return Ok((StatusCode::UNAUTHORIZED, err.to_string()).into_response());
         }
     };
 
@@ -309,48 +299,44 @@ async fn get_participants(
             creator: signaling.creator_id.as_slice().encode_hex(),
         };
 
-        Ok(warp::reply::with_status(warp::reply::json(&response), StatusCode::OK).into_response())
+        Ok(Json(response).into_response())
     } else {
-        Ok(StatusCode::NOT_FOUND.into_response())
+        Err(StatusCode::NOT_FOUND)
     }
 }
 
 async fn join_conference(
-    config: &'static config::Config,
-    sfu: Arc<Mutex<Sfu>>,
-    authorization_header: String,
-    join_request: JoinRequest,
-) -> Result<warp::reply::Response, warp::Rejection> {
+    Extension(config): Extension<&'static config::Config>,
+    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
+    TypedHeader(authorization_header): TypedHeader<headers::Authorization<Basic>>,
+    Json(join_request): Json<JoinRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
     trace!("join_conference():");
 
     let (user_id, call_id) = match parse_and_authenticate(config, &authorization_header) {
         Ok((user_id, call_id)) => (user_id, call_id),
         Err(err) => {
             warn!("join(): unauthorized {}", err);
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&err.to_string()),
-                StatusCode::UNAUTHORIZED,
-            )
-            .into_response());
+            return Ok((StatusCode::UNAUTHORIZED, err.to_string()).into_response());
         }
     };
 
     if join_request.dhe_public_key.is_empty() {
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&"Empty dhe_public_key in the request.".to_string()),
+        return Ok((
             StatusCode::NOT_ACCEPTABLE,
+            "Empty dhe_public_key in the request.".to_string(),
         )
-        .into_response());
+            .into_response());
     }
 
     let client_dhe_public_key = match <[u8; 32]>::from_hex(join_request.dhe_public_key) {
         Ok(client_dhe_public_key) => client_dhe_public_key,
         Err(_) => {
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&"Invalid dhe_public_key in the request.".to_string()),
+            return Ok((
                 StatusCode::NOT_ACCEPTABLE,
+                "Invalid dhe_public_key in the request.".to_string(),
             )
-            .into_response());
+                .into_response());
         }
     };
 
@@ -359,11 +345,11 @@ async fn join_conference(
         Some(client_hkdf_extra_info) => match Vec::<u8>::from_hex(client_hkdf_extra_info) {
             Ok(client_hkdf_extra_info) => client_hkdf_extra_info,
             Err(_) => {
-                return Ok(warp::reply::with_status(
-                    warp::reply::json(&"Invalid hkdf_extra_info in the request.".to_string()),
+                return Ok((
                     StatusCode::NOT_ACCEPTABLE,
+                    "Invalid hkdf_extra_info in the request.".to_string(),
                 )
-                .into_response());
+                    .into_response());
             }
         },
     };
@@ -403,34 +389,32 @@ async fn join_conference(
                 dhe_public_key: server_dhe_public_key.encode_hex(),
             };
 
-            Ok(
-                warp::reply::with_status(warp::reply::json(&response), StatusCode::OK)
-                    .into_response(),
-            )
+            Ok(Json(response).into_response())
         }
         Err(err) => {
             error!("client failed to join call {}", err.to_string());
-            Ok(warp::reply::with_status(
-                warp::reply::json(&err.to_string()),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
-            .into_response())
+            Ok((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response())
         }
     }
 }
 
-/// A warp filter for providing the config for a route.
-fn with_config(
-    config: &'static config::Config,
-) -> impl Filter<Extract = (&'static config::Config,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || config)
-}
+fn app(sfu: Arc<Mutex<Sfu>>, config: &'static config::Config) -> Router {
+    let metrics_route = Router::new()
+        .route("/metrics", get(get_metrics))
+        .layer(Extension(sfu.clone()));
 
-/// A warp filter for extracting the Sfu state for a route.
-fn with_sfu(
-    sfu: Arc<Mutex<Sfu>>,
-) -> impl Filter<Extract = (Arc<Mutex<Sfu>>,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || sfu.clone())
+    let routes = Router::new()
+        .route(
+            "/v2/conference/participants",
+            get(get_participants).put(join_conference),
+        )
+        .layer(
+            ServiceBuilder::new()
+                .layer(Extension(config))
+                .layer(Extension(sfu)),
+        );
+
+    Router::new().merge(metrics_route).merge(routes)
 }
 
 pub async fn start(
@@ -438,46 +422,22 @@ pub async fn start(
     sfu: Arc<Mutex<Sfu>>,
     http_ender_rx: Receiver<()>,
 ) -> Result<()> {
-    // Filter to support: GET /metrics
-    let metrics_api = warp::path!("metrics")
-        .and(warp::get())
-        .and(with_sfu(sfu.clone()))
-        .and_then(get_metrics);
+    let addr = SocketAddr::new(IpAddr::from_str(&config.binding_ip)?, config.signaling_port);
 
-    // Filter to support: GET /v2/conference/participants
-    let get_participants_api = warp::path!("v2" / "conference" / "participants")
-        .and(warp::get())
-        .and(with_config(config))
-        .and(with_sfu(sfu.clone()))
-        .and(warp::header("authorization"))
-        .and_then(get_participants);
-
-    // Filter to support: PUT /v2/conference/participants
-    let join_api = warp::path!("v2" / "conference" / "participants")
-        .and(warp::put())
-        .and(with_config(config))
-        .and(with_sfu(sfu.clone()))
-        .and(warp::header("authorization"))
-        .and(warp::body::json())
-        .and_then(join_conference);
-
-    let api = metrics_api.or(get_participants_api).or(join_api);
-
-    // Add other options to form the final routes to be served.
-    // TODO: Disabling the "with(log)" mechanism since it causes the following
-    // error when trying to launch with tokio::spawn():
-    //   implementation of `warp::reply::Reply` is not general enough
-    //let routes = api.with(warp::log("calling_service"));
-
-    let (addr, server) = warp::serve(api).bind_with_graceful_shutdown(
-        (IpAddr::from_str(&config.binding_ip)?, config.signaling_port),
-        async {
-            http_ender_rx.await.ok();
-        },
-    );
+    let server = axum::Server::try_bind(&addr)?
+        .serve(
+            app(sfu, config)
+                .layer(middleware::from_fn(log_response))
+                .into_make_service(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = http_ender_rx.await;
+        });
 
     info!("http_server ready: {}", addr);
-    server.await;
+    if let Err(err) = server.await {
+        error!("http_server returned: {}", err);
+    }
 
     info!("http_server shutdown");
     Ok(())
@@ -573,91 +533,6 @@ mod http_server_tests {
     }
 
     #[tokio::test]
-    async fn test_parse_basic_authorization_header() {
-        let result = parse_basic_authorization_header("");
-        assert!(result.is_err());
-        assert_eq!(
-            result.err().unwrap().to_string(),
-            "Could not parse authorization header"
-        );
-
-        // Error: Could not parse authorization header
-        assert!(parse_basic_authorization_header("B").is_err());
-        assert!(parse_basic_authorization_header("Basic").is_err());
-        assert!(parse_basic_authorization_header("Basic ").is_err());
-        assert!(parse_basic_authorization_header("B X").is_err());
-        assert!(parse_basic_authorization_header("Basi XYZ").is_err());
-
-        // DecodeError: Encoded text cannot have a 6-bit remainder.
-        assert!(parse_basic_authorization_header("Basic X").is_err());
-
-        // DecodeError: Invalid last symbol 90, offset 2.
-        assert!(parse_basic_authorization_header("Basic XYZ").is_err());
-
-        // Utf8Error: invalid utf-8 sequence of 1 bytes from index 0
-        assert!(parse_basic_authorization_header("Basic //3//Q==").is_err());
-
-        // Utf8Error: invalid utf-8 sequence of 1 bytes from index 8
-        assert!(
-            parse_basic_authorization_header("Basic MTIzNDU2Nzj95v3n/ej96f3q/ev97P3t/e797w==")
-                .is_err()
-        );
-
-        let result = parse_basic_authorization_header("Basic VGVzdA==");
-        assert!(result.is_err());
-        assert_eq!(
-            result.err().unwrap().to_string(),
-            "Authorization header not valid"
-        );
-
-        // Error: Authorization header not valid
-        assert!(parse_basic_authorization_header("Basic MSAy").is_err());
-        assert!(parse_basic_authorization_header("Basic MWIgMmI=").is_err());
-
-        // ":"
-        assert_eq!(
-            parse_basic_authorization_header("Basic Og==").unwrap(),
-            ("".to_string(), "".to_string())
-        );
-
-        // "username:password"
-        assert_eq!(
-            parse_basic_authorization_header("Basic dXNlcm5hbWU6cGFzc3dvcmQ=").unwrap(),
-            ("username".to_string(), "password".to_string())
-        );
-
-        // ":password"
-        assert_eq!(
-            parse_basic_authorization_header("Basic OnBhc3N3b3Jk").unwrap(),
-            ("".to_string(), "password".to_string())
-        );
-
-        // "username:"
-        assert_eq!(
-            parse_basic_authorization_header("Basic dXNlcm5hbWU6").unwrap(),
-            ("username".to_string(), "".to_string())
-        );
-
-        // "::"
-        assert_eq!(
-            parse_basic_authorization_header("Basic Ojo=").unwrap(),
-            ("".to_string(), ":".to_string())
-        );
-
-        // ":::::"
-        assert_eq!(
-            parse_basic_authorization_header("Basic Ojo6Ojo=").unwrap(),
-            ("".to_string(), "::::".to_string())
-        );
-
-        // "1a2b3c:1a2b3c:1a2b3c:1a2b3c"
-        assert_eq!(
-            parse_basic_authorization_header("Basic MWEyYjNjOjFhMmIzYzoxYTJiM2M6MWEyYjNj").unwrap(),
-            ("1a2b3c".to_string(), "1a2b3c:1a2b3c:1a2b3c".to_string())
-        );
-    }
-
-    #[tokio::test]
     async fn test_authenticate() {
         let config = &CONFIG;
 
@@ -710,12 +585,13 @@ mod http_server_tests {
         let config = &CONFIG;
 
         // Version 1: "username:1a:2b:1:"
-        let result = parse_and_authenticate(config, "Basic dXNlcm5hbWU6MWE6MmI6MTo=");
+        let result = parse_and_authenticate(config, &Authorization::basic("username", "1a:2b:1:"));
         assert!(result.is_ok());
         assert!(result.unwrap() == (vec![26].into(), vec![43].into()));
 
         // Version 2: "username:2:1a:2b:1:2:3"
-        let result = parse_and_authenticate(config, "Basic dXNlcm5hbWU6MjoxYToyYjoxOjI6Mw==");
+        let result =
+            parse_and_authenticate(config, &Authorization::basic("username", "2:1a:2b:1:2:3"));
         assert!(result.is_ok());
         assert!(result.unwrap() == (vec![26].into(), vec![43].into()));
     }

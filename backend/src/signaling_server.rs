@@ -3,18 +3,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-//! Implementation of the SFU signaling server. This version is based on warp.
+//! Implementation of the SFU signaling server. This version is based on axum.
 //! Supported REST APIs:
 //!   GET /health
 //!   GET /v1/info
 //!   GET /v1/call/$call_id/clients
 //!   POST /v1/call/$call_id/client/$demux_id (join)
-//!   DELETE /v1/call/$call_id/client/$demux_id (leave)
 
 use std::{
-    convert::{Infallible, TryInto},
-    error::Error,
-    net::IpAddr,
+    convert::TryInto,
+    net::{IpAddr, SocketAddr},
     str::{self, FromStr},
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -24,15 +22,22 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use calling_common::Instant;
+use axum::{
+    extract::Path,
+    http::StatusCode,
+    middleware,
+    response::IntoResponse,
+    routing::{get, post},
+    Extension, Json, Router,
+};
 use hex::{FromHex, ToHex};
 use log::*;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot::{self, Receiver};
-use warp::{http::StatusCode, Filter, Reply};
+use tower::ServiceBuilder;
 
-use crate::{call, config, ice, sfu, sfu::Sfu};
+use crate::{call, config, ice, middleware::log_response, sfu, sfu::Sfu};
 
 const SYSTEM_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -75,20 +80,6 @@ pub struct JoinResponse {
     pub server_dhe_public_key: String,
 }
 
-/// Struct to support warp rejection (errors) for invalid argument values.
-#[derive(Debug)]
-struct InvalidArgument {
-    reason: String,
-}
-impl warp::reject::Reject for InvalidArgument {}
-
-/// Struct to support warp rejection (errors) for internal errors.
-#[derive(Debug)]
-struct InternalError {
-    reason: String,
-}
-impl warp::reject::Reject for InternalError {}
-
 /// Get a call_id (Vec<u8>) from a string hex value.
 fn call_id_from_hex(call_id: &str) -> Result<sfu::CallId> {
     if call_id.is_empty() {
@@ -128,10 +119,10 @@ pub fn parse_user_id_and_resolution_request_id_from_endpoint_id(
 
 /// Return a health response after accessing the SFU and obtaining basic information.
 async fn get_health(
-    sfu: Arc<Mutex<Sfu>>,
-    is_healthy: Arc<AtomicBool>,
-    cpu_idle_pct: Arc<AtomicU8>,
-) -> Result<warp::reply::Response, warp::Rejection> {
+    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
+    Extension(is_healthy): Extension<Arc<AtomicBool>>,
+    Extension(cpu_idle_pct): Extension<Arc<AtomicU8>>,
+) -> Result<impl IntoResponse, StatusCode> {
     trace!("get_health():");
 
     if is_healthy.load(Ordering::Relaxed) {
@@ -153,17 +144,17 @@ async fn get_health(
             cpu_idle_pct: cpu_idle_pct.load(Ordering::Relaxed),
         };
 
-        Ok(warp::reply::with_status(warp::reply::json(&response), StatusCode::OK).into_response())
+        Ok(Json(response))
     } else {
         // Return a server error because it is not healthy for external reasons.
-        Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        Err(StatusCode::INTERNAL_SERVER_ERROR)
     }
 }
 
 /// Obtain information about the server.
 async fn get_info(
-    config: &'static config::Config,
-) -> Result<warp::reply::Response, warp::Rejection> {
+    Extension(config): Extension<&'static config::Config>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     trace!("get_info():");
 
     if let Some(private_ip) = &config.signaling_ip {
@@ -171,11 +162,12 @@ async fn get_info(
             direct_access_ip: private_ip.to_string(),
         };
 
-        Ok(warp::reply::json(&response).into_response())
+        Ok(Json(response))
     } else {
-        Err(warp::reject::custom(InternalError {
-            reason: "private_ip not set".to_string(),
-        }))
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "private_ip not set".to_string(),
+        ))
     }
 }
 
@@ -183,16 +175,13 @@ async fn get_info(
 /// the call does not exist or an empty list if there are no clients
 /// currently in the call.
 async fn get_clients(
-    call_id: String,
-    sfu: Arc<Mutex<Sfu>>,
-) -> Result<warp::reply::Response, warp::Rejection> {
+    Path(call_id): Path<String>,
+    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     trace!("get_clients(): {}", call_id);
 
-    let call_id = call_id_from_hex(&call_id).map_err(|err| {
-        warp::reject::custom(InvalidArgument {
-            reason: err.to_string(),
-        })
-    })?;
+    let call_id =
+        call_id_from_hex(&call_id).map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
     let sfu = sfu.lock();
     if let Some(signaling) = sfu.get_call_signaling_info(call_id) {
@@ -204,7 +193,7 @@ async fn get_clients(
                 .collect(),
         };
 
-        Ok(warp::reply::json(&response).into_response())
+        Ok(Json(response).into_response())
     } else {
         Ok(StatusCode::NOT_FOUND.into_response())
     }
@@ -212,48 +201,31 @@ async fn get_clients(
 
 /// Handles a request for a client to join a call.
 async fn join(
-    call_id: String,
-    demux_id: u32,
-    config: &'static config::Config,
-    sfu: Arc<Mutex<Sfu>>,
-    request: JoinRequest,
-) -> Result<warp::reply::Response, warp::Rejection> {
+    Path((call_id, demux_id)): Path<(String, u32)>,
+    Extension(config): Extension<&'static config::Config>,
+    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
+    Json(request): Json<JoinRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     trace!("join(): {} {}", call_id, demux_id);
 
-    let call_id = call_id_from_hex(&call_id).map_err(|err| {
-        warp::reject::custom(InvalidArgument {
-            reason: err.to_string(),
-        })
-    })?;
-    let demux_id = demux_id.try_into().map_err(|err: call::Error| {
-        warp::reject::custom(InvalidArgument {
-            reason: err.to_string(),
-        })
-    })?;
+    let call_id =
+        call_id_from_hex(&call_id).map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+
+    let demux_id = demux_id
+        .try_into()
+        .map_err(|err: call::Error| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
     let (user_id, resolution_request_id) =
-        parse_user_id_and_resolution_request_id_from_endpoint_id(&request.endpoint_id).map_err(
-            |err| {
-                warp::reject::custom(InvalidArgument {
-                    reason: err.to_string(),
-                })
-            },
-        )?;
+        parse_user_id_and_resolution_request_id_from_endpoint_id(&request.endpoint_id)
+            .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let client_dhe_public_key =
-        <[u8; 32]>::from_hex(request.client_dhe_public_key).map_err(|err| {
-            warp::reject::custom(InvalidArgument {
-                reason: err.to_string(),
-            })
-        })?;
+    let client_dhe_public_key = <[u8; 32]>::from_hex(request.client_dhe_public_key)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
     let client_hkdf_extra_info = match request.hkdf_extra_info {
         None => vec![],
-        Some(hkdf_extra_info) => Vec::<u8>::from_hex(hkdf_extra_info).map_err(|err| {
-            warp::reject::custom(InvalidArgument {
-                reason: err.to_string(),
-            })
-        })?,
+        Some(hkdf_extra_info) => Vec::<u8>::from_hex(hkdf_extra_info)
+            .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?,
     };
 
     let server_ice_ufrag = ice::random_ufrag();
@@ -284,177 +256,58 @@ async fn join(
                 server_dhe_public_key,
             };
 
-            Ok(warp::reply::json(&response).into_response())
+            Ok(Json(response))
         }
         Err(err) => {
             error!("client failed to join call {}", err);
             if err == sfu::SfuError::DuplicateDemuxIdDetected {
                 // Invalid argument because the demux_id is a duplicate.
-                Err(warp::reject::custom(InvalidArgument {
-                    reason: err.to_string(),
-                }))
+                Err((StatusCode::BAD_REQUEST, err.to_string()))
             } else {
-                Err(warp::reject::custom(InternalError {
-                    reason: format!("failed to add client to call {}", err),
-                }))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to add client to call {}", err),
+                ))
             }
         }
     }
 }
 
-/// Handles a request for a client to leave a call.
-async fn leave(
-    call_id: String,
-    demux_id: u32,
-    sfu: Arc<Mutex<Sfu>>,
-) -> Result<warp::reply::Response, warp::Rejection> {
-    trace!("leave(): {} {}", call_id, demux_id);
-
-    let call_id = call_id_from_hex(&call_id).map_err(|err| {
-        warp::reject::custom(InvalidArgument {
-            reason: err.to_string(),
-        })
-    })?;
-    let demux_id = demux_id.try_into().map_err(|err: call::Error| {
-        warp::reject::custom(InvalidArgument {
-            reason: err.to_string(),
-        })
-    })?;
-
-    sfu.lock()
-        .remove_client_from_call(Instant::now(), call_id, demux_id);
-
-    Ok(StatusCode::NO_CONTENT.into_response())
-}
-
-/// Map rejections to a format that should be presented in the response.
-async fn rejection_handler(rejection: warp::Rejection) -> Result<impl Reply, Infallible> {
-    let code;
-    let message;
-
-    if rejection.is_not_found() {
-        code = StatusCode::NOT_FOUND;
-        message = "".to_string();
-    } else if let Some(r) = rejection.find::<InvalidArgument>() {
-        // Our detection of invalid request arguments.
-        code = StatusCode::BAD_REQUEST;
-        message = r.reason.to_string();
-    } else if let Some(r) = rejection.find::<InternalError>() {
-        // Our internal errors.
-        code = StatusCode::INTERNAL_SERVER_ERROR;
-        message = r.reason.to_string();
-    } else if let Some(e) = rejection.find::<warp::filters::body::BodyDeserializeError>() {
-        // Warp's detection of invalid requests (when deserializing json).
-        code = StatusCode::BAD_REQUEST;
-        message = match e.source() {
-            Some(cause) => cause.to_string(),
-            None => "".to_string(),
-        };
-    } else {
-        code = StatusCode::INTERNAL_SERVER_ERROR;
-        message = "unknown".to_string();
-    }
-
-    Ok(warp::reply::with_status(message, code))
-}
-
-/// A warp filter that provides the is_healthy flag to a route.
-fn with_is_healthy(
-    is_healthy: Arc<AtomicBool>,
-) -> impl Filter<Extract = (Arc<AtomicBool>,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || is_healthy.clone())
-}
-
-/// A warp filter that provides the cpu_idle_pct to a route.
-fn with_cpu_idle_pct(
-    cpu_idle_pct: Arc<AtomicU8>,
-) -> impl Filter<Extract = (Arc<AtomicU8>,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || cpu_idle_pct.clone())
-}
-
-/// A warp filter that provides the config to a route.
-fn with_config(
-    config: &'static config::Config,
-) -> impl Filter<Extract = (&'static config::Config,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || config)
-}
-
-/// A warp filter that provides the sfu state to a route.
-fn with_sfu(
-    sfu: Arc<Mutex<Sfu>>,
-) -> impl Filter<Extract = (Arc<Mutex<Sfu>>,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || sfu.clone())
-}
-
-/// Filter to support the "GET /health" API for the server and testing.
-fn get_health_api(
-    sfu: Arc<Mutex<Sfu>>,
-    is_healthy: Arc<AtomicBool>,
-    cpu_idle_pct: Arc<AtomicU8>,
-) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    warp::path!("health")
-        .and(warp::get())
-        .and(with_sfu(sfu))
-        .and(with_is_healthy(is_healthy))
-        .and(with_cpu_idle_pct(cpu_idle_pct))
-        .and_then(get_health)
-}
-
-/// Filter to support the "GET /v1/info" API for the server and testing.
-fn get_info_api(
-    config: &'static config::Config,
-) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    warp::path!("v1" / "info")
-        .and(warp::get())
-        .and(with_config(config))
-        .and_then(get_info)
-}
-
-/// Filter to support the "GET /v1/call/$call_id/clients" API for the server and testing.
-fn get_clients_api(
-    sfu: Arc<Mutex<Sfu>>,
-) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    warp::path!("v1" / "call" / String / "clients")
-        .and(warp::get())
-        .and(with_sfu(sfu))
-        .and_then(get_clients)
-}
-
-/// Filter to support the "POST /v1/call/$call_id/client/$demux_id" API for the server and testing.
-fn join_api(
-    config: &'static config::Config,
-    sfu: Arc<Mutex<Sfu>>,
-) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    warp::path!("v1" / "call" / String / "client" / u32)
-        .and(warp::post())
-        .and(with_config(config))
-        .and(with_sfu(sfu))
-        .and(warp::body::json())
-        .and_then(join)
-}
-
-/// Filter to support the "DELETE /v1/call/$call_id/client/$demux_id" API for the server and testing.
-fn leave_api(
-    sfu: Arc<Mutex<Sfu>>,
-) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    warp::path!("v1" / "call" / String / "client" / u32)
-        .and(warp::delete())
-        .and(with_sfu(sfu))
-        .and_then(leave)
-}
-
-/// The overall signaling api combined as a single filter for the server and testing.
+/// The overall signaling api combined as a Router for the server and testing.
 pub fn signaling_api(
     config: &'static config::Config,
     sfu: Arc<Mutex<Sfu>>,
     is_healthy: Arc<AtomicBool>,
     cpu_idle_pct: Arc<AtomicU8>,
-) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    get_health_api(sfu.clone(), is_healthy, cpu_idle_pct)
-        .or(get_info_api(config))
-        .or(get_clients_api(sfu.clone()))
-        .or(join_api(config, sfu.clone()))
-        .or(leave_api(sfu))
+) -> Router {
+    let health_route = Router::new().route("/health", get(get_health)).layer(
+        ServiceBuilder::new()
+            .layer(Extension(sfu.clone()))
+            .layer(Extension(is_healthy))
+            .layer(Extension(cpu_idle_pct)),
+    );
+
+    let info_route = Router::new()
+        .route("/v1/info", get(get_info))
+        .layer(ServiceBuilder::new().layer(Extension(config)));
+
+    let clients_route = Router::new()
+        .route("/v1/call/:call_id/clients", get(get_clients))
+        .layer(ServiceBuilder::new().layer(Extension(sfu.clone())));
+
+    let join_route = Router::new()
+        .route("/v1/call/:call_id/client/:demux_id", post(join))
+        .layer(
+            ServiceBuilder::new()
+                .layer(Extension(config))
+                .layer(Extension(sfu)),
+        );
+
+    Router::new()
+        .merge(health_route)
+        .merge(info_route)
+        .merge(clients_route)
+        .merge(join_route)
 }
 
 pub async fn start(
@@ -463,24 +316,27 @@ pub async fn start(
     ender_rx: Receiver<()>,
     is_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
+    let addr = SocketAddr::new(IpAddr::from_str(&config.binding_ip)?, config.signaling_port);
+
     let cpu_idle_pct = Arc::new(AtomicU8::new(0));
     let (monitor_ender_tx, monitor_ender_rx) = oneshot::channel();
 
     start_monitor(monitor_ender_rx, cpu_idle_pct.clone());
 
-    let api = signaling_api(config, sfu, is_healthy, cpu_idle_pct)
-        .with(warp::log("calling_service"))
-        .recover(rejection_handler);
-
-    let (addr, server) = warp::serve(api).bind_with_graceful_shutdown(
-        (IpAddr::from_str(&config.binding_ip)?, config.signaling_port),
-        async {
+    let server = axum::Server::try_bind(&addr)?
+        .serve(
+            signaling_api(config, sfu, is_healthy, cpu_idle_pct)
+                .layer(middleware::from_fn(log_response))
+                .into_make_service(),
+        )
+        .with_graceful_shutdown(async {
             let _ = ender_rx.await;
-        },
-    );
+        });
 
     info!("signaling_server ready: {}", addr);
-    server.await;
+    if let Err(err) = server.await {
+        error!("signaling_server returned: {}", err);
+    }
 
     info!("signaling_server shutdown");
     let _ = monitor_ender_tx.send(());
@@ -519,9 +375,12 @@ fn start_monitor(mut ender_rx: Receiver<()>, cpu_idle_pct: Arc<AtomicU8>) {
 mod signaling_server_tests {
     use std::convert::TryInto;
 
+    use axum::body::Body;
+    use axum::http::{self, Request};
+    use calling_common::Instant;
     use once_cell::sync::Lazy;
     use tokio::sync::oneshot;
-    use warp::test::request;
+    use tower::ServiceExt;
 
     use super::*;
     use crate::sfu::{DemuxId, DhePublicKey};
@@ -630,16 +489,22 @@ mod signaling_server_tests {
         let is_healthy = Arc::new(AtomicBool::new(true));
         let cpu_idle_pct = Arc::new(AtomicU8::new(100));
 
-        let api =
-            signaling_api(config, sfu, is_healthy.clone(), cpu_idle_pct).recover(rejection_handler);
+        let api = signaling_api(config, sfu, is_healthy.clone(), cpu_idle_pct);
 
-        let response = request().method("GET").path("/health").reply(&api).await;
+        let response = api
+            .clone()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
 
         is_healthy.store(false, Ordering::Relaxed);
 
-        let response = request().method("GET").path("/health").reply(&api).await;
+        let response = api
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -651,16 +516,21 @@ mod signaling_server_tests {
         let is_healthy = Arc::new(AtomicBool::new(true));
         let cpu_idle_pct = Arc::new(AtomicU8::new(100));
 
-        let api = signaling_api(config, sfu, is_healthy, cpu_idle_pct).recover(rejection_handler);
+        let api = signaling_api(config, sfu, is_healthy, cpu_idle_pct);
 
-        let response = request().method("GET").path("/v1/info").reply(&api).await;
+        let response = api
+            .oneshot(Request::get("/v1/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get("content-type").unwrap(),
             "application/json"
         );
-        assert_eq!(response.body(), r#"{"directAccessIp":"127.0.0.1"}"#);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(&body[..], br#"{"directAccessIp":"127.0.0.1"}"#);
     }
 
     #[tokio::test]
@@ -670,9 +540,12 @@ mod signaling_server_tests {
         let is_healthy = Arc::new(AtomicBool::new(true));
         let cpu_idle_pct = Arc::new(AtomicU8::new(100));
 
-        let api = signaling_api(config, sfu, is_healthy, cpu_idle_pct).recover(rejection_handler);
+        let api = signaling_api(config, sfu, is_healthy, cpu_idle_pct);
 
-        let response = request().method("GET").path("/v1/info").reply(&api).await;
+        let response = api
+            .oneshot(Request::get("/v1/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -684,14 +557,17 @@ mod signaling_server_tests {
         let is_healthy = Arc::new(AtomicBool::new(true));
         let cpu_idle_pct = Arc::new(AtomicU8::new(100));
 
-        let api =
-            signaling_api(config, sfu.clone(), is_healthy, cpu_idle_pct).recover(rejection_handler);
+        let api = signaling_api(config, sfu.clone(), is_healthy, cpu_idle_pct);
 
-        let response = request()
-            .method("GET")
-            .path(&format!("/v1/call/{}/clients", CALL_ID))
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         // No clients were added.
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -706,20 +582,25 @@ mod signaling_server_tests {
             CLIENT_DHE_PUB_KEY,
         );
 
-        let response = request()
-            .method("GET")
-            .path(&format!("/v1/call/{}/clients", CALL_ID))
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get("content-type").unwrap(),
             "application/json"
         );
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         assert_eq!(
-            response.body(),
-            &format!("{{\"endpointIds\":[\"{}\"]}}", ENDPOINT_ID_1)
+            &body[..],
+            format!(r#"{{"endpointIds":["{}"]}}"#, ENDPOINT_ID_1).as_bytes()
         );
 
         // Join with client 32.
@@ -732,45 +613,62 @@ mod signaling_server_tests {
             CLIENT_DHE_PUB_KEY,
         );
 
-        let response = request()
-            .method("GET")
-            .path(&format!("/v1/call/{}/clients", CALL_ID))
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         assert_eq!(
-            response.body(),
-            &format!(
-                "{{\"endpointIds\":[\"{}\",\"{}\"]}}",
+            &body[..],
+            format!(
+                r#"{{"endpointIds":["{}","{}"]}}"#,
                 ENDPOINT_ID_1, ENDPOINT_ID_2
             )
+            .as_bytes()
         );
 
         remove_client_from_sfu(sfu.clone(), CALL_ID, 16u32.try_into().unwrap());
 
-        let response = request()
-            .method("GET")
-            .path(&format!("/v1/call/{}/clients", CALL_ID))
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         assert_eq!(
-            response.body(),
-            &format!("{{\"endpointIds\":[\"{}\"]}}", ENDPOINT_ID_2)
+            &body[..],
+            format!(r#"{{"endpointIds":["{}"]}}"#, ENDPOINT_ID_2).as_bytes()
         );
 
         remove_client_from_sfu(sfu.clone(), CALL_ID, 32u32.try_into().unwrap());
 
-        let response = request()
-            .method("GET")
-            .path(&format!("/v1/call/{}/clients", CALL_ID))
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.body(), "{\"endpointIds\":[]}");
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(&body[..], br#"{"endpointIds":[]}"#);
     }
 
     #[tokio::test]
@@ -780,111 +678,137 @@ mod signaling_server_tests {
         let is_healthy = Arc::new(AtomicBool::new(true));
         let cpu_idle_pct = Arc::new(AtomicU8::new(100));
 
-        let api =
-            signaling_api(config, sfu.clone(), is_healthy, cpu_idle_pct).recover(rejection_handler);
+        let api = signaling_api(config, sfu.clone(), is_healthy, cpu_idle_pct);
 
         // Join with a invalid DemuxId.
-        let response = request()
-            .method("POST")
-            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 1))
-            .json(&JoinRequest {
-                endpoint_id: ENDPOINT_ID_1.to_string(),
-                client_ice_ufrag: UFRAG.to_string(),
-                client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
-                hkdf_extra_info: None,
-            })
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 1))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&JoinRequest {
+                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            client_ice_ufrag: UFRAG.to_string(),
+                            client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
+                            hkdf_extra_info: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         // Join with an invalid CallId.
-        let response = request()
-            .method("POST")
-            .path(&format!("/v1/call/{}/client/{}", "INVALIDNOTHEX", 16))
-            .json(&JoinRequest {
-                endpoint_id: ENDPOINT_ID_1.to_string(),
-                client_ice_ufrag: UFRAG.to_string(),
-                client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
-                hkdf_extra_info: None,
-            })
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::post(&format!("/v1/call/{}/client/{}", "INVALIDNOTHEX", 16))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&JoinRequest {
+                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            client_ice_ufrag: UFRAG.to_string(),
+                            client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
+                            hkdf_extra_info: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         // Join with an invalid endpoint_id.
-        let response = request()
-            .method("POST")
-            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
-            .json(&JoinRequest {
-                endpoint_id: "MALFORMEDNOHYPHEN".to_string(),
-                client_ice_ufrag: UFRAG.to_string(),
-                client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
-                hkdf_extra_info: None,
-            })
-            .reply(&api)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        // Join with an invalid endpoint_id.
-        let response = request()
-            .method("POST")
-            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
-            .json(&JoinRequest {
-                endpoint_id: "MALFORMEDNOHYPHEN".to_string(),
-                client_ice_ufrag: UFRAG.to_string(),
-                client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
-                hkdf_extra_info: None,
-            })
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&JoinRequest {
+                            endpoint_id: "MALFORMEDNOHYPHEN".to_string(),
+                            client_ice_ufrag: UFRAG.to_string(),
+                            client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
+                            hkdf_extra_info: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         // Join with an invalid DHE public key
-        let response = request()
-            .method("POST")
-            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
-            .json(&JoinRequest {
-                endpoint_id: ENDPOINT_ID_1.to_string(),
-                client_ice_ufrag: UFRAG.to_string(),
-                client_dhe_public_key: "INVALID".to_string(),
-                hkdf_extra_info: None,
-            })
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&JoinRequest {
+                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            client_ice_ufrag: UFRAG.to_string(),
+                            client_dhe_public_key: "INVALID".to_string(),
+                            hkdf_extra_info: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         // Join with an invalid HKDF extra info
-        let response = request()
-            .method("POST")
-            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
-            .json(&JoinRequest {
-                endpoint_id: ENDPOINT_ID_1.to_string(),
-                client_ice_ufrag: UFRAG.to_string(),
-                client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
-                hkdf_extra_info: Some("G".to_string()),
-            })
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&JoinRequest {
+                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            client_ice_ufrag: UFRAG.to_string(),
+                            client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
+                            hkdf_extra_info: Some("G".to_string()),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         // Join with good parameters.
-        let response = request()
-            .method("POST")
-            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
-            .json(&JoinRequest {
-                endpoint_id: ENDPOINT_ID_1.to_string(),
-                client_ice_ufrag: UFRAG.to_string(),
-                client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
-                hkdf_extra_info: None,
-            })
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&JoinRequest {
+                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            client_ice_ufrag: UFRAG.to_string(),
+                            client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
+                            hkdf_extra_info: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -892,7 +816,8 @@ mod signaling_server_tests {
             "application/json"
         );
 
-        let response: JoinResponse = serde_json::from_slice(response.body()).unwrap();
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(response.server_ip, "127.0.0.1");
         assert_eq!(response.server_port, 10000);
         assert_eq!(64, response.server_dhe_public_key.len());
@@ -904,77 +829,26 @@ mod signaling_server_tests {
         assert_eq!(get_client_count_in_call_from_sfu(sfu.clone(), CALL_ID), 1);
 
         // Attempt to join again using the same demux_id (should be a bad request).
-        let response = request()
-            .method("POST")
-            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
-            .json(&JoinRequest {
-                endpoint_id: ENDPOINT_ID_1.to_string(),
-                client_ice_ufrag: UFRAG.to_string(),
-                client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
-                hkdf_extra_info: None,
-            })
-            .reply(&api)
-            .await;
+        let response = api
+            .clone()
+            .oneshot(
+                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&JoinRequest {
+                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            client_ice_ufrag: UFRAG.to_string(),
+                            client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
+                            hkdf_extra_info: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(get_client_count_in_call_from_sfu(sfu.clone(), CALL_ID), 1);
-    }
-
-    #[tokio::test]
-    async fn test_leave() {
-        let config = &DEFAULT_CONFIG;
-        let sfu = new_sfu(Instant::now(), config);
-        let is_healthy = Arc::new(AtomicBool::new(true));
-        let cpu_idle_pct = Arc::new(AtomicU8::new(100));
-
-        let api =
-            signaling_api(config, sfu.clone(), is_healthy, cpu_idle_pct).recover(rejection_handler);
-
-        // Join with client 16 and verify.
-        add_client_to_sfu(
-            sfu.clone(),
-            CALL_ID,
-            ENDPOINT_ID_1,
-            16u32.try_into().unwrap(),
-            UFRAG,
-            CLIENT_DHE_PUB_KEY,
-        );
-        assert!(
-            check_call_exists_in_sfu(sfu.clone(), CALL_ID),
-            "Call doesn't exist"
-        );
-        assert_eq!(get_client_count_in_call_from_sfu(sfu.clone(), CALL_ID), 1);
-
-        let response = request()
-            .method("DELETE")
-            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
-            .reply(&api)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-        assert!(
-            check_call_exists_in_sfu(sfu.clone(), CALL_ID),
-            "Call doesn't exist"
-        );
-        assert_eq!(get_client_count_in_call_from_sfu(sfu.clone(), CALL_ID), 0);
-
-        // Attempt to leave again (response is indifferent since the client has already left).
-        let response = request()
-            .method("DELETE")
-            .path(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
-            .reply(&api)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-        // Attempt to leave again from an unknown call.
-        let response = request()
-            .method("DELETE")
-            .path(&format!("/v1/call/1234/client/{}", 16))
-            .reply(&api)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 }
