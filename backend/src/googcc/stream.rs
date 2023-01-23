@@ -150,7 +150,7 @@ impl<S: Stream> Stream for LatestOnly<S> {
             None => (0, Some(0)),
             Some(stream) => {
                 let (original_min, max) = stream.size_hint();
-                let min = if original_min == 0 { 0 } else { 1 };
+                let min = usize::from(original_min != 0);
                 (min, max)
             }
         }

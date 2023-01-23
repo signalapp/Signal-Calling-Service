@@ -109,7 +109,7 @@ pub fn parse_user_id_and_resolution_request_id_from_endpoint_id(
 ) -> Result<(sfu::UserId, u64)> {
     if let [user_id_hex, suffix] = endpoint_id.splitn(2, '-').collect::<Vec<_>>()[..] {
         let resolution_request_id = u64::from_str(suffix)?;
-        let user_id = Vec::from_hex(&user_id_hex)?;
+        let user_id = Vec::from_hex(user_id_hex)?;
 
         Ok((user_id.into(), resolution_request_id))
     } else {

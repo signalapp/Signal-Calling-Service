@@ -107,7 +107,7 @@ impl Writer for U24 {
         3
     }
     fn write(&self, out: &mut dyn Writable) {
-        (&(u32::from(*self)).to_be_bytes()[1..4]).write(out);
+        (u32::from(*self)).to_be_bytes()[1..4].write(out);
     }
 }
 
@@ -125,7 +125,7 @@ impl Writer for U48 {
         6
     }
     fn write(&self, out: &mut dyn Writable) {
-        (&u64::from(*self).to_be_bytes()[2..8]).write(out);
+        u64::from(*self).to_be_bytes()[2..8].write(out);
     }
 }
 

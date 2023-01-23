@@ -213,7 +213,7 @@ mod test {
 
         // Not enough to do another reset
         let mut floor = floor;
-        for i in 0..(749u16) {
+        for i in 0..749u16 {
             floor = floor.update(20 + (i % 20) as Level);
         }
         assert_eq!(Some(10), floor.get());
@@ -224,7 +224,7 @@ mod test {
 
         // And another
         let mut floor = floor;
-        for i in 0..(750u16) {
+        for i in 0..750u16 {
             floor = floor.update(20 + (i % 20) as Level);
         }
         assert_eq!(Some(16), floor.get());

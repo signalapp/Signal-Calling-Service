@@ -110,7 +110,7 @@ impl Mul<f64> for DataSize {
     type Output = Self;
 
     fn mul(self, x: f64) -> Self {
-        Self::from_bits((self.bits as f64 * x as f64) as u64)
+        Self::from_bits((self.bits as f64 * x) as u64)
     }
 }
 
@@ -126,7 +126,7 @@ impl Div<f64> for DataSize {
     type Output = Self;
 
     fn div(self, x: f64) -> Self {
-        Self::from_bits((self.bits as f64 / x as f64) as u64)
+        Self::from_bits((self.bits as f64 / x) as u64)
     }
 }
 

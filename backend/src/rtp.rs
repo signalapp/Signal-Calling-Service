@@ -263,7 +263,7 @@ impl Header {
             let mut extension_start = 0;
             while extensions.len() > extension_start {
                 let (extension_header, extension_val) =
-                    (&extensions[extension_start..]).checked_split_at(1)?;
+                    extensions[extension_start..].checked_split_at(1)?;
                 let extension_id = extension_header[0] >> 4;
                 if extension_id == 0 {
                     // Tail padding
@@ -1402,7 +1402,7 @@ impl ReceiverReportSender {
         if let (Some(max_seqnum), Some(max_seqnum_in_last)) =
             (self.max_seqnum, self.max_seqnum_in_last)
         {
-            let expected_since_last = (max_seqnum.saturating_sub(max_seqnum_in_last)) as u32;
+            let expected_since_last = max_seqnum.saturating_sub(max_seqnum_in_last);
             let lost_since_last = self
                 .cumulative_loss
                 .saturating_sub(self.cumulative_loss_in_last);
@@ -2762,7 +2762,7 @@ mod test {
                 "{:x} {:x} {}",
                 ssrc,
                 seqnum,
-                hex::encode(&salt),
+                hex::encode(salt),
             );
         }
     }
