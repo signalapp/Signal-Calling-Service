@@ -44,7 +44,7 @@ pub async fn start(
 
     let tick_interval = Duration::from_millis(config.tick_interval_ms);
 
-    let local_addr = SocketAddr::new(config.binding_ip.parse()?, config.ice_candidate_port);
+    let local_addr = SocketAddr::new(config.binding_ip, config.ice_candidate_port);
 
     let udp_handler_state = UdpServerState::new(local_addr, num_threads, tick_interval)?;
     let udp_handler_state_for_tick = udp_handler_state.clone();

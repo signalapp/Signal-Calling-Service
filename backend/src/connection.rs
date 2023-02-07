@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::net::SocketAddr;
-
 use calling_common::{DataRate, DataSize, Duration, Instant};
 use log::*;
+use std::net::{
+    IpAddr::{V4, V6},
+    SocketAddr,
+};
 use thiserror::Error;
 
 use crate::{
@@ -68,6 +70,7 @@ pub struct Connection {
     /// the Connection decides which should be used for sending packets.
     /// See Connection::outgoing_addr().
     outgoing_addr: Option<SocketAddr>,
+    outgoing_addr_is_ipv6: Option<bool>,
 }
 
 struct Ice {
@@ -154,6 +157,7 @@ impl Connection {
                 controller: googcc::CongestionController::new(googcc_config, now),
             },
             outgoing_addr: None,
+            outgoing_addr_is_ipv6: None,
         }
     }
 
@@ -166,6 +170,10 @@ impl Connection {
     /// All packets except for ICE binding responses should be sent to this address, if there is one.
     pub fn outgoing_addr(&self) -> Option<SocketAddr> {
         self.outgoing_addr
+    }
+
+    pub fn outgoing_addr_is_ipv6(&self) -> Option<bool> {
+        self.outgoing_addr_is_ipv6
     }
 
     pub fn set_dequeue_scheduler(&mut self, dequeue_scheduler: Option<Box<Scheduler>>) {
@@ -204,6 +212,12 @@ impl Connection {
         if verified_binding_request.nominated() && self.outgoing_addr != Some(sender_addr) {
             event!("calling.sfu.ice.outgoing_addr_switch");
             self.outgoing_addr = Some(sender_addr);
+            // self.outgoing_addr_is_ipv6 = Some(sender_addr.ip().to_canonical().is_ipv6());
+            // can't use this because it's not yet stable, do a little bit of the work ourselves
+            self.outgoing_addr_is_ipv6 = match sender_addr.ip() {
+                V4(_) => Some(false),
+                V6(addr) => Some(addr.to_ipv4_mapped().is_none()),
+            };
         }
         self.ice.binding_request_received = Some(now);
 

@@ -235,11 +235,20 @@ impl Sfu {
 
         let mut remembered_packet_count = Histogram::default();
         let mut remembered_packet_bytes = Histogram::default();
+        let mut v4_connections = 0;
+        let mut v6_connections = 0;
         for connection in self.connection_by_id.values() {
             let connection = connection.lock();
             let stats = connection.rtp_endpoint_stats();
             remembered_packet_count.push(stats.remembered_packet_count);
             remembered_packet_bytes.push(stats.remembered_packet_bytes);
+            if let Some(ipv6) = connection.outgoing_addr_is_ipv6() {
+                if ipv6 {
+                    v6_connections += 1;
+                } else {
+                    v4_connections += 1;
+                }
+            }
         }
         histograms.insert(
             "calling.sfu.connections.remembered_packets.count",
@@ -248,6 +257,14 @@ impl Sfu {
         histograms.insert(
             "calling.sfu.connections.remembered_packets.size_bytes",
             remembered_packet_bytes,
+        );
+        values.insert(
+            "calling.sfu.connections.udp_v4_count",
+            v4_connections as f32,
+        );
+        values.insert(
+            "calling.sfu.connections.udp_v6_count",
+            v6_connections as f32,
         );
 
         SfuStats { histograms, values }
@@ -889,7 +906,13 @@ impl rand_core5::CryptoRng for OsRngCompatibleWithDalek {}
 
 #[cfg(test)]
 mod sfu_tests {
-    use std::{convert::TryFrom, net::IpAddr, ops::Add, str::FromStr, sync::Arc};
+    use std::{
+        convert::TryFrom,
+        net::{IpAddr, Ipv4Addr},
+        ops::Add,
+        str::FromStr,
+        sync::Arc,
+    };
 
     use hex::{FromHex, ToHex};
     use once_cell::sync::Lazy;
@@ -973,7 +996,7 @@ mod sfu_tests {
 
         // Make sure elements exist correctly.
         let sfu = sfu.lock();
-        assert_eq!("127.0.0.1".to_string(), sfu.config.binding_ip);
+        assert_eq!(Ipv4Addr::LOCALHOST, sfu.config.binding_ip);
         assert_eq!(8080, sfu.config.signaling_port);
         assert_eq!(8, sfu.config.max_clients_per_call);
         assert_eq!(0, sfu.call_by_call_id.len());

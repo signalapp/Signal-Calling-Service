@@ -5,23 +5,24 @@
 
 //! Configuration options for the calling backend.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use clap;
 
 /// General configuration options, set by command line arguments or
 /// falls back to default or environment variables (in some cases).
-#[derive(Default, clap::Parser, Debug, Clone)]
+#[derive(clap::Parser, Debug, Clone)]
 #[clap(name = "calling_backend")]
 pub struct Config {
     /// The IP address to bind to for all servers.
     #[clap(long, default_value = "0.0.0.0")]
-    pub binding_ip: String,
+    pub binding_ip: IpAddr,
 
-    /// The IP address to share for for ICE candidates. Clients will connect
-    /// to the calling backend using this IP.
+    /// The IP address to share for for ICE candidates. Clients will
+    /// connect to the calling backend using this IP. If unset, binding-ip
+    /// is used, if binding-ip is also unset, 127.0.0.1 is used
     #[clap(long)]
-    pub ice_candidate_ip: Option<String>,
+    pub ice_candidate_ip: Vec<IpAddr>,
 
     /// The port to use for ICE candidates. Clients will connect to the
     /// calling backend using this port.
@@ -32,7 +33,7 @@ pub struct Config {
     /// defined, then the signaling_server will be used, otherwise the
     /// http_server will be used for testing.
     #[clap(long)]
-    pub signaling_ip: Option<String>,
+    pub signaling_ip: Option<IpAddr>,
 
     /// The port to use for the signaling interface.
     #[clap(long, default_value = "8080")]
@@ -119,28 +120,29 @@ pub struct MetricsOptions {
 }
 
 /// Returns the public address of the server for media/UDP as per configuration.
-pub fn get_server_media_address(config: &'static Config) -> SocketAddr {
-    let ip = config
-        .ice_candidate_ip
-        .as_deref()
-        .unwrap_or_else(|| {
-            if config.binding_ip == "0.0.0.0" {
-                "127.0.0.1"
-            } else {
-                &config.binding_ip
-            }
-        })
-        .parse()
-        .expect("ice_candidate_ip should parse");
-    SocketAddr::new(ip, config.ice_candidate_port)
+pub fn get_server_media_address(config: &'static Config) -> (IpAddr, u16, Vec<IpAddr>) {
+    if config.ice_candidate_ip.is_empty() {
+        let ip = if config.binding_ip == Ipv4Addr::UNSPECIFIED {
+            Ipv4Addr::LOCALHOST.into()
+        } else {
+            config.binding_ip
+        };
+        (ip, config.ice_candidate_port, vec![ip])
+    } else {
+        (
+            config.ice_candidate_ip[0],
+            config.ice_candidate_port,
+            config.ice_candidate_ip.clone(),
+        )
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn default_test_config() -> Config {
     Config {
-        binding_ip: "127.0.0.1".to_string(),
-        ice_candidate_ip: Some("127.0.0.1".to_string()),
-        signaling_ip: Some("127.0.0.1".to_string()),
+        binding_ip: Ipv4Addr::LOCALHOST.into(),
+        ice_candidate_ip: vec![Ipv4Addr::LOCALHOST.into()],
+        signaling_ip: Some(Ipv4Addr::LOCALHOST.into()),
         signaling_port: 8080,
         ice_candidate_port: 10000,
         max_clients_per_call: 8,

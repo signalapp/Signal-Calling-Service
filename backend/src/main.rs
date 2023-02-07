@@ -146,13 +146,16 @@ fn main() -> Result<()> {
 
         // Start the udp_server.
         let udp_server_handle = tokio::spawn(async move {
-            let _ = udp_server::start(
+            if let Err(err) = udp_server::start(
                 config,
                 sfu_clone_for_udp,
                 udp_ender_rx,
                 is_healthy_clone_for_udp,
             )
-            .await;
+            .await
+            {
+                error!("udp server shutdown {:?}", err);
+            }
             let _ = signal_canceller_tx_clone_for_udp.send(()).await;
         });
 

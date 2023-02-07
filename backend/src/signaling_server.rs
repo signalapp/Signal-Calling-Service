@@ -12,7 +12,7 @@
 
 use std::{
     convert::TryInto,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     str::{self, FromStr},
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -74,6 +74,7 @@ pub struct JoinRequest {
 #[serde(rename_all = "camelCase")]
 pub struct JoinResponse {
     pub server_ip: String,
+    pub server_ips: Vec<String>,
     pub server_port: u16,
     pub server_ice_ufrag: String,
     pub server_ice_pwd: String,
@@ -245,12 +246,13 @@ async fn join(
         client_hkdf_extra_info,
     ) {
         Ok(server_dhe_public_key) => {
-            let media_addr = config::get_server_media_address(config);
+            let (first_ip, server_port, ips) = config::get_server_media_address(config);
             let server_dhe_public_key = server_dhe_public_key.encode_hex();
 
             let response = JoinResponse {
-                server_ip: media_addr.ip().to_string(),
-                server_port: media_addr.port(),
+                server_ip: first_ip.to_string(),
+                server_ips: ips.iter().map(|ip| ip.to_string()).collect(),
+                server_port,
                 server_ice_ufrag,
                 server_ice_pwd,
                 server_dhe_public_key,
@@ -316,7 +318,7 @@ pub async fn start(
     ender_rx: Receiver<()>,
     is_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
-    let addr = SocketAddr::new(IpAddr::from_str(&config.binding_ip)?, config.signaling_port);
+    let addr = SocketAddr::new(config.binding_ip, config.signaling_port);
 
     let cpu_idle_pct = Arc::new(AtomicU8::new(0));
     let (monitor_ender_tx, monitor_ender_rx) = oneshot::channel();

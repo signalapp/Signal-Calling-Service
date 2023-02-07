@@ -83,6 +83,8 @@ pub struct JoinRequest {
 pub struct JoinResponse {
     #[serde(rename = "serverIp")]
     pub ip: String,
+    #[serde(rename = "serverIps")]
+    pub ips: Vec<String>,
     #[serde(rename = "serverPort")]
     pub port: u16,
     #[serde(rename = "serverIceUfrag")]

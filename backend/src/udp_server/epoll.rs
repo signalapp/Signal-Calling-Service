@@ -7,7 +7,7 @@ use std::{
     collections::{hash_map, HashMap},
     future::Future,
     io,
-    net::{SocketAddr, UdpSocket},
+    net::{Ipv6Addr, SocketAddr, UdpSocket},
     os::unix::io::{AsRawFd, FromRawFd, RawFd},
     sync::Arc,
 };
@@ -60,10 +60,13 @@ impl UdpServerState {
     ///
     /// Also creates a separate epoll file descriptor for each thread we plan to use.
     pub fn new(
-        local_addr: SocketAddr,
+        mut local_addr: SocketAddr,
         num_threads: usize,
         tick_interval: Duration,
     ) -> Result<Arc<Self>> {
+        if local_addr.is_ipv4() && local_addr.ip().is_unspecified() {
+            local_addr = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), local_addr.port());
+        }
         let new_client_socket = Self::open_socket_with_reusable_port(&local_addr)?;
         let all_epoll_fds = (0..num_threads)
             .map(|_| epoll_create1(EpollCreateFlags::empty()))
@@ -85,9 +88,13 @@ impl UdpServerState {
     fn open_socket_with_reusable_port(local_addr: &SocketAddr) -> Result<UdpSocket> {
         use nix::sys::socket::*;
 
-        // Open an IPv4 UDP socket in blocking mode.
+        // Open a UDP socket in blocking mode.
         let socket_fd = socket(
-            AddressFamily::Inet,
+            if local_addr.is_ipv4() {
+                AddressFamily::Inet
+            } else {
+                AddressFamily::Inet6
+            },
             SockType::Datagram,
             SockFlag::empty(),
             SockProtocol::Udp,

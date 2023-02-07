@@ -51,7 +51,8 @@ pub struct JoinRequest {
 pub struct JoinResponse {
     pub demux_id: u32,
     pub port: u16,
-    pub ip: String,
+    pub ip: String, // TODO remove once all clients use 'ips' field instead
+    pub ips: Vec<String>,
     pub ice_ufrag: String,
     pub ice_pwd: String,
     pub dhe_public_key: String,
@@ -155,6 +156,7 @@ pub async fn join(
         demux_id: response.demux_id,
         port: response.port,
         ip: response.ip,
+        ips: response.ips,
         ice_ufrag: response.ice_ufrag,
         ice_pwd: response.ice_pwd,
         dhe_public_key: response.dhe_public_key,
@@ -625,6 +627,7 @@ mod api_server_v2_tests {
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
                     ip: "127.0.0.1".to_string(),
+                    ips: vec!["127.0.0.1".to_string()],
                     port: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
@@ -710,6 +713,7 @@ mod api_server_v2_tests {
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
                     ip: "127.0.0.1".to_string(),
+                    ips: vec!["127.0.0.1".to_string()],
                     port: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),

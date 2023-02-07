@@ -15,6 +15,15 @@ if [[ -z "${EXTERNAL_IP}" ]]; then
   fi
 fi
 
+if [[ -z "${EXTERNAL_IPV6}" ]]; then
+  EXTERNAL_IPV6="$(curl -f -Ss "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ipv6s" -H "Metadata-Flavor: Google")"
+fi
+if [[ -z "${EXTERNAL_IPV6}" ]]; then
+  IPV6_ICE=()
+else
+  IPV6_ICE=(--ice-candidate-ip "$EXTERNAL_IPV6")
+fi
+
 if [[ -z "${INTERNAL_IP}" ]]; then
   INTERNAL_IP="$(curl -Ss "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip" -H "Metadata-Flavor: Google")"
   if [[ -z "${INTERNAL_IP}" ]]; then
@@ -25,6 +34,7 @@ fi
 
 set -- calling_backend \
   --ice-candidate-ip "$EXTERNAL_IP" \
+  "${IPV6_ICE[@]}" \
   --signaling-ip "$INTERNAL_IP" \
   "$@"
 

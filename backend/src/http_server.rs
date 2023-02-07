@@ -9,14 +9,7 @@
 //!   GET /v2/conference/participants
 //!   PUT /v2/conference/participants
 
-use std::{
-    convert::TryInto,
-    net::{IpAddr, SocketAddr},
-    str,
-    str::FromStr,
-    sync::Arc,
-    time::UNIX_EPOCH,
-};
+use std::{convert::TryInto, net::SocketAddr, str, sync::Arc, time::UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -72,6 +65,7 @@ pub struct JoinResponse {
     pub demux_id: u32,
     pub port: u16,
     pub ip: String,
+    pub ips: Vec<String>,
     pub ice_ufrag: String,
     pub ice_pwd: String,
     pub dhe_public_key: String,
@@ -378,12 +372,13 @@ async fn join_conference(
         client_hkdf_extra_info,
     ) {
         Ok(server_dhe_public_key) => {
-            let media_addr = config::get_server_media_address(config);
+            let (first_ip, port, ips) = config::get_server_media_address(config);
 
             let response = JoinResponse {
                 demux_id: demux_id.into(),
-                port: media_addr.port(),
-                ip: media_addr.ip().to_string(),
+                port,
+                ip: first_ip.to_string(),
+                ips: ips.iter().map(|ip| ip.to_string()).collect(),
                 ice_ufrag: server_ice_ufrag,
                 ice_pwd: server_ice_pwd,
                 dhe_public_key: server_dhe_public_key.encode_hex(),
@@ -422,7 +417,7 @@ pub async fn start(
     sfu: Arc<Mutex<Sfu>>,
     http_ender_rx: Receiver<()>,
 ) -> Result<()> {
-    let addr = SocketAddr::new(IpAddr::from_str(&config.binding_ip)?, config.signaling_port);
+    let addr = SocketAddr::new(config.binding_ip, config.signaling_port);
 
     let server = axum::Server::try_bind(&addr)?
         .serve(
