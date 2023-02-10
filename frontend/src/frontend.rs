@@ -384,11 +384,16 @@ impl Frontend {
             FrontendError::InternalError
         })?;
 
+        let ips = match backend_join_response.ips {
+            Some(ips) => ips,
+            None => vec![backend_join_response.ip.clone()],
+        };
+
         Ok(JoinResponseWrapper {
             demux_id: demux_id.as_u32(),
             port: backend_join_response.port,
             ip: backend_join_response.ip,
-            ips: backend_join_response.ips,
+            ips,
             ice_ufrag: backend_join_response.ice_ufrag,
             ice_pwd: backend_join_response.ice_pwd,
             dhe_public_key: backend_dhe_public_key,

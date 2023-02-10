@@ -627,7 +627,7 @@ mod api_server_v2_tests {
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
                     ip: "127.0.0.1".to_string(),
-                    ips: vec!["127.0.0.1".to_string()],
+                    ips: Some(vec!["127.0.0.1".to_string()]),
                     port: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
@@ -664,6 +664,7 @@ mod api_server_v2_tests {
         assert_eq!(join_response.demux_id, DEMUX_ID_1);
         assert_eq!(join_response.port, 8080);
         assert_eq!(join_response.ip, "127.0.0.1".to_string());
+        assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
         assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
         assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
         assert_eq!(
@@ -713,7 +714,7 @@ mod api_server_v2_tests {
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
                     ip: "127.0.0.1".to_string(),
-                    ips: vec!["127.0.0.1".to_string()],
+                    ips: Some(vec!["127.0.0.1".to_string()]),
                     port: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
@@ -750,6 +751,94 @@ mod api_server_v2_tests {
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
         assert_eq!(join_response.ip, "127.0.0.1".to_string());
+        assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
+        assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
+        assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
+        assert_eq!(
+            join_response.dhe_public_key,
+            BACKEND_DHE_PUBLIC_KEY.to_string()
+        );
+        assert_eq!(&join_response.call_creator, USER_ID_1);
+    }
+
+    /// Invoke the "PUT /v2/conference/participants" to join in the case where there is a call and backend is older and does not return ips.
+    #[tokio::test]
+    async fn test_join_with_call_old_backend() {
+        let config = &CONFIG;
+
+        // Create mocked dependencies with expectations.
+        let storage = create_mocked_storage_with_call_for_region(config.region.to_string());
+        let mut backend = Box::new(MockBackend::new());
+        let mut id_generator = Box::new(MockIdGenerator::new());
+
+        // Create additional expectations.
+        id_generator
+            .expect_get_random_demux_id_and_endpoint_id()
+            // user_id: &str
+            .with(eq(USER_ID_2))
+            .once()
+            // Result<(DemuxId, String), FrontendError>
+            .returning(|_| Ok((DEMUX_ID_2.try_into().unwrap(), ENDPOINT_ID_2.to_string())));
+
+        let expected_demux_id: DemuxId = DEMUX_ID_2.try_into().unwrap();
+
+        backend
+            .expect_join()
+            // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
+            .with(
+                eq(backend::Address::try_from("127.0.0.1").unwrap()),
+                eq(CALL_ID_1),
+                eq(expected_demux_id),
+                eq(backend::JoinRequest {
+                    client_id: ENDPOINT_ID_2.to_string(),
+                    ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
+                    hkdf_extra_info: None,
+                }),
+            )
+            .once()
+            // Result<JoinResponse, BackendError>
+            .returning(|_, _, _, _| {
+                Ok(backend::JoinResponse {
+                    ip: "127.0.0.1".to_string(),
+                    ips: None,
+                    port: 8080,
+                    ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
+                    ice_pwd: BACKEND_ICE_PWD.to_string(),
+                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                })
+            });
+
+        let frontend = create_frontend_with_id_generator(config, storage, backend, id_generator);
+
+        // Create an axum application.
+        let app = app(frontend);
+
+        // Create the request.
+        let join_request = create_join_request();
+
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v2/conference/participants")
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(USER_ID_2),
+            )
+            .body(Body::from(serde_json::to_vec(&join_request).unwrap()))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(join_response.demux_id, DEMUX_ID_2);
+        assert_eq!(join_response.port, 8080);
+        assert_eq!(join_response.ip, "127.0.0.1".to_string());
+        assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
         assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
         assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
         assert_eq!(
