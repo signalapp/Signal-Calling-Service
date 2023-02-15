@@ -11,6 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 anyhow = "1.0"
+arbitrary = "1"
 hex-literal = "0.3.2"
 libfuzzer-sys = "0.4"
 rand = "0.8"
@@ -52,6 +53,12 @@ doc = false
 [[bin]]
 name = "rtp"
 path = "fuzz_targets/rtp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "googcc"
+path = "fuzz_targets/googcc.rs"
 test = false
 doc = false
 
