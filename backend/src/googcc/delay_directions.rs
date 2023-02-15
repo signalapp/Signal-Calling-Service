@@ -8,6 +8,7 @@ use std::cmp::{max, min};
 use async_stream::stream;
 use calling_common::{exponential_moving_average, Duration, Instant, RingBuffer};
 use futures::{pin_mut, Stream, StreamExt};
+use log::*;
 
 use crate::transportcc::{Ack, RemoteInstant};
 
@@ -744,14 +745,20 @@ fn calculate_delay_slopes(
                 );
                 history.push((relative_arrival.as_secs(), smoothed_delay.as_secs()));
                 if history.is_full() {
-                    let delay_slope = linear_regression(history.iter().copied())
-                        .expect("after the first group, the history should never have all departure times the same");
-                    yield (
-                        latest_ack.feedback_arrival,
-                        delay_slope,
-                        departure_delta,
-                        sample_count,
-                    );
+                    if let Some(delay_slope) = linear_regression(history.iter().copied()) {
+                        yield (
+                            latest_ack.feedback_arrival,
+                            delay_slope,
+                            departure_delta,
+                            sample_count,
+                        );
+                    } else {
+                        error!(
+                            "ack group history only contains one set of arrival times: {:?}",
+                            history
+                        );
+                        debug_assert!(false, "after the first group, the history should never have all arrival times the same");
+                    }
                 }
             }
         }

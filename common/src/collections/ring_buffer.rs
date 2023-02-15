@@ -4,6 +4,7 @@
 //
 
 use std::collections::VecDeque;
+use std::fmt::Debug;
 
 /// A fixed size RingBuffer. On insert drops the oldest inserted item iff full.
 pub struct RingBuffer<T> {
@@ -44,6 +45,12 @@ impl<T> RingBuffer<T> {
 
     pub fn is_full(&self) -> bool {
         self.len() == self.limit
+    }
+}
+
+impl<T: Debug> Debug for RingBuffer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.values)
     }
 }
 
