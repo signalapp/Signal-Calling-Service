@@ -28,7 +28,7 @@ struct GoogleToken {
     token: Option<String>,
 }
 
-const GCP_TIMEOUT: Duration = Duration::from_secs(2);
+const GCP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// from https://cloud.google.com/compute/docs/access/create-enable-service-accounts-for-instances#applications
 #[derive(Deserialize)]
@@ -174,8 +174,8 @@ impl InstanceLister {
         .await?;
 
         tokio::spawn(async move {
-            let mut cont = true;
-            while cont {
+            let mut succeeded = false;
+            loop {
                 let timeout = time::sleep(INSTANCE_LIST_INTERVAL);
                 let request = lister.get_list();
                 tokio::pin!(timeout);
@@ -184,12 +184,16 @@ impl InstanceLister {
                     _ = &mut timeout => (),
                     _ = &mut canceller_rx => {
                         info!("instance lister shutdown");
-                        cont = false;
+                        break;
                     },
                     instance_group = request => {
                         match instance_group {
                             Ok(g) => match lister.get_instances(g, &map).await {
                                 Ok((new_map, true)) => {
+                                    if !succeeded {
+                                        succeeded = true;
+                                        info!("instance group fetched successfully");
+                                    }
                                     map = new_map;
                                     let _ = LoadBalancer::set_host_list_impl(
                                         load_balancer_sender.clone(),
@@ -197,13 +201,20 @@ impl InstanceLister {
                                     )
                                     .await;
                                 }
-                                Ok((_, false)) => (),
+                                Ok((_, false)) => {
+                                    if !succeeded {
+                                        succeeded = true;
+                                        info!("instance group fetched successfully");
+                                    }
+                                }
                                 Err(err) => {
-                                    error!("Error fetching instances {}", err);
+                                    succeeded = false;
+                                    warn!("Error fetching instances {}, will retry", err);
                                 }
                             },
                             Err(err) => {
-                                error!("Error fetching instance group {}", err)
+                                succeeded = false;
+                                warn!("Error fetching instance group {}, will retry", err)
                             }
                         };
                         timeout.await;
