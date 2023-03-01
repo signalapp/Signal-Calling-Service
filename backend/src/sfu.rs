@@ -713,7 +713,8 @@ impl Sfu {
         let remove_inactive_calls_timer = start_timer_us!("calling.sfu.tick.remove_inactive_calls");
 
         let mut expired_demux_ids_by_call_id: HashMap<CallId, Vec<DemuxId>> = HashMap::new();
-        let mut outgoing_queue_sizes: Vec<(DemuxId, DataSize)> = Vec::new();
+        let mut outgoing_queue_sizes_by_call_id: HashMap<CallId, Vec<(DemuxId, DataSize)>> =
+            HashMap::new();
         self.connection_by_id.retain(|connection_id, connection| {
             let mut connection = connection.lock();
             if check_for_inactivity && connection.inactive(now) {
@@ -737,7 +738,9 @@ impl Sfu {
             } else {
                 // Don't remove the connection; it's still active!
                 connection.tick(&mut packets_to_send, now);
-                outgoing_queue_sizes
+                outgoing_queue_sizes_by_call_id
+                    .entry(connection_id.call_id.clone())
+                    .or_default()
                     .push((connection_id.demux_id, connection.outgoing_queue_size()));
                 true
             }
@@ -770,16 +773,18 @@ impl Sfu {
                     true
                 }
             } else {
-                for (demux_id, outgoing_queue_size) in &outgoing_queue_sizes {
-                    // Note: this works even if the duration is zero.
-                    // Normally, we shouldn't ever be configured with 0 drain duration
-                    // But perhaps allowing it to mean "as fast as possible"?
-                    // would be an interesting thing to be able to do.
-                    let outgoing_queue_drain_rate =
-                        *outgoing_queue_size / outgoing_queue_drain_duration;
-                    // Ignore the error because it can only mean the client is gone, in which case it doesn't matter.
-                    let _ =
-                        call.set_outgoing_queue_drain_rate(*demux_id, outgoing_queue_drain_rate);
+                if let Some(outgoing_queue_sizes) = outgoing_queue_sizes_by_call_id.get(call_id) {
+                    for (demux_id, outgoing_queue_size) in outgoing_queue_sizes {
+                        // Note: this works even if the duration is zero.
+                        // Normally, we shouldn't ever be configured with 0 drain duration
+                        // But perhaps allowing it to mean "as fast as possible"?
+                        // would be an interesting thing to be able to do.
+                        let outgoing_queue_drain_rate =
+                            *outgoing_queue_size / outgoing_queue_drain_duration;
+                        // Ignore the error because it can only mean the client is gone, in which case it doesn't matter.
+                        let _ = call
+                            .set_outgoing_queue_drain_rate(*demux_id, outgoing_queue_drain_rate);
+                    }
                 }
                 // Don't remove the call; there are still clients!
                 let (outgoing_rtp, outgoing_key_frame_requests) = call.tick(now);
