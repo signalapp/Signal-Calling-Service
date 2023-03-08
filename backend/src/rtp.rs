@@ -1359,6 +1359,9 @@ struct ReceiverReportSender {
     max_seqnum_in_last: Option<u32>,
     cumulative_loss: u32,
     cumulative_loss_in_last: u32,
+    last_receive_time: Instant,
+    last_rtp_timestamp: u32,
+    jitter_q4: u32,
 }
 
 impl ReceiverReportSender {
@@ -1368,25 +1371,44 @@ impl ReceiverReportSender {
             max_seqnum_in_last: None,
             cumulative_loss: 0,
             cumulative_loss_in_last: 0,
+            last_receive_time: Instant::now(),
+            last_rtp_timestamp: 0,
+            jitter_q4: 0,
         }
     }
 
-    fn remember_received(&mut self, seqnum: FullSequenceNumber) {
+    fn remember_received(
+        &mut self,
+        seqnum: FullSequenceNumber,
+        payload_type: PayloadType,
+        rtp_timestamp: u32,
+        receive_time: Instant,
+    ) {
         let seqnum = seqnum as u32;
         if let Some(max_seqnum) = self.max_seqnum {
-            if seqnum > max_seqnum {
-                if seqnum - max_seqnum > SEQNUM_GAP_THRESHOLD {
-                    // Ignore seqnum gap caused by stream restart.
-                    self.cumulative_loss = 0;
-                    self.cumulative_loss_in_last = 0;
-                    self.max_seqnum = Some(seqnum);
-                    self.max_seqnum_in_last = Some(seqnum - 1);
-                    return;
-                }
+            if seqnum.abs_diff(max_seqnum) > SEQNUM_GAP_THRESHOLD {
+                // Large seqnum gaps are caused by stream restarts. When this happens, reset the
+                // state since the values for the old stream may not be relevant anymore.
+                self.cumulative_loss = 0;
+                self.cumulative_loss_in_last = 0;
+                self.max_seqnum = Some(seqnum);
+                self.max_seqnum_in_last = Some(seqnum - 1);
 
+                self.last_receive_time = receive_time;
+                self.last_rtp_timestamp = rtp_timestamp;
+                self.jitter_q4 = 0;
+                return;
+            }
+
+            if seqnum > max_seqnum {
                 let seqnums_in_gap = seqnum - max_seqnum - 1;
                 self.cumulative_loss = self.cumulative_loss.saturating_add(seqnums_in_gap);
                 self.max_seqnum = Some(seqnum);
+
+                self.update_jitter(payload_type, rtp_timestamp, receive_time);
+
+                self.last_receive_time = receive_time;
+                self.last_rtp_timestamp = rtp_timestamp;
             } else {
                 self.cumulative_loss = self.cumulative_loss.saturating_sub(1);
             }
@@ -1395,7 +1417,45 @@ impl ReceiverReportSender {
             // When we get the first seqnum, make it so we've expected 1 seqnum since "last"
             // even though there hasn't been a last yet.
             self.max_seqnum_in_last = Some(seqnum.saturating_sub(1));
+
+            self.last_receive_time = receive_time;
+            self.last_rtp_timestamp = rtp_timestamp;
         }
+    }
+
+    fn update_jitter(
+        &mut self,
+        payload_type: PayloadType,
+        rtp_timestamp: u32,
+        receive_time: Instant,
+    ) {
+        let receive_diff = receive_time.saturating_duration_since(self.last_receive_time);
+
+        let payload_freq_hz = if payload_type == OPUS_PAYLOAD_TYPE {
+            48000
+        } else if payload_type == VP8_PAYLOAD_TYPE {
+            90000
+        } else {
+            warn!(
+                "unexpected payload type {}, using payload frequency of 90000",
+                payload_type
+            );
+            90000
+        };
+
+        // The difference in receive time (interarrival time) converted to the units of the RTP
+        // timestamps.
+        let receive_diff_rtp = receive_diff.as_millis() as u32 * payload_freq_hz / 1000;
+
+        // The difference in transmission time represented in the units of RTP timestamps.
+        let tx_diff_rtp = (receive_diff_rtp as i64)
+            .saturating_sub(rtp_timestamp.saturating_sub(self.last_rtp_timestamp) as i64)
+            .unsigned_abs() as u32;
+
+        let jitter_diff_q4 = (tx_diff_rtp << 4) as i32 - self.jitter_q4 as i32;
+        self.jitter_q4 = self
+            .jitter_q4
+            .saturating_add_signed((jitter_diff_q4 + 8) >> 4);
     }
 
     fn write_receiver_report_block(&mut self, ssrc: Ssrc) -> Option<Vec<u8>> {
@@ -1425,8 +1485,9 @@ impl ReceiverReportSender {
             // that.
             self.cumulative_loss_in_last = self.cumulative_loss;
 
+            let interarrival_jitter: u32 = self.jitter_q4 >> 4;
+
             // Not used yet.
-            let interarrival_jitter: u32 = 0;
             let last_sender_report_timestamp: u32 = 0;
             let delay_since_last_sender_report: u32 = 0;
 
@@ -1638,9 +1699,12 @@ impl Endpoint {
         if is_media_payload_type(incoming.payload_type()) {
             let ssrc_state = self.get_incoming_ssrc_state_mut(incoming.ssrc());
 
-            ssrc_state
-                .receiver_report_sender
-                .remember_received(incoming.seqnum());
+            ssrc_state.receiver_report_sender.remember_received(
+                incoming.seqnum(),
+                incoming.payload_type(),
+                incoming.timestamp,
+                now,
+            );
         }
 
         if let Some(tcc_seqnum) = incoming.tcc_seqnum {
@@ -2768,7 +2832,7 @@ mod test {
     }
 
     #[test]
-    fn test_receiver_report_sender() {
+    fn test_receiver_report_sender_packet_loss() {
         let mut receiver_report_sender = ReceiverReportSender::new();
 
         fn expected_bytes(
@@ -2805,7 +2869,7 @@ mod test {
 
         // Receiving all packets in order means no loss.
         for seqnum in 1000..=1004 {
-            receiver_report_sender.remember_received(seqnum);
+            receiver_report_sender.remember_received(seqnum, OPUS_PAYLOAD_TYPE, 0, Instant::now());
         }
 
         assert_eq!(
@@ -2815,7 +2879,7 @@ mod test {
 
         // Even if packets are received out of order, if there are no gaps, then there's no loss.
         for seqnum in &[1009, 1005, 1007, 1008, 1010, 1006] {
-            receiver_report_sender.remember_received(*seqnum);
+            receiver_report_sender.remember_received(*seqnum, OPUS_PAYLOAD_TYPE, 0, Instant::now());
         }
 
         assert_eq!(
@@ -2824,7 +2888,7 @@ mod test {
         );
 
         // Now we lose 1011..=1019
-        receiver_report_sender.remember_received(1020);
+        receiver_report_sender.remember_received(1020, OPUS_PAYLOAD_TYPE, 0, Instant::now());
 
         // ... which means that we lost 9 packets (230 / 256).
         assert_eq!(
@@ -2834,7 +2898,7 @@ mod test {
 
         // Receiving duplicate packets reduces the cumulative loss
         for _ in 0..4 {
-            receiver_report_sender.remember_received(1020);
+            receiver_report_sender.remember_received(1020, OPUS_PAYLOAD_TYPE, 0, Instant::now());
         }
 
         assert_eq!(
@@ -2843,7 +2907,7 @@ mod test {
         );
 
         for _ in 0..10 {
-            receiver_report_sender.remember_received(1020);
+            receiver_report_sender.remember_received(1020, OPUS_PAYLOAD_TYPE, 0, Instant::now());
         }
 
         // ... but we don't support negative loss.
@@ -2853,19 +2917,203 @@ mod test {
         );
 
         // Increase loss again
-        receiver_report_sender.remember_received(1050);
+        receiver_report_sender.remember_received(1050, OPUS_PAYLOAD_TYPE, 0, Instant::now());
 
         assert_eq!(
             Some(expected_bytes(ssrc, 247, 29, 1050)),
             receiver_report_sender.write_receiver_report_block(ssrc)
         );
 
-        receiver_report_sender.remember_received(3050);
+        receiver_report_sender.remember_received(3050, OPUS_PAYLOAD_TYPE, 0, Instant::now());
 
         // ... to show that a large gap in seqnums causes the statistics to be reset.
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 0, 3050)),
             receiver_report_sender.write_receiver_report_block(ssrc)
         );
+    }
+
+    #[test]
+    fn test_receiver_report_sender_jitter() {
+        let mut receiver_report_sender = ReceiverReportSender::new();
+
+        fn expected_bytes(ssrc: Ssrc, interarrival_jitter: u32, max_seqnum: u32) -> Vec<u8> {
+            let last_sender_report_timestamp: u32 = 0;
+            let delay_since_last_sender_report: u32 = 0;
+
+            (
+                ssrc,
+                [0u8],
+                U24::from(0),
+                max_seqnum,
+                (
+                    interarrival_jitter,
+                    last_sender_report_timestamp,
+                    delay_since_last_sender_report,
+                ),
+            )
+                .to_vec()
+        }
+
+        let ssrc = 123456;
+
+        // Given a 20 ms ptime (50 packets / second) and a sample rate of 48000, RTP timestamps
+        // would increment by this amount assuming no other delays.
+        let rtp_interval = 48000 / 50;
+
+        let now = Instant::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        // Receiving all packets at a constant rate means that there's no jitter
+        receiver_report_sender.remember_received(10, OPUS_PAYLOAD_TYPE, rtp_interval, at(20));
+        receiver_report_sender.remember_received(11, OPUS_PAYLOAD_TYPE, 2 * rtp_interval, at(40));
+        receiver_report_sender.remember_received(12, OPUS_PAYLOAD_TYPE, 3 * rtp_interval, at(60));
+
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 12)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        // Receiving older packets doesn't update jitter
+        receiver_report_sender.remember_received(9, OPUS_PAYLOAD_TYPE, 0, at(85));
+
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 12)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        // We were previously expecting packets to be received every 20 ms, but this is received 40
+        // ms after the previous one, so there is jitter now.
+        receiver_report_sender.remember_received(13, OPUS_PAYLOAD_TYPE, 4 * rtp_interval, at(100));
+
+        // An interarrival jitter of 60 is 1.25 ms in this case. Although WebRTC stores jitter
+        // stats with millisecond precision, so shows up as 1 ms. The conversion factor from RTP
+        // timestamps to real time is 1 / (48000 / 50 / 20). Sample rate=48000, packets / second =
+        // 50, ptime = 20.
+        assert_eq!(
+            Some(expected_bytes(ssrc, 60, 13)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        // A large increase in sequence numbers is treated as a stream reset, and the jitter is
+        // also reset.
+        receiver_report_sender.remember_received(
+            1000,
+            OPUS_PAYLOAD_TYPE,
+            5 * rtp_interval,
+            at(120),
+        );
+
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 1000)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+    }
+
+    #[test]
+    fn test_receiver_report_sender_jitter_recovery() {
+        let mut receiver_report_sender = ReceiverReportSender::new();
+
+        fn expected_bytes(ssrc: Ssrc, interarrival_jitter: u32, max_seqnum: u32) -> Vec<u8> {
+            let last_sender_report_timestamp: u32 = 0;
+            let delay_since_last_sender_report: u32 = 0;
+
+            (
+                ssrc,
+                [0u8],
+                U24::from(0),
+                max_seqnum,
+                (
+                    interarrival_jitter,
+                    last_sender_report_timestamp,
+                    delay_since_last_sender_report,
+                ),
+            )
+                .to_vec()
+        }
+
+        let ssrc = 123456;
+
+        // Given a 20 ms ptime (50 packets / second) and a sample rate of 48000, RTP timestamps
+        // would increment by this amount assuming no other delays.
+        let rtp_interval = 48000 / 50;
+
+        let now = Instant::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut seqnum = 10;
+        receiver_report_sender.remember_received(seqnum, OPUS_PAYLOAD_TYPE, rtp_interval, at(20));
+
+        seqnum += 1;
+        receiver_report_sender.remember_received(
+            seqnum,
+            OPUS_PAYLOAD_TYPE,
+            2 * rtp_interval,
+            at(40),
+        );
+
+        seqnum += 1;
+        receiver_report_sender.remember_received(
+            seqnum,
+            OPUS_PAYLOAD_TYPE,
+            3 * rtp_interval,
+            at(60),
+        );
+
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 12)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        // Now interarrival time increases to 21 ms and jitter increases.
+        let expected_jitter_values = [
+            3, 5, 8, 10, 13, 15, 17, 19, 21, 22, 24, 26, 27, 28, 29, 31, 32, 33, 34, 34, 35, 36,
+            37, 37, 38, 39, 39, 40, 40, 41, 41, 41, 42, 42, 43, 43, 43, 43, 44, 44, 44, 44, 45, 45,
+            45, 45, 45, 45, 45, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 47, 47, 47, 47, 47, 47,
+            47, 47, 47, 47, 47,
+        ];
+        let mut time = 60;
+        for (i, expected_jitter) in expected_jitter_values.iter().enumerate() {
+            time += 21;
+
+            seqnum += 1;
+
+            receiver_report_sender.remember_received(
+                seqnum,
+                OPUS_PAYLOAD_TYPE,
+                (4 + (i as u32)) * rtp_interval,
+                at(time),
+            );
+
+            assert_eq!(
+                Some(expected_bytes(ssrc, *expected_jitter, seqnum as u32)),
+                receiver_report_sender.write_receiver_report_block(ssrc)
+            );
+        }
+
+        // Then goes back to 20 ms and jitter gradually recovers (trends to 0).
+        let i_offset = expected_jitter_values.len();
+        let expected_jitter_values = [
+            44, 41, 39, 36, 34, 32, 30, 28, 26, 24, 23, 21, 20, 19, 18, 16, 15, 14, 13, 13, 12, 11,
+            10, 10, 9, 8, 8, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4,
+        ];
+        for (i, expected_jitter) in expected_jitter_values.iter().enumerate() {
+            time += 20;
+            let i = i + i_offset;
+
+            seqnum += 1;
+
+            receiver_report_sender.remember_received(
+                seqnum,
+                OPUS_PAYLOAD_TYPE,
+                (4 + (i as u32)) * rtp_interval,
+                at(time),
+            );
+
+            assert_eq!(
+                Some(expected_bytes(ssrc, *expected_jitter, seqnum as u32)),
+                receiver_report_sender.write_receiver_report_block(ssrc)
+            );
+        }
     }
 }
