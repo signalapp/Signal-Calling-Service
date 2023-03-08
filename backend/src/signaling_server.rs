@@ -23,7 +23,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::Path,
+    extract::{Path, State},
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -120,7 +120,7 @@ pub fn parse_user_id_and_resolution_request_id_from_endpoint_id(
 
 /// Return a health response after accessing the SFU and obtaining basic information.
 async fn get_health(
-    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
+    State(sfu): State<Arc<Mutex<Sfu>>>,
     Extension(is_healthy): Extension<Arc<AtomicBool>>,
     Extension(cpu_idle_pct): Extension<Arc<AtomicU8>>,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -176,8 +176,8 @@ async fn get_info(
 /// the call does not exist or an empty list if there are no clients
 /// currently in the call.
 async fn get_clients(
+    State(sfu): State<Arc<Mutex<Sfu>>>,
     Path(call_id): Path<String>,
-    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     trace!("get_clients(): {}", call_id);
 
@@ -202,9 +202,9 @@ async fn get_clients(
 
 /// Handles a request for a client to join a call.
 async fn join(
+    State(sfu): State<Arc<Mutex<Sfu>>>,
     Path((call_id, demux_id)): Path<(String, u32)>,
     Extension(config): Extension<&'static config::Config>,
-    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
     Json(request): Json<JoinRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     trace!("join(): {} {}", call_id, demux_id);
@@ -282,12 +282,14 @@ pub fn signaling_api(
     is_healthy: Arc<AtomicBool>,
     cpu_idle_pct: Arc<AtomicU8>,
 ) -> Router {
-    let health_route = Router::new().route("/health", get(get_health)).layer(
-        ServiceBuilder::new()
-            .layer(Extension(sfu.clone()))
-            .layer(Extension(is_healthy))
-            .layer(Extension(cpu_idle_pct)),
-    );
+    let health_route = Router::new()
+        .route("/health", get(get_health))
+        .layer(
+            ServiceBuilder::new()
+                .layer(Extension(is_healthy))
+                .layer(Extension(cpu_idle_pct)),
+        )
+        .with_state(sfu.clone());
 
     let info_route = Router::new()
         .route("/v1/info", get(get_info))
@@ -295,15 +297,12 @@ pub fn signaling_api(
 
     let clients_route = Router::new()
         .route("/v1/call/:call_id/clients", get(get_clients))
-        .layer(ServiceBuilder::new().layer(Extension(sfu.clone())));
+        .with_state(sfu.clone());
 
     let join_route = Router::new()
         .route("/v1/call/:call_id/client/:demux_id", post(join))
-        .layer(
-            ServiceBuilder::new()
-                .layer(Extension(config))
-                .layer(Extension(sfu)),
-        );
+        .layer(Extension(config))
+        .with_state(sfu);
 
     Router::new()
         .merge(health_route)

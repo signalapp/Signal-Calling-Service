@@ -5,16 +5,16 @@
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::{
+    error::{DeleteItemError, DeleteItemErrorKind, PutItemError, PutItemErrorKind},
     model::{AttributeValue, Select},
-    types::SdkError,
-    Client, Config, Endpoint,
+    Client, Config,
 };
 use aws_smithy_async::rt::sleep::default_async_sleep;
 use aws_smithy_types::retry::RetryConfigBuilder;
-use aws_types::{region::Region, Credentials};
+use aws_types::region::Region;
 use calling_common::Duration;
-use http::Uri;
 use hyper::client::HttpConnector;
 use hyper::{Body, Method, Request};
 use log::*;
@@ -111,7 +111,7 @@ impl DynamoDb {
 
                 let aws_config = Config::builder()
                     .credentials_provider(Credentials::from_keys(KEY, PASSWORD, None))
-                    .endpoint_resolver(Endpoint::immutable(Uri::from_static(endpoint)))
+                    .endpoint_url(endpoint)
                     .sleep_impl(sleep_impl)
                     .region(Region::new(&config.storage_region))
                     .build();
@@ -200,18 +200,19 @@ impl Storage for DynamoDb {
 
         match response {
             Ok(_) => Ok(Some(call)),
-            Err(SdkError::ServiceError { err: e, raw: _ })
-                if e.is_conditional_check_failed_exception() =>
-            {
-                Ok(self
+            Err(err) => match err.into_service_error() {
+                PutItemError {
+                    kind: PutItemErrorKind::ConditionalCheckFailedException(_),
+                    ..
+                } => Ok(self
                     .get_call_record(&call.group_id)
                     .await
-                    .context("failed to get call from storage after conditional check failed")?)
-            }
-            Err(err) => Err(StorageError::UnexpectedError(
-                anyhow::Error::from(err)
-                    .context("failed to put_item to storage for get_or_add_call_record"),
-            )),
+                    .context("failed to get call from storage after conditional check failed")?),
+                err => Err(StorageError::UnexpectedError(
+                    anyhow::Error::from(err)
+                        .context("failed to put_item to storage for get_or_add_call_record"),
+                )),
+            },
         }
     }
 
@@ -241,12 +242,14 @@ impl Storage for DynamoDb {
 
         match response {
             Ok(_) => Ok(()),
-            Err(SdkError::ServiceError { err: e, raw: _ })
-                if e.is_conditional_check_failed_exception() =>
-            {
-                Ok(())
-            }
-            Err(err) => Err(StorageError::UnexpectedError(err.into())),
+
+            Err(err) => match err.into_service_error() {
+                DeleteItemError {
+                    kind: DeleteItemErrorKind::ConditionalCheckFailedException(_),
+                    ..
+                } => Ok(()),
+                err => Err(StorageError::UnexpectedError(err.into())),
+            },
         }
     }
 

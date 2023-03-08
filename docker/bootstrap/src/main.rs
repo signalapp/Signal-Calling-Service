@@ -3,12 +3,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use aws_sdk_dynamodb::model::{
-    AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection,
-    ProjectionType, ProvisionedThroughput, ScalarAttributeType,
+use aws_sdk_dynamodb::{
+    model::{
+        AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection,
+        ProjectionType, ProvisionedThroughput, ScalarAttributeType,
+    },
+    Client, Error, Region,
 };
-use aws_sdk_dynamodb::{Client, Endpoint, Error, Region};
-use http::Uri;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -18,9 +19,7 @@ async fn main() -> Result<(), Error> {
 
     // Be sure that AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are defined in the environment.
     let sdk_config = aws_config::from_env()
-        .endpoint_resolver(Endpoint::immutable(Uri::from_static(
-            "http://dynamodb:8000",
-        )))
+        .endpoint_url("http://dynamodb:8000")
         .region(Region::new("us-west-1"))
         .load()
         .await;
@@ -86,7 +85,7 @@ async fn main() -> Result<(), Error> {
         }
         Err(err) => {
             eprintln!("  Error: {}", err);
-            Err(Error::Unhandled(Box::new(err)))
+            Err(err.into())
         }
     }
 }

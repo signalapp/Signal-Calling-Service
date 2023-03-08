@@ -44,18 +44,19 @@ subtle = "2.4.0"
 # For http client and server
 hyper = { version = "0.14", features = ["full"] }
 hyper-rustls = { version = "0.23", features = ["webpki-roots"] }
-axum = { version = "0.5", features = ["headers"] }
+axum = { version = "0.6", features = ["headers"] }
 tower = "0.4"
 mime = "0.3"
 http = "0.2"
 
 # For storage access to DynamoDB
-aws-types = { version = "0.51", features = ["hardcoded-credentials"] }
-aws-smithy-types = "0.51"
-aws-smithy-async = "0.51"
-aws-config = "0.51"
-aws-sdk-dynamodb = "0.21"
-serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+0_21"] }
+aws-types = "0.54"
+aws-credential-types = { version = "0.54", features = ["hardcoded-credentials"] }
+aws-smithy-types = "0.54"
+aws-smithy-async = "0.54"
+aws-config = "0.54"
+aws-sdk-dynamodb = "0.24"
+serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+0_24"] }
 
 # For metrics
 parking_lot = "0.12"

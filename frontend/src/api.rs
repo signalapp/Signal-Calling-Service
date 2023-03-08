@@ -15,12 +15,11 @@ use std::{
 
 use anyhow::Result;
 use axum::{
-    extract::MatchedPath,
-    handler::Handler,
+    extract::{MatchedPath, State},
     middleware::{self, Next},
     response::IntoResponse,
     routing::get,
-    Extension, Router,
+    Router,
 };
 use http::{header, Request, StatusCode};
 use log::*;
@@ -70,13 +69,6 @@ fn get_user_agent<B>(req: &Request<B>) -> Result<&str, StatusCode> {
         })
 }
 
-fn get_frontend<B>(req: &Request<B>) -> Result<&Arc<Frontend>, StatusCode> {
-    req.extensions().get::<Arc<Frontend>>().ok_or_else(|| {
-        error!("authorize: could not get frontend extension");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
-}
-
 fn user_agent_event_string(user_agent: &str) -> &str {
     if user_agent.starts_with("Signal-iOS") {
         "ios"
@@ -99,6 +91,7 @@ fn user_agent_event_string(user_agent: &str) -> &str {
 
 /// Middleware to process metrics after a response is sent.
 async fn metrics<B>(
+    State(frontend): State<Arc<Frontend>>,
     req: Request<B>,
     next: Next<B>,
 ) -> Result<axum::response::Response, StatusCode> {
@@ -110,7 +103,6 @@ async fn metrics<B>(
     let method = req.method().as_str().to_lowercase();
     let path = get_request_path(&req);
     let user_agent = get_user_agent(&req)?.to_string();
-    let frontend = get_frontend(&req)?.clone();
 
     let response = next.run(req).await;
 
@@ -169,6 +161,7 @@ async fn metrics<B>(
 
 /// Middleware to handle the authorization header.
 async fn authorize<B>(
+    State(frontend): State<Arc<Frontend>>,
     mut req: Request<B>,
     next: Next<B>,
 ) -> Result<axum::response::Response, StatusCode> {
@@ -189,8 +182,6 @@ async fn authorize<B>(
             );
             StatusCode::UNAUTHORIZED
         })?;
-
-    let frontend = get_frontend(&req)?;
 
     let (_, password) = Authenticator::parse_basic_authorization_header(authorization_header)
         .map_err(|err| {
@@ -255,15 +246,15 @@ fn app(frontend: Arc<Frontend>) -> Router {
         )
         .layer(
             ServiceBuilder::new()
-                .layer(Extension(frontend))
-                .layer(middleware::from_fn(metrics))
-                .layer(middleware::from_fn(authorize)),
-        );
+                .layer(middleware::from_fn_with_state(frontend.clone(), metrics))
+                .layer(middleware::from_fn_with_state(frontend.clone(), authorize)),
+        )
+        .with_state(frontend);
 
     Router::new()
         .merge(health_route)
         .merge(routes)
-        .fallback(unknown_request_handler.into_service())
+        .fallback(unknown_request_handler)
 }
 
 pub async fn start(frontend: Arc<Frontend>, ender_rx: Receiver<()>) -> Result<()> {

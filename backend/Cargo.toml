@@ -32,7 +32,7 @@ futures = "0.3"
 num_cpus = "1.13"
 
 # For http
-axum = { version = "0.5", features = ["headers"] }
+axum = { version = "0.6", features = ["headers"] }
 hyper = { version = "0.14", features = ["full"] }
 tower = "0.4"
 

@@ -719,7 +719,7 @@ fn calculate_delay_slopes(
             ack_deltas.next().await
         {
             let mut sample_count = 1;
-            let mut accumulated_delay: TimeDelta = (first_arrival_delta - first_departure_delta);
+            let mut accumulated_delay: TimeDelta = first_arrival_delta - first_departure_delta;
             let mut smoothed_delay: TimeDelta = accumulated_delay;
             // Put secs in the history because it makes it easier to do the linear_regression without a bunch of generics.
             let mut history: RingBuffer<(f64, f64)> = RingBuffer::new(history_len);

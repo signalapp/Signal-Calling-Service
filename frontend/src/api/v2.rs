@@ -7,7 +7,7 @@ use std::{str, sync::Arc};
 
 use anyhow::Result;
 use axum::{
-    extract::OriginalUri,
+    extract::{OriginalUri, State},
     response::{IntoResponse, Redirect},
     Extension, Json,
 };
@@ -69,7 +69,7 @@ fn temporary_redirect(uri: &str) -> Result<axum::response::Response, StatusCode>
 
 /// Handler for the GET /conference/participants route.
 pub async fn get_participants(
-    Extension(frontend): Extension<Arc<Frontend>>,
+    State(frontend): State<Arc<Frontend>>,
     Extension(user_authorization): Extension<UserAuthorization>,
     OriginalUri(original_uri): OriginalUri,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -113,10 +113,10 @@ pub async fn get_participants(
 
 /// Handler for the PUT /conference/participants route.
 pub async fn join(
-    Extension(frontend): Extension<Arc<Frontend>>,
+    State(frontend): State<Arc<Frontend>>,
     Extension(user_authorization): Extension<UserAuthorization>,
-    Json(request): Json<JoinRequest>,
     OriginalUri(original_uri): OriginalUri,
+    Json(request): Json<JoinRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("join: ");
 
