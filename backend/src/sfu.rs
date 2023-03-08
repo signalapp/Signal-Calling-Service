@@ -732,6 +732,12 @@ impl Sfu {
                     .or_default()
                     .push(connection_id.demux_id);
 
+                if connection.outgoing_addr().is_none() {
+                    event!("calling.sfu.close_connection.no_nominee");
+                } else {
+                    event!("calling.sfu.close_connection.inactive");
+                }
+
                 // This prevents an Arc cycle where connection -> scheduler -> connection.
                 connection.set_dequeue_scheduler(None);
                 false
