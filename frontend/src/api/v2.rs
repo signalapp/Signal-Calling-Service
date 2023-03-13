@@ -57,6 +57,8 @@ pub struct JoinResponse {
     pub ice_pwd: String,
     pub dhe_public_key: String,
     pub call_creator: String,
+    #[serde(rename = "conferenceId")]
+    pub call_id: String,
 }
 
 fn temporary_redirect(uri: &str) -> Result<axum::response::Response, StatusCode> {
@@ -161,6 +163,7 @@ pub async fn join(
         ice_pwd: response.ice_pwd,
         dhe_public_key: response.dhe_public_key,
         call_creator: call.creator,
+        call_id: call.call_id,
     })
     .into_response())
 }
@@ -672,6 +675,7 @@ mod api_server_v2_tests {
             BACKEND_DHE_PUBLIC_KEY.to_string()
         );
         assert_eq!(&join_response.call_creator, USER_ID_1);
+        assert_eq!(&join_response.call_id, CALL_ID_1);
     }
 
     /// Invoke the "PUT /v2/conference/participants" to join in the case where there is a call.
@@ -759,6 +763,7 @@ mod api_server_v2_tests {
             BACKEND_DHE_PUBLIC_KEY.to_string()
         );
         assert_eq!(&join_response.call_creator, USER_ID_1);
+        assert_eq!(&join_response.call_id, CALL_ID_1);
     }
 
     /// Invoke the "PUT /v2/conference/participants" to join in the case where there is a call and backend is older and does not return ips.
@@ -846,6 +851,7 @@ mod api_server_v2_tests {
             BACKEND_DHE_PUBLIC_KEY.to_string()
         );
         assert_eq!(&join_response.call_creator, USER_ID_1);
+        assert_eq!(&join_response.call_id, CALL_ID_1);
     }
 
     /// Invoke the "PUT /v2/conference/participants" to join in the case where the call is
