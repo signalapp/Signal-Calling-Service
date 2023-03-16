@@ -1392,7 +1392,7 @@ impl ReceiverReportSender {
                 self.cumulative_loss = 0;
                 self.cumulative_loss_in_last = 0;
                 self.max_seqnum = Some(seqnum);
-                self.max_seqnum_in_last = Some(seqnum - 1);
+                self.max_seqnum_in_last = Some(seqnum.saturating_sub(1));
 
                 self.last_receive_time = receive_time;
                 self.last_rtp_timestamp = rtp_timestamp;
@@ -2926,9 +2926,25 @@ mod test {
 
         receiver_report_sender.remember_received(3050, OPUS_PAYLOAD_TYPE, 0, Instant::now());
 
-        // ... to show that a large gap in seqnums causes the statistics to be reset.
+        // ... to show that a large increase in seqnums causes the statistics to be reset.
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 0, 3050)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        // Increase loss again
+        receiver_report_sender.remember_received(3060, OPUS_PAYLOAD_TYPE, 0, Instant::now());
+
+        assert_eq!(
+            Some(expected_bytes(ssrc, 230, 9, 3060)),
+            receiver_report_sender.write_receiver_report_block(ssrc)
+        );
+
+        receiver_report_sender.remember_received(0, OPUS_PAYLOAD_TYPE, 0, Instant::now());
+
+        // ... to show that a large decrease in seqnums causes the statistics to be reset.
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 0, 0)),
             receiver_report_sender.write_receiver_report_block(ssrc)
         );
     }
