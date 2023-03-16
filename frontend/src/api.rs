@@ -27,7 +27,7 @@ use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
 
 use crate::{
-    authenticator::{AuthToken, Authenticator},
+    authenticator::{AuthToken, Authenticator, AuthenticatorError},
     frontend::{Frontend, FrontendError},
     metrics::histogram::Histogram,
 };
@@ -212,12 +212,16 @@ async fn authorize<B>(
         )
         .map_err(|err| {
             event!("calling.frontend.api.authorization.unauthorized");
-            info!(
-                "authorize: {} for {} from {}",
-                err,
-                req.method(),
-                user_agent
-            );
+
+            if err != AuthenticatorError::ExpiredCredentials {
+                info!(
+                    "authorize: {} for {} from {}",
+                    err,
+                    req.method(),
+                    user_agent
+                );
+            }
+
             StatusCode::UNAUTHORIZED
         })?;
 

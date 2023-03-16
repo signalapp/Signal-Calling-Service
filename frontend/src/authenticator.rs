@@ -102,11 +102,31 @@ impl FromStr for AuthToken {
 }
 
 /// What we know about the authorization a client has.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UserAuthorization {
     pub user_id: UserId,
     pub group_id: GroupId,
     pub user_permission: UserPermission,
+}
+
+#[derive(thiserror::Error, Debug, Eq, PartialEq)]
+pub enum AuthenticatorError {
+    #[error("invalid hmac_key length")]
+    InvalidMacKeyLength,
+    #[error("bad signature")]
+    BadSignature,
+    #[error("invalid time")]
+    InvalidTime,
+    #[error("expired credentials")]
+    ExpiredCredentials,
+    #[error("authorization header not valid")]
+    AuthHeaderNotValid,
+    #[error("could not parse authorization header")]
+    AuthHeaderParseFailure,
+    #[error("{0}")]
+    DecodeFailure(#[from] base64::DecodeError),
+    #[error("{0}")]
+    Utf8Failure(#[from] std::str::Utf8Error),
 }
 
 /// The Authenticator is used to verify the authorization header for incoming http requests.
@@ -114,9 +134,9 @@ pub struct Authenticator {
     key: [u8; 32],
 }
 
-fn hmac_sha256_digest(key: &[u8], data: &[u8]) -> Result<impl AsRef<[u8]>> {
+fn hmac_sha256_digest(key: &[u8], data: &[u8]) -> Result<impl AsRef<[u8]>, AuthenticatorError> {
     let mut hmac =
-        HmacSha256::new_from_slice(key).map_err(|_| anyhow!("invalid hmac_key length"))?;
+        HmacSha256::new_from_slice(key).map_err(|_| AuthenticatorError::InvalidMacKeyLength)?;
     hmac.update(data);
     Ok(hmac.finalize().into_bytes())
 }
@@ -124,14 +144,14 @@ fn hmac_sha256_digest(key: &[u8], data: &[u8]) -> Result<impl AsRef<[u8]>> {
 fn verify_gv2_auth_mac(
     expected_mac_digest: impl AsRef<[u8]>,
     actual_mac_digest: impl AsRef<[u8]>,
-) -> Result<()> {
+) -> Result<(), AuthenticatorError> {
     if bool::from(
         expected_mac_digest.as_ref()[..GV2_AUTH_MATCH_LIMIT].ct_eq(actual_mac_digest.as_ref()),
     ) {
         Ok(())
     } else {
         event!("calling.frontend.authenticator.bad_signature");
-        Err(anyhow!("bad signature"))
+        Err(AuthenticatorError::BadSignature)
     }
 }
 
@@ -143,7 +163,11 @@ impl Authenticator {
     }
 
     /// Verify the given token and return an UserAuthorization or an error.
-    pub fn verify(&self, auth_token: AuthToken, password: &str) -> Result<UserAuthorization> {
+    pub fn verify(
+        &self,
+        auth_token: AuthToken,
+        password: &str,
+    ) -> Result<UserAuthorization, AuthenticatorError> {
         // Check that the MACs match (up to the match limit).
         let expected_mac_digest =
             hmac_sha256_digest(&self.key, password[auth_token.validation_range].as_bytes())?;
@@ -155,10 +179,10 @@ impl Authenticator {
             > auth_token
                 .time
                 .checked_add(GV2_AUTH_MAX_HEADER_AGE)
-                .ok_or_else(|| anyhow!("invalid time"))?
+                .ok_or(AuthenticatorError::InvalidTime)?
         {
             event!("calling.frontend.authenticator.expired_credentials");
-            return Err(anyhow!("expired credentials"));
+            return Err(AuthenticatorError::ExpiredCredentials);
         }
 
         Ok(UserAuthorization {
@@ -172,7 +196,7 @@ impl Authenticator {
     /// Returns a tuple of the credentials (username, password).
     pub fn parse_basic_authorization_header(
         authorization_header: &str,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, String), AuthenticatorError> {
         // Get the credentials from the Basic authorization header.
         if let Some(("Basic", credentials_base64)) = authorization_header.split_once(' ') {
             // Decode the credentials to utf-8 formatted string.
@@ -182,10 +206,10 @@ impl Authenticator {
             // Split the credentials into the username and password.
             let (username, password) = credentials
                 .split_once(':')
-                .ok_or_else(|| anyhow!("authorization header not valid"))?;
+                .ok_or(AuthenticatorError::AuthHeaderNotValid)?;
             Ok((username.to_string(), password.to_string()))
         } else {
-            Err(anyhow!("could not parse authorization header"))
+            Err(AuthenticatorError::AuthHeaderParseFailure)
         }
     }
 }
@@ -193,6 +217,7 @@ impl Authenticator {
 #[cfg(test)]
 mod authenticator_tests {
     use super::*;
+    use base64::DecodeError::{InvalidLastSymbol, InvalidLength};
     use env_logger::Env;
     use hex::ToHex;
 
@@ -223,24 +248,34 @@ mod authenticator_tests {
         initialize_logging();
 
         let result = Authenticator::parse_basic_authorization_header("");
-        assert!(result.is_err());
+        assert_eq!(result, Err(AuthenticatorError::AuthHeaderParseFailure));
         assert_eq!(
             result.err().unwrap().to_string(),
             "could not parse authorization header"
         );
 
+        let is_auth_header_parse_failure = |header: &str| -> bool {
+            Authenticator::parse_basic_authorization_header(header)
+                == Err(AuthenticatorError::AuthHeaderParseFailure)
+        };
+
         // Error: could not parse authorization header
-        assert!(Authenticator::parse_basic_authorization_header("B").is_err());
-        assert!(Authenticator::parse_basic_authorization_header("Basic").is_err());
-        assert!(Authenticator::parse_basic_authorization_header("Basic ").is_err());
-        assert!(Authenticator::parse_basic_authorization_header("B X").is_err());
-        assert!(Authenticator::parse_basic_authorization_header("Basi XYZ").is_err());
+        assert!(is_auth_header_parse_failure("B"));
+        assert!(is_auth_header_parse_failure("Basic"));
+        assert!(is_auth_header_parse_failure("B X"));
+        assert!(is_auth_header_parse_failure("Basi XYZ"));
 
         // DecodeError: Encoded text cannot have a 6-bit remainder.
-        assert!(Authenticator::parse_basic_authorization_header("Basic X").is_err());
+        assert_eq!(
+            Authenticator::parse_basic_authorization_header("Basic X"),
+            Err(AuthenticatorError::DecodeFailure(InvalidLength))
+        );
 
         // DecodeError: Invalid last symbol 90, offset 2.
-        assert!(Authenticator::parse_basic_authorization_header("Basic XYZ").is_err());
+        assert_eq!(
+            Authenticator::parse_basic_authorization_header("Basic XYZ"),
+            Err(AuthenticatorError::DecodeFailure(InvalidLastSymbol(2, 90)))
+        );
 
         // Utf8Error: invalid utf-8 sequence of 1 bytes from index 0
         assert!(Authenticator::parse_basic_authorization_header("Basic //3//Q==").is_err());
@@ -258,9 +293,15 @@ mod authenticator_tests {
             "authorization header not valid"
         );
 
+        let is_auth_header_not_valid = |header: &str| -> bool {
+            Authenticator::parse_basic_authorization_header(header)
+                == Err(AuthenticatorError::AuthHeaderNotValid)
+        };
+
         // Error: authorization header not valid
-        assert!(Authenticator::parse_basic_authorization_header("Basic MSAy").is_err());
-        assert!(Authenticator::parse_basic_authorization_header("Basic MWIgMmI=").is_err());
+        assert!(is_auth_header_not_valid("Basic "));
+        assert!(is_auth_header_not_valid("Basic MSAy"));
+        assert!(is_auth_header_not_valid("Basic MWIgMmI="));
 
         // ":"
         assert_eq!(
@@ -458,7 +499,7 @@ mod authenticator_tests {
             generate_signed_v2_password(USER_ID_1, GROUP_ID_1, timestamp.as_secs(), "1", &key);
 
         let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
-        assert_eq!(result.err().unwrap().to_string(), "bad signature");
+        assert_eq!(result, Err(AuthenticatorError::BadSignature));
 
         // Save the password without the mac part.
         let (password_no_mac, _) = password
@@ -470,7 +511,7 @@ mod authenticator_tests {
         // Make the mac garbage hex.
         let password = format!("{}:{}", password_no_mac, "deadbeefdeadbeef");
         let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
-        assert_eq!(result.err().unwrap().to_string(), "bad signature");
+        assert_eq!(result, Err(AuthenticatorError::BadSignature));
     }
 
     fn get_signed_v2_password_for_duration(timestamp: Duration) -> String {
@@ -490,8 +531,7 @@ mod authenticator_tests {
         // dummy timestamp (no go).
         let password = get_signed_v2_password_for_duration(Duration::from_secs(1));
         let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
-        assert!(result.is_err());
-        assert_eq!(result.err().unwrap().to_string(), "expired credentials");
+        assert_eq!(result, Err(AuthenticatorError::ExpiredCredentials));
 
         // 48 hour old timestamp (no go).
         let password = get_signed_v2_password_for_duration(
@@ -502,8 +542,7 @@ mod authenticator_tests {
                 .unwrap(),
         );
         let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
-        assert!(result.is_err());
-        assert_eq!(result.err().unwrap().to_string(), "expired credentials");
+        assert_eq!(result, Err(AuthenticatorError::ExpiredCredentials));
 
         // 30 hour and 1 second old timestamp (no go).
         let password = get_signed_v2_password_for_duration(
@@ -514,8 +553,7 @@ mod authenticator_tests {
                 .unwrap(),
         );
         let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
-        assert!(result.is_err());
-        assert_eq!(result.err().unwrap().to_string(), "expired credentials");
+        assert_eq!(result, Err(AuthenticatorError::ExpiredCredentials));
 
         // 30 hour old timestamp (no go).
         let password = get_signed_v2_password_for_duration(
@@ -526,8 +564,7 @@ mod authenticator_tests {
                 .unwrap(),
         );
         let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
-        assert!(result.is_err());
-        assert_eq!(result.err().unwrap().to_string(), "expired credentials");
+        assert_eq!(result, Err(AuthenticatorError::ExpiredCredentials));
 
         // 30 hour less 1 second new timestamp (ok).
         let password = get_signed_v2_password_for_duration(
