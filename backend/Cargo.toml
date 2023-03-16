@@ -5,7 +5,7 @@
 
 [package]
 name = "calling_backend"
-version = "1.6.4"
+version = "1.6.5"
 authors = ["Calling Team <callingteam@signal.org>"]
 edition = "2021"
 description = "Media forwarding server for group calls."
