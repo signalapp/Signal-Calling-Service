@@ -6,18 +6,23 @@
 #[macro_use]
 extern crate log;
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use calling_common::Duration;
 use calling_frontend::{
-    api, authenticator::Authenticator, backend::BackendHttpClient, cleaner, config,
-    frontend::Frontend, frontend::FrontendIdGenerator, metrics, storage::DynamoDb,
+    api,
+    authenticator::Authenticator,
+    backend::BackendHttpClient,
+    cleaner, config,
+    frontend::Frontend,
+    frontend::FrontendIdGenerator,
+    metrics,
+    storage::{DynamoDb, IdentityFetcher},
 };
 use clap::Parser;
 use env_logger::Env;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use std::{env, sync::Arc};
 use tokio::{
     runtime,
     signal::unix::{signal, SignalKind},
@@ -123,7 +128,23 @@ fn main() -> Result<()> {
 
     // Create frontend entities that might fail.
     let authenticator = Authenticator::from_hex_key(&config.authentication_key)?;
-    let (storage, identity_fetcher) = threaded_rt.block_on(DynamoDb::new(config))?;
+    let identity_fetcher = if config.storage_endpoint.is_some() {
+        // Create an identity fetcher with a dummy token path, which isn't used
+        // for testing with a storage endpoint and won't be fetched.
+        IdentityFetcher::new(config, "/tmp/token")
+    } else {
+        // Get the location of the identity token file from the environment variable,
+        // the same location that the storage client will try to get it from when
+        // searching for credentials.
+        let identity_token_path = env::var("AWS_WEB_IDENTITY_TOKEN_FILE")?;
+        let identity_fetcher = IdentityFetcher::new(config, &identity_token_path);
+
+        // Fetch an identity token once before connecting for the first time.
+        threaded_rt.block_on(identity_fetcher.fetch_token())?;
+
+        identity_fetcher
+    };
+    let storage = threaded_rt.block_on(DynamoDb::new(config))?;
     let backend = threaded_rt.block_on(BackendHttpClient::from_config(config))?;
 
     threaded_rt.block_on(async {
@@ -137,7 +158,6 @@ fn main() -> Result<()> {
             api_metrics: Mutex::new(Default::default()),
         });
 
-        let frontend_clone_for_cleaner = frontend.clone();
         let frontend_clone_for_metrics = frontend.clone();
 
         // Start the api server.
@@ -150,7 +170,7 @@ fn main() -> Result<()> {
 
         // Start the cleaner server.
         let cleaner_handle = tokio::spawn(async move {
-            let _ = cleaner::start(frontend_clone_for_cleaner, cleaner_ender_rx).await;
+            let _ = cleaner::start(config, cleaner_ender_rx).await;
             let _ = signal_canceller_tx_clone_for_cleaner.send(()).await;
         });
 

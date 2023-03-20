@@ -235,7 +235,7 @@ impl Frontend {
         &self,
         call: &CallRecord,
     ) -> Result<Vec<String>, FrontendError> {
-        // Get the direct address to the Calling Server.
+        // Get the direct address to the Calling Backend.
         let backend_address = backend::Address::try_from(&call.backend_ip).map_err(|err| {
             warn!(
                 "get_client_ids_in_call: failed to parse backend_ip: {}",
@@ -354,7 +354,7 @@ impl Frontend {
                 FrontendError::InternalError
             })?;
 
-        // Get the direct address to the Calling Server.
+        // Get the direct address to the Calling Backend.
         let backend_address = backend::Address::try_from(&call.backend_ip).map_err(|err| {
             error!("join_client_to_call: failed to parse backend_ip: {}", err);
             FrontendError::InternalError
@@ -398,19 +398,6 @@ impl Frontend {
             ice_pwd: backend_join_response.ice_pwd,
             dhe_public_key: backend_dhe_public_key,
         })
-    }
-
-    pub async fn get_call_records_for_region(
-        &self,
-        region: &str,
-    ) -> Result<Vec<CallRecord>, FrontendError> {
-        self.storage
-            .get_call_records_for_region(region)
-            .await
-            .map_err(|err| {
-                Frontend::log_error("get_call_records_for_region", err.into());
-                FrontendError::InternalError
-            })
     }
 
     pub async fn remove_call_record(

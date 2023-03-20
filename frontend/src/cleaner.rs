@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use calling_common::Duration;
 use log::*;
@@ -12,12 +10,52 @@ use rand::{thread_rng, Rng};
 use tokio::sync::oneshot::Receiver;
 
 use crate::{
-    frontend::{Frontend, FrontendError},
+    backend::{self, Backend, BackendError, BackendHttpClient},
+    config,
     metrics::Timer,
+    storage::{CallRecord, DynamoDb, Storage},
 };
 
-pub async fn start(frontend: Arc<Frontend>, ender_rx: Receiver<()>) -> Result<()> {
-    let cleanup_interval = Duration::from_millis(frontend.config.cleanup_interval_ms);
+/// Returns true if the call is currently being handled by the associated Calling Backend.
+async fn does_call_exist_on_backend(call_record: &CallRecord, backend: &BackendHttpClient) -> bool {
+    // Get the direct address to the Calling Backend from the call record.
+    match backend::Address::try_from(&call_record.backend_ip) {
+        Err(err) => {
+            error!("failed to parse backend_ip: {:?}", err);
+
+            // If the ip is badly formatted, the call should not be in the database.
+            false
+        }
+        Ok(backend_address) => {
+            if let Err(err) = backend
+                .get_clients(&backend_address, &call_record.call_id)
+                .await
+            {
+                match err {
+                    BackendError::CallNotFound => {
+                        event!("calling.frontend.cleaner.get.clients.call_not_found");
+                    }
+                    _ => {
+                        error!("failed to get clients from backend: {:?}", err);
+                        event!("calling.frontend.cleaner.get.clients.backend_error");
+                    }
+                }
+
+                // The Calling Backend is not handling the call or there was an unexpected error.
+                false
+            } else {
+                // The call exists on the Calling Backend.
+                true
+            }
+        }
+    }
+}
+
+pub async fn start(config: &'static config::Config, ender_rx: Receiver<()>) -> Result<()> {
+    let cleanup_interval = Duration::from_millis(config.cleanup_interval_ms);
+
+    let storage = Box::new(DynamoDb::new(config).await?);
+    let backend = Box::new(BackendHttpClient::from_config(config).await?);
 
     // Spawn a normal (cooperative) task to cleanup calls from storage periodically.
     let cleaner_handle = tokio::spawn(async move {
@@ -32,34 +70,28 @@ pub async fn start(frontend: Arc<Frontend>, ender_rx: Receiver<()>) -> Result<()
 
             let cleaner_timer = start_timer_us!("calling.frontend.cleaner.timed");
 
-            if let Ok(calls) = frontend
-                .get_call_records_for_region(&frontend.config.region)
-                .await
-            {
-                for call_record in calls {
-                    // For each call record, get the list of clients currently in that call from
-                    // the backend. If the backend server is available and reports that the call
-                    // is not found, it can be removed from storage. If there is a problem
-                    // accessing the backend, we assume the server does not exist anymore or
-                    // otherwise isn't working correctly and still remove it from storage.
-                    if let Err(err) = frontend.get_client_ids_in_call(&call_record).await {
-                        info!(
-                            "Cleaning up call: {} - {:.6}",
-                            call_record.group_id, call_record.call_id
-                        );
+            match storage.get_call_records_for_region(&config.region).await {
+                Ok(calls) => {
+                    for call_record in calls {
+                        if !does_call_exist_on_backend(&call_record, &backend).await {
+                            info!(
+                                "Cleaning up call: {} - {:.6}",
+                                call_record.group_id, call_record.call_id
+                            );
 
-                        // Remove the call since it doesn't exist anymore.
-                        let _ = frontend
-                            .remove_call_record(&call_record.group_id, &call_record.call_id)
-                            .await;
-
-                        // Log metrics for either disposition: not found or access error.
-                        if err == FrontendError::CallNotFound {
-                            event!("calling.frontend.cleaner.get.clients.call_not_found");
-                        } else {
-                            event!("calling.frontend.cleaner.get.clients.backend_unavailable");
+                            // Remove the call from the database since it doesn't exist anymore
+                            // on the Calling Backend (or there is an *error* accessing it).
+                            if let Err(err) = storage
+                                .remove_call_record(&call_record.group_id, &call_record.call_id)
+                                .await
+                            {
+                                error!("{:?}", err);
+                            }
                         }
                     }
+                }
+                Err(err) => {
+                    error!("{:?}", err);
                 }
             }
 

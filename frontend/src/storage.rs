@@ -20,7 +20,7 @@ use hyper::{Body, Method, Request};
 use log::*;
 use serde::{Deserialize, Serialize};
 use serde_dynamo::{from_item, to_item};
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
 use tokio::{io::AsyncWriteExt, sync::oneshot::Receiver};
 
 #[cfg(test)]
@@ -92,11 +92,9 @@ pub struct DynamoDb {
 }
 
 impl DynamoDb {
-    pub async fn new(config: &'static config::Config) -> Result<(Self, IdentityFetcher)> {
+    pub async fn new(config: &'static config::Config) -> Result<Self> {
         let sleep_impl =
             default_async_sleep().ok_or_else(|| anyhow!("failed to create sleep_impl"))?;
-
-        let identity_fetcher;
 
         let client = match &config.storage_endpoint {
             Some(endpoint) => {
@@ -104,10 +102,6 @@ impl DynamoDb {
                 const PASSWORD: &str = "DUMMY_PASSWORD";
 
                 info!("Using endpoint for DynamodDB testing: {}", endpoint);
-
-                // Create an identity fetcher with a dummy token path, which isn't used
-                // for testing.
-                identity_fetcher = IdentityFetcher::new(config, "/tmp/token");
 
                 let aws_config = Config::builder()
                     .credentials_provider(Credentials::from_keys(KEY, PASSWORD, None))
@@ -122,14 +116,6 @@ impl DynamoDb {
                     "Using region for DynamodDB access: {}",
                     config.storage_region.as_str()
                 );
-
-                // Get the location of the identity token file from the environment variable,
-                // the same location that the client will try to get it from for credentials.
-                let identity_token_path = env::var("AWS_WEB_IDENTITY_TOKEN_FILE")?;
-                identity_fetcher = IdentityFetcher::new(config, &identity_token_path);
-
-                // Fetch an identity token once before connecting for the first time.
-                identity_fetcher.fetch_token().await?;
 
                 let retry_config = RetryConfigBuilder::new()
                     .max_attempts(4)
@@ -147,13 +133,10 @@ impl DynamoDb {
             }
         };
 
-        Ok((
-            Self {
-                client,
-                table_name: config.storage_table.to_string(),
-            },
-            identity_fetcher,
-        ))
+        Ok(Self {
+            client,
+            table_name: config.storage_table.to_string(),
+        })
     }
 }
 
@@ -242,7 +225,6 @@ impl Storage for DynamoDb {
 
         match response {
             Ok(_) => Ok(()),
-
             Err(err) => match err.into_service_error() {
                 DeleteItemError {
                     kind: DeleteItemErrorKind::ConditionalCheckFailedException(_),
@@ -295,7 +277,7 @@ pub struct IdentityFetcher {
 }
 
 impl IdentityFetcher {
-    fn new(config: &'static config::Config, identity_token_path: &str) -> Self {
+    pub fn new(config: &'static config::Config, identity_token_path: &str) -> Self {
         IdentityFetcher {
             client: hyper::client::Client::builder().build_http(),
             fetch_interval: Duration::from_millis(config.identity_fetcher_interval_ms),
@@ -304,7 +286,7 @@ impl IdentityFetcher {
         }
     }
 
-    async fn fetch_token(&self) -> Result<()> {
+    pub async fn fetch_token(&self) -> Result<()> {
         if let Some(url) = &self.identity_token_url {
             let request = Request::builder()
                 .method(Method::GET)
