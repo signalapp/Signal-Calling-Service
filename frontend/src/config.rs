@@ -75,6 +75,10 @@ pub struct Config {
     #[clap(long)]
     pub storage_table: String,
 
+    /// The name of the new table that can track information about rooms across calls.
+    #[clap(long)]
+    pub modern_storage_table: String,
+
     /// The AWS region in which the DynamoDB server resides.
     #[clap(long)]
     pub storage_region: String,
@@ -109,6 +113,7 @@ pub fn default_test_config() -> Config {
         oauth2_token_url: None,
         backend_ip: None,
         storage_table: "CallRecords".to_string(),
+        modern_storage_table: "Rooms".to_string(),
         storage_region: "us-east-1".to_string(),
         storage_endpoint: Some("localhost:9010".to_string()),
         metrics_datadog_host: None,

@@ -45,6 +45,12 @@ impl From<&str> for GroupId {
     }
 }
 
+impl From<GroupId> for String {
+    fn from(group_id: GroupId) -> Self {
+        group_id.0
+    }
+}
+
 impl AsRef<str> for GroupId {
     fn as_ref(&self) -> &str {
         self.0.as_ref()

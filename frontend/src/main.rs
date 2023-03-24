@@ -46,6 +46,7 @@ fn print_config(config: &'static config::Config) {
     info!("  {:38}{:?}", "backend_list_instances_url:", config.backend_list_instances_url);
     info!("  {:38}{:?}", "backend_ip:", config.backend_ip);
     info!("  {:38}{}", "storage_table:", config.storage_table);
+    info!("  {:38}{}", "modern_storage_table:", config.modern_storage_table);
     info!("  {:38}{:?}", "identity_url:", config.identity_token_url);
     info!("  {:38}{:?}", "oauth2_url:", config.oauth2_token_url);
     info!("  {:38}{:?}", "storage_endpoint:", config.storage_endpoint);

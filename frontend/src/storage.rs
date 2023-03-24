@@ -54,6 +54,29 @@ pub struct CallRecord {
     pub creator: UserId,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", tag = "recordType", rename = "ActiveCall")]
+pub struct ModernCallRecord {
+    pub room_id: String,
+    pub era_id: String,
+    pub backend_ip: String,
+    #[serde(rename = "region")]
+    pub backend_region: String,
+    pub creator: UserId,
+}
+
+impl From<CallRecord> for ModernCallRecord {
+    fn from(value: CallRecord) -> Self {
+        Self {
+            room_id: value.group_id.into(),
+            era_id: value.call_id,
+            backend_ip: value.backend_ip,
+            backend_region: value.backend_region,
+            creator: value.creator,
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum StorageError {
     #[error(transparent)]
@@ -89,6 +112,7 @@ pub trait Storage: Sync + Send {
 pub struct DynamoDb {
     client: Client,
     table_name: String,
+    modern_table_name: String,
 }
 
 impl DynamoDb {
@@ -144,6 +168,7 @@ impl DynamoDb {
         Ok(Self {
             client,
             table_name: config.storage_table.to_string(),
+            modern_table_name: config.modern_storage_table.to_string(),
         })
     }
 }
@@ -190,7 +215,23 @@ impl Storage for DynamoDb {
             .await;
 
         match response {
-            Ok(_) => Ok(Some(call)),
+            Ok(_) => {
+                if let Err(e) = self
+                    .client
+                    .put_item()
+                    .table_name(&self.modern_table_name)
+                    .set_item(Some(
+                        to_item(ModernCallRecord::from(call.clone()))
+                            .expect("failed to convert ModernCallRecord to item"),
+                    ))
+                    // Don't use a condition_expression, overwrite the item if it already exists.
+                    .send()
+                    .await
+                {
+                    error!("couldn't add the record to the modern table: {e}");
+                }
+                Ok(Some(call))
+            }
             Err(err) => match err.into_service_error() {
                 PutItemError {
                     kind: PutItemErrorKind::ConditionalCheckFailedException(_),
@@ -232,7 +273,28 @@ impl Storage for DynamoDb {
             .await;
 
         match response {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let Err(e) = self
+                    .client
+                    .delete_item()
+                    .table_name(&self.modern_table_name)
+                    // Delete the item for the given key.
+                    .key("roomId", AttributeValue::S(group_id.as_ref().to_string()))
+                    .key("recordType", AttributeValue::S("ActiveCall".to_string()))
+                    // But only if the given call_id matches the expected value, otherwise the
+                    // previous call was removed and a new one created already.
+                    .condition_expression("eraId = :value".to_string())
+                    .expression_attribute_values(
+                        ":value".to_string(),
+                        AttributeValue::S(call_id.to_string()),
+                    )
+                    .send()
+                    .await
+                {
+                    error!("couldn't remove the record from the modern table: {e}");
+                }
+                Ok(())
+            }
             Err(err) => match err.into_service_error() {
                 DeleteItemError {
                     kind: DeleteItemErrorKind::ConditionalCheckFailedException(_),
