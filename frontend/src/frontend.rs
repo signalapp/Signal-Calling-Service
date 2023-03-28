@@ -25,7 +25,7 @@ use crate::{
     authenticator::{Authenticator, UserAuthorization},
     backend::{self, Backend, BackendError},
     config,
-    storage::{CallRecord, Storage},
+    storage::{ModernCallRecord, Storage},
 };
 
 pub type UserId = String;
@@ -226,7 +226,10 @@ impl Frontend {
         }
     }
 
-    pub async fn get_call_record(&self, group_id: &GroupId) -> Result<CallRecord, FrontendError> {
+    pub async fn get_call_record(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<ModernCallRecord, FrontendError> {
         self.storage
             .get_call_record(group_id)
             .await
@@ -239,7 +242,7 @@ impl Frontend {
 
     pub async fn get_client_ids_in_call(
         &self,
-        call: &CallRecord,
+        call: &ModernCallRecord,
     ) -> Result<Vec<String>, FrontendError> {
         // Get the direct address to the Calling Backend.
         let backend_address = backend::Address::try_from(&call.backend_ip).map_err(|err| {
@@ -252,14 +255,14 @@ impl Frontend {
 
         match self
             .backend
-            .get_clients(&backend_address, &call.call_id)
+            .get_clients(&backend_address, &call.era_id)
             .await
         {
             Ok(clients_response) => Ok(clients_response.client_ids),
             Err(BackendError::CallNotFound) => {
                 if let Err(err) = self
                     .storage
-                    .remove_call_record(&call.group_id, &call.call_id)
+                    .remove_call_record(&call.room_id, &call.era_id)
                     .await
                 {
                     // Warn about the error, but keep going.
@@ -284,7 +287,7 @@ impl Frontend {
     pub async fn get_or_create_call_record(
         &self,
         user_authorization: &UserAuthorization,
-    ) -> Result<CallRecord, FrontendError> {
+    ) -> Result<ModernCallRecord, FrontendError> {
         let call = self
             .storage
             .get_call_record(&user_authorization.group_id)
@@ -309,9 +312,9 @@ impl Frontend {
             FrontendError::InternalError
         })?;
 
-        let call_record = CallRecord {
-            group_id: user_authorization.group_id.clone(),
-            call_id: self.id_generator.get_random_call_id(16),
+        let call_record = ModernCallRecord {
+            room_id: user_authorization.group_id.clone(),
+            era_id: self.id_generator.get_random_call_id(16),
             backend_ip,
             backend_region: self.config.region.to_string(),
             creator: user_authorization.user_id.to_string(),
@@ -338,7 +341,7 @@ impl Frontend {
             // wasn't one when we try to get it.
             warn!(
                 "get_or_create_call_record: failed to get call, attempt {} for {:.6}",
-                attempt, call_record.call_id
+                attempt, call_record.era_id
             );
         }
 
@@ -349,7 +352,7 @@ impl Frontend {
     pub async fn join_client_to_call(
         &self,
         user_id: &str,
-        call: &CallRecord,
+        call: &ModernCallRecord,
         join_request: JoinRequestWrapper,
     ) -> Result<JoinResponseWrapper, FrontendError> {
         let (demux_id, client_id) = self
@@ -370,7 +373,7 @@ impl Frontend {
             .backend
             .join(
                 &backend_address,
-                &call.call_id,
+                &call.era_id,
                 demux_id,
                 &backend::JoinRequest {
                     client_id: client_id.to_string(),

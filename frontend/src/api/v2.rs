@@ -105,7 +105,7 @@ pub async fn get_participants(
         })?;
 
     Ok(Json(ParticipantsResponse {
-        call_id: call.call_id,
+        call_id: call.era_id,
         max_devices: frontend.config.max_clients_per_call,
         participants,
         creator: call.creator,
@@ -163,7 +163,7 @@ pub async fn join(
         ice_pwd: response.ice_pwd,
         dhe_public_key: response.dhe_public_key,
         call_creator: call.creator,
-        call_id: call.call_id,
+        call_id: call.era_id,
     })
     .into_response())
 }
@@ -190,7 +190,7 @@ mod api_server_v2_tests {
         backend::{self, BackendError, MockBackend},
         config,
         frontend::{DemuxId, FrontendIdGenerator, GroupId, MockIdGenerator},
-        storage::{CallRecord, MockStorage},
+        storage::{MockStorage, ModernCallRecord},
     };
 
     const AUTH_KEY: &str = "f00f0014fe091de31827e8d686969fad65013238aadd25ef8629eb8a9e5ef69b";
@@ -272,10 +272,10 @@ mod api_server_v2_tests {
         create_authorization_header(user_id, "0")
     }
 
-    fn create_call_record(backend_region: &str) -> CallRecord {
-        CallRecord {
-            group_id: GROUP_ID_1.into(),
-            call_id: CALL_ID_1.to_string(),
+    fn create_call_record(backend_region: &str) -> ModernCallRecord {
+        ModernCallRecord {
+            room_id: GROUP_ID_1.into(),
+            era_id: CALL_ID_1.to_string(),
             backend_ip: "127.0.0.1".to_string(),
             backend_region: backend_region.to_string(),
             creator: USER_ID_1.to_string(),

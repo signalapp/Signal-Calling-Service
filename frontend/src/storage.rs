@@ -9,6 +9,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::{
     error::{DeleteItemError, DeleteItemErrorKind, PutItemError, PutItemErrorKind},
     model::{AttributeValue, Select},
+    types::DisplayErrorContext,
     Client, Config,
 };
 use aws_smithy_async::rt::sleep::default_async_sleep;
@@ -57,7 +58,7 @@ pub struct CallRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "recordType", rename = "ActiveCall")]
 pub struct ModernCallRecord {
-    pub room_id: String,
+    pub room_id: GroupId,
     pub era_id: String,
     pub backend_ip: String,
     #[serde(rename = "region")]
@@ -65,11 +66,11 @@ pub struct ModernCallRecord {
     pub creator: UserId,
 }
 
-impl From<CallRecord> for ModernCallRecord {
-    fn from(value: CallRecord) -> Self {
+impl From<ModernCallRecord> for CallRecord {
+    fn from(value: ModernCallRecord) -> Self {
         Self {
-            room_id: value.group_id.into(),
-            era_id: value.call_id,
+            group_id: value.room_id,
+            call_id: value.era_id,
             backend_ip: value.backend_ip,
             backend_region: value.backend_region,
             creator: value.creator,
@@ -86,27 +87,29 @@ pub enum StorageError {
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Storage: Sync + Send {
-    /// Gets an existing call from the table matching the given group_id or returns None.
-    async fn get_call_record(&self, group_id: &GroupId)
-        -> Result<Option<CallRecord>, StorageError>;
+    /// Gets an existing call from the table matching the given room_id or returns None.
+    async fn get_call_record(
+        &self,
+        room_id: &GroupId,
+    ) -> Result<Option<ModernCallRecord>, StorageError>;
     /// Adds the given call to the table but if there is already a call with the same
     /// group_id, returns that instead.
     async fn get_or_add_call_record(
         &self,
-        call: CallRecord,
-    ) -> Result<Option<CallRecord>, StorageError>;
+        call: ModernCallRecord,
+    ) -> Result<Option<ModernCallRecord>, StorageError>;
     /// Removes the given call from the table as long as the call_id of the record that
     /// exists in the table is the same.
     async fn remove_call_record(
         &self,
-        group_id: &GroupId,
+        room_id: &GroupId,
         call_id: &str,
     ) -> Result<(), StorageError>;
     /// Returns a list of all calls in the table that are in the given region.
     async fn get_call_records_for_region(
         &self,
         region: &str,
-    ) -> Result<Vec<CallRecord>, StorageError>;
+    ) -> Result<Vec<ModernCallRecord>, StorageError>;
 }
 
 pub struct DynamoDb {
@@ -178,15 +181,13 @@ impl Storage for DynamoDb {
     async fn get_call_record(
         &self,
         group_id: &GroupId,
-    ) -> Result<Option<CallRecord>, StorageError> {
+    ) -> Result<Option<ModernCallRecord>, StorageError> {
         let response = self
             .client
             .get_item()
-            .table_name(&self.table_name)
-            .key(
-                GROUP_CONFERENCE_ID_STRING,
-                AttributeValue::S(group_id.as_ref().to_string()),
-            )
+            .table_name(&self.modern_table_name)
+            .key("roomId", AttributeValue::S(group_id.as_ref().to_string()))
+            .key("recordType", AttributeValue::S("ActiveCall".to_string()))
             .consistent_read(true)
             .send()
             .await
@@ -200,17 +201,17 @@ impl Storage for DynamoDb {
 
     async fn get_or_add_call_record(
         &self,
-        call: CallRecord,
-    ) -> Result<Option<CallRecord>, StorageError> {
+        call: ModernCallRecord,
+    ) -> Result<Option<ModernCallRecord>, StorageError> {
         let response = self
             .client
             .put_item()
-            .table_name(&self.table_name)
+            .table_name(&self.modern_table_name)
             .set_item(Some(
-                to_item(&call).context("failed to convert CallRecord to item")?,
+                to_item(&call).expect("failed to convert ModernCallRecord to item"),
             ))
             // Don't overwrite the item if it already exists.
-            .condition_expression("attribute_not_exists(groupConferenceId)".to_string())
+            .condition_expression("attribute_not_exists(roomId)".to_string())
             .send()
             .await;
 
@@ -219,16 +220,19 @@ impl Storage for DynamoDb {
                 if let Err(e) = self
                     .client
                     .put_item()
-                    .table_name(&self.modern_table_name)
+                    .table_name(&self.table_name)
                     .set_item(Some(
-                        to_item(ModernCallRecord::from(call.clone()))
-                            .expect("failed to convert ModernCallRecord to item"),
+                        to_item(CallRecord::from(call.clone()))
+                            .context("failed to convert CallRecord to item")?,
                     ))
                     // Don't use a condition_expression, overwrite the item if it already exists.
                     .send()
                     .await
                 {
-                    error!("couldn't add the record to the modern table: {e}");
+                    error!(
+                        "couldn't add the record to the legacy table: {}",
+                        DisplayErrorContext(e)
+                    );
                 }
                 Ok(Some(call))
             }
@@ -237,7 +241,7 @@ impl Storage for DynamoDb {
                     kind: PutItemErrorKind::ConditionalCheckFailedException(_),
                     ..
                 } => Ok(self
-                    .get_call_record(&call.group_id)
+                    .get_call_record(&call.room_id)
                     .await
                     .context("failed to get call from storage after conditional check failed")?),
                 err => Err(StorageError::UnexpectedError(
@@ -256,19 +260,14 @@ impl Storage for DynamoDb {
         let response = self
             .client
             .delete_item()
-            .table_name(&self.table_name)
+            .table_name(&self.modern_table_name)
             // Delete the item for the given key.
-            .key(
-                GROUP_CONFERENCE_ID_STRING,
-                AttributeValue::S(group_id.as_ref().to_string()),
-            )
+            .key("roomId", AttributeValue::S(group_id.as_ref().to_string()))
+            .key("recordType", AttributeValue::S("ActiveCall".to_string()))
             // But only if the given call_id matches the expected value, otherwise the
             // previous call was removed and a new one created already.
-            .condition_expression("jvbConferenceId = :value".to_string())
-            .expression_attribute_values(
-                ":value".to_string(),
-                AttributeValue::S(call_id.to_string()),
-            )
+            .condition_expression("eraId = :value")
+            .expression_attribute_values(":value", AttributeValue::S(call_id.to_string()))
             .send()
             .await;
 
@@ -277,13 +276,15 @@ impl Storage for DynamoDb {
                 if let Err(e) = self
                     .client
                     .delete_item()
-                    .table_name(&self.modern_table_name)
+                    .table_name(&self.table_name)
                     // Delete the item for the given key.
-                    .key("roomId", AttributeValue::S(group_id.as_ref().to_string()))
-                    .key("recordType", AttributeValue::S("ActiveCall".to_string()))
+                    .key(
+                        GROUP_CONFERENCE_ID_STRING,
+                        AttributeValue::S(group_id.as_ref().to_string()),
+                    )
                     // But only if the given call_id matches the expected value, otherwise the
                     // previous call was removed and a new one created already.
-                    .condition_expression("eraId = :value".to_string())
+                    .condition_expression("jvbConferenceId = :value".to_string())
                     .expression_attribute_values(
                         ":value".to_string(),
                         AttributeValue::S(call_id.to_string()),
@@ -291,7 +292,10 @@ impl Storage for DynamoDb {
                     .send()
                     .await
                 {
-                    error!("couldn't remove the record from the modern table: {e}");
+                    error!(
+                        "couldn't remove the record from the legacy table: {}",
+                        DisplayErrorContext(e)
+                    );
                 }
                 Ok(())
             }
@@ -308,18 +312,16 @@ impl Storage for DynamoDb {
     async fn get_call_records_for_region(
         &self,
         region: &str,
-    ) -> Result<Vec<CallRecord>, StorageError> {
+    ) -> Result<Vec<ModernCallRecord>, StorageError> {
         let response = self
             .client
             .query()
-            .table_name(&self.table_name)
+            .table_name(&self.modern_table_name)
             .index_name("region-index")
-            .key_condition_expression("#region = :value".to_string())
-            .expression_attribute_names("#region".to_string(), "region".to_string())
-            .expression_attribute_values(
-                ":value".to_string(),
-                AttributeValue::S(region.to_string()),
-            )
+            .key_condition_expression("#region = :value and recordType = :recordType")
+            .expression_attribute_names("#region", "region")
+            .expression_attribute_values(":value", AttributeValue::S(region.to_string()))
+            .expression_attribute_values(":recordType", AttributeValue::S("ActiveCall".to_string()))
             .consistent_read(false)
             .select(Select::AllAttributes)
             .send()

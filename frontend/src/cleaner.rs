@@ -13,11 +13,14 @@ use crate::{
     backend::{self, Backend, BackendError, BackendHttpClient},
     config,
     metrics::Timer,
-    storage::{CallRecord, DynamoDb, Storage},
+    storage::{DynamoDb, ModernCallRecord, Storage},
 };
 
 /// Returns true if the call is currently being handled by the associated Calling Backend.
-async fn does_call_exist_on_backend(call_record: &CallRecord, backend: &BackendHttpClient) -> bool {
+async fn does_call_exist_on_backend(
+    call_record: &ModernCallRecord,
+    backend: &BackendHttpClient,
+) -> bool {
     // Get the direct address to the Calling Backend from the call record.
     match backend::Address::try_from(&call_record.backend_ip) {
         Err(err) => {
@@ -28,7 +31,7 @@ async fn does_call_exist_on_backend(call_record: &CallRecord, backend: &BackendH
         }
         Ok(backend_address) => {
             if let Err(err) = backend
-                .get_clients(&backend_address, &call_record.call_id)
+                .get_clients(&backend_address, &call_record.era_id)
                 .await
             {
                 match err {
@@ -76,13 +79,13 @@ pub async fn start(config: &'static config::Config, ender_rx: Receiver<()>) -> R
                         if !does_call_exist_on_backend(&call_record, &backend).await {
                             info!(
                                 "Cleaning up call: {} - {:.6}",
-                                call_record.group_id, call_record.call_id
+                                call_record.room_id, call_record.era_id
                             );
 
                             // Remove the call from the database since it doesn't exist anymore
                             // on the Calling Backend (or there is an *error* accessing it).
                             if let Err(err) = storage
-                                .remove_call_record(&call_record.group_id, &call_record.call_id)
+                                .remove_call_record(&call_record.room_id, &call_record.era_id)
                                 .await
                             {
                                 error!("{:?}", err);
