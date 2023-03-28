@@ -12,7 +12,7 @@ use aws_sdk_dynamodb::{
     Client, Config,
 };
 use aws_smithy_async::rt::sleep::default_async_sleep;
-use aws_smithy_types::retry::RetryConfigBuilder;
+use aws_smithy_types::{retry::RetryConfigBuilder, timeout::TimeoutConfig};
 use aws_types::region::Region;
 use calling_common::Duration;
 use hyper::client::HttpConnector;
@@ -122,9 +122,17 @@ impl DynamoDb {
                     .initial_backoff(std::time::Duration::from_millis(100))
                     .build();
 
+                let timeout_config = TimeoutConfig::builder()
+                    .operation_timeout(core::time::Duration::from_secs(30))
+                    .operation_attempt_timeout(core::time::Duration::from_secs(10))
+                    .read_timeout(core::time::Duration::from_millis(3100))
+                    .connect_timeout(core::time::Duration::from_millis(3100))
+                    .build();
+
                 let aws_config = aws_config::from_env()
                     .sleep_impl(sleep_impl)
                     .retry_config(retry_config)
+                    .timeout_config(timeout_config)
                     .region(Region::new(&config.storage_region))
                     .load()
                     .await;
