@@ -114,8 +114,6 @@ services:
       - --calling-server-url
       - "http://calling-backend:8080"
       - --storage-table
-      - "Conferences"
-      - --modern-storage-table
       - "Rooms"
       - --storage-endpoint
       - "http://dynamodb:8000"

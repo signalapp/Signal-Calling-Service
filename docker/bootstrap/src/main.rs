@@ -46,57 +46,6 @@ async fn main() -> Result<(), Error> {
 
     let client = Client::new(&sdk_config);
 
-    build_table(&client, "Conferences", |table| {
-        let provisional_throughput = ProvisionedThroughput::builder()
-            .read_capacity_units(5)
-            .write_capacity_units(1)
-            .build();
-
-        let attribute_definition_id = AttributeDefinition::builder()
-            .attribute_name("groupConferenceId")
-            .attribute_type(ScalarAttributeType::S)
-            .build();
-
-        let attribute_definition_region = AttributeDefinition::builder()
-            .attribute_name("region")
-            .attribute_type(ScalarAttributeType::S)
-            .build();
-
-        let key_schema_element = KeySchemaElement::builder()
-            .attribute_name("groupConferenceId")
-            .key_type(KeyType::Hash)
-            .build();
-
-        let global_secondary_index = GlobalSecondaryIndex::builder()
-            .index_name("region-index")
-            .provisioned_throughput(
-                ProvisionedThroughput::builder()
-                    .read_capacity_units(10)
-                    .write_capacity_units(1)
-                    .build(),
-            )
-            .projection(
-                Projection::builder()
-                    .projection_type(ProjectionType::All)
-                    .build(),
-            )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name("region")
-                    .key_type(KeyType::Hash)
-                    .build(),
-            )
-            .build();
-
-        table
-            .provisioned_throughput(provisional_throughput)
-            .attribute_definitions(attribute_definition_id)
-            .attribute_definitions(attribute_definition_region)
-            .key_schema(key_schema_element)
-            .global_secondary_indexes(global_secondary_index)
-    })
-    .await?;
-
     build_table(&client, "Rooms", |table| {
         let provisional_throughput = ProvisionedThroughput::builder()
             .read_capacity_units(5)

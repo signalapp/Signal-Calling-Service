@@ -190,7 +190,7 @@ mod api_server_v2_tests {
         backend::{self, BackendError, MockBackend},
         config,
         frontend::{DemuxId, FrontendIdGenerator, GroupId, MockIdGenerator},
-        storage::{MockStorage, ModernCallRecord},
+        storage::{CallRecord, MockStorage},
     };
 
     const AUTH_KEY: &str = "f00f0014fe091de31827e8d686969fad65013238aadd25ef8629eb8a9e5ef69b";
@@ -272,8 +272,8 @@ mod api_server_v2_tests {
         create_authorization_header(user_id, "0")
     }
 
-    fn create_call_record(backend_region: &str) -> ModernCallRecord {
-        ModernCallRecord {
+    fn create_call_record(backend_region: &str) -> CallRecord {
+        CallRecord {
             room_id: GROUP_ID_1.into(),
             era_id: CALL_ID_1.to_string(),
             backend_ip: "127.0.0.1".to_string(),

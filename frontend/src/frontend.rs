@@ -25,7 +25,7 @@ use crate::{
     authenticator::{Authenticator, UserAuthorization},
     backend::{self, Backend, BackendError},
     config,
-    storage::{ModernCallRecord, Storage},
+    storage::{CallRecord, Storage},
 };
 
 pub type UserId = String;
@@ -229,7 +229,7 @@ impl Frontend {
     pub async fn get_call_record(
         &self,
         group_id: &GroupId,
-    ) -> Result<ModernCallRecord, FrontendError> {
+    ) -> Result<CallRecord, FrontendError> {
         self.storage
             .get_call_record(group_id)
             .await
@@ -242,7 +242,7 @@ impl Frontend {
 
     pub async fn get_client_ids_in_call(
         &self,
-        call: &ModernCallRecord,
+        call: &CallRecord,
     ) -> Result<Vec<String>, FrontendError> {
         // Get the direct address to the Calling Backend.
         let backend_address = backend::Address::try_from(&call.backend_ip).map_err(|err| {
@@ -287,7 +287,7 @@ impl Frontend {
     pub async fn get_or_create_call_record(
         &self,
         user_authorization: &UserAuthorization,
-    ) -> Result<ModernCallRecord, FrontendError> {
+    ) -> Result<CallRecord, FrontendError> {
         let call = self
             .storage
             .get_call_record(&user_authorization.group_id)
@@ -312,7 +312,7 @@ impl Frontend {
             FrontendError::InternalError
         })?;
 
-        let call_record = ModernCallRecord {
+        let call_record = CallRecord {
             room_id: user_authorization.group_id.clone(),
             era_id: self.id_generator.get_random_call_id(16),
             backend_ip,
@@ -352,7 +352,7 @@ impl Frontend {
     pub async fn join_client_to_call(
         &self,
         user_id: &str,
-        call: &ModernCallRecord,
+        call: &CallRecord,
         join_request: JoinRequestWrapper,
     ) -> Result<JoinResponseWrapper, FrontendError> {
         let (demux_id, client_id) = self

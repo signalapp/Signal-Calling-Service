@@ -13,14 +13,11 @@ use crate::{
     backend::{self, Backend, BackendError, BackendHttpClient},
     config,
     metrics::Timer,
-    storage::{DynamoDb, ModernCallRecord, Storage},
+    storage::{CallRecord, DynamoDb, Storage},
 };
 
 /// Returns true if the call is currently being handled by the associated Calling Backend.
-async fn does_call_exist_on_backend(
-    call_record: &ModernCallRecord,
-    backend: &BackendHttpClient,
-) -> bool {
+async fn does_call_exist_on_backend(call_record: &CallRecord, backend: &BackendHttpClient) -> bool {
     // Get the direct address to the Calling Backend from the call record.
     match backend::Address::try_from(&call_record.backend_ip) {
         Err(err) => {
