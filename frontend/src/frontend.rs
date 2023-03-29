@@ -31,48 +31,48 @@ use crate::{
 pub type UserId = String;
 
 #[derive(Clone, Deserialize, Serialize, Eq, PartialEq)]
-pub struct GroupId(String);
+pub struct RoomId(String);
 
-impl From<String> for GroupId {
-    fn from(group_id_string: String) -> Self {
-        Self(group_id_string)
+impl From<String> for RoomId {
+    fn from(room_id_string: String) -> Self {
+        Self(room_id_string)
     }
 }
 
-impl From<&str> for GroupId {
-    fn from(group_id: &str) -> Self {
-        Self(group_id.to_string())
+impl From<&str> for RoomId {
+    fn from(room_id: &str) -> Self {
+        Self(room_id.to_string())
     }
 }
 
-impl From<GroupId> for String {
-    fn from(group_id: GroupId) -> Self {
-        group_id.0
+impl From<RoomId> for String {
+    fn from(room_id: RoomId) -> Self {
+        room_id.0
     }
 }
 
-impl AsRef<str> for GroupId {
+impl AsRef<str> for RoomId {
     fn as_ref(&self) -> &str {
         self.0.as_ref()
     }
 }
 
-/// Implement Display for GroupId to redact most of the string.
-impl fmt::Display for GroupId {
+/// Implement Display for RoomId to redact most of the string.
+impl fmt::Display for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:.4}", self.0)
     }
 }
 
-/// Implement Debug for GroupId to redact most of the string.
-impl fmt::Debug for GroupId {
+/// Implement Debug for RoomId to redact most of the string.
+impl fmt::Debug for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:.4}", self.0)
     }
 }
 
 /// A wrapper around a u32 with the 4 LSBs set to 0.
-/// Uniquely identifies a client within a call (scoped to the CallId).
+/// Uniquely identifies a client within a call (scoped to the call era).
 #[derive(Clone, Debug, Eq, PartialEq, Copy, Hash, PartialOrd, Ord)]
 pub struct DemuxId(u32);
 
@@ -102,7 +102,7 @@ impl From<DemuxId> for u32 {
 #[cfg_attr(test, automock)]
 pub trait IdGenerator: Sync + Send {
     fn get_random_demux_id_and_endpoint_id(&self, user_id: &str) -> Result<(DemuxId, String)>;
-    fn get_random_call_id(&self, n: usize) -> String;
+    fn get_random_era_id(&self, n: usize) -> String;
 }
 
 pub struct FrontendIdGenerator;
@@ -115,7 +115,7 @@ impl IdGenerator for FrontendIdGenerator {
         Ok((demux_id, endpoint_id))
     }
 
-    fn get_random_call_id(&self, n: usize) -> String {
+    fn get_random_era_id(&self, n: usize) -> String {
         random_hex_string(n)
     }
 }
@@ -226,12 +226,9 @@ impl Frontend {
         }
     }
 
-    pub async fn get_call_record(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<CallRecord, FrontendError> {
+    pub async fn get_call_record(&self, room_id: &RoomId) -> Result<CallRecord, FrontendError> {
         self.storage
-            .get_call_record(group_id)
+            .get_call_record(room_id)
             .await
             .map_err(|err| {
                 Frontend::log_error("get_call_record", err.into());
@@ -290,7 +287,7 @@ impl Frontend {
     ) -> Result<CallRecord, FrontendError> {
         let call = self
             .storage
-            .get_call_record(&user_authorization.group_id)
+            .get_call_record(&user_authorization.room_id)
             .await
             .map_err(|err| {
                 Frontend::log_error("get_or_create_call_record", err.into());
@@ -313,8 +310,8 @@ impl Frontend {
         })?;
 
         let call_record = CallRecord {
-            room_id: user_authorization.group_id.clone(),
-            era_id: self.id_generator.get_random_call_id(16),
+            room_id: user_authorization.room_id.clone(),
+            era_id: self.id_generator.get_random_era_id(16),
             backend_ip,
             backend_region: self.config.region.to_string(),
             creator: user_authorization.user_id.to_string(),
@@ -322,7 +319,7 @@ impl Frontend {
 
         // Allow for up to 5 retries to add the call to storage before giving up.
         for attempt in 1..=5 {
-            // In the rare case that /someone else/ created a call for the group
+            // In the rare case that /someone else/ created a call for the room
             // just now, that record will be returned instead.
             let call = self
                 .storage
@@ -411,11 +408,11 @@ impl Frontend {
 
     pub async fn remove_call_record(
         &self,
-        group_id: &GroupId,
-        call_id: &str,
+        room_id: &RoomId,
+        era_id: &str,
     ) -> Result<(), FrontendError> {
         self.storage
-            .remove_call_record(group_id, call_id)
+            .remove_call_record(room_id, era_id)
             .await
             .map_err(|err| {
                 Frontend::log_error("remove_call_record", err.into());

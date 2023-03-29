@@ -32,7 +32,7 @@ pub struct Participant {
 #[serde(rename_all = "camelCase")]
 pub struct ParticipantsResponse {
     #[serde(rename = "conferenceId")]
-    pub call_id: String,
+    pub era_id: String,
     pub max_devices: u32,
     pub participants: Vec<Participant>,
     pub creator: String,
@@ -58,7 +58,7 @@ pub struct JoinResponse {
     pub dhe_public_key: String,
     pub call_creator: String,
     #[serde(rename = "conferenceId")]
-    pub call_id: String,
+    pub era_id: String,
 }
 
 fn temporary_redirect(uri: &str) -> Result<axum::response::Response, StatusCode> {
@@ -78,7 +78,7 @@ pub async fn get_participants(
     trace!("get_participants:");
 
     let call = frontend
-        .get_call_record(&user_authorization.group_id)
+        .get_call_record(&user_authorization.room_id)
         .await?;
 
     if let Some(redirect_uri) = frontend.get_redirect_uri(&call.backend_region, &original_uri) {
@@ -105,7 +105,7 @@ pub async fn get_participants(
         })?;
 
     Ok(Json(ParticipantsResponse {
-        call_id: call.era_id,
+        era_id: call.era_id,
         max_devices: frontend.config.max_clients_per_call,
         participants,
         creator: call.creator,
@@ -163,7 +163,7 @@ pub async fn join(
         ice_pwd: response.ice_pwd,
         dhe_public_key: response.dhe_public_key,
         call_creator: call.creator,
-        call_id: call.era_id,
+        era_id: call.era_id,
     })
     .into_response())
 }
@@ -189,7 +189,7 @@ mod api_server_v2_tests {
         authenticator::{Authenticator, HmacSha256, GV2_AUTH_MATCH_LIMIT},
         backend::{self, BackendError, MockBackend},
         config,
-        frontend::{DemuxId, FrontendIdGenerator, GroupId, MockIdGenerator},
+        frontend::{DemuxId, FrontendIdGenerator, MockIdGenerator, RoomId},
         storage::{CallRecord, MockStorage},
     };
 
@@ -198,7 +198,7 @@ mod api_server_v2_tests {
     const USER_ID_1: &str = "1111111111111111";
     const USER_ID_2: &str = "2222222222222222";
     const GROUP_ID_1: &str = "aaaaaaaaaaaaaaaa";
-    const CALL_ID_1: &str = "a1a1a1a1";
+    const ERA_ID_1: &str = "a1a1a1a1";
     const ENDPOINT_ID_1: &str = "1111111111111111-123456";
     const DEMUX_ID_1: u32 = 1070920496;
     const ENDPOINT_ID_2: &str = "2222222222222222-987654";
@@ -275,7 +275,7 @@ mod api_server_v2_tests {
     fn create_call_record(backend_region: &str) -> CallRecord {
         CallRecord {
             room_id: GROUP_ID_1.into(),
-            era_id: CALL_ID_1.to_string(),
+            era_id: ERA_ID_1.to_string(),
             backend_ip: "127.0.0.1".to_string(),
             backend_region: backend_region.to_string(),
             creator: USER_ID_1.to_string(),
@@ -304,8 +304,8 @@ mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_record()
-            // group_id: &GroupId
-            .with(eq(GroupId::from(GROUP_ID_1)))
+            // room_id: &RoomId
+            .with(eq(RoomId::from(GROUP_ID_1)))
             .once()
             // Result<Option<CallRecord>>
             .returning(|_| Ok(None));
@@ -316,8 +316,8 @@ mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_record()
-            // group_id: &GroupId
-            .with(eq(GroupId::from(GROUP_ID_1)))
+            // room_id: &RoomId
+            .with(eq(RoomId::from(GROUP_ID_1)))
             .once()
             // Result<Option<CallRecord>>
             .returning(move |_| Ok(Some(create_call_record(&region))));
@@ -335,7 +335,7 @@ mod api_server_v2_tests {
             // backend_address: &BackendAddress, call_id: &str,
             .with(
                 eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(CALL_ID_1),
+                eq(ERA_ID_1),
             )
             .once()
             // Result<ClientsResponse, BackendError>
@@ -439,7 +439,7 @@ mod api_server_v2_tests {
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(participants_response.call_id, CALL_ID_1);
+        assert_eq!(participants_response.era_id, ERA_ID_1);
         assert_eq!(
             participants_response.max_devices,
             config.max_clients_per_call
@@ -518,8 +518,8 @@ mod api_server_v2_tests {
         // Create expectations.
         storage
             .expect_get_call_record()
-            // group_id: &GroupId
-            .with(eq(GroupId::from(GROUP_ID_1)))
+            // room_id: &RoomId
+            .with(eq(RoomId::from(GROUP_ID_1)))
             .once()
             // Result<Option<CallRecord>>
             .returning(move |_| Ok(Some(create_call_record(&config.region))))
@@ -530,7 +530,7 @@ mod api_server_v2_tests {
             // backend_address: &BackendAddress, call_id: &str,
             .with(
                 eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(CALL_ID_1),
+                eq(ERA_ID_1),
             )
             .once()
             // Result<ClientsResponse, BackendError>
@@ -539,8 +539,8 @@ mod api_server_v2_tests {
 
         storage
             .expect_remove_call_record()
-            // group_id: &GroupId, call_id: &str
-            .with(eq(GroupId::from(GROUP_ID_1)), eq(CALL_ID_1))
+            // room_id: &RoomId, era_id: &str
+            .with(eq(RoomId::from(GROUP_ID_1)), eq(ERA_ID_1))
             .once()
             // Result<()>
             .returning(|_, _| Ok(()))
@@ -586,10 +586,10 @@ mod api_server_v2_tests {
             .returning(|| Ok("127.0.0.1".to_string()));
 
         id_generator
-            .expect_get_random_call_id()
+            .expect_get_random_era_id()
             .with(eq(16))
             .once()
-            .returning(|_| CALL_ID_1.to_string());
+            .returning(|_| ERA_ID_1.to_string());
 
         let expected_call_record = create_call_record(&config.region);
 
@@ -616,7 +616,7 @@ mod api_server_v2_tests {
             // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
             .with(
                 eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(CALL_ID_1),
+                eq(ERA_ID_1),
                 eq(expected_demux_id),
                 eq(backend::JoinRequest {
                     client_id: ENDPOINT_ID_1.to_string(),
@@ -675,7 +675,7 @@ mod api_server_v2_tests {
             BACKEND_DHE_PUBLIC_KEY.to_string()
         );
         assert_eq!(&join_response.call_creator, USER_ID_1);
-        assert_eq!(&join_response.call_id, CALL_ID_1);
+        assert_eq!(&join_response.era_id, ERA_ID_1);
     }
 
     /// Invoke the "PUT /v2/conference/participants" to join in the case where there is a call.
@@ -704,7 +704,7 @@ mod api_server_v2_tests {
             // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
             .with(
                 eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(CALL_ID_1),
+                eq(ERA_ID_1),
                 eq(expected_demux_id),
                 eq(backend::JoinRequest {
                     client_id: ENDPOINT_ID_2.to_string(),
@@ -763,7 +763,7 @@ mod api_server_v2_tests {
             BACKEND_DHE_PUBLIC_KEY.to_string()
         );
         assert_eq!(&join_response.call_creator, USER_ID_1);
-        assert_eq!(&join_response.call_id, CALL_ID_1);
+        assert_eq!(&join_response.era_id, ERA_ID_1);
     }
 
     /// Invoke the "PUT /v2/conference/participants" to join in the case where there is a call and backend is older and does not return ips.
@@ -792,7 +792,7 @@ mod api_server_v2_tests {
             // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
             .with(
                 eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(CALL_ID_1),
+                eq(ERA_ID_1),
                 eq(expected_demux_id),
                 eq(backend::JoinRequest {
                     client_id: ENDPOINT_ID_2.to_string(),
@@ -851,7 +851,7 @@ mod api_server_v2_tests {
             BACKEND_DHE_PUBLIC_KEY.to_string()
         );
         assert_eq!(&join_response.call_creator, USER_ID_1);
-        assert_eq!(&join_response.call_id, CALL_ID_1);
+        assert_eq!(&join_response.era_id, ERA_ID_1);
     }
 
     /// Invoke the "PUT /v2/conference/participants" to join in the case where the call is

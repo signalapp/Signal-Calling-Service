@@ -27,7 +27,7 @@ use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
 
 use crate::{
-    authenticator::{AuthToken, Authenticator, AuthenticatorError},
+    authenticator::{Authenticator, AuthenticatorError, GroupAuthToken},
     frontend::{Frontend, FrontendError},
     metrics::histogram::Histogram,
 };
@@ -198,7 +198,7 @@ async fn authorize<B>(
     let user_authorization = frontend
         .authenticator
         .verify(
-            AuthToken::from_str(&password).map_err(|err| {
+            GroupAuthToken::from_str(&password).map_err(|err| {
                 event!("calling.frontend.api.authorization.malformed");
                 info!(
                     "authorize: malformed credentials for {} from {}: {}",

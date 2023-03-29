@@ -15,7 +15,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use crate::frontend::{GroupId, UserId};
+use crate::frontend::{RoomId, UserId};
 
 pub type HmacSha256 = Hmac<Sha256>;
 
@@ -49,16 +49,16 @@ impl UserPermission {
     }
 }
 
-pub struct AuthToken {
+pub struct GroupAuthToken {
     pub user_id: UserId,
-    pub group_id: GroupId,
+    pub group_id: RoomId,
     pub time: SystemTime,
     pub user_permission: UserPermission,
     pub mac_digest: Vec<u8>,
     pub validation_range: Range<usize>,
 }
 
-impl FromStr for AuthToken {
+impl FromStr for GroupAuthToken {
     type Err = anyhow::Error;
 
     fn from_str(password: &str) -> Result<Self, Self::Err> {
@@ -87,7 +87,7 @@ impl FromStr for AuthToken {
             let mac_digest =
                 Vec::from_hex(mac_digest_hex).map_err(|_| anyhow!("mac not hexadecimal"))?;
 
-            Ok(AuthToken {
+            Ok(GroupAuthToken {
                 user_id: user_id.to_string(),
                 group_id: group_id.into(),
                 time,
@@ -105,7 +105,7 @@ impl FromStr for AuthToken {
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserAuthorization {
     pub user_id: UserId,
-    pub group_id: GroupId,
+    pub room_id: RoomId,
     pub user_permission: UserPermission,
 }
 
@@ -165,7 +165,7 @@ impl Authenticator {
     /// Verify the given token and return an UserAuthorization or an error.
     pub fn verify(
         &self,
-        auth_token: AuthToken,
+        auth_token: GroupAuthToken,
         password: &str,
     ) -> Result<UserAuthorization, AuthenticatorError> {
         // Check that the MACs match (up to the match limit).
@@ -187,7 +187,7 @@ impl Authenticator {
 
         Ok(UserAuthorization {
             user_id: auth_token.user_id,
-            group_id: auth_token.group_id,
+            room_id: auth_token.group_id,
             user_permission: auth_token.user_permission,
         })
     }
@@ -389,11 +389,11 @@ mod authenticator_tests {
         let password =
             generate_signed_v2_password(USER_ID_1, GROUP_ID_1, timestamp.as_secs(), "1", &key);
 
-        let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
+        let result = authenticator.verify(GroupAuthToken::from_str(&password).unwrap(), &password);
         assert!(result.is_ok());
         let user_authorization = result.unwrap();
         assert_eq!(user_authorization.user_id, USER_ID_1);
-        assert_eq!(user_authorization.group_id, GroupId::from(GROUP_ID_1));
+        assert_eq!(user_authorization.room_id, RoomId::from(GROUP_ID_1));
         assert_eq!(
             user_authorization.user_permission,
             UserPermission::CreateAndJoin
@@ -418,37 +418,37 @@ mod authenticator_tests {
     fn test_auth_token_malformed() {
         initialize_logging();
 
-        let result = AuthToken::from_str("1:2");
+        let result = GroupAuthToken::from_str("1:2");
         assert!(result.is_err());
 
         // Error: Password not valid
-        assert!(AuthToken::from_str("").is_err());
-        assert!(AuthToken::from_str(":").is_err());
-        assert!(AuthToken::from_str("::").is_err());
-        assert!(AuthToken::from_str(":::").is_err());
-        assert!(AuthToken::from_str("::::").is_err());
-        assert!(AuthToken::from_str(":::::").is_err());
-        assert!(AuthToken::from_str("2:::::").is_err());
-        assert!(AuthToken::from_str("1:2:3").is_err());
-        assert!(AuthToken::from_str("1:2:3:4:5").is_err());
+        assert!(GroupAuthToken::from_str("").is_err());
+        assert!(GroupAuthToken::from_str(":").is_err());
+        assert!(GroupAuthToken::from_str("::").is_err());
+        assert!(GroupAuthToken::from_str(":::").is_err());
+        assert!(GroupAuthToken::from_str("::::").is_err());
+        assert!(GroupAuthToken::from_str(":::::").is_err());
+        assert!(GroupAuthToken::from_str("2:::::").is_err());
+        assert!(GroupAuthToken::from_str("1:2:3").is_err());
+        assert!(GroupAuthToken::from_str("1:2:3:4:5").is_err());
 
         // Error: Odd number of digits
-        assert!(AuthToken::from_str("1:2b::").is_err());
-        assert!(AuthToken::from_str("1a:2::").is_err());
-        assert!(AuthToken::from_str("1a2:2b:1:3c").is_err());
-        assert!(AuthToken::from_str("2:1:2b:::").is_err());
-        assert!(AuthToken::from_str("2:1a:2:::").is_err());
+        assert!(GroupAuthToken::from_str("1:2b::").is_err());
+        assert!(GroupAuthToken::from_str("1a:2::").is_err());
+        assert!(GroupAuthToken::from_str("1a2:2b:1:3c").is_err());
+        assert!(GroupAuthToken::from_str("2:1:2b:::").is_err());
+        assert!(GroupAuthToken::from_str("2:1a:2:::").is_err());
 
         // Error: Invalid character 'x' at position 1
-        assert!(AuthToken::from_str("1x:2b:1:").is_err());
-        assert!(AuthToken::from_str("1a:2x:1:").is_err());
-        assert!(AuthToken::from_str("2:1x:2b:1::").is_err());
-        assert!(AuthToken::from_str("2:1a:2x:1::").is_err());
+        assert!(GroupAuthToken::from_str("1x:2b:1:").is_err());
+        assert!(GroupAuthToken::from_str("1a:2x:1:").is_err());
+        assert!(GroupAuthToken::from_str("2:1x:2b:1::").is_err());
+        assert!(GroupAuthToken::from_str("2:1a:2x:1::").is_err());
 
         // Error: Unknown version
-        assert!(AuthToken::from_str(":1a:2b:1:2:3").is_err());
-        assert!(AuthToken::from_str("1:1a:2b:1:2:3").is_err());
-        assert!(AuthToken::from_str("3:1a:2b:1:2:3").is_err());
+        assert!(GroupAuthToken::from_str(":1a:2b:1:2:3").is_err());
+        assert!(GroupAuthToken::from_str("1:1a:2b:1:2:3").is_err());
+        assert!(GroupAuthToken::from_str("3:1a:2b:1:2:3").is_err());
 
         let key = <[u8; 32]>::from_hex(AUTH_KEY_2).unwrap();
 
@@ -468,17 +468,17 @@ mod authenticator_tests {
 
         // Make the mac not hex.
         let mac_not_hex = format!("{}:{}", password_no_mac, "not hex");
-        let result = AuthToken::from_str(&mac_not_hex);
+        let result = GroupAuthToken::from_str(&mac_not_hex);
         assert_eq!(result.err().unwrap().to_string(), "mac not hexadecimal");
 
         let password =
             generate_signed_v2_password(USER_ID_1, GROUP_ID_1, timestamp.as_secs(), "", &key);
-        let result = AuthToken::from_str(&password);
+        let result = GroupAuthToken::from_str(&password);
         assert!(result.is_err());
 
         let password =
             generate_signed_v2_password(USER_ID_1, GROUP_ID_1, timestamp.as_secs(), "11", &key);
-        let result = AuthToken::from_str(&password);
+        let result = GroupAuthToken::from_str(&password);
         assert!(result.is_err());
     }
 
@@ -498,7 +498,7 @@ mod authenticator_tests {
         let password =
             generate_signed_v2_password(USER_ID_1, GROUP_ID_1, timestamp.as_secs(), "1", &key);
 
-        let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
+        let result = authenticator.verify(GroupAuthToken::from_str(&password).unwrap(), &password);
         assert_eq!(result, Err(AuthenticatorError::BadSignature));
 
         // Save the password without the mac part.
@@ -510,7 +510,7 @@ mod authenticator_tests {
 
         // Make the mac garbage hex.
         let password = format!("{}:{}", password_no_mac, "deadbeefdeadbeef");
-        let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
+        let result = authenticator.verify(GroupAuthToken::from_str(&password).unwrap(), &password);
         assert_eq!(result, Err(AuthenticatorError::BadSignature));
     }
 
@@ -530,7 +530,7 @@ mod authenticator_tests {
 
         // dummy timestamp (no go).
         let password = get_signed_v2_password_for_duration(Duration::from_secs(1));
-        let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
+        let result = authenticator.verify(GroupAuthToken::from_str(&password).unwrap(), &password);
         assert_eq!(result, Err(AuthenticatorError::ExpiredCredentials));
 
         // 48 hour old timestamp (no go).
@@ -541,7 +541,7 @@ mod authenticator_tests {
                 .checked_sub(Duration::from_secs(60 * 60 * 48))
                 .unwrap(),
         );
-        let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
+        let result = authenticator.verify(GroupAuthToken::from_str(&password).unwrap(), &password);
         assert_eq!(result, Err(AuthenticatorError::ExpiredCredentials));
 
         // 30 hour and 1 second old timestamp (no go).
@@ -552,7 +552,7 @@ mod authenticator_tests {
                 .checked_sub(Duration::from_secs(60 * 60 * 30 + 1))
                 .unwrap(),
         );
-        let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
+        let result = authenticator.verify(GroupAuthToken::from_str(&password).unwrap(), &password);
         assert_eq!(result, Err(AuthenticatorError::ExpiredCredentials));
 
         // 30 hour old timestamp (no go).
@@ -563,7 +563,7 @@ mod authenticator_tests {
                 .checked_sub(Duration::from_secs(60 * 60 * 30))
                 .unwrap(),
         );
-        let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
+        let result = authenticator.verify(GroupAuthToken::from_str(&password).unwrap(), &password);
         assert_eq!(result, Err(AuthenticatorError::ExpiredCredentials));
 
         // 30 hour less 1 second new timestamp (ok).
@@ -574,11 +574,11 @@ mod authenticator_tests {
                 .checked_sub(Duration::from_secs(60 * 60 * 30 - 1))
                 .unwrap(),
         );
-        let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
+        let result = authenticator.verify(GroupAuthToken::from_str(&password).unwrap(), &password);
         assert!(result.is_ok());
         let user_authorization = result.unwrap();
         assert_eq!(user_authorization.user_id, USER_ID_1);
-        assert_eq!(user_authorization.group_id, GroupId::from(GROUP_ID_1));
+        assert_eq!(user_authorization.room_id, RoomId::from(GROUP_ID_1));
         assert_eq!(
             user_authorization.user_permission,
             UserPermission::CreateAndJoin
@@ -598,7 +598,7 @@ mod authenticator_tests {
 
         let password =
             generate_signed_v2_password(USER_ID_1, GROUP_ID_1, timestamp.as_secs(), "0", &key);
-        let result = authenticator.verify(AuthToken::from_str(&password).unwrap(), &password);
+        let result = authenticator.verify(GroupAuthToken::from_str(&password).unwrap(), &password);
         assert!(result.is_ok());
         let user_authorization = result.unwrap();
         assert_eq!(

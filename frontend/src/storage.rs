@@ -9,7 +9,6 @@ use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::{
     error::{DeleteItemError, DeleteItemErrorKind, PutItemError, PutItemErrorKind},
     model::{AttributeValue, Select},
-    types::DisplayErrorContext,
     Client, Config,
 };
 use aws_smithy_async::rt::sleep::default_async_sleep;
@@ -29,7 +28,7 @@ use mockall::{automock, predicate::*};
 
 use crate::{
     config,
-    frontend::{GroupId, UserId},
+    frontend::{RoomId, UserId},
     metrics::Timer,
 };
 
@@ -38,7 +37,7 @@ use crate::{
 pub struct CallRecord {
     /// The room that the client is authorized to join.
     /// Provided to the frontend by the client.
-    pub room_id: GroupId,
+    pub room_id: RoomId,
     /// A random id generated and sent back to the client to let it know
     /// about the specific call "in" the room.
     ///
@@ -65,20 +64,16 @@ pub enum StorageError {
 #[async_trait]
 pub trait Storage: Sync + Send {
     /// Gets an existing call from the table matching the given room_id or returns None.
-    async fn get_call_record(&self, room_id: &GroupId) -> Result<Option<CallRecord>, StorageError>;
+    async fn get_call_record(&self, room_id: &RoomId) -> Result<Option<CallRecord>, StorageError>;
     /// Adds the given call to the table but if there is already a call with the same
-    /// group_id, returns that instead.
+    /// room_id, returns that instead.
     async fn get_or_add_call_record(
         &self,
         call: CallRecord,
     ) -> Result<Option<CallRecord>, StorageError>;
-    /// Removes the given call from the table as long as the call_id of the record that
+    /// Removes the given call from the table as long as the era_id of the record that
     /// exists in the table is the same.
-    async fn remove_call_record(
-        &self,
-        room_id: &GroupId,
-        call_id: &str,
-    ) -> Result<(), StorageError>;
+    async fn remove_call_record(&self, room_id: &RoomId, era_id: &str) -> Result<(), StorageError>;
     /// Returns a list of all calls in the table that are in the given region.
     async fn get_call_records_for_region(
         &self,
@@ -150,15 +145,12 @@ impl DynamoDb {
 
 #[async_trait]
 impl Storage for DynamoDb {
-    async fn get_call_record(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<CallRecord>, StorageError> {
+    async fn get_call_record(&self, room_id: &RoomId) -> Result<Option<CallRecord>, StorageError> {
         let response = self
             .client
             .get_item()
             .table_name(&self.table_name)
-            .key("roomId", AttributeValue::S(group_id.as_ref().to_string()))
+            .key("roomId", AttributeValue::S(room_id.as_ref().to_string()))
             .key("recordType", AttributeValue::S("ActiveCall".to_string()))
             .consistent_read(true)
             .send()
@@ -205,22 +197,18 @@ impl Storage for DynamoDb {
         }
     }
 
-    async fn remove_call_record(
-        &self,
-        group_id: &GroupId,
-        call_id: &str,
-    ) -> Result<(), StorageError> {
+    async fn remove_call_record(&self, room_id: &RoomId, era_id: &str) -> Result<(), StorageError> {
         let response = self
             .client
             .delete_item()
             .table_name(&self.table_name)
             // Delete the item for the given key.
-            .key("roomId", AttributeValue::S(group_id.as_ref().to_string()))
+            .key("roomId", AttributeValue::S(room_id.as_ref().to_string()))
             .key("recordType", AttributeValue::S("ActiveCall".to_string()))
-            // But only if the given call_id matches the expected value, otherwise the
+            // But only if the given era_id matches the expected value, otherwise the
             // previous call was removed and a new one created already.
             .condition_expression("eraId = :value")
-            .expression_attribute_values(":value", AttributeValue::S(call_id.to_string()))
+            .expression_attribute_values(":value", AttributeValue::S(era_id.to_string()))
             .send()
             .await;
 
