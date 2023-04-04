@@ -16,7 +16,7 @@ mod slice;
 mod thread_pool;
 mod time;
 
-use std::{cmp::PartialEq, convert::TryInto};
+use std::{cmp::PartialEq, convert::TryInto, io::Write};
 
 pub use bits::*;
 pub use collections::*;
@@ -234,6 +234,25 @@ impl CheckedSplitAtMut for [u8] {
             Some(self.split_at_mut(mid))
         }
     }
+}
+
+pub fn format_log_line(
+    buf: &mut env_logger::fmt::Formatter,
+    record: &log::Record<'_>,
+) -> std::io::Result<()> {
+    write!(buf, "[{} {:<5} ", buf.timestamp_millis(), record.level())?;
+    match record.file() {
+        // Log the filename for crates in this workspace.
+        Some(file) if !file.starts_with(['\\', '/']) => {
+            write!(buf, "{}:{}", file, record.line().unwrap_or(0))?;
+        }
+        // Log the target (usually the module path) for anything else.
+        _ => {
+            write!(buf, "{}", record.target())?;
+        }
+    }
+    writeln!(buf, "] {}", record.args())?;
+    Ok(())
 }
 
 #[cfg(test)]

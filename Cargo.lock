@@ -606,9 +606,11 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "base64 0.13.1",
+ "env_logger",
  "flume",
  "hex",
  "hex-literal",
+ "log",
  "rand",
  "sha2",
  "thiserror",

@@ -85,7 +85,7 @@ fn main() -> Result<()> {
             .default_filter_or("calling_frontend=info")
             .default_write_style_or("never"),
     )
-    .format_timestamp_millis()
+    .format(calling_common::format_log_line)
     .init();
 
     info!("Signal Calling Frontend starting up...");
