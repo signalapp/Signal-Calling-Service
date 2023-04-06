@@ -318,33 +318,15 @@ impl Frontend {
             creator: user_authorization.user_id.to_string(),
         };
 
-        // Allow for up to 5 retries to add the call to storage before giving up.
-        for attempt in 1..=5 {
-            // In the rare case that /someone else/ created a call for the room
-            // just now, that record will be returned instead.
-            let call = self
-                .storage
-                .get_or_add_call_record(call_record.clone())
-                .await
-                .map_err(|err| {
-                    Frontend::log_error("get_or_create_call_record", err.into());
-                    FrontendError::InternalError
-                })?;
-
-            if let Some(call) = call {
-                return Ok(call);
-            }
-
-            // A call was in storage when we tried to add one, but now there
-            // wasn't one when we try to get it.
-            warn!(
-                "get_or_create_call_record: failed to get call, attempt {} for {:.6}",
-                attempt, call_record.era_id
-            );
-        }
-
-        error!("get_or_create_call_record: Unable to resolve conflicts");
-        Err(FrontendError::InternalError)
+        // In the rare case that /someone else/ created a call for the room
+        // just now, that record will be returned instead.
+        self.storage
+            .get_or_add_call_record(call_record.clone())
+            .await
+            .map_err(|err| {
+                Frontend::log_error("get_or_create_call_record", err.into());
+                FrontendError::InternalError
+            })
     }
 
     pub async fn join_client_to_call(

@@ -601,8 +601,8 @@ mod api_server_v2_tests {
             // call: &CallRecord
             .with(eq(expected_call_record))
             .once()
-            // Result<Option<CallRecord>, StorageError>
-            .returning(move |_| Ok(Some(create_call_record(&config.region))));
+            // Result<CallRecord, StorageError>
+            .returning(move |_| Ok(create_call_record(&config.region)));
 
         id_generator
             .expect_get_random_demux_id_and_endpoint_id()

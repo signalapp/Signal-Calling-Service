@@ -7,8 +7,8 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::{
-    error::{DeleteItemError, DeleteItemErrorKind, PutItemError, PutItemErrorKind},
-    model::{AttributeValue, Select},
+    error::{DeleteItemError, DeleteItemErrorKind},
+    model::{AttributeValue, ReturnValue, Select},
     Client, Config,
 };
 use aws_smithy_async::rt::sleep::default_async_sleep;
@@ -19,9 +19,10 @@ use hyper::client::HttpConnector;
 use hyper::{Body, Method, Request};
 use log::*;
 use serde::{Deserialize, Serialize};
-use serde_dynamo::{from_item, to_item};
-use std::path::PathBuf;
+use serde_dynamo::{from_item, to_item, Item};
 use tokio::{io::AsyncWriteExt, sync::oneshot::Receiver};
+
+use std::{collections::HashMap, path::PathBuf};
 
 #[cfg(test)]
 use mockall::{automock, predicate::*};
@@ -67,10 +68,7 @@ pub trait Storage: Sync + Send {
     async fn get_call_record(&self, room_id: &RoomId) -> Result<Option<CallRecord>, StorageError>;
     /// Adds the given call to the table but if there is already a call with the same
     /// room_id, returns that instead.
-    async fn get_or_add_call_record(
-        &self,
-        call: CallRecord,
-    ) -> Result<Option<CallRecord>, StorageError>;
+    async fn get_or_add_call_record(&self, call: CallRecord) -> Result<CallRecord, StorageError>;
     /// Removes the given call from the table as long as the era_id of the record that
     /// exists in the table is the same.
     async fn remove_call_record(&self, room_id: &RoomId, era_id: &str) -> Result<(), StorageError>;
@@ -143,6 +141,71 @@ impl DynamoDb {
     }
 }
 
+/// A wrapper around [`Item`] that can generate "upsert"-like update expressions.
+///
+/// Note that if there *is* an existing record, but it does *not* have all of the attributes
+/// specified, those attributes will be added to the existing record. This differs from a
+/// conditional expression, which will leave an existing record untouched.
+///
+/// ```dynamodb
+/// SET #foo = if_not_exists(#foo, :foo), #bar = if_not_exists(#bar, :bar)
+/// ```
+struct UpsertableItem {
+    partition_key: &'static str,
+    sort_key: &'static str,
+    attributes: Item,
+}
+
+impl UpsertableItem {
+    fn new(partition_key: &'static str, sort_key: &'static str, attributes: Item) -> Self {
+        Self {
+            partition_key,
+            sort_key,
+            attributes,
+        }
+    }
+
+    fn is_primary_key(&self, k: &str) -> bool {
+        k == self.partition_key || k == self.sort_key
+    }
+
+    fn generate_update_expression(&self) -> String {
+        assert!(
+            self.attributes.len() > 2,
+            "no attributes besides primary keys"
+        );
+        let mut expressions = self
+            .attributes
+            .keys()
+            .filter(|k| !self.is_primary_key(k))
+            .map(|k| format!("#{k} = if_not_exists(#{k}, :{k})"));
+        let mut result = "SET ".to_string();
+        result.push_str(&expressions.next().expect("at least one attribute"));
+        for expr in expressions {
+            result.push(',');
+            result.push_str(&expr);
+        }
+        result
+    }
+
+    fn generate_attribute_names(&self) -> HashMap<String, String> {
+        self.attributes
+            .keys()
+            .filter(|k| !self.is_primary_key(k))
+            .map(|k| (format!("#{k}"), k.to_string()))
+            .collect()
+    }
+
+    fn into_attribute_values(mut self) -> HashMap<String, AttributeValue> {
+        std::mem::take(&mut self.attributes)
+            .into_inner()
+            .into_iter()
+            .filter(|(k, _v)| !self.is_primary_key(k))
+            .map(|(k, v)| (format!(":{k}"), v.into()))
+            .collect()
+    }
+}
+
 #[async_trait]
 impl Storage for DynamoDb {
     async fn get_call_record(&self, room_id: &RoomId) -> Result<Option<CallRecord>, StorageError> {
@@ -163,37 +226,40 @@ impl Storage for DynamoDb {
             .transpose()?)
     }
 
-    async fn get_or_add_call_record(
-        &self,
-        call: CallRecord,
-    ) -> Result<Option<CallRecord>, StorageError> {
+    async fn get_or_add_call_record(&self, call: CallRecord) -> Result<CallRecord, StorageError> {
+        let call_as_item = UpsertableItem::new(
+            "roomId",
+            "recordType",
+            to_item(&call).expect("failed to convert CallRecord to item"),
+        );
         let response = self
             .client
-            .put_item()
+            .update_item()
             .table_name(&self.table_name)
-            .set_item(Some(
-                to_item(&call).expect("failed to convert CallRecord to item"),
-            ))
-            // Don't overwrite the item if it already exists.
-            .condition_expression("attribute_not_exists(roomId)".to_string())
+            .update_expression(call_as_item.generate_update_expression())
+            .key(
+                call_as_item.partition_key,
+                AttributeValue::S(call.room_id.as_ref().to_string()),
+            )
+            .key(
+                call_as_item.sort_key,
+                AttributeValue::S("ActiveCall".to_string()),
+            )
+            .set_expression_attribute_names(Some(call_as_item.generate_attribute_names()))
+            .set_expression_attribute_values(Some(call_as_item.into_attribute_values()))
+            .return_values(ReturnValue::AllNew)
             .send()
             .await;
 
         match response {
-            Ok(_) => Ok(Some(call)),
-            Err(err) => match err.into_service_error() {
-                PutItemError {
-                    kind: PutItemErrorKind::ConditionalCheckFailedException(_),
-                    ..
-                } => Ok(self
-                    .get_call_record(&call.room_id)
-                    .await
-                    .context("failed to get call from storage after conditional check failed")?),
-                err => Err(StorageError::UnexpectedError(
-                    anyhow::Error::from(err)
-                        .context("failed to put_item to storage for get_or_add_call_record"),
-                )),
-            },
+            Ok(response) => Ok(from_item(
+                response.attributes().expect("requested attributes").clone(),
+            )
+            .context("failed to convert item to CallRecord")?),
+            Err(err) => Err(StorageError::UnexpectedError(
+                anyhow::Error::from(err)
+                    .context("failed to update_item in storage for get_or_add_call_record"),
+            )),
         }
     }
 
