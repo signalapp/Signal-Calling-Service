@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::{
-    error::{DeleteItemError, DeleteItemErrorKind},
+    error::{DeleteItemError, DeleteItemErrorKind, UpdateItemError, UpdateItemErrorKind},
     model::{AttributeValue, ReturnValue, Select},
     Client, Config,
 };
@@ -20,9 +20,10 @@ use hyper::{Body, Method, Request};
 use log::*;
 use serde::{Deserialize, Serialize};
 use serde_dynamo::{from_item, to_item, Item};
+use serde_with::serde_as;
 use tokio::{io::AsyncWriteExt, sync::oneshot::Receiver};
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::SystemTime};
 
 #[cfg(test)]
 use mockall::{automock, predicate::*};
@@ -55,8 +56,82 @@ pub struct CallRecord {
     pub creator: UserId,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum CallLinkRestrictions {
+    None,
+    AdminApproval,
+}
+
+#[serde_as]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", tag = "recordType")]
+pub struct CallLinkState {
+    /// Uniquely identifies the call link / the room.
+    pub room_id: RoomId,
+    /// Bytes chosen by the room creator to identify admins.
+    #[serde(with = "serde_bytes")]
+    pub admin_passkey: Vec<u8>,
+    /// Controls access to the room.
+    pub restrictions: CallLinkRestrictions,
+    /// The name of the room, decryptable by clients who know the call link's root key.
+    ///
+    /// May be empty.
+    #[serde(with = "serde_bytes")]
+    pub encrypted_name: Vec<u8>,
+    /// Whether or not the call link has been manually revoked.
+    pub revoked: bool,
+    /// When the link expires.
+    ///
+    /// Note that records are preserved after expiration, at least for a while, so clients can fetch
+    /// the name of an expired link.
+    #[serde_as(as = "serde_with::TimestampSeconds<i64>")]
+    pub expiration: SystemTime,
+}
+
+impl CallLinkState {
+    pub fn new(room_id: RoomId, admin_passkey: Vec<u8>, now: SystemTime) -> Self {
+        Self {
+            room_id,
+            admin_passkey,
+            restrictions: CallLinkRestrictions::None,
+            encrypted_name: vec![],
+            revoked: false,
+            expiration: now + std::time::Duration::from_secs(60 * 60 * 24 * 90),
+        }
+    }
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", tag = "recordType", rename = "CallLinkState")]
+pub struct CallLinkUpdate {
+    /// Bytes chosen by the room creator to identify admins.
+    #[serde(with = "serde_bytes")]
+    pub admin_passkey: Vec<u8>,
+    /// Controls access to the room. If None, will not be updated.
+    pub restrictions: Option<CallLinkRestrictions>,
+    /// The name of the room, decryptable by clients who know the call link's root key.
+    ///
+    /// May be empty. If None, will not be updated.
+    #[serde(with = "serde_bytes")]
+    pub encrypted_name: Option<Vec<u8>>,
+    /// Whether or not the call link has been manually revoked. If None, will not be updated.
+    pub revoked: Option<bool>,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum StorageError {
+    #[error(transparent)]
+    UnexpectedError(#[from] anyhow::Error),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum CallLinkUpdateError {
+    #[error("room does not exist")]
+    RoomDoesNotExist,
+    #[error("admin passkey does not match")]
+    AdminPasskeyDidNotMatch,
     #[error(transparent)]
     UnexpectedError(#[from] anyhow::Error),
 }
@@ -77,6 +152,16 @@ pub trait Storage: Sync + Send {
         &self,
         region: &str,
     ) -> Result<Vec<CallRecord>, StorageError>;
+
+    /// Fetches the current state for a call link.
+    async fn get_call_link(&self, room_id: &RoomId) -> Result<Option<CallLinkState>, StorageError>;
+    /// Updates some or all of a call link's attributes.
+    async fn update_call_link(
+        &self,
+        room_id: &RoomId,
+        new_attributes: &CallLinkUpdate,
+        must_exist: bool,
+    ) -> Result<CallLinkState, CallLinkUpdateError>;
 }
 
 pub struct DynamoDb {
@@ -153,15 +238,34 @@ impl DynamoDb {
 struct UpsertableItem {
     partition_key: &'static str,
     sort_key: &'static str,
-    attributes: Item,
+    update_attributes: Item,
+    default_attributes: Item,
 }
 
 impl UpsertableItem {
-    fn new(partition_key: &'static str, sort_key: &'static str, attributes: Item) -> Self {
+    fn with_updates(partition_key: &'static str, sort_key: &'static str, attributes: Item) -> Self {
+        Self::new(partition_key, sort_key, attributes, Default::default())
+    }
+
+    fn with_defaults(
+        partition_key: &'static str,
+        sort_key: &'static str,
+        attributes: Item,
+    ) -> Self {
+        Self::new(partition_key, sort_key, Default::default(), attributes)
+    }
+
+    fn new(
+        partition_key: &'static str,
+        sort_key: &'static str,
+        update_attributes: Item,
+        default_attributes: Item,
+    ) -> Self {
         Self {
             partition_key,
             sort_key,
-            attributes,
+            update_attributes,
+            default_attributes,
         }
     }
 
@@ -170,36 +274,51 @@ impl UpsertableItem {
     }
 
     fn generate_update_expression(&self) -> String {
-        assert!(
-            self.attributes.len() > 2,
-            "no attributes besides primary keys"
-        );
-        let mut expressions = self
-            .attributes
+        let update_expressions = self
+            .update_attributes
             .keys()
             .filter(|k| !self.is_primary_key(k))
+            .map(|k| format!("#{k} = :{k}"));
+        let default_expressions = self
+            .default_attributes
+            .keys()
+            .filter(|k| !self.is_primary_key(k) && !self.update_attributes.contains_key(k.as_str()))
             .map(|k| format!("#{k} = if_not_exists(#{k}, :{k})"));
-        let mut result = "SET ".to_string();
-        result.push_str(&expressions.next().expect("at least one attribute"));
-        for expr in expressions {
-            result.push(',');
-            result.push_str(&expr);
-        }
-        result
+
+        // We don't technically need to sort the expressions, but it's better to be deterministic.
+        // (And easier to test.)
+        let mut expressions = update_expressions
+            .chain(default_expressions)
+            .collect::<Vec<_>>();
+        assert!(
+            !expressions.is_empty(),
+            "no attributes besides primary keys, no need for upsert"
+        );
+        expressions.sort();
+        format!("SET {}", expressions.join(","))
     }
 
     fn generate_attribute_names(&self) -> HashMap<String, String> {
-        self.attributes
+        self.update_attributes
             .keys()
+            .chain(self.default_attributes.keys())
             .filter(|k| !self.is_primary_key(k))
             .map(|k| (format!("#{k}"), k.to_string()))
             .collect()
     }
 
     fn into_attribute_values(mut self) -> HashMap<String, AttributeValue> {
-        std::mem::take(&mut self.attributes)
+        let update_attributes = std::mem::take(&mut self.update_attributes)
             .into_inner()
-            .into_iter()
+            .into_iter();
+        let default_attributes = std::mem::take(&mut self.default_attributes)
+            .into_inner()
+            .into_iter();
+
+        // Allow update-attributes to override default-attributes if both have an entry for the same
+        // field.
+        default_attributes
+            .chain(update_attributes)
             .filter(|(k, _v)| !self.is_primary_key(k))
             .map(|(k, v)| (format!(":{k}"), v.into()))
             .collect()
@@ -227,7 +346,7 @@ impl Storage for DynamoDb {
     }
 
     async fn get_or_add_call_record(&self, call: CallRecord) -> Result<CallRecord, StorageError> {
-        let call_as_item = UpsertableItem::new(
+        let call_as_item = UpsertableItem::with_defaults(
             "roomId",
             "recordType",
             to_item(&call).expect("failed to convert CallRecord to item"),
@@ -318,6 +437,98 @@ impl Storage for DynamoDb {
 
         Ok(vec![])
     }
+
+    async fn get_call_link(&self, room_id: &RoomId) -> Result<Option<CallLinkState>, StorageError> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key("roomId", AttributeValue::S(room_id.as_ref().to_string()))
+            .key("recordType", AttributeValue::S("CallLinkState".to_string()))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("failed to get_item from storage")?;
+
+        Ok(response
+            .item
+            .map(|item| from_item(item).context("failed to convert item to CallLinkState"))
+            .transpose()?)
+    }
+
+    /// Updates some or all of a call link's attributes.
+    async fn update_call_link(
+        &self,
+        room_id: &RoomId,
+        new_attributes: &CallLinkUpdate,
+        must_exist: bool,
+    ) -> Result<CallLinkState, CallLinkUpdateError> {
+        let mut call_as_item = UpsertableItem::with_updates(
+            "roomId",
+            "recordType",
+            to_item(new_attributes).expect("failed to convert CallLinkUpdate to item"),
+        );
+
+        let passkey_condition;
+        if must_exist {
+            passkey_condition = "adminPasskey = :adminPasskey";
+        } else {
+            call_as_item.default_attributes = to_item(CallLinkState::new(
+                room_id.clone(),
+                new_attributes.admin_passkey.clone(),
+                SystemTime::now(),
+            ))
+            .expect("failed to convert CallLinkState to item");
+            passkey_condition =
+                "adminPasskey = :adminPasskey OR attribute_not_exists(adminPasskey)";
+        }
+
+        let response = self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key("roomId", AttributeValue::S(room_id.as_ref().to_string()))
+            .key("recordType", AttributeValue::S("CallLinkState".to_string()))
+            .update_expression(call_as_item.generate_update_expression())
+            .condition_expression(passkey_condition)
+            .set_expression_attribute_names(Some(call_as_item.generate_attribute_names()))
+            .set_expression_attribute_values(Some(call_as_item.into_attribute_values()))
+            .return_values(ReturnValue::AllNew)
+            .send()
+            .await;
+
+        match response {
+            Ok(response) => Ok(from_item(
+                response.attributes().expect("requested attributes").clone(),
+            )
+            .context("failed to convert item to CallLinkState")?),
+            Err(err) => match err.into_service_error() {
+                UpdateItemError {
+                    kind: UpdateItemErrorKind::ConditionalCheckFailedException(_),
+                    ..
+                } => {
+                    if !must_exist {
+                        // The only way this could have failed is if there *was* a room but the admin passkey was wrong.
+                        Err(CallLinkUpdateError::AdminPasskeyDidNotMatch)
+                    } else {
+                        // Check if the room exists.
+                        match self.get_call_link(room_id).await {
+                            Ok(Some(_)) => Err(CallLinkUpdateError::AdminPasskeyDidNotMatch),
+                            Ok(None) => Err(CallLinkUpdateError::RoomDoesNotExist),
+                            Err(inner_err) => Err(CallLinkUpdateError::UnexpectedError(
+                                anyhow::Error::from(inner_err)
+                                    .context("failed to check for existing room after failing to update_item in storage for update_call_link"),
+                            ))
+                        }
+                    }
+                }
+                err => Err(CallLinkUpdateError::UnexpectedError(
+                    anyhow::Error::from(err)
+                        .context("failed to update_item in storage for update_call_link"),
+                )),
+            },
+        }
+    }
 }
 
 /// Supports the DynamoDB storage implementation by periodically refreshing an identity
@@ -393,5 +604,74 @@ impl IdentityFetcher {
 
         info!("fetcher shutdown");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_item(kv_pairs: &[(&'static str, &'static str)]) -> Item {
+        kv_pairs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    serde_dynamo::AttributeValue::S(v.to_string()),
+                )
+            })
+            .collect::<HashMap<_, _>>()
+            .into()
+    }
+
+    #[test]
+    fn upsertable_item_attribute_merging() {
+        let default_attributes = make_item(&[
+            ("partitionKey", "p"),
+            ("sortKey", "s"),
+            ("defaultOnly", "default"),
+            ("defaultAndUpdate", "default"),
+        ]);
+        let update_attributes = make_item(&[
+            ("partitionKey", "p"),
+            ("sortKey", "s"),
+            ("updateOnly", "update"),
+            ("defaultAndUpdate", "update"),
+        ]);
+
+        let item = UpsertableItem::new(
+            "partitionKey",
+            "sortKey",
+            update_attributes,
+            default_attributes,
+        );
+        assert_eq!(
+            item.generate_update_expression(),
+            "SET #defaultAndUpdate = :defaultAndUpdate,#defaultOnly = if_not_exists(#defaultOnly, :defaultOnly),#updateOnly = :updateOnly"
+        );
+        assert_eq!(
+            item.generate_attribute_names(),
+            HashMap::from_iter(
+                [
+                    ("#defaultOnly", "defaultOnly"),
+                    ("#defaultAndUpdate", "defaultAndUpdate"),
+                    ("#updateOnly", "updateOnly")
+                ]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+            )
+        );
+
+        assert_eq!(
+            item.into_attribute_values(),
+            make_item(&[
+                (":defaultOnly", "default"),
+                (":defaultAndUpdate", "update"),
+                (":updateOnly", "update"),
+            ])
+            .into_inner()
+            .into_iter()
+            .map(|(k, v)| (k, v.into()))
+            .collect()
+        );
     }
 }

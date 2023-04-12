@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+mod call_links;
 mod v2;
 
 use std::{
@@ -243,7 +244,7 @@ async fn unknown_request_handler() -> impl IntoResponse {
 fn app(frontend: Arc<Frontend>) -> Router {
     let health_route = Router::new().route("/health", get(get_health));
 
-    let routes = Router::new()
+    let sfu_routes = Router::new()
         .route(
             "/v2/conference/participants",
             get(v2::get_participants).put(v2::join),
@@ -253,11 +254,21 @@ fn app(frontend: Arc<Frontend>) -> Router {
                 .layer(middleware::from_fn_with_state(frontend.clone(), metrics))
                 .layer(middleware::from_fn_with_state(frontend.clone(), authorize)),
         )
+        .with_state(frontend.clone());
+
+    // FIXME: metrics? or don't worry about it?
+    let call_link_routes = Router::new()
+        .route(
+            "/v1/call-link/:room_id",
+            get(call_links::read_call_link).put(call_links::update_call_link),
+        )
+        .layer(ServiceBuilder::new())
         .with_state(frontend);
 
     Router::new()
         .merge(health_route)
-        .merge(routes)
+        .merge(sfu_routes)
+        .merge(call_link_routes)
         .fallback(unknown_request_handler)
 }
 
