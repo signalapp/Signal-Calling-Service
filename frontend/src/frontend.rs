@@ -286,25 +286,22 @@ impl Frontend {
         &self,
         user_authorization: &UserAuthorization,
     ) -> Result<CallRecord, FrontendError> {
-        let call = self
-            .storage
-            .get_call_record(&user_authorization.room_id)
-            .await
-            .map_err(|err| {
-                Frontend::log_error("get_or_create_call_record", err.into());
-                FrontendError::InternalError
-            })?;
-
-        if let Some(call) = call {
-            return Ok(call);
-        }
-
         if !user_authorization.user_permission.can_create() {
-            return Err(FrontendError::NoPermissionToCreateCall);
+            // Either a call already exists or it doesn't.
+            return self
+                .storage
+                .get_call_record(&user_authorization.room_id)
+                .await
+                .map_err(|err| {
+                    Frontend::log_error("get_or_create_call_record", err.into());
+                    FrontendError::InternalError
+                })
+                .transpose()
+                .unwrap_or(Err(FrontendError::NoPermissionToCreateCall));
         }
 
-        // There is no existing call, so we'll try to create one. First, access
-        // a backend server through load balancing and get its IP address.
+        // Create a call if we need to. First, access a backend server through load balancing and
+        // get its IP address.
         let backend_ip = self.backend.select_ip().await.map_err(|err| {
             Frontend::log_error("get_or_create_call_record", err.into());
             FrontendError::InternalError
@@ -318,8 +315,6 @@ impl Frontend {
             creator: user_authorization.user_id.to_string(),
         };
 
-        // In the rare case that /someone else/ created a call for the room
-        // just now, that record will be returned instead.
         self.storage
             .get_or_add_call_record(call_record.clone())
             .await

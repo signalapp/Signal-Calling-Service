@@ -327,6 +327,21 @@ mod api_server_v2_tests {
         storage
     }
 
+    fn create_mocked_storage_for_join(region: &str, user: &str) -> Box<MockStorage> {
+        let mut storage = Box::new(MockStorage::new());
+        let mut expected_call_record = create_call_record(region);
+        expected_call_record.creator = user.to_string();
+        let resulting_call_record = create_call_record(region);
+        storage
+            .expect_get_or_add_call_record()
+            // call: CallRecord
+            .with(eq(expected_call_record))
+            .once()
+            // Result<CallRecord>
+            .return_once(move |_| Ok(resulting_call_record));
+        storage
+    }
+
     fn create_mocked_backend_unused() -> Box<MockBackend> {
         Box::new(MockBackend::new())
     }
@@ -577,7 +592,7 @@ mod api_server_v2_tests {
         let config = &CONFIG;
 
         // Create mocked dependencies with expectations.
-        let mut storage = create_mocked_storage_no_call();
+        let storage = create_mocked_storage_for_join(&config.region, USER_ID_1);
         let mut backend = Box::new(MockBackend::new());
         let mut id_generator = Box::new(MockIdGenerator::new());
 
@@ -593,16 +608,6 @@ mod api_server_v2_tests {
             .with(eq(16))
             .once()
             .returning(|_| ERA_ID_1.to_string());
-
-        let expected_call_record = create_call_record(&config.region);
-
-        storage
-            .expect_get_or_add_call_record()
-            // call: &CallRecord
-            .with(eq(expected_call_record))
-            .once()
-            // Result<CallRecord, StorageError>
-            .returning(move |_| Ok(create_call_record(&config.region)));
 
         id_generator
             .expect_get_random_demux_id_and_endpoint_id()
@@ -688,11 +693,21 @@ mod api_server_v2_tests {
         let config = &CONFIG;
 
         // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_with_call_for_region(config.region.to_string());
+        let storage = create_mocked_storage_for_join(&config.region, USER_ID_2);
         let mut backend = Box::new(MockBackend::new());
         let mut id_generator = Box::new(MockIdGenerator::new());
 
         // Create additional expectations.
+        backend
+            .expect_select_ip()
+            .once()
+            // Result<String, BackendError>
+            .returning(|| Ok("127.0.0.1".to_string()));
+        id_generator
+            .expect_get_random_era_id()
+            .with(eq(16))
+            .once()
+            .returning(|_| ERA_ID_1.to_string());
         id_generator
             .expect_get_random_demux_id_and_endpoint_id()
             // user_id: &str
@@ -777,11 +792,21 @@ mod api_server_v2_tests {
         let config = &CONFIG;
 
         // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_with_call_for_region(config.region.to_string());
+        let storage = create_mocked_storage_for_join(&config.region, USER_ID_2);
         let mut backend = Box::new(MockBackend::new());
         let mut id_generator = Box::new(MockIdGenerator::new());
 
         // Create additional expectations.
+        backend
+            .expect_select_ip()
+            .once()
+            // Result<String, BackendError>
+            .returning(|| Ok("127.0.0.1".to_string()));
+        id_generator
+            .expect_get_random_era_id()
+            .with(eq(16))
+            .once()
+            .returning(|_| ERA_ID_1.to_string());
         id_generator
             .expect_get_random_demux_id_and_endpoint_id()
             // user_id: &str
@@ -867,10 +892,32 @@ mod api_server_v2_tests {
         let config = &CONFIG;
 
         // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_with_call_for_region(ALT_REGION.to_string());
-        let backend = create_mocked_backend_unused();
+        let mut storage = Box::new(MockStorage::new());
+        let mut backend = Box::new(MockBackend::new());
+        backend
+            .expect_select_ip()
+            .once()
+            // Result<String, BackendError>
+            .returning(|| Ok("127.0.0.1".to_string()));
+        let mut id_generator = Box::new(MockIdGenerator::new());
+        id_generator
+            .expect_get_random_era_id()
+            .with(eq(16))
+            .once()
+            .returning(|_| ERA_ID_1.to_string());
 
-        let frontend = create_frontend(config, storage, backend);
+        let mut expected_call_record = create_call_record(&config.region);
+        expected_call_record.creator = USER_ID_2.to_string();
+        let resulting_call_record = create_call_record(ALT_REGION);
+        storage
+            .expect_get_or_add_call_record()
+            // call: CallRecord
+            .with(eq(expected_call_record))
+            .once()
+            // Result<CallRecord>
+            .return_once(move |_| Ok(resulting_call_record));
+
+        let frontend = create_frontend_with_id_generator(config, storage, backend, id_generator);
 
         // Create an axum application.
         let app = app(frontend);
