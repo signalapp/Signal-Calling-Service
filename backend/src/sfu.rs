@@ -7,8 +7,7 @@
 
 use core::ops::DerefMut;
 use std::{
-    cmp::min, collections::HashMap, convert::TryInto, fmt::Write, net::SocketAddr, sync::Arc,
-    time::SystemTime,
+    cmp::min, collections::HashMap, convert::TryInto, fmt::Write, sync::Arc, time::SystemTime,
 };
 
 use anyhow::Result;
@@ -26,11 +25,13 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 use crate::{
     call::{self, Call, LoggableCallId},
     config,
-    connection::{self, Connection, HandleRtcpResult, PacketToSend},
+    connection::{self, AddressType, Connection, HandleRtcpResult, PacketToSend},
     googcc, ice,
     ice::BindingRequest,
     metrics::{Histogram, Timer},
-    pacer, rtp,
+    pacer,
+    packet_server::SocketLocator,
+    rtp,
 };
 pub use crate::{
     call::{CallId, DemuxId, UserId},
@@ -42,9 +43,9 @@ pub enum SfuError {
     #[error("DemuxId is already in use for the call")]
     DuplicateDemuxIdDetected,
     #[error("non-ICE packet from unknown address: {0}")]
-    UnknownAddress(SocketAddr),
+    UnknownAddress(SocketLocator),
     #[error("packet with unknown type from {0}")]
-    UnknownPacketType(SocketAddr),
+    UnknownPacketType(SocketLocator),
     #[error(
         "connection with (CallId={:?} DemuxId={:?}) went missing",
         LoggableCallId::from(.0),
@@ -120,7 +121,7 @@ pub struct Sfu {
     connection_by_id: HashMap<ConnectionId, Arc<Mutex<Connection>>>,
     /// Packets are demuxed by either the incoming socket address or the ICE binding request username.
     connection_id_by_ice_request_username: HashMap<Vec<u8>, ConnectionId>,
-    connection_id_by_address: TwoGenerationCacheWithManualRemoveOld<SocketAddr, ConnectionId>,
+    connection_id_by_address: TwoGenerationCacheWithManualRemoveOld<SocketLocator, ConnectionId>,
 
     /// The last time activity was checked.
     activity_checked: Instant,
@@ -128,12 +129,12 @@ pub struct Sfu {
     diagnostics_logged: Instant,
 }
 
-/// The state that results from the SFU receiving a tick event, to be processed by the UDP server.
+/// The state that results from the SFU receiving a tick event, to be processed by the packet server.
 ///
 /// See [Sfu::tick].
 pub struct TickOutput {
-    pub packets_to_send: Vec<(PacketToSend, SocketAddr)>,
-    pub expired_client_addrs: Vec<SocketAddr>,
+    pub packets_to_send: Vec<(PacketToSend, SocketLocator)>,
+    pub expired_client_addrs: Vec<SocketLocator>,
 }
 
 pub struct SfuStats {
@@ -235,18 +236,22 @@ impl Sfu {
 
         let mut remembered_packet_count = Histogram::default();
         let mut remembered_packet_bytes = Histogram::default();
-        let mut v4_connections = 0;
-        let mut v6_connections = 0;
+        let mut udp_v4_connections = 0;
+        let mut udp_v6_connections = 0;
+        let mut tcp_v4_connections = 0;
+        let mut tcp_v6_connections = 0;
+
         for connection in self.connection_by_id.values() {
             let connection = connection.lock();
             let stats = connection.rtp_endpoint_stats();
             remembered_packet_count.push(stats.remembered_packet_count);
             remembered_packet_bytes.push(stats.remembered_packet_bytes);
-            if let Some(ipv6) = connection.outgoing_addr_is_ipv6() {
-                if ipv6 {
-                    v6_connections += 1;
-                } else {
-                    v4_connections += 1;
+            if let Some(addr_type) = connection.outgoing_addr_type() {
+                match addr_type {
+                    AddressType::UdpV4 => udp_v4_connections += 1,
+                    AddressType::UdpV6 => udp_v6_connections += 1,
+                    AddressType::TcpV4 => tcp_v4_connections += 1,
+                    AddressType::TcpV6 => tcp_v6_connections += 1,
                 }
             }
         }
@@ -260,11 +265,19 @@ impl Sfu {
         );
         values.insert(
             "calling.sfu.connections.udp_v4_count",
-            v4_connections as f32,
+            udp_v4_connections as f32,
         );
         values.insert(
             "calling.sfu.connections.udp_v6_count",
-            v6_connections as f32,
+            udp_v6_connections as f32,
+        );
+        values.insert(
+            "calling.sfu.connections.tcp_v4_count",
+            tcp_v4_connections as f32,
+        );
+        values.insert(
+            "calling.sfu.connections.tcp_v6_count",
+            tcp_v6_connections as f32,
         );
 
         SfuStats { histograms, values }
@@ -430,9 +443,32 @@ impl Sfu {
         }
 
         if let Some(connection) = self.connection_by_id.remove(&connection_id) {
-            let connection = connection.lock();
+            event!("calling.sfu.close_connection.remove_client_from_call");
+
+            let mut connection = connection.lock();
+            // This prevents an Arc cycle where connection -> scheduler -> connection.
+            connection.set_dequeue_scheduler(None);
+
             self.connection_id_by_ice_request_username
                 .remove(connection.ice_request_username());
+
+            // Entries are removed from self.connection_id_by_address over time in tick().
+        }
+    }
+
+    // Remove connection from active connection HashMaps
+    fn remove_connection(&mut self, call_id: CallId, demux_id: DemuxId) {
+        let connection_id = ConnectionId::from_call_id_and_demux_id(call_id, demux_id);
+        if let Some(connection) = self.connection_by_id.remove(&connection_id) {
+            event!("calling.sfu.close_connection.rtp");
+
+            let mut connection = connection.lock();
+            // This prevents an Arc cycle where connection -> scheduler -> connection.
+            connection.set_dequeue_scheduler(None);
+
+            self.connection_id_by_ice_request_username
+                .remove(connection.ice_request_username());
+
             // Entries are removed from self.connection_id_by_address over time in tick().
         }
     }
@@ -447,7 +483,7 @@ impl Sfu {
 
     fn get_connection_from_address(
         &self,
-        address: &SocketAddr,
+        address: &SocketLocator,
     ) -> Result<(ConnectionId, Arc<Mutex<Connection>>), SfuError> {
         let connection_id = self
             .connection_id_by_address
@@ -485,9 +521,9 @@ impl Sfu {
 
     pub fn handle_packet(
         sfu: &Mutex<Self>,
-        sender_addr: SocketAddr,
+        sender_addr: SocketLocator,
         incoming_packet: &mut [u8],
-    ) -> Result<Vec<(PacketToSend, SocketAddr)>, SfuError> {
+    ) -> Result<Vec<(PacketToSend, SocketLocator)>, SfuError> {
         trace!("handle_packet():");
 
         // RTP should go first because it's by far the most common.
@@ -518,12 +554,22 @@ impl Sfu {
                     .get_call_from_id(&incoming_connection_id.call_id)?;
                 let mut call = call.lock();
                 time_scope_us!("calling.sfu.handle_packet.rtp.in_call_lock");
-                call.handle_rtp(
+                match call.handle_rtp(
                     incoming_connection_id.demux_id,
                     incoming_rtp,
                     Instant::now(),
-                )
-                .map_err(SfuError::CallError)?
+                ) {
+                    Ok(outgoing_rtp) => outgoing_rtp,
+                    Err(call::Error::Leave) => {
+                        drop(call);
+                        sfu.lock().remove_connection(
+                            incoming_connection_id.call_id,
+                            incoming_connection_id.demux_id,
+                        );
+                        return Ok(vec![]);
+                    }
+                    Err(e) => return Err(SfuError::CallError(e)),
+                }
             };
 
             let mut packets_to_send = vec![];
@@ -654,7 +700,7 @@ impl Sfu {
     pub fn tick(&mut self, now: Instant) -> TickOutput {
         time_scope_us!("calling.sfu.tick");
         let config = self.config;
-        let mut packets_to_send: Vec<(PacketToSend, SocketAddr)> = vec![];
+        let mut packets_to_send: Vec<(PacketToSend, SocketLocator)> = vec![];
 
         // Post diagnostics to the log if needed.
         if let Some(diagnostics_interval_secs) = config.diagnostics_interval_secs {
@@ -919,7 +965,7 @@ impl rand_core5::CryptoRng for OsRngCompatibleWithDalek {}
 mod sfu_tests {
     use std::{
         convert::TryFrom,
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         ops::Add,
         str::FromStr,
         sync::Arc,
@@ -1406,7 +1452,10 @@ mod sfu_tests {
         let sfu = new_sfu(Instant::now(), &DEFAULT_CONFIG);
 
         let mut buf = [0u8; 1500];
-        let sender_addr = SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 20000);
+        let sender_addr = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::from_str("127.0.0.1").unwrap(),
+            20000,
+        ));
 
         let result = Sfu::handle_packet(&sfu, sender_addr, &mut buf);
         assert_eq!(result, Err(SfuError::UnknownPacketType(sender_addr)));

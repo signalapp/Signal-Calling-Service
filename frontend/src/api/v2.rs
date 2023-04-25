@@ -51,6 +51,8 @@ pub struct JoinRequest {
 pub struct JoinResponse {
     pub demux_id: u32,
     pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_tcp: Option<u16>,
     pub ip: String, // TODO remove once all clients use 'ips' field instead
     pub ips: Vec<String>,
     pub ice_ufrag: String,
@@ -157,6 +159,7 @@ pub async fn join(
     Ok(Json(JoinResponse {
         demux_id: response.demux_id,
         port: response.port,
+        port_tcp: response.port_tcp,
         ip: response.ip,
         ips: response.ips,
         ice_ufrag: response.ice_ufrag,
@@ -632,6 +635,7 @@ mod api_server_v2_tests {
                     ip: "127.0.0.1".to_string(),
                     ips: Some(vec!["127.0.0.1".to_string()]),
                     port: 8080,
+                    port_tcp: Some(8080),
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
@@ -720,6 +724,7 @@ mod api_server_v2_tests {
                     ip: "127.0.0.1".to_string(),
                     ips: Some(vec!["127.0.0.1".to_string()]),
                     port: 8080,
+                    port_tcp: Some(8080),
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
@@ -808,6 +813,7 @@ mod api_server_v2_tests {
                     ip: "127.0.0.1".to_string(),
                     ips: None,
                     port: 8080,
+                    port_tcp: None,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),

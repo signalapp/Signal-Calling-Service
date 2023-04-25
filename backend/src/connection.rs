@@ -5,15 +5,13 @@
 
 use calling_common::{DataRate, DataSize, Duration, Instant};
 use log::*;
-use std::net::{
-    IpAddr::{V4, V6},
-    SocketAddr,
-};
+use std::net::IpAddr::{V4, V6};
 use thiserror::Error;
 
 use crate::{
     googcc, ice,
     pacer::{self, Pacer, Scheduler},
+    packet_server::SocketLocator,
     rtp,
 };
 
@@ -50,6 +48,14 @@ pub enum Error {
     ReceivedInvalidRtcp,
 }
 
+#[derive(Clone, Copy)]
+pub enum AddressType {
+    UdpV4,
+    UdpV6,
+    TcpV4,
+    TcpV6,
+}
+
 /// The state of a connection to a client.
 /// Combines the ICE and SRTP/SRTCP state.
 /// Takes care of transport auth, crypto, ACKs, NACKs,
@@ -69,8 +75,8 @@ pub struct Connection {
     /// When receiving ICE binding requests from different addresses,
     /// the Connection decides which should be used for sending packets.
     /// See Connection::outgoing_addr().
-    outgoing_addr: Option<SocketAddr>,
-    outgoing_addr_is_ipv6: Option<bool>,
+    outgoing_addr: Option<SocketLocator>,
+    outgoing_addr_type: Option<AddressType>,
 }
 
 struct Ice {
@@ -157,7 +163,7 @@ impl Connection {
                 controller: googcc::CongestionController::new(googcc_config, now),
             },
             outgoing_addr: None,
-            outgoing_addr_is_ipv6: None,
+            outgoing_addr_type: None,
         }
     }
 
@@ -168,12 +174,12 @@ impl Connection {
     }
 
     /// All packets except for ICE binding responses should be sent to this address, if there is one.
-    pub fn outgoing_addr(&self) -> Option<SocketAddr> {
+    pub fn outgoing_addr(&self) -> Option<SocketLocator> {
         self.outgoing_addr
     }
 
-    pub fn outgoing_addr_is_ipv6(&self) -> Option<bool> {
-        self.outgoing_addr_is_ipv6
+    pub fn outgoing_addr_type(&self) -> Option<AddressType> {
+        self.outgoing_addr_type
     }
 
     pub fn set_dequeue_scheduler(&mut self, dequeue_scheduler: Option<Box<Scheduler>>) {
@@ -186,7 +192,7 @@ impl Connection {
     /// back to the address from which the request came, not to the outgoing_addr.
     pub fn handle_ice_binding_request(
         &mut self,
-        sender_addr: SocketAddr,
+        sender_addr: SocketLocator,
         binding_request: ice::BindingRequest,
         now: Instant,
     ) -> Result<PacketToSend, Error> {
@@ -212,12 +218,27 @@ impl Connection {
         if verified_binding_request.nominated() && self.outgoing_addr != Some(sender_addr) {
             event!("calling.sfu.ice.outgoing_addr_switch");
             self.outgoing_addr = Some(sender_addr);
-            // self.outgoing_addr_is_ipv6 = Some(sender_addr.ip().to_canonical().is_ipv6());
-            // can't use this because it's not yet stable, do a little bit of the work ourselves
-            self.outgoing_addr_is_ipv6 = match sender_addr.ip() {
-                V4(_) => Some(false),
-                V6(addr) => Some(addr.to_ipv4_mapped().is_none()),
-            };
+            self.outgoing_addr_type = Some(match sender_addr {
+                // addr.ip().to_canonical().is_ipv6());
+                // can't use this because it's not yet stable, do a little bit of the work ourselves
+                SocketLocator::Udp(addr) => match addr.ip() {
+                    V4(_) => AddressType::UdpV4,
+                    V6(addr) => {
+                        if addr.to_ipv4_mapped().is_none() {
+                            AddressType::UdpV6
+                        } else {
+                            AddressType::UdpV4
+                        }
+                    }
+                },
+                SocketLocator::Tcp { is_ipv6, .. } => {
+                    if is_ipv6 {
+                        AddressType::TcpV6
+                    } else {
+                        AddressType::TcpV4
+                    }
+                }
+            });
         }
         self.ice.binding_request_received = Some(now);
 
@@ -309,7 +330,7 @@ impl Connection {
     // but that actually makes it more difficult for sfu.rs to aggregate the
     // results of calling this across many connections.
     // So we use (packet, addr) for convenience.
-    pub fn tick(&mut self, packets_to_send: &mut Vec<(PacketToSend, SocketAddr)>, now: Instant) {
+    pub fn tick(&mut self, packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>, now: Instant) {
         self.send_acks_if_its_been_too_long(packets_to_send, now);
         self.send_nacks_if_its_been_too_long(packets_to_send, now);
         self.send_receiver_report_if_its_been_too_long(packets_to_send, now);
@@ -334,7 +355,7 @@ impl Connection {
         // but that actually makes it more difficult for sfu.rs to aggregate the
         // results of calling this across many connections.
         // So we use this vec of (packet, addr) for convenience.
-        rtp_to_send: &mut Vec<(PacketToSend, SocketAddr)>,
+        rtp_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
         now: Instant,
     ) {
         let rtp_endpoint = &mut self.rtp.endpoint;
@@ -357,7 +378,7 @@ impl Connection {
 
     /// Dequeues previously encrypted outgoing RTP (if possible)
     /// or generates padding (if necessary).
-    pub fn dequeue_outgoing_rtp(&mut self, now: Instant) -> Option<(PacketToSend, SocketAddr)> {
+    pub fn dequeue_outgoing_rtp(&mut self, now: Instant) -> Option<(PacketToSend, SocketLocator)> {
         let rtp_endpoint = &mut self.rtp.endpoint;
         let generate_padding = |padding_ssrc| rtp_endpoint.send_padding(padding_ssrc, now);
         let outgoing_rtp = self
@@ -380,7 +401,7 @@ impl Connection {
         // but that actually makes it more difficult for sfu.rs to aggregate the
         // results of calling this across many connections.
         // So we use (packet, addr) for convenience.
-    ) -> Option<(PacketToSend, SocketAddr)> {
+    ) -> Option<(PacketToSend, SocketLocator)> {
         let outgoing_addr = self.outgoing_addr?;
         let rtp_endpoint = &mut self.rtp.endpoint;
         let rtcp_packet = rtp_endpoint.send_pli(key_frame_request.ssrc)?;
@@ -394,7 +415,7 @@ impl Connection {
     // So we use (packet, addr) for convenience.
     fn send_acks_if_its_been_too_long(
         &mut self,
-        packets_to_send: &mut Vec<(PacketToSend, SocketAddr)>,
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
         now: Instant,
     ) {
         if let Some(acks_sent) = self.rtp.acks_sent {
@@ -420,7 +441,7 @@ impl Connection {
     // So we use (packet, addr) for convenience.
     fn send_nacks_if_its_been_too_long(
         &mut self,
-        packets_to_send: &mut Vec<(PacketToSend, SocketAddr)>,
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
         now: Instant,
     ) {
         if let Some(nacks_sent) = self.rtp.nacks_sent {
@@ -442,7 +463,7 @@ impl Connection {
 
     fn send_receiver_report_if_its_been_too_long(
         &mut self,
-        packets_to_send: &mut Vec<(PacketToSend, SocketAddr)>,
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
         now: Instant,
     ) {
         if let Some(receiver_report_sent) = self.rtp.receiver_report_sent {
@@ -488,7 +509,7 @@ pub struct HandleRtcpResult {
     // but that actually makes it more difficult for sfu.rs to aggregate the
     // outgoing packets across many connections.
     // So we use (packet, addr) for convenience.
-    pub outgoing_rtx: Vec<(PacketToSend, SocketAddr)>,
+    pub outgoing_rtx: Vec<(PacketToSend, SocketLocator)>,
     pub new_target_send_rate: Option<DataRate>,
 }
 
@@ -548,7 +569,7 @@ mod connection_tests {
 
     fn handle_ice_binding_request(
         connection: &mut Connection,
-        client_addr: SocketAddr,
+        client_addr: SocketLocator,
         transaction_id: u128,
         nominated: bool,
         now: Instant,
@@ -639,14 +660,14 @@ mod connection_tests {
     #[test]
     fn test_ice() {
         let mut now = Instant::now();
-        let client_addr1 = "1.2.3.4:5".parse().unwrap();
-        let client_addr2 = "6.7.8.9:10".parse().unwrap();
+        let client_addr1 = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let client_addr2 = SocketLocator::Udp("198.51.100.9:10".parse().unwrap());
 
         let mut connection = new_connection(now);
 
         let mut transaction_id = 0u128;
         let mut handle_request = |connection: &mut Connection,
-                                  client_addr: SocketAddr,
+                                  client_addr: SocketLocator,
                                   nominated: bool,
                                   now: Instant|
          -> Result<(PacketToSend, PacketToSend), Error> {
@@ -809,7 +830,7 @@ mod connection_tests {
         // Can't send yet because there is no outgoing address.
         assert_eq!(0, rtp_to_send.len());
 
-        let client_addr = "1.2.3.4:5".parse().unwrap();
+        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
         handle_ice_binding_request(&mut connection, client_addr, 1, true, now).unwrap();
         // Packets without tcc seqnums skip the pacer queue and still go out even if the rate is 0.
         set_send_rate(&mut connection, DataRate::from_kbps(0), now);
@@ -829,7 +850,7 @@ mod connection_tests {
         let mut connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt, encrypt, now);
-        let client_addr = "1.2.3.4:5".parse().unwrap();
+        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
         handle_ice_binding_request(&mut connection, client_addr, 1, true, now).unwrap();
 
         let set_padding_send_rate =
@@ -904,7 +925,7 @@ mod connection_tests {
         let mut connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt.clone(), encrypt.clone(), now);
-        let client_addr = "1.2.3.4:5".parse().unwrap();
+        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
         handle_ice_binding_request(&mut connection, client_addr, 1, true, now).unwrap();
 
         let encrypted_rtp = new_encrypted_rtp(1, None, &encrypt);
@@ -1009,7 +1030,7 @@ mod connection_tests {
         connection.tick(&mut packets_to_send, at(4));
         assert_eq!(0, packets_to_send.len());
 
-        let client_addr = "1.2.3.4:5".parse().unwrap();
+        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
         handle_ice_binding_request(&mut connection, client_addr, 1, true, at(5)).unwrap();
         assert_eq!(Some(client_addr), connection.outgoing_addr());
 
@@ -1064,7 +1085,7 @@ mod connection_tests {
         let mut connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt, encrypt.clone(), now);
-        let client_addr = "1.2.3.4:5".parse().unwrap();
+        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
         handle_ice_binding_request(&mut connection, client_addr, 1, true, now).unwrap();
 
         let ssrc = 10;
@@ -1117,7 +1138,7 @@ mod connection_tests {
         let mut connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt.clone(), encrypt.clone(), now);
-        let client_addr = "1.2.3.4:5".parse().unwrap();
+        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
         handle_ice_binding_request(&mut connection, client_addr, 1, true, now).unwrap();
 
         for seqnum in 1..=25 {

@@ -5,7 +5,7 @@
 
 //! Configuration options for the calling backend.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use clap;
 
@@ -15,12 +15,12 @@ use clap;
 #[clap(name = "calling_backend")]
 pub struct Config {
     /// The IP address to bind to for all servers.
-    #[clap(long, default_value = "0.0.0.0")]
+    #[clap(long, default_value = "::")]
     pub binding_ip: IpAddr,
 
     /// The IP address to share for for ICE candidates. Clients will
     /// connect to the calling backend using this IP. If unset, binding-ip
-    /// is used, if binding-ip is also unset, 127.0.0.1 is used
+    /// is used, if binding-ip is set to 0.0.0.0 or ::, 127.0.0.1 is used
     #[clap(long)]
     pub ice_candidate_ip: Vec<IpAddr>,
 
@@ -28,6 +28,11 @@ pub struct Config {
     /// calling backend using this port.
     #[clap(long, default_value = "10000")]
     pub ice_candidate_port: u16,
+
+    /// The port to use for ICE candidates when connected over TCP. Clients
+    /// will connect to the calling backend using this port.
+    #[clap(long, default_value = "10000")]
+    pub ice_candidate_port_tcp: u16,
 
     /// The IP address to share for direct access to the signaling_server. If
     /// defined, then the signaling_server will be used, otherwise the
@@ -119,21 +124,45 @@ pub struct MetricsOptions {
     pub version: Option<String>,
 }
 
-/// Returns the public address of the server for media/UDP as per configuration.
-pub fn get_server_media_address(config: &'static Config) -> (IpAddr, u16, Vec<IpAddr>) {
-    if config.ice_candidate_ip.is_empty() {
-        let ip = if config.binding_ip == Ipv4Addr::UNSPECIFIED {
-            Ipv4Addr::LOCALHOST.into()
+#[derive(Debug, Clone)]
+pub struct MediaPorts {
+    pub udp: u16,
+    pub tcp: u16,
+}
+
+pub struct ServerMediaAddress {
+    pub addresses: Vec<IpAddr>,
+    pub ports: MediaPorts,
+}
+
+/// Public address of the server for media/UDP/TCP derived from the configuration.
+impl ServerMediaAddress {
+    pub fn from(config: &'static Config) -> Self {
+        let addresses = if config.ice_candidate_ip.is_empty() {
+            let ip = if config.binding_ip == Ipv4Addr::UNSPECIFIED
+                || config.binding_ip == Ipv6Addr::UNSPECIFIED
+            {
+                Ipv4Addr::LOCALHOST.into()
+            } else {
+                config.binding_ip
+            };
+            vec![ip]
         } else {
-            config.binding_ip
+            config.ice_candidate_ip.clone()
         };
-        (ip, config.ice_candidate_port, vec![ip])
-    } else {
-        (
-            config.ice_candidate_ip[0],
-            config.ice_candidate_port,
-            config.ice_candidate_ip.clone(),
-        )
+        Self {
+            addresses,
+            ports: MediaPorts {
+                udp: config.ice_candidate_port,
+                tcp: config.ice_candidate_port_tcp,
+            },
+        }
+    }
+
+    pub fn ip(&self) -> &IpAddr {
+        self.addresses
+            .get(0)
+            .expect("addresses should be non-empty")
     }
 }
 
@@ -145,6 +174,7 @@ pub(crate) fn default_test_config() -> Config {
         signaling_ip: Some(Ipv4Addr::LOCALHOST.into()),
         signaling_port: 8080,
         ice_candidate_port: 10000,
+        ice_candidate_port_tcp: 10000,
         max_clients_per_call: 8,
         initial_target_send_rate_kbps: 1500,
         min_target_send_rate_kbps: 100,

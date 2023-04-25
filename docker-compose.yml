@@ -139,6 +139,7 @@ services:
           memory: 5G
     ports:
       - "8080:8080"
+      - "9900:9900"
       - "10000:10000/udp"
     entrypoint: calling_backend
     command:
@@ -147,6 +148,8 @@ services:
       - "127.0.0.1"
       - --signaling-ip
       - "127.0.0.1"
+      - --ice-candidate-port-tcp
+      - "9900"
       - --inactivity-timeout-secs
       - "60"
       - --diagnostics-interval-secs

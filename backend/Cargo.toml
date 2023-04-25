@@ -72,13 +72,14 @@ async-stream = "0.3"
 # For congestion-control-specific helpers
 pin-project = "1.0"
 
-# For low-level UDP sockets
+# For low-level UDP sockets and tracking TCP sockets
 nix = { version = "0.25", optional = true }
+unique_id = "0.1"
 
 # For current process memory stats
 psutil = { version = "3.2.2", default-features = false, features = ["cpu", "process"] }
-
 accounting-allocator = "0.1"
+
 
 [build-dependencies]
 prost-build = "0.11"

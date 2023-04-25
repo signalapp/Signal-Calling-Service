@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-//! Implementation of the udp server.
+//! Implementation of the packet server.
 
 use std::{
+    fmt,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -34,27 +35,44 @@ use crate::{
     sfu::{Sfu, SfuError},
 };
 
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum SocketLocator {
+    Udp(SocketAddr),
+    Tcp { id: i64, is_ipv6: bool },
+}
+
+impl fmt::Display for SocketLocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SocketLocator::Udp(a) => write!(f, "U{}", a),
+            SocketLocator::Tcp { id, is_ipv6 } => write!(f, "T{}-{}", id, is_ipv6),
+        }
+    }
+}
+
 pub async fn start(
     config: &'static config::Config,
     sfu: Arc<Mutex<Sfu>>,
-    udp_ender_rx: Receiver<()>,
+    packet_ender_rx: Receiver<()>,
     is_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
     let num_threads = num_cpus::get();
 
     let tick_interval = Duration::from_millis(config.tick_interval_ms);
 
-    let local_addr = SocketAddr::new(config.binding_ip, config.ice_candidate_port);
+    let local_addr_udp = SocketAddr::new(config.binding_ip, config.ice_candidate_port);
+    let local_addr_tcp = SocketAddr::new(config.binding_ip, config.ice_candidate_port_tcp);
 
-    let udp_handler_state = UdpServerState::new(local_addr, num_threads, tick_interval)?;
-    let udp_handler_state_for_tick = udp_handler_state.clone();
-    let udp_handler_state_for_dequeue = udp_handler_state.clone();
+    let packet_handler_state =
+        PacketServerState::new(local_addr_udp, local_addr_tcp, num_threads, tick_interval)?;
+    let packet_handler_state_for_tick = packet_handler_state.clone();
+    let packet_handler_state_for_dequeue = packet_handler_state.clone();
 
     let sfu_for_tick = sfu.clone();
 
     info!(
-        "udp_server ready: {:?}; starting {} threads",
-        local_addr, num_threads
+        "packet_server ready: udp {:?}, tcp {:?}; starting {} threads",
+        local_addr_udp, local_addr_tcp, num_threads
     );
 
     let thread_pool = ThreadPool::new(num_threads);
@@ -63,7 +81,7 @@ pub async fn start(
         .set_new_connection_handler(Box::new(move |connection| {
             let thread_pool_for_dequeue = thread_pool.clone();
             let connection_for_dequeue = connection.clone();
-            let udp_handler_state_for_dequeue = udp_handler_state_for_dequeue.clone();
+            let packet_handler_state_for_dequeue = packet_handler_state_for_dequeue.clone();
             connection
                 .lock()
                 // Note: this creates a reference cycle, but that cycle is broken
@@ -71,7 +89,7 @@ pub async fn start(
                 // by calling .set_dequeue_scheduler(None).
                 .set_dequeue_scheduler(Some(Box::new(move |time_to_dequeue| {
                     let connection_for_dequeue = connection_for_dequeue.clone();
-                    let udp_handler_state_for_dequeue = udp_handler_state_for_dequeue.clone();
+                    let packet_handler_state_for_dequeue = packet_handler_state_for_dequeue.clone();
                     thread_pool_for_dequeue.spawn_blocking_at(
                         time_to_dequeue,
                         Box::new(move || {
@@ -79,16 +97,16 @@ pub async fn start(
                                 .lock()
                                 .dequeue_outgoing_rtp(Instant::now())
                             {
-                                udp_handler_state_for_dequeue.send_packet(&buf, addr);
+                                packet_handler_state_for_dequeue.send_packet(&buf, addr);
                             }
                         }),
                     );
                 })));
         }));
 
-    // Spawn (blocking) threads for the UDP server.
-    let udp_packet_handles = udp_handler_state.start_threads(move |sender_addr, data| {
-        time_scope_us!("calling.udp_server.handle_packet");
+    // Spawn (blocking) threads for the packet server.
+    let packet_packet_handles = packet_handler_state.start_threads(move |sender_addr, data| {
+        time_scope_us!("calling.udp_server.handle_packet"); // metric names use udp_server for historic continuity
 
         trace!(
             "received packet of {} bytes from {}",
@@ -133,7 +151,7 @@ pub async fn start(
             let tick_output = { sfu_for_tick.lock().tick(Instant::now()) };
 
             // Process outside the scope of the lock on the sfu.
-            match udp_handler_state_for_tick.tick(tick_output) {
+            match packet_handler_state_for_tick.tick(tick_output) {
                 Ok(()) => {}
                 Err(err) => {
                     error!("{}", err);
@@ -145,11 +163,11 @@ pub async fn start(
 
     // Wait for any task to complete and cancel the rest.
     tokio::select!(
-        _ = udp_packet_handles => {},
+        _ = packet_packet_handles => {},
         _ = tick_handle => {},
-        _ = udp_ender_rx => {},
+        _ = packet_ender_rx => {},
     );
 
-    info!("udp_server shutdown");
+    info!("packet_server shutdown");
     Ok(())
 }

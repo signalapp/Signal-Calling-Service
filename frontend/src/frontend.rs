@@ -129,6 +129,7 @@ pub struct JoinRequestWrapper {
 pub struct JoinResponseWrapper {
     pub demux_id: u32,
     pub port: u16,
+    pub port_tcp: Option<u16>,
     pub ip: String,
     pub ips: Vec<String>,
     pub ice_ufrag: String,
@@ -398,6 +399,7 @@ impl Frontend {
         Ok(JoinResponseWrapper {
             demux_id: demux_id.as_u32(),
             port: backend_join_response.port,
+            port_tcp: backend_join_response.port_tcp,
             ip: backend_join_response.ip,
             ips,
             ice_ufrag: backend_join_response.ice_ufrag,

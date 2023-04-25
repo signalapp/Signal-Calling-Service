@@ -64,6 +64,7 @@ pub struct JoinRequest {
 pub struct JoinResponse {
     pub demux_id: u32,
     pub port: u16,
+    pub port_tcp: u16,
     pub ip: String,
     pub ips: Vec<String>,
     pub ice_ufrag: String,
@@ -372,13 +373,18 @@ async fn join_conference(
         client_hkdf_extra_info,
     ) {
         Ok(server_dhe_public_key) => {
-            let (first_ip, port, ips) = config::get_server_media_address(config);
+            let media_server = config::ServerMediaAddress::from(config);
 
             let response = JoinResponse {
                 demux_id: demux_id.into(),
-                port,
-                ip: first_ip.to_string(),
-                ips: ips.iter().map(|ip| ip.to_string()).collect(),
+                port: media_server.ports.udp,
+                port_tcp: media_server.ports.tcp,
+                ip: media_server.ip().to_string(),
+                ips: media_server
+                    .addresses
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect(),
                 ice_ufrag: server_ice_ufrag,
                 ice_pwd: server_ice_pwd,
                 dhe_public_key: server_dhe_public_key.encode_hex(),

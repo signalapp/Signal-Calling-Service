@@ -214,6 +214,8 @@ pub enum Error {
     UnknownDemuxId(DemuxId),
     #[error("Invalid demux ID: {0:?}")]
     InvalidDemuxId(u32),
+    #[error("received RTP leave")]
+    Leave,
 }
 
 /// Represents an RTP packet that should be sent to a particular client
@@ -460,7 +462,7 @@ impl Call {
                     sender_demux_id.as_u32()
                 );
                 self.remove_client(sender_demux_id, now);
-                return Ok(vec![]);
+                return Err(Error::Leave);
             }
 
             // The client resends this periodically, so we don't want to do anything
@@ -4122,8 +4124,10 @@ mod call_tests {
         );
 
         // demux_id2 leaves, so there's no height allocated for demux_id1 anymore.
-        call.handle_rtp(demux_id2, create_leave_rtp().borrow_mut(), at(3710))
-            .unwrap();
+        assert_eq!(
+            call.handle_rtp(demux_id2, create_leave_rtp().borrow_mut(), at(3710)),
+            Err(Error::Leave)
+        );
 
         let mut empty_resolution_request = create_server_to_client_rtp(
             1,
@@ -4162,8 +4166,10 @@ mod call_tests {
         // Clear out updates.
         let (_rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
 
-        call.handle_rtp(demux_id1, create_leave_rtp().borrow_mut(), at(400))
-            .unwrap();
+        assert_eq!(
+            call.handle_rtp(demux_id1, create_leave_rtp().borrow_mut(), at(400)),
+            Err(Error::Leave)
+        );
         assert_eq!(1, call.clients.len());
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));

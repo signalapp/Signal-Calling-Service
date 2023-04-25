@@ -10,7 +10,7 @@ use std::sync::{atomic::AtomicBool, Arc};
 
 use anyhow::Result;
 use calling_backend::{
-    config, http_server, metrics_server, sfu::Sfu, signaling_server, udp_server,
+    config, http_server, metrics_server, packet_server, sfu::Sfu, signaling_server,
 };
 use calling_common::{DataRate, Duration, Instant};
 use clap::Parser;
@@ -32,6 +32,7 @@ fn print_config(config: &'static config::Config) {
     info!("  {:38}{}", "binding_ip:", config.binding_ip);
     info!("  {:38}{:?}", "ice_candidate_ip:", config.ice_candidate_ip);
     info!("  {:38}{}", "ice_candidate_port:", config.ice_candidate_port);
+    info!("  {:38}{}", "ice_candidate_port_tcp:", config.ice_candidate_port_tcp);
     info!("  {:38}{:?}", "signaling_ip:", config.signaling_ip);
     info!("  {:38}{}", "signaling_port:", config.signaling_port);
     info!("  {:38}{}", "max_clients_per_call:", config.max_clients_per_call);
@@ -144,9 +145,9 @@ fn main() -> Result<()> {
             let _ = signal_canceller_tx.send(()).await;
         });
 
-        // Start the udp_server.
-        let udp_server_handle = tokio::spawn(async move {
-            if let Err(err) = udp_server::start(
+        // Start the packet_server.
+        let packet_server_handle = tokio::spawn(async move {
+            if let Err(err) = packet_server::start(
                 config,
                 sfu_clone_for_udp,
                 udp_ender_rx,
@@ -177,7 +178,7 @@ fn main() -> Result<()> {
         // Wait for the servers to exit.
         let _ = tokio::join!(
             signaling_server_handle,
-            udp_server_handle,
+            packet_server_handle,
             metrics_server_handle,
         );
     });

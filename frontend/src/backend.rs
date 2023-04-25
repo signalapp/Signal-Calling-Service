@@ -87,6 +87,8 @@ pub struct JoinResponse {
     pub ips: Option<Vec<String>>,
     #[serde(rename = "serverPort")]
     pub port: u16,
+    #[serde(rename = "serverPortTcp", default)]
+    pub port_tcp: Option<u16>,
     #[serde(rename = "serverIceUfrag")]
     pub ice_ufrag: String,
     #[serde(rename = "serverIcePwd")]

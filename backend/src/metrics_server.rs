@@ -120,7 +120,8 @@ impl Datadog {
         let host = config.metrics.datadog.as_ref()?;
 
         let sink = UdpEventSink::new(host).unwrap();
-        let (source, _, _) = config::get_server_media_address(config);
+        let media_server = config::ServerMediaAddress::from(config);
+        let source = media_server.ip();
 
         let mut point_tags = vec![
             ("region", config.metrics.region.clone()),

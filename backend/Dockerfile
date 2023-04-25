@@ -44,6 +44,8 @@ RUN cargo build --bin calling_backend --release
 # Create a minimal container to deploy and run the calling backend.
 FROM debian:${debian_ver}-slim AS run-stage
 
+COPY --from=build-stage /usr/src/calling-service/target/release/calling_backend /usr/local/bin/
+
 # Update system packages.
 RUN apt-get update \
     && apt-get upgrade -y \
@@ -51,10 +53,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends --no-install-suggests curl \
     # Install jq for parsing gcp metadata.
     && apt-get install -y --no-install-recommends --no-install-suggests jq \
+    # Allow non-root using privileged ports.
+    && apt-get install -y --no-install-recommends --no-install-suggests libcap2-bin \
+    && setcap CAP_NET_BIND_SERVICE=+ep /usr/local/bin/calling_backend \
+    && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false libcap2-bin \
     # Cleanup unnecessary stuff.
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build-stage /usr/src/calling-service/target/release/calling_backend /usr/local/bin/
 COPY backend/docker-entrypoint.sh /usr/local/bin/
 
 USER nobody:nogroup

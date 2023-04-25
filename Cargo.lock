@@ -506,6 +506,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
+name = "blob-uuid"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83fc15853171b33280f5614e77f5fa4debd33f51a86c44daa4ba3d759674c561"
+dependencies = [
+ "base64 0.13.1",
+ "uuid",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -595,6 +605,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower",
+ "unique_id",
  "unzip3",
  "x25519-dalek",
  "zeroize",
@@ -2469,6 +2480,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f962df74c8c05a667b5ee8bcf162993134c104e96440b663c8daa176dc772d8c"
 
 [[package]]
+name = "unique_id"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae605c39dfbdec433798d4a8b03ffbac711dc51cdeb1ba5c725bdcaf24e464cc"
+dependencies = [
+ "blob-uuid",
+ "lazy_static",
+ "uuid",
+]
+
+[[package]]
 name = "universal-hash"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2495,6 +2517,15 @@ name = "urlencoding"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8db7427f936968176eaa7cdf81b7f98b980b18495ec28f1b5791ac3bfe3eea9"
+
+[[package]]
+name = "uuid"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1674845326ee10d37ca60470760d4288a6f80f304007d92e5c53bab78c9cfd79"
+dependencies = [
+ "getrandom 0.2.8",
+]
 
 [[package]]
 name = "version_check"

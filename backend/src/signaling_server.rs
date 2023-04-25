@@ -76,6 +76,7 @@ pub struct JoinResponse {
     pub server_ip: String,
     pub server_ips: Vec<String>,
     pub server_port: u16,
+    pub server_port_tcp: u16,
     pub server_ice_ufrag: String,
     pub server_ice_pwd: String,
     pub server_dhe_public_key: String,
@@ -246,13 +247,18 @@ async fn join(
         client_hkdf_extra_info,
     ) {
         Ok(server_dhe_public_key) => {
-            let (first_ip, server_port, ips) = config::get_server_media_address(config);
+            let media_server = config::ServerMediaAddress::from(config);
             let server_dhe_public_key = server_dhe_public_key.encode_hex();
 
             let response = JoinResponse {
-                server_ip: first_ip.to_string(),
-                server_ips: ips.iter().map(|ip| ip.to_string()).collect(),
-                server_port,
+                server_ip: media_server.ip().to_string(),
+                server_ips: media_server
+                    .addresses
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect(),
+                server_port: media_server.ports.udp,
+                server_port_tcp: media_server.ports.tcp,
                 server_ice_ufrag,
                 server_ice_pwd,
                 server_dhe_public_key,

@@ -13,27 +13,28 @@ use anyhow::Result;
 use calling_common::Duration;
 use log::*;
 
-use crate::{metrics::TimingOptions, sfu};
+use crate::{metrics::TimingOptions, packet_server::SocketLocator, sfu};
 
-/// The shared state for a generic UDP server.
+/// The shared state for a generic packet server, only UDP is supported.
 ///
 /// This server is implemented with a single socket for all sends and receives. Multiple threads can
 /// use the socket, but this only helps if packet processing takes a long time. Otherwise they'll
 /// just block in the kernel trying to send.
-pub(super) struct UdpServerState {
+pub(super) struct PacketServerState {
     socket: UdpSocket,
     num_threads: usize,
 }
 
-impl UdpServerState {
+impl PacketServerState {
     /// Sets up the server state by binding a socket to `local_addr`.
     pub fn new(
-        local_addr: SocketAddr,
+        local_addr_udp: SocketAddr,
+        _local_addr_tcp: SocketAddr,
         num_threads: usize,
         _tick_interval: Duration,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            socket: UdpSocket::bind(local_addr)?,
+            socket: UdpSocket::bind(local_addr_udp)?,
             num_threads,
         }))
     }
@@ -47,7 +48,7 @@ impl UdpServerState {
     /// This should only be called once.
     pub fn start_threads(
         self: Arc<Self>,
-        handle_packet: impl FnMut(SocketAddr, &mut [u8]) -> Vec<(Vec<u8>, SocketAddr)>
+        handle_packet: impl FnMut(SocketLocator, &mut [u8]) -> Vec<(Vec<u8>, SocketLocator)>
             + Clone
             + Send
             + 'static,
@@ -62,10 +63,10 @@ impl UdpServerState {
 
     /// Runs a single listener on the current thread.
     ///
-    /// See [`UdpServerState::start_threads`].
+    /// See [`PacketServerState::start_threads`].
     fn run(
         self: Arc<Self>,
-        mut handle_packet: impl FnMut(SocketAddr, &mut [u8]) -> Vec<(Vec<u8>, SocketAddr)>,
+        mut handle_packet: impl FnMut(SocketLocator, &mut [u8]) -> Vec<(Vec<u8>, SocketLocator)>,
     ) {
         let mut buf = [0u8; 1500];
 
@@ -79,7 +80,8 @@ impl UdpServerState {
             };
 
             if let Some((size, sender_addr)) = received_packet {
-                let packets_to_send = handle_packet(sender_addr, &mut buf[..size]);
+                let packets_to_send =
+                    handle_packet(SocketLocator::Udp(sender_addr), &mut buf[..size]);
                 for (buf, addr) in packets_to_send {
                     time_scope!(
                         "calling.udp.generic.send_packet",
@@ -92,10 +94,15 @@ impl UdpServerState {
         }
     }
 
-    pub fn send_packet(&self, buf: &[u8], addr: SocketAddr) {
-        trace!("sending packet of {} bytes to {}", buf.len(), addr);
-        if let Err(err) = self.socket.send_to(buf, addr) {
-            warn!("send_to failed: {}", err);
+    pub fn send_packet(&self, buf: &[u8], addr: SocketLocator) {
+        match addr {
+            SocketLocator::Udp(addr) => {
+                trace!("sending packet of {} bytes to {}", buf.len(), addr);
+                if let Err(err) = self.socket.send_to(buf, addr) {
+                    warn!("send_to failed: {}", err);
+                }
+            }
+            _ => warn!("unable to send packet to {}", addr),
         }
     }
 
