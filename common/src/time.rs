@@ -145,6 +145,15 @@ impl Duration {
         // TODO: use std::time::Duration::saturating_sub when stabilized
         self.checked_sub(rhs).unwrap_or_default()
     }
+
+    pub fn truncated_to(&self, unit: Duration) -> Duration {
+        assert!(
+            unit.0.subsec_nanos() == 0,
+            "only works on granularities of 1 second or larger"
+        );
+        let remainder = self.0.as_secs() % unit.0.as_secs();
+        self.saturating_sub(Duration::from_secs(remainder))
+    }
 }
 
 impl From<std::time::Duration> for Duration {
