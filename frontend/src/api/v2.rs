@@ -197,6 +197,7 @@ mod api_server_v2_tests {
     };
 
     const AUTH_KEY: &str = "f00f0014fe091de31827e8d686969fad65013238aadd25ef8629eb8a9e5ef69b";
+    const ZKPARAMS: &str = "AMJqvmQRYwEGlm0MSy6QFPIAvgOVsqRASNX1meQyCOYHJFqxO8lITPkow5kmhPrsNbu9JhVfKFwesVSKhdZaqQko3IZlJZMqP7DDw0DgTWpdnYzSt0XBWT50DM1cw1nCUXXBZUiijdaFs+JRlTKdh54M7sf43pFxyMHlS3URH50LOeR8jVQKaUHi1bDP2GR9ZXp3Ot9Fsp0pM4D/vjL5PwoOUuzNNdpIqUSFhKVrtazwuHNn9ecHMsFsN0QPzByiDA8nhKcGpdzyWUvGjEDBvpKkBtqjo8QuXWjyS3jSl2oJ/Z4Fh3o2N1YfD2aWV/K88o+TN2/j2/k+KbaIZgmiWwppLU+SYGwthxdDfZgnbaaGT/vMYX9P5JlUWSuP3xIxDzPzxBEFho67BP0Pvux+0a5nEOEVEpfRSs61MMvwNXEKZtzkO0QFbOrFYrPntyb7ToqNi66OQNyTfl/J7kqFZg2MTm3CKjHTAIvVMFAGCIamsrT9sWXOtuNeMS94xazxDA==";
 
     const USER_ID_1: &str = "1111111111111111";
     const USER_ID_2: &str = "2222222222222222";
@@ -369,6 +370,7 @@ mod api_server_v2_tests {
         Arc::new(Frontend {
             config,
             authenticator: Authenticator::from_hex_key(AUTH_KEY).unwrap(),
+            zkparams: bincode::deserialize(&base64::decode(ZKPARAMS).unwrap()).unwrap(),
             storage,
             backend,
             id_generator: Box::new(FrontendIdGenerator),
@@ -385,6 +387,7 @@ mod api_server_v2_tests {
         Arc::new(Frontend {
             config,
             authenticator: Authenticator::from_hex_key(AUTH_KEY).unwrap(),
+            zkparams: bincode::deserialize(&base64::decode(ZKPARAMS).unwrap()).unwrap(),
             storage,
             backend,
             id_generator,

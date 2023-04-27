@@ -8,6 +8,7 @@ mod v2;
 
 use std::{
     collections::HashMap,
+    fmt::Display,
     net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::Arc,
@@ -22,7 +23,7 @@ use axum::{
     routing::get,
     Router,
 };
-use http::{header, Request, StatusCode};
+use http::{header, Request, StatusCode, Method};
 use log::*;
 use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
@@ -230,6 +231,90 @@ async fn authorize<B>(
     Ok(next.run(req).await)
 }
 
+/// Middleware to parse the authorization header for the call link endpoints.
+///
+/// We can't actually authenticate now because we need to fetch the room info.
+async fn authorize_call_link<B>(
+    mut req: Request<B>,
+    next: Next<B>,
+) -> Result<axum::response::Response, StatusCode> {
+    trace!("authorize");
+
+    let user_agent = get_user_agent(&req)?;
+
+    let authorization_header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+        .ok_or_else(|| {
+            event!("calling.frontend.api.authorization.header.missing");
+            warn!(
+                "authorize: authorization header missing for {} from {}",
+                req.method(),
+                user_agent
+            );
+            StatusCode::UNAUTHORIZED
+        })?;
+
+    let token =
+        Authenticator::parse_bearer_authorization_header(authorization_header).map_err(|err| {
+            event!("calling.frontend.api.authorization.header.invalid");
+            warn!(
+                "authorize: {} for {} from {}",
+                err,
+                req.method(),
+                user_agent
+            );
+            StatusCode::BAD_REQUEST
+        })?;
+
+    let fail_malformed = |err: &dyn Display| {
+        event!("calling.frontend.api.authorization.malformed.zkcredential");
+        info!(
+            "authorize: malformed credentials for {} from {}: {}",
+            req.method(),
+            user_agent,
+            err
+        );
+        StatusCode::BAD_REQUEST
+    };
+
+    // We use '.' as a separator because it matches the "token68" charset expected for Bearer auth.
+    match token.split_once('.') {
+        Some(("auth", credential_base64)) => {
+            let credential_bytes =
+                base64::decode(credential_base64).map_err(|e| fail_malformed(&e))?;
+            let credential: zkgroup::call_links::CallLinkAuthCredentialPresentation =
+                bincode::deserialize(&credential_bytes).map_err(|e| fail_malformed(&e))?;
+
+            // We can't verify the credential without the room info, so wait to see how it's used.
+            // Put the presentation in an Arc to satisfy the Clone requirement on the Extension extractor.
+            req.extensions_mut().insert(Arc::new(credential));
+            Ok(next.run(req).await)
+        }
+        Some(("create", credential_base64)) if req.method() == Method::PUT => {
+            let credential_bytes =
+                base64::decode(credential_base64).map_err(|e| fail_malformed(&e))?;
+            let credential: zkgroup::call_links::CreateCallLinkCredentialPresentation =
+                bincode::deserialize(&credential_bytes).map_err(|e| fail_malformed(&e))?;
+
+            // We can't verify the credential without the room info, so wait to see how it's used.
+            // Put the presentation in an Arc to satisfy the Clone requirement on the Extension extractor.
+            req.extensions_mut().insert(Arc::new(credential));
+            Ok(next.run(req).await)
+        }
+        _ => {
+            event!("calling.frontend.api.authorization.header.unrecognized");
+            warn!(
+                "authorize: unrecognized token for {} from {}",
+                req.method(),
+                user_agent
+            );
+            Err(StatusCode::BAD_REQUEST)
+        }
+    }
+}
+
 /// Handler for the GET /health route.
 async fn get_health() {
     trace!("get_health():");
@@ -262,7 +347,10 @@ fn app(frontend: Arc<Frontend>) -> Router {
             "/v1/call-link/:room_id",
             get(call_links::read_call_link).put(call_links::update_call_link),
         )
-        .layer(ServiceBuilder::new())
+        .layer(ServiceBuilder::new().layer(middleware::from_fn_with_state(
+            frontend.clone(),
+            authorize_call_link,
+        )))
         .with_state(frontend);
 
     Router::new()

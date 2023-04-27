@@ -128,6 +128,7 @@ fn main() -> Result<()> {
 
     // Create frontend entities that might fail.
     let authenticator = Authenticator::from_hex_key(&config.authentication_key)?;
+    let zkparams = bincode::deserialize(&base64::decode(&config.zkparams)?)?;
     let identity_fetcher = if config.storage_endpoint.is_some() {
         // Create an identity fetcher with a dummy token path, which isn't used
         // for testing with a storage endpoint and won't be fetched.
@@ -152,6 +153,7 @@ fn main() -> Result<()> {
         let frontend: Arc<Frontend> = Arc::new(Frontend {
             config,
             authenticator,
+            zkparams,
             storage: Box::new(storage),
             backend: Box::new(backend),
             id_generator: Box::new(FrontendIdGenerator),

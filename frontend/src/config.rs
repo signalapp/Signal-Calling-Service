@@ -24,9 +24,13 @@ pub struct Config {
     #[clap(long)]
     pub region: String,
 
-    /// The authentication key to use when validating API requests.
+    /// The authentication key to use when validating group credentials, hex-encoded.
     #[clap(long)]
     pub authentication_key: String,
+
+    /// The authentication key to use when validating zero-knowledge credentials, base64-encoded.
+    #[clap(long)]
+    pub zkparams: String,
 
     /// Deployment version of the frontend. Appears as a tag in metrics and in logging.
     #[clap(long)]
@@ -101,6 +105,7 @@ pub fn default_test_config() -> Config {
         identity_token_url: None,
         authentication_key: "f00f0014fe091de31827e8d686969fad65013238aadd25ef8629eb8a9e5ef69b"
             .to_string(),
+        zkparams: "AMJqvmQRYwEGlm0MSy6QFPIAvgOVsqRASNX1meQyCOYHJFqxO8lITPkow5kmhPrsNbu9JhVfKFwesVSKhdZaqQko3IZlJZMqP7DDw0DgTWpdnYzSt0XBWT50DM1cw1nCUXXBZUiijdaFs+JRlTKdh54M7sf43pFxyMHlS3URH50LOeR8jVQKaUHi1bDP2GR9ZXp3Ot9Fsp0pM4D/vjL5PwoOUuzNNdpIqUSFhKVrtazwuHNn9ecHMsFsN0QPzByiDA8nhKcGpdzyWUvGjEDBvpKkBtqjo8QuXWjyS3jSl2oJ/Z4Fh3o2N1YfD2aWV/K88o+TN2/j2/k+KbaIZgmiWwppLU+SYGwthxdDfZgnbaaGT/vMYX9P5JlUWSuP3xIxDzPzxBEFho67BP0Pvux+0a5nEOEVEpfRSs61MMvwNXEKZtzkO0QFbOrFYrPntyb7ToqNi66OQNyTfl/J7kqFZg2MTm3CKjHTAIvVMFAGCIamsrT9sWXOtuNeMS94xazxDA==".to_string(),
         region: "us-west1".to_string(),
         version: "1".to_string(),
         regional_url_template: "".to_string(),

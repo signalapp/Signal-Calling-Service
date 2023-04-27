@@ -72,6 +72,9 @@ pub struct CallLinkState {
     /// Bytes chosen by the room creator to identify admins.
     #[serde(with = "serde_bytes")]
     pub admin_passkey: Vec<u8>,
+    /// A serialized CallLinkPublicParams, used to verify credentials.
+    #[serde(with = "serde_bytes")]
+    pub zkparams: Vec<u8>,
     /// Controls access to the room.
     pub restrictions: CallLinkRestrictions,
     /// The name of the room, decryptable by clients who know the call link's root key.
@@ -90,10 +93,16 @@ pub struct CallLinkState {
 }
 
 impl CallLinkState {
-    pub fn new(room_id: RoomId, admin_passkey: Vec<u8>, now: SystemTime) -> Self {
+    pub fn new(
+        room_id: RoomId,
+        admin_passkey: Vec<u8>,
+        zkparams: Vec<u8>,
+        now: SystemTime,
+    ) -> Self {
         Self {
             room_id,
             admin_passkey,
+            zkparams,
             restrictions: CallLinkRestrictions::None,
             encrypted_name: vec![],
             revoked: false,
@@ -159,8 +168,8 @@ pub trait Storage: Sync + Send {
     async fn update_call_link(
         &self,
         room_id: &RoomId,
-        new_attributes: &CallLinkUpdate,
-        must_exist: bool,
+        new_attributes: CallLinkUpdate,
+        zkparams_for_creation: Option<Vec<u8>>,
     ) -> Result<CallLinkState, CallLinkUpdateError>;
 }
 
@@ -460,27 +469,33 @@ impl Storage for DynamoDb {
     async fn update_call_link(
         &self,
         room_id: &RoomId,
-        new_attributes: &CallLinkUpdate,
-        must_exist: bool,
+        new_attributes: CallLinkUpdate,
+        zkparams_for_creation: Option<Vec<u8>>,
     ) -> Result<CallLinkState, CallLinkUpdateError> {
         let mut call_as_item = UpsertableItem::with_updates(
             "roomId",
             "recordType",
-            to_item(new_attributes).expect("failed to convert CallLinkUpdate to item"),
+            to_item(&new_attributes).expect("failed to convert CallLinkUpdate to item"),
         );
 
-        let passkey_condition;
-        if must_exist {
-            passkey_condition = "adminPasskey = :adminPasskey";
-        } else {
+        let must_exist;
+        let condition;
+        if let Some(zkparams_for_creation) = zkparams_for_creation {
             call_as_item.default_attributes = to_item(CallLinkState::new(
                 room_id.clone(),
-                new_attributes.admin_passkey.clone(),
+                new_attributes.admin_passkey,
+                zkparams_for_creation,
                 SystemTime::now(),
             ))
             .expect("failed to convert CallLinkState to item");
-            passkey_condition =
-                "adminPasskey = :adminPasskey OR attribute_not_exists(adminPasskey)";
+            must_exist = false;
+            condition = concat!(
+                "(adminPasskey = :adminPasskey OR attribute_not_exists(adminPasskey)) AND ",
+                "(zkparams = :zkparams OR attribute_not_exists(zkparams))"
+            );
+        } else {
+            must_exist = true;
+            condition = "adminPasskey = :adminPasskey";
         }
 
         let response = self
@@ -490,7 +505,7 @@ impl Storage for DynamoDb {
             .key("roomId", AttributeValue::S(room_id.as_ref().to_string()))
             .key("recordType", AttributeValue::S("CallLinkState".to_string()))
             .update_expression(call_as_item.generate_update_expression())
-            .condition_expression(passkey_condition)
+            .condition_expression(condition)
             .set_expression_attribute_names(Some(call_as_item.generate_attribute_names()))
             .set_expression_attribute_values(Some(call_as_item.into_attribute_values()))
             .return_values(ReturnValue::AllNew)
@@ -508,7 +523,7 @@ impl Storage for DynamoDb {
                     ..
                 } => {
                     if !must_exist {
-                        // The only way this could have failed is if there *was* a room but the admin passkey was wrong.
+                        // The only way this could have failed is if there *was* a room but the admin passkey (or zkparams) was wrong.
                         Err(CallLinkUpdateError::AdminPasskeyDidNotMatch)
                     } else {
                         // Check if the room exists.

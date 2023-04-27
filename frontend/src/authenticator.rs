@@ -212,6 +212,21 @@ impl Authenticator {
             Err(AuthenticatorError::AuthHeaderParseFailure)
         }
     }
+
+    /// Helper function to parse an authorization header using the Bearer authentication scheme.
+    ///
+    /// Does not validate that the token is only made up of the required token68 characters.
+    pub fn parse_bearer_authorization_header(
+        authorization_header: &str,
+    ) -> Result<&str, AuthenticatorError> {
+        // Get the credentials from the Bearer authorization header.
+        match authorization_header.split_once(' ') {
+            Some((scheme, token)) if scheme.eq_ignore_ascii_case("Bearer") => {
+                Ok(token.trim_start_matches(' '))
+            }
+            _ => Err(AuthenticatorError::AuthHeaderParseFailure),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +362,45 @@ mod authenticator_tests {
             )
             .unwrap(),
             ("1a2b3c".to_string(), "1a2b3c:1a2b3c:1a2b3c".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_bearer_authorization_header() {
+        initialize_logging();
+
+        let result = Authenticator::parse_bearer_authorization_header("");
+        assert_eq!(result, Err(AuthenticatorError::AuthHeaderParseFailure));
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "could not parse authorization header"
+        );
+
+        let is_auth_header_parse_failure = |header: &str| -> bool {
+            Authenticator::parse_bearer_authorization_header(header)
+                == Err(AuthenticatorError::AuthHeaderParseFailure)
+        };
+
+        // Error: could not parse authorization header
+        assert!(is_auth_header_parse_failure("B"));
+        assert!(is_auth_header_parse_failure("Bearer"));
+        assert!(is_auth_header_parse_failure("B X"));
+        assert!(is_auth_header_parse_failure("Bear XYZ"));
+        assert!(is_auth_header_parse_failure("Bearerr XYZ"));
+
+        assert_eq!(
+            Authenticator::parse_bearer_authorization_header("Bearer XYZ"),
+            Ok("XYZ")
+        );
+
+        assert_eq!(
+            Authenticator::parse_bearer_authorization_header("bEaReR XYZ"),
+            Ok("XYZ")
+        );
+
+        assert_eq!(
+            Authenticator::parse_bearer_authorization_header("Bearer           XYZ"),
+            Ok("XYZ")
         );
     }
 

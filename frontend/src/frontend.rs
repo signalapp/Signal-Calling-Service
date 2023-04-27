@@ -152,6 +152,7 @@ pub enum FrontendError {
 pub struct Frontend {
     pub config: &'static config::Config,
     pub authenticator: Authenticator,
+    pub zkparams: zkgroup::generic_server_params::GenericServerSecretParams,
     pub storage: Box<dyn Storage>,
     pub backend: Box<dyn Backend>,
     pub id_generator: Box<dyn IdGenerator>,
