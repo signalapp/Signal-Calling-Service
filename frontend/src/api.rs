@@ -21,12 +21,13 @@ use axum::{
     middleware::{self, Next},
     response::IntoResponse,
     routing::get,
-    Router,
+    Extension, Router,
 };
-use http::{header, Request, StatusCode, Method};
+use http::{header, Method, Request, StatusCode};
 use log::*;
 use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
+use zkgroup::call_links::CreateCallLinkCredentialPresentation;
 
 use crate::{
     authenticator::{Authenticator, AuthenticatorError, GroupAuthToken},
@@ -50,11 +51,11 @@ impl From<FrontendError> for StatusCode {
     }
 }
 
-fn get_request_path<B>(req: &Request<B>) -> String {
+fn get_request_path<B>(req: &Request<B>) -> &str {
     if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
-        matched_path.as_str().to_owned()
+        matched_path.as_str()
     } else {
-        req.uri().path().to_owned()
+        req.uri().path()
     }
 }
 
@@ -106,21 +107,23 @@ async fn metrics<B>(
     let path = get_request_path(&req);
     let user_agent = get_user_agent(&req)?.to_string();
 
-    let response = next.run(req).await;
-
-    let latency = start.elapsed();
-
-    let version = if path.starts_with("/v2/") {
+    let tag = if path.starts_with("/v1/call-links/") {
+        "call_links.v1"
+    } else if path.starts_with("/v2/") {
         "v2"
     } else {
         "unknown"
     };
 
+    let response = next.run(req).await;
+
+    let latency = start.elapsed();
+
     let mut api_metrics = frontend.api_metrics.lock();
 
     let _ = api_metrics
         .counts
-        .entry(format!("calling.frontend.api.{}.{}", version, method))
+        .entry(format!("calling.frontend.api.{}.{}", tag, method))
         .and_modify(|value| *value = value.saturating_add(1))
         .or_insert(1);
 
@@ -128,7 +131,7 @@ async fn metrics<B>(
         .counts
         .entry(format!(
             "calling.frontend.api.{}.{}.{}",
-            version,
+            tag,
             method,
             response.status().as_str()
         ))
@@ -141,7 +144,7 @@ async fn metrics<B>(
             .counts
             .entry(format!(
                 "calling.frontend.api.{}.{}.user_agent.{}",
-                version,
+                tag,
                 method,
                 user_agent_event_string(&user_agent)
             ))
@@ -151,10 +154,7 @@ async fn metrics<B>(
 
     let latencies = api_metrics
         .latencies
-        .entry(format!(
-            "calling.frontend.api.{}.{}.latency",
-            version, method
-        ))
+        .entry(format!("calling.frontend.api.{}.{}.latency", tag, method))
         .or_insert_with(Histogram::default);
     latencies.push(latency.as_micros() as u64);
 
@@ -229,6 +229,58 @@ async fn authorize<B>(
 
     req.extensions_mut().insert(user_authorization);
     Ok(next.run(req).await)
+}
+
+async fn extra_call_link_metrics<B>(
+    State(frontend): State<Arc<Frontend>>,
+    create_auth: Option<Extension<Arc<CreateCallLinkCredentialPresentation>>>,
+    req: Request<B>,
+    next: Next<B>,
+) -> Result<axum::response::Response, StatusCode> {
+    if create_auth.is_none() || req.method() != Method::PUT {
+        return Ok(next.run(req).await);
+    }
+
+    trace!("extra_call_link_metrics");
+
+    // Get the method and user_agent here to avoid cloning the whole
+    // request before next.run() consumes it.
+    let path = get_request_path(&req);
+    let user_agent = get_user_agent(&req)?.to_string();
+
+    let tag = if path.starts_with("/v1/call-links/") {
+        "call_links.v1"
+    } else {
+        "unknown"
+    };
+
+    let response = next.run(req).await;
+
+    // In addition to the normal metrics, break out attempts to create a new room.
+    // This isn't going to match up exactly with the number of new rooms because of retries
+    // and failures.
+    let mut api_metrics = frontend.api_metrics.lock();
+
+    let _ = api_metrics
+        .counts
+        .entry(format!(
+            "calling.frontend.api.{}.create.{}",
+            tag,
+            response.status().as_str()
+        ))
+        .and_modify(|value| *value = value.saturating_add(1))
+        .or_insert(1);
+    let _ = api_metrics
+        .counts
+        .entry(format!(
+            "calling.frontend.api.{}.create.user_agent.{}",
+            tag,
+            user_agent_event_string(&user_agent)
+        ))
+        .and_modify(|value| *value = value.saturating_add(1))
+        .or_insert(1);
+
+    Ok(response)
 }
 
 /// Middleware to parse the authorization header for the call link endpoints.
@@ -341,16 +393,23 @@ fn app(frontend: Arc<Frontend>) -> Router {
         )
         .with_state(frontend.clone());
 
-    // FIXME: metrics? or don't worry about it?
     let call_link_routes = Router::new()
         .route(
             "/v1/call-link/:room_id",
             get(call_links::read_call_link).put(call_links::update_call_link),
         )
-        .layer(ServiceBuilder::new().layer(middleware::from_fn_with_state(
-            frontend.clone(),
-            authorize_call_link,
-        )))
+        .layer(
+            ServiceBuilder::new()
+                .layer(middleware::from_fn_with_state(frontend.clone(), metrics))
+                .layer(middleware::from_fn_with_state(
+                    frontend.clone(),
+                    authorize_call_link,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    frontend.clone(),
+                    extra_call_link_metrics,
+                )),
+        )
         .with_state(frontend);
 
     Router::new()
