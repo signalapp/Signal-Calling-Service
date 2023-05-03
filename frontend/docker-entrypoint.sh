@@ -25,18 +25,31 @@ if [[ -z "${CALLING_AUTH_KEY}" ]]; then
     echo "Error: AUTH_SECRET_NAME not defined but needed to get calling-auth-key!"
     exit 1
   fi 
+  if [[ -z "${ZKPARAMS_SECRET_NAME}" ]]; then
+    echo "Error: ZKPARAMS_SECRET_NAME not defined but needed to get calling-zkparams!"
+    exit 1
+  fi
+
   TOKEN="$(curl -Ss "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" -H "Metadata-Flavor: Google" | jq '.access_token')"
+
   CALLING_AUTH_KEY="$(curl -Ss "https://secretmanager.googleapis.com/v1/projects/$SECRET_PROJECT/secrets/$AUTH_SECRET_NAME/versions/latest:access" -H "Metadata-Flavor: Google" -H "authorization: Bearer $TOKEN" | jq -r '.payload.data' | base64 --decode)"
 
   if [[ -z "${CALLING_AUTH_KEY}" ]]; then
     echo "Error: CALLING_AUTH_KEY not defined!"
     exit 1
   fi
+
+  # zkparams are expected to be base64, so we don't have to decode them.
+  ZKPARAMS="$(curl -Ss "https://secretmanager.googleapis.com/v1/projects/$SECRET_PROJECT/secrets/$ZKPARAMS_SECRET_NAME/versions/latest:access" -H "Metadata-Flavor: Google" -H "authorization: Bearer $TOKEN" | jq -r '.payload.data')"
 fi
 
-set -- calling_frontend \
+if [[ -z "${ZKPARAMS}" ]]; then
+  echo "Error: ZKPARAMS not defined!"
+  exit 1
+fi
+
+calling_frontend \
   --region "$REGION" \
   --authentication-key "$CALLING_AUTH_KEY" \
+  --zkparams "$ZKPARAMS" \
   "$@"
-
-"$@"
