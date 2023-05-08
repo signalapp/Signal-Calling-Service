@@ -32,10 +32,8 @@ if [[ -z "${INTERNAL_IP}" ]]; then
   fi
 fi
 
-set -- calling_backend \
+calling_backend \
   --ice-candidate-ip "$EXTERNAL_IP" \
   "${IPV6_ICE[@]}" \
   --signaling-ip "$INTERNAL_IP" \
   "$@"
-
-"$@"
