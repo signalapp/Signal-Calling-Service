@@ -268,7 +268,7 @@ impl LoadBalancerTask {
             }
         }
         warn!("no healthy hosts");
-        return Err(anyhow!("no healthy hosts"));
+        Err(anyhow!("no healthy hosts"))
     }
 }
 
