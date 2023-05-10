@@ -32,6 +32,7 @@ use tower::ServiceBuilder;
 use crate::{
     config, ice,
     middleware::log_response,
+    region::Region,
     sfu::{self, Sfu},
 };
 
@@ -371,6 +372,7 @@ async fn join_conference(
         join_request.ice_ufrag,
         client_dhe_public_key,
         client_hkdf_extra_info,
+        Region::Unset,
     ) {
         Ok(server_dhe_public_key) => {
             let media_server = config::ServerMediaAddress::from(config);

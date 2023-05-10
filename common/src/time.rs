@@ -154,6 +154,10 @@ impl Duration {
         let remainder = self.0.as_secs() % unit.0.as_secs();
         self.saturating_sub(Duration::from_secs(remainder))
     }
+
+    pub fn is_zero(&self) -> bool {
+        self.0.is_zero()
+    }
 }
 
 impl From<std::time::Duration> for Duration {

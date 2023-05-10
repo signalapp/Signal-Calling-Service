@@ -18,6 +18,7 @@ pub mod middleware;
 pub mod pacer;
 pub mod packet_server;
 pub mod protos;
+pub mod region;
 pub mod rtp;
 pub mod sfu;
 pub mod signaling_server;

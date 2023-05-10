@@ -77,6 +77,7 @@ pub struct JoinRequest {
     pub dhe_public_key: Option<String>,
     #[serde(rename = "hkdfExtraInfo")]
     pub hkdf_extra_info: Option<String>,
+    pub region: String,
 }
 
 #[derive(Deserialize, Debug)]

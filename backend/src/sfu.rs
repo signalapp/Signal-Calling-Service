@@ -23,7 +23,7 @@ use thiserror::Error;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::{
-    call::{self, Call, LoggableCallId},
+    call::{self, Call, LoggableCallId, DUMMY_DEMUX_ID},
     config,
     connection::{self, AddressType, Connection, HandleRtcpResult, PacketToSend},
     googcc, ice,
@@ -31,6 +31,7 @@ use crate::{
     metrics::{Histogram, Timer},
     pacer,
     packet_server::SocketLocator,
+    region::Region,
     rtp,
 };
 pub use crate::{
@@ -82,6 +83,12 @@ struct ConnectionId {
 impl ConnectionId {
     fn from_call_id_and_demux_id(call_id: CallId, demux_id: DemuxId) -> ConnectionId {
         Self { call_id, demux_id }
+    }
+    fn from_call_id(call_id: CallId) -> ConnectionId {
+        Self {
+            call_id,
+            demux_id: DUMMY_DEMUX_ID,
+        }
     }
 }
 
@@ -236,6 +243,7 @@ impl Sfu {
 
         let mut remembered_packet_count = Histogram::default();
         let mut remembered_packet_bytes = Histogram::default();
+        let mut outgoing_queue_size = Histogram::default();
         let mut udp_v4_connections = 0;
         let mut udp_v6_connections = 0;
         let mut tcp_v4_connections = 0;
@@ -246,6 +254,7 @@ impl Sfu {
             let stats = connection.rtp_endpoint_stats();
             remembered_packet_count.push(stats.remembered_packet_count);
             remembered_packet_bytes.push(stats.remembered_packet_bytes);
+            outgoing_queue_size.push(connection.outgoing_queue_size().as_bytes() as usize);
             if let Some(addr_type) = connection.outgoing_addr_type() {
                 match addr_type {
                     AddressType::UdpV4 => udp_v4_connections += 1,
@@ -262,6 +271,10 @@ impl Sfu {
         histograms.insert(
             "calling.sfu.connections.remembered_packets.size_bytes",
             remembered_packet_bytes,
+        );
+        histograms.insert(
+            "calling.sfu.connections.outgoing_queue_size_bytes",
+            outgoing_queue_size,
         );
         values.insert(
             "calling.sfu.connections.udp_v4_count",
@@ -297,6 +310,7 @@ impl Sfu {
         client_ice_ufrag: String,
         client_dhe_public_key: DhePublicKey,
         client_hkdf_extra_info: Vec<u8>,
+        region: Region,
     ) -> Result<DhePublicKey, SfuError> {
         let loggable_call_id = LoggableCallId::from(&call_id);
         trace!("get_or_create_call_and_add_client():");
@@ -361,9 +375,10 @@ impl Sfu {
             }
 
             info!(
-                "call_id: {} adding demux_id: {}",
+                "call_id: {} adding demux_id: {}, join region {}",
                 loggable_call_id,
-                demux_id.as_u32()
+                demux_id.as_u32(),
+                region
             );
 
             call.add_client(
@@ -711,15 +726,24 @@ impl Sfu {
                 // Keep a string buffer we can reuse for posting diagnostic logs.
                 let mut diagnostic_string: String = String::with_capacity(3072);
 
-                for call in self.call_by_call_id.values() {
+                for (call_id, call) in &self.call_by_call_id {
                     let call = call.lock();
                     let stats = call.get_stats();
                     if !stats.clients.is_empty() {
                         diagnostic_string.clear();
                         let _ = write!(diagnostic_string, "call_id: {}", stats.loggable_call_id);
-
+                        let mut connection_id = ConnectionId::from_call_id(call_id.clone());
                         for client in stats.clients {
-                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), target: {}, requested_base: {}, ideal: {}, allocated: {}, queue_drain: {}, max_requested_height: {} }}",
+                            connection_id.demux_id = client.demux_id;
+                            let rtt = if let Some(connection) =
+                                self.get_connection_from_id(&connection_id)
+                            {
+                                connection.lock().rtt().as_millis()
+                            } else {
+                                0
+                            };
+
+                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), target: {}, requested_base: {}, ideal: {}, allocated: {}, queue_drain: {}, max_requested_height: {}, rtt_ms: {} }}",
                                   client.demux_id.as_u32(),
                                   client.video0_incoming_height.unwrap_or_default().as_u16(),
                                   client.video1_incoming_height.unwrap_or_default().as_u16(),
@@ -733,6 +757,7 @@ impl Sfu {
                                   client.allocated_send_rate.as_kbps(),
                                   client.outgoing_queue_drain_rate.as_kbps(),
                                   client.max_requested_height.unwrap_or_default().as_u16(),
+                                  rtt,
                             );
                         }
 
@@ -818,7 +843,27 @@ impl Sfu {
                         + Duration::from_secs(config.inactivity_timeout_secs)
                 {
                     // If the call hasn't had any activity recently, remove it.
-                    info!("call_id: {} removed", call.loggable_call_id());
+                    let call_time = call.call_time();
+                    info!(
+                        "call_id: {} removed; seconds empty: {}, solo: {}, pair: {}, many: {}",
+                        call.loggable_call_id(),
+                        call_time.empty.as_secs(),
+                        call_time.solo.as_secs(),
+                        call_time.pair.as_secs(),
+                        call_time.many.as_secs()
+                    );
+
+                    event!("calling.sfu.call_complete");
+                    if !call_time.many.is_zero() {
+                        event!("calling.sfu.call_complete.many");
+                    } else if !call_time.pair.is_zero() {
+                        event!("calling.sfu.call_complete.pair");
+                    } else if !call_time.solo.is_zero() {
+                        event!("calling.sfu.call_complete.solo");
+                    } else {
+                        event!("calling.sfu.call_complete.empty");
+                    }
+
                     false
                 } else {
                     // Keep the call around for a while longer.
@@ -1042,6 +1087,7 @@ mod sfu_tests {
             client_ice_ufrag,
             client_dhe_public_key,
             vec![],
+            Region::Unset,
         )?;
         Ok(())
     }

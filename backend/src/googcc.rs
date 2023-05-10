@@ -170,6 +170,10 @@ impl CongestionController {
         self.calculator
             .next(&mut self.current_request, delay_direction, rtt, acked_rate)
     }
+
+    pub fn rtt(&self) -> Duration {
+        self.calculator.rtt
+    }
 }
 
 struct TargetCalculator {

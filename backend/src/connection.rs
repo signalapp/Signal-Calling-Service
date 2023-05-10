@@ -499,6 +499,10 @@ impl Connection {
         self.congestion_control.controller.request(googcc_request);
         self.congestion_control.pacer.set_config(pacer_config, now);
     }
+
+    pub fn rtt(&self) -> Duration {
+        self.congestion_control.controller.rtt()
+    }
 }
 
 /// Result of Connection::handle_rtcp_packet().

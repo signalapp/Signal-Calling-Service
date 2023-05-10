@@ -20,7 +20,7 @@ use anyhow::Result;
 use byteorder::{BigEndian, ByteOrder};
 use calling_common::{try_scoped, Duration, Instant};
 use log::*;
-use nix::sys::epoll::*;
+use nix::{errno::Errno, sys::epoll::*};
 use parking_lot::{Mutex, RwLock};
 use scopeguard::ScopeGuard;
 use unique_id::sequence::SequenceGenerator;
@@ -352,8 +352,7 @@ impl PacketServerState {
                                     }
                                 }
                                 _ => {
-                                    event!("calling.udp.epoll.socket_error");
-                                    warn!("socket error: {}", err);
+                                    Self::socket_error(&err);
                                 }
                             }
                         }
@@ -398,7 +397,7 @@ impl PacketServerState {
                                 continue;
                             }
                             _ => {
-                                warn!("recv_from() failed: {}", err);
+                                Self::socket_error(&err);
                             }
                         }
                         continue;
@@ -416,8 +415,35 @@ impl PacketServerState {
         }
     }
 
-    /// sends socket and returns true if socket is still good, or false if
-    /// it should be closed
+    /// Counts socket errors; unexpected errors are logged.
+    #[track_caller]
+    fn socket_error(err: &io::Error) {
+        match err.kind() {
+            io::ErrorKind::PermissionDenied => {
+                event!("calling.udp.epoll.socket_error.permission_denied");
+            }
+            io::ErrorKind::ConnectionReset => {
+                event!("calling.udp.epoll.socket_error.reset_by_peer");
+            }
+            _ => {
+                let errno = err.raw_os_error();
+                // io::ErrorKind doesn't have all the kinds we want to match (or they're unstable)
+                // so also look at the raw OS error.
+                if errno == Some(Errno::EHOSTUNREACH as i32) {
+                    // io::ErrorKind::HostUnreachable pending io_error_more #86442
+                    event!("calling.udp.epoll.socket_error.host_unreachable");
+                } else if errno == Some(Errno::EMSGSIZE as i32) {
+                    event!("calling.udp.epoll.socket_error.packet_too_big");
+                } else {
+                    event!("calling.udp.epoll.socket_error");
+                    warn!("socket_error: {}", err);
+                }
+            }
+        }
+    }
+
+    /// Sends socket and returns true if socket is still good, or false if
+    /// it should be closed.
     fn send_and_keep(socket: &Socket, buf: &[u8]) -> bool {
         if let Err(err) = socket.send(buf) {
             match err.kind() {
@@ -430,7 +456,9 @@ impl PacketServerState {
                     return false;
                 }
                 io::ErrorKind::WouldBlock => {}
-                _ => warn!("send() failed: {}", err),
+                _ => {
+                    Self::socket_error(&err);
+                }
             }
         }
         true
@@ -539,38 +567,48 @@ impl PacketServerState {
     /// This includes cleaning up connections for clients that have left or the quiet ones that
     /// reached ttl without having passed any data.
     pub fn tick(&self, mut tick_update: sfu::TickOutput) -> Result<()> {
-        for (buf, addr) in tick_update.packets_to_send {
-            trace!("sending tick packet of {} bytes to {}", buf.len(), addr);
+        time_scope_us!("calling.packet_server.tick");
 
-            let connections_lock = self.all_connections.read();
-            match connections_lock.get_by_addr(&addr) {
-                ConnectionState::New(socket) => {
-                    if !Self::send_and_keep(socket, &buf) {
-                        warn!("shouldn't find new TCP socket in tick, closing");
-                        // This will call mark_closed below
-                        tick_update.expired_client_addrs.push(addr)
-                    } else {
-                        warn!("shouldn't find new TCP socket in tick, unable to mark active");
+        {
+            time_scope_us!("calling.packet_server.tick.sending");
+            for (buf, addr) in tick_update.packets_to_send {
+                trace!("sending tick packet of {} bytes to {}", buf.len(), addr);
+
+                let connections_lock = self.all_connections.read();
+                match connections_lock.get_by_addr(&addr) {
+                    ConnectionState::New(socket) => {
+                        if !Self::send_and_keep(socket, &buf) {
+                            warn!("shouldn't find new TCP socket in tick, closing");
+                            // This will call mark_closed below
+                            tick_update.expired_client_addrs.push(addr)
+                        } else {
+                            warn!("shouldn't find new TCP socket in tick, unable to mark active");
+                        }
                     }
-                }
-                ConnectionState::Connected(socket) => {
-                    if !Self::send_and_keep(socket, &buf) {
-                        // This will call mark_closed below
-                        tick_update.expired_client_addrs.push(addr)
+                    ConnectionState::Connected(socket) => {
+                        if !Self::send_and_keep(socket, &buf) {
+                            // This will call mark_closed below
+                            tick_update.expired_client_addrs.push(addr)
+                        }
                     }
-                }
-                ConnectionState::Closed(_) => {
-                    trace!("dropping packet (connection already closed)")
-                }
-                ConnectionState::NotYetConnected => {
-                    trace!("dropping packet (not yet connected)")
+                    ConnectionState::Closed(_) => {
+                        trace!("dropping packet (connection already closed)")
+                    }
+                    ConnectionState::NotYetConnected => {
+                        trace!("dropping packet (not yet connected)")
+                    }
                 }
             }
         }
 
-        self.all_connections
-            .write()
-            .for_each_inactive_sender(|locator| tick_update.expired_client_addrs.push(*locator));
+        {
+            time_scope_us!("calling.packet_server.tick.inactive_sender");
+            self.all_connections
+                .write()
+                .for_each_inactive_sender(|locator| {
+                    tick_update.expired_client_addrs.push(*locator)
+                });
+        }
 
         // Collect the addresses of any sockets that have been closed for several ticks.
         // We can now free up those table entries.
@@ -579,6 +617,7 @@ impl PacketServerState {
         let expiration = now - (CLOSED_SOCKET_EXPIRATION_IN_TICKS * self.tick_interval);
         let mut expired_socket_addrs = vec![];
         {
+            time_scope_us!("calling.packet_server.tick.collect_expired_addrs");
             let connections_lock = self.all_connections.read();
             for (addr, close_timestamp) in connections_lock.closed_connection_iter() {
                 if close_timestamp <= &expiration {
@@ -587,33 +626,36 @@ impl PacketServerState {
             }
         }
 
-        // Clean up any clients that have already left.
-        if !tick_update.expired_client_addrs.is_empty() || !expired_socket_addrs.is_empty() {
-            match self
-                .all_connections
-                .try_write_for(self.tick_interval.into())
-            {
-                None => {
-                    anyhow::bail!(
+        {
+            time_scope_us!("calling.packet_server.tick.cleanup_expired_clients");
+            // Clean up any clients that have already left.
+            if !tick_update.expired_client_addrs.is_empty() || !expired_socket_addrs.is_empty() {
+                match self
+                    .all_connections
+                    .try_write_for(self.tick_interval.into())
+                {
+                    None => {
+                        anyhow::bail!(
                         "could not acquire connection lock after {:?}; one of the epoll handler threads is likely deadlocked",
                         self.tick_interval
                     );
-                }
-                Some(mut socket_lock) => {
-                    // Clean up sockets closed on previous ticks.
-                    // This two-phase cleanup makes the following scenario unlikely:
-                    // 1. Packet handler produces packets for socket X.
-                    // 2. The packet handler is pre-empted.
-                    // 3. The tick handler runs and removes socket X.
-                    // 4. The packet handler resumes and tries to send to socket X.
-                    // 5. The packet handler thinks it needs to make a new connection.
-                    for addr in expired_socket_addrs.iter() {
-                        socket_lock.remove_closed(addr);
                     }
+                    Some(mut socket_lock) => {
+                        // Clean up sockets closed on previous ticks.
+                        // This two-phase cleanup makes the following scenario unlikely:
+                        // 1. Packet handler produces packets for socket X.
+                        // 2. The packet handler is pre-empted.
+                        // 3. The tick handler runs and removes socket X.
+                        // 4. The packet handler resumes and tries to send to socket X.
+                        // 5. The packet handler thinks it needs to make a new connection.
+                        for addr in expired_socket_addrs.iter() {
+                            socket_lock.remove_closed(addr);
+                        }
 
-                    // Mark clients to be cleaned up next tick.
-                    for addr in tick_update.expired_client_addrs.iter() {
-                        socket_lock.mark_closed(addr, now);
+                        // Mark clients to be cleaned up next tick.
+                        for addr in tick_update.expired_client_addrs.iter() {
+                            socket_lock.mark_closed(addr, now);
+                        }
                     }
                 }
             }

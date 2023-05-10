@@ -99,7 +99,7 @@ services:
     entrypoint: calling_frontend
     command:
       - --region
-      - "us-west-1"
+      - "us-west1"
       - --authentication-key
       # Set the auth key to the one you want, but do not commit with it!
       - "deaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddeaddead"

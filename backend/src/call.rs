@@ -141,6 +141,8 @@ impl TryFrom<u32> for DemuxId {
     }
 }
 
+pub const DUMMY_DEMUX_ID: DemuxId = DemuxId(0);
+
 impl From<DemuxId> for u32 {
     fn from(demux_id: DemuxId) -> u32 {
         demux_id.0
@@ -262,6 +264,15 @@ pub struct Call {
     /// The last time key frame requests were sent, in general and specifically for certain SSRCs
     key_frame_requests_sent: Instant,
     key_frame_request_sent_by_ssrc: HashMap<rtp::Ssrc, Instant>,
+    call_time: CallTimeStats,
+}
+
+#[derive(Default)]
+pub struct CallTimeStats {
+    pub empty: Duration,
+    pub solo: Duration,
+    pub pair: Duration,
+    pub many: Duration,
 }
 
 /// Info we need to transfer from the Call to the Connection
@@ -308,6 +319,7 @@ impl Call {
 
             key_frame_requests_sent: now - KEY_FRAME_REQUEST_CALCULATION_INTERVAL, // easier than using None :)
             key_frame_request_sent_by_ssrc: HashMap::new(),
+            call_time: CallTimeStats::default(),
         }
     }
 
@@ -335,6 +347,10 @@ impl Call {
         self.created
     }
 
+    pub fn call_time(&self) -> &CallTimeStats {
+        &self.call_time
+    }
+
     pub fn has_client(&self, demux_id: DemuxId) -> bool {
         self.clients
             .iter()
@@ -360,6 +376,13 @@ impl Call {
             now,
         ));
         // An update message to clients about clients will be sent at the next tick().
+        let increment = now.saturating_duration_since(self.client_added_or_removed);
+        match self.clients.len() {
+            0 => self.call_time.empty += increment,
+            1 => self.call_time.solo += increment,
+            2 => self.call_time.pair += increment,
+            _ => self.call_time.many += increment,
+        }
         self.client_added_or_removed = now;
         self.allocate_video_layers(demux_id, self.initial_target_send_rate, now);
         // We may have to update the padding SSRCs because there can't be any padding SSRCs until two people join
@@ -377,6 +400,13 @@ impl Call {
             self.clients.swap_remove(index);
 
             // An update message to clients about clients will be sent at the next tick().
+            let increment = now.saturating_duration_since(self.client_added_or_removed);
+            match self.clients.len() {
+                0 => self.call_time.empty += increment,
+                1 => self.call_time.solo += increment,
+                2 => self.call_time.pair += increment,
+                _ => self.call_time.many += increment,
+            }
             self.client_added_or_removed = now;
             self.reallocate_target_send_rates(now);
             self.update_padding_ssrcs();

@@ -955,7 +955,7 @@ impl<'packet> ControlPacket<'packet> {
             // otherwise we'd have to encrypt all fuzz inputs.
             #[cfg(not(fuzzing))]
             {
-                warn!("Receiving unencrypted RTCP is not supported!");
+                event!("calling.sfu.unencrypted_rtp");
                 return None;
             }
         }

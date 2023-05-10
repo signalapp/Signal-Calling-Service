@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use urlencoding::encode;
 
 #[cfg(test)]
 use mockall::{automock, predicate::*};
@@ -124,6 +125,7 @@ pub struct JoinRequestWrapper {
     pub ice_ufrag: String,
     pub dhe_public_key: String,
     pub hkdf_extra_info: Option<String>,
+    pub region: String,
 }
 
 pub struct JoinResponseWrapper {
@@ -217,11 +219,12 @@ impl Frontend {
     pub fn get_redirect_uri(&self, backend_region: &str, original_uri: &Uri) -> Option<String> {
         if backend_region != self.config.region {
             Some(format!(
-                "{}{}",
+                "{}{}?region={}",
                 self.config
                     .regional_url_template
                     .replace("<region>", backend_region),
-                original_uri
+                original_uri.path(),
+                encode(&self.config.region),
             ))
         } else {
             None
@@ -356,6 +359,7 @@ impl Frontend {
                     ice_ufrag: join_request.ice_ufrag,
                     dhe_public_key: Some(join_request.dhe_public_key),
                     hkdf_extra_info: join_request.hkdf_extra_info,
+                    region: join_request.region,
                 },
             )
             .await

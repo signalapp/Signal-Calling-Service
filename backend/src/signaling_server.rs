@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot::{self, Receiver};
 use tower::ServiceBuilder;
 
-use crate::{call, config, ice, middleware::log_response, sfu, sfu::Sfu};
+use crate::{call, config, ice, middleware::log_response, region::Region, sfu, sfu::Sfu};
 
 const SYSTEM_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -68,6 +68,7 @@ pub struct JoinRequest {
     pub client_ice_ufrag: String,
     pub client_dhe_public_key: String,
     pub hkdf_extra_info: Option<String>,
+    pub region: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -233,6 +234,12 @@ async fn join(
     let server_ice_ufrag = ice::random_ufrag();
     let server_ice_pwd = ice::random_pwd();
 
+    let region = if let Some(region) = request.region {
+        Region::from_str(&region).unwrap_or(Region::Unknown)
+    } else {
+        Region::Unset
+    };
+
     let mut sfu = sfu.lock();
     match sfu.get_or_create_call_and_add_client(
         call_id,
@@ -245,6 +252,7 @@ async fn join(
         request.client_ice_ufrag,
         client_dhe_public_key,
         client_hkdf_extra_info,
+        region,
     ) {
         Ok(server_dhe_public_key) => {
             let media_server = config::ServerMediaAddress::from(config);
@@ -443,6 +451,7 @@ mod signaling_server_tests {
                 client_ice_ufrag.to_string(),
                 client_dhe_pub_key,
                 vec![],
+                Region::Unset,
             )
             .unwrap();
     }
@@ -699,6 +708,7 @@ mod signaling_server_tests {
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
+                            region: None,
                         })
                         .unwrap(),
                     ))
@@ -721,6 +731,7 @@ mod signaling_server_tests {
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
+                            region: None,
                         })
                         .unwrap(),
                     ))
@@ -743,6 +754,7 @@ mod signaling_server_tests {
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
+                            region: None,
                         })
                         .unwrap(),
                     ))
@@ -765,6 +777,7 @@ mod signaling_server_tests {
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: "INVALID".to_string(),
                             hkdf_extra_info: None,
+                            region: None,
                         })
                         .unwrap(),
                     ))
@@ -787,6 +800,7 @@ mod signaling_server_tests {
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: Some("G".to_string()),
+                            region: None,
                         })
                         .unwrap(),
                     ))
@@ -809,6 +823,7 @@ mod signaling_server_tests {
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
+                            region: None,
                         })
                         .unwrap(),
                     ))
@@ -847,6 +862,7 @@ mod signaling_server_tests {
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
+                            region: None,
                         })
                         .unwrap(),
                     ))

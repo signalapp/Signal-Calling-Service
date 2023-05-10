@@ -7,7 +7,7 @@ use std::{str, sync::Arc};
 
 use anyhow::Result;
 use axum::{
-    extract::{OriginalUri, State},
+    extract::{OriginalUri, Query, State},
     response::{IntoResponse, Redirect},
     Extension, Json,
 };
@@ -115,11 +115,17 @@ pub async fn get_participants(
     .into_response())
 }
 
+#[derive(Deserialize)]
+pub struct Region {
+    region: Option<String>,
+}
+
 /// Handler for the PUT /conference/participants route.
 pub async fn join(
     State(frontend): State<Arc<Frontend>>,
     Extension(user_authorization): Extension<UserAuthorization>,
     OriginalUri(original_uri): OriginalUri,
+    Query(region): Query<Region>,
     Json(request): Json<JoinRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("join: ");
@@ -141,6 +147,12 @@ pub async fn join(
         return temporary_redirect(&redirect_uri);
     }
 
+    let region = if let Some(region) = region.region {
+        region
+    } else {
+        frontend.config.region.clone()
+    };
+
     let join_client_timer =
         start_timer_us!("calling.frontend.api.v2.join.join_client_to_call.timed");
     let response = frontend
@@ -151,6 +163,7 @@ pub async fn join(
                 ice_ufrag: request.ice_ufrag,
                 dhe_public_key: request.dhe_public_key,
                 hkdf_extra_info: request.hkdf_extra_info,
+                region,
             },
         )
         .await?;
@@ -207,9 +220,10 @@ mod api_server_v2_tests {
     const DEMUX_ID_1: u32 = 1070920496;
     const ENDPOINT_ID_2: &str = "2222222222222222-987654";
     const DEMUX_ID_2: u32 = 1778901216;
-    const LOCAL_REGION: &str = "us-west-1";
-    const ALT_REGION: &str = "ap-northeast-2";
-    const REDIRECTED_URL: &str = "https://ap-northeast-2.test.com/v2/conference/participants";
+    const LOCAL_REGION: &str = "us-west1";
+    const ALT_REGION: &str = "asia-northeast3";
+    const REDIRECTED_URL: &str =
+        "https://asia-northeast3.test.com/v2/conference/participants?region=us-west1";
     const CLIENT_ICE_UFRAG: &str = "client-ufrag";
     const CLIENT_DHE_PUBLIC_KEY: &str = "f924028e9b8021b77eb97b36f1d43e63";
     const BACKEND_ICE_UFRAG: &str = "backend-ufrag";
@@ -634,6 +648,7 @@ mod api_server_v2_tests {
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
+                    region: LOCAL_REGION.to_string(),
                 }),
             )
             .once()
@@ -733,6 +748,7 @@ mod api_server_v2_tests {
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
+                    region: LOCAL_REGION.to_string(),
                 }),
             )
             .once()
@@ -832,6 +848,7 @@ mod api_server_v2_tests {
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
+                    region: LOCAL_REGION.to_string(),
                 }),
             )
             .once()
