@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "calling_backend"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "accounting-allocator",
  "aes 0.8.2",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "calling_frontend"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
