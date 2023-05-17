@@ -23,10 +23,10 @@ use mockall::{automock, predicate::*};
 
 use crate::{
     api::ApiMetrics,
-    authenticator::{Authenticator, UserAuthorization},
+    authenticator::Authenticator,
     backend::{self, Backend, BackendError},
     config,
-    storage::{CallRecord, Storage},
+    storage::{CallLinkRestrictions, CallRecord, Storage},
 };
 
 pub type UserId = String;
@@ -126,6 +126,8 @@ pub struct JoinRequestWrapper {
     pub dhe_public_key: String,
     pub hkdf_extra_info: Option<String>,
     pub region: String,
+    pub restrictions: CallLinkRestrictions,
+    pub is_admin: bool,
 }
 
 pub struct JoinResponseWrapper {
@@ -288,13 +290,15 @@ impl Frontend {
 
     pub async fn get_or_create_call_record(
         &self,
-        user_authorization: &UserAuthorization,
+        room_id: &RoomId,
+        can_create: bool,
+        user_id: &UserId,
     ) -> Result<CallRecord, FrontendError> {
-        if !user_authorization.user_permission.can_create() {
+        if !can_create {
             // Either a call already exists or it doesn't.
             return self
                 .storage
-                .get_call_record(&user_authorization.room_id)
+                .get_call_record(room_id)
                 .await
                 .map_err(|err| {
                     Frontend::log_error("get_or_create_call_record", err.into());
@@ -312,11 +316,11 @@ impl Frontend {
         })?;
 
         let call_record = CallRecord {
-            room_id: user_authorization.room_id.clone(),
+            room_id: room_id.clone(),
             era_id: self.id_generator.get_random_era_id(16),
             backend_ip,
             backend_region: self.config.region.to_string(),
-            creator: user_authorization.user_id.to_string(),
+            creator: user_id.to_string(),
         };
 
         self.storage
@@ -360,6 +364,7 @@ impl Frontend {
                     dhe_public_key: Some(join_request.dhe_public_key),
                     hkdf_extra_info: join_request.hkdf_extra_info,
                     region: join_request.region,
+                    is_admin: join_request.is_admin,
                 },
             )
             .await

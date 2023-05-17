@@ -171,6 +171,11 @@ pub trait Storage: Sync + Send {
         new_attributes: CallLinkUpdate,
         zkparams_for_creation: Option<Vec<u8>>,
     ) -> Result<CallLinkState, CallLinkUpdateError>;
+    /// Fetches both the current state for a call link and the call record
+    async fn get_call_link_and_record(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(Option<CallLinkState>, Option<CallRecord>), StorageError>;
 }
 
 pub struct DynamoDb {
@@ -543,6 +548,52 @@ impl Storage for DynamoDb {
                 )),
             },
         }
+    }
+
+    async fn get_call_link_and_record(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(Option<CallLinkState>, Option<CallRecord>), StorageError> {
+        let response = self
+            .client
+            .query()
+            .table_name(&self.table_name)
+            .key_condition_expression("#room_id = :value")
+            .expression_attribute_names("#room_id", "room_id")
+            .expression_attribute_values(":value", AttributeValue::S(room_id.as_ref().to_string()))
+            .consistent_read(true)
+            .select(Select::AllAttributes)
+            .send()
+            .await
+            .context("failed to query for call link and record from storage")?;
+
+        let mut link_state = None;
+        let mut call_record = None;
+
+        if let Some(items) = response.items {
+            for item in items {
+                if let Some(AttributeValue::S(record_type)) = item.get("recordType") {
+                    match record_type.as_str() {
+                        "ActiveCall" => {
+                            call_record = Some(
+                                from_item(item).context("failed to convert item to CallRecord")?,
+                            )
+                        }
+                        "CallLinkState" => {
+                            link_state = Some(
+                                from_item(item)
+                                    .context("failed to convert item to CallLinkState")?,
+                            )
+                        }
+                        &_ => {
+                            warn!("unexpected record_type: {}", record_type);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((link_state, call_record))
     }
 }
 

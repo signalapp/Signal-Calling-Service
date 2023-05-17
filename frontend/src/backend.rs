@@ -78,6 +78,8 @@ pub struct JoinRequest {
     #[serde(rename = "hkdfExtraInfo")]
     pub hkdf_extra_info: Option<String>,
     pub region: String,
+    #[serde(rename = "isAdmin")]
+    pub is_admin: bool,
 }
 
 #[derive(Deserialize, Debug)]

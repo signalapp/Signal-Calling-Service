@@ -250,6 +250,9 @@ async fn extra_call_link_metrics<B>(
 
     let tag = if path.starts_with("/v1/call-links/") {
         "call_links.v1"
+    } else if path.starts_with("/v2/conference/") {
+        // don't add extra metrics for joining with a call link
+        return Ok(next.run(req).await);
     } else {
         "unknown"
     };
@@ -299,7 +302,7 @@ async fn authorize_call_link<B>(
         .get(header::AUTHORIZATION)
         .and_then(|header| header.to_str().ok())
         .ok_or_else(|| {
-            event!("calling.frontend.api.authorization.header.missing");
+            event!("calling.frontend.api.call_links_authorization.header.missing");
             warn!(
                 "authorize: authorization header missing for {} from {}",
                 req.method(),
@@ -310,7 +313,7 @@ async fn authorize_call_link<B>(
 
     let token =
         Authenticator::parse_bearer_authorization_header(authorization_header).map_err(|err| {
-            event!("calling.frontend.api.authorization.header.invalid");
+            event!("calling.frontend.api.call_links_authorization.header.invalid");
             warn!(
                 "authorize: {} for {} from {}",
                 err,
@@ -397,6 +400,10 @@ fn app(frontend: Arc<Frontend>) -> Router {
         .route(
             "/v1/call-link/:room_id",
             get(call_links::read_call_link).put(call_links::update_call_link),
+        )
+        .route(
+            "/v2/conference/:room_id/participants",
+            get(v2::get_participants_by_room_id).put(v2::join_by_room_id),
         )
         .layer(
             ServiceBuilder::new()

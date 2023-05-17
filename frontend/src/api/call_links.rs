@@ -99,7 +99,7 @@ fn current_time_in_seconds_since_epoch() -> u64 {
         .as_secs()
 }
 
-fn verify_auth_credential_against_zkparams(
+pub fn verify_auth_credential_against_zkparams(
     auth_credential: &CallLinkAuthCredentialPresentation,
     existing_call_link: &storage::CallLinkState,
     frontend: &Frontend,
@@ -271,7 +271,7 @@ pub async fn update_call_link(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     use calling_common::Duration;
@@ -293,9 +293,10 @@ mod tests {
     const AUTH_KEY: &str = "f00f0014fe091de31827e8d686969fad65013238aadd25ef8629eb8a9e5ef69b";
     const ZKPARAMS: &str = "AMJqvmQRYwEGlm0MSy6QFPIAvgOVsqRASNX1meQyCOYHJFqxO8lITPkow5kmhPrsNbu9JhVfKFwesVSKhdZaqQko3IZlJZMqP7DDw0DgTWpdnYzSt0XBWT50DM1cw1nCUXXBZUiijdaFs+JRlTKdh54M7sf43pFxyMHlS3URH50LOeR8jVQKaUHi1bDP2GR9ZXp3Ot9Fsp0pM4D/vjL5PwoOUuzNNdpIqUSFhKVrtazwuHNn9ecHMsFsN0QPzByiDA8nhKcGpdzyWUvGjEDBvpKkBtqjo8QuXWjyS3jSl2oJ/Z4Fh3o2N1YfD2aWV/K88o+TN2/j2/k+KbaIZgmiWwppLU+SYGwthxdDfZgnbaaGT/vMYX9P5JlUWSuP3xIxDzPzxBEFho67BP0Pvux+0a5nEOEVEpfRSs61MMvwNXEKZtzkO0QFbOrFYrPntyb7ToqNi66OQNyTfl/J7kqFZg2MTm3CKjHTAIvVMFAGCIamsrT9sWXOtuNeMS94xazxDA==";
 
-    const USER_ID_1: &str = "11111111111111111111111111111111";
+    pub const USER_ID_1: &str = "11111111111111111111111111111111";
+    pub const USER_ID_1_DOUBLE_ENCODED: &str = "00b033dec3c913aa7d087a49be7bbf4115cd441453778a73d5c705f3515d500841b867748697709fe3f587f796d6c9b20104a27cd1250af6b330fc0dd4eda07005";
     const ROOM_ID: &str = "ff0000dd";
-    const ADMIN_PASSKEY: &[u8] = b"swordfish";
+    pub const ADMIN_PASSKEY: &[u8] = b"swordfish";
 
     const DISTANT_FUTURE_IN_EPOCH_SECONDS: u64 = 4133980800; // 2101-01-01
 
@@ -344,7 +345,7 @@ mod tests {
         now.truncated_to(Duration::from_secs(24 * 60 * 60))
     }
 
-    fn create_authorization_header_for_user(frontend: &Frontend, user_id: &str) -> String {
+    pub fn create_authorization_header_for_user(frontend: &Frontend, user_id: &str) -> String {
         let public_server_params = frontend.zkparams.get_public_params();
         let user_id = FromHex::from_hex(user_id).expect("valid user ID");
         let redemption_time = start_of_today().as_secs();
@@ -369,7 +370,7 @@ mod tests {
         )
     }
 
-    fn create_authorization_header_for_creator(frontend: &Frontend, user_id: &str) -> String {
+    pub fn create_authorization_header_for_creator(frontend: &Frontend, user_id: &str) -> String {
         let public_server_params = frontend.zkparams.get_public_params();
         let user_id = FromHex::from_hex(user_id).expect("valid user ID");
         let room_id = Vec::from_hex(ROOM_ID).expect("valid room ID");
@@ -398,7 +399,7 @@ mod tests {
         )
     }
 
-    fn default_call_link_state() -> storage::CallLinkState {
+    pub fn default_call_link_state() -> storage::CallLinkState {
         storage::CallLinkState {
             room_id: ROOM_ID.into(),
             admin_passkey: ADMIN_PASSKEY.into(),
