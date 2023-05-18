@@ -558,8 +558,8 @@ impl Storage for DynamoDb {
             .client
             .query()
             .table_name(&self.table_name)
-            .key_condition_expression("#room_id = :value")
-            .expression_attribute_names("#room_id", "room_id")
+            .key_condition_expression("#roomId = :value")
+            .expression_attribute_names("#roomId", "roomId")
             .expression_attribute_values(":value", AttributeValue::S(room_id.as_ref().to_string()))
             .consistent_read(true)
             .select(Select::AllAttributes)
