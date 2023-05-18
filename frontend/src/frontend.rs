@@ -409,6 +409,7 @@ impl Frontend {
             })
     }
 
+    #[track_caller]
     fn log_error(context: &str, err: Error) {
         // Custom format the error using up to the first two errors in the chain. This is
         // enough to get single line description of the error.
@@ -416,10 +417,29 @@ impl Frontend {
         err.chain().skip(1).take(1).for_each(|cause| {
             let _ = write!(error_string, ": {}", cause);
         });
-        error!("{}: {}", context, error_string);
+        let location = std::panic::Location::caller();
+        log::logger().log(
+            &Record::builder()
+                .level(log::Level::Error)
+                .target(module_path!())
+                .file(Some(location.file()))
+                .line(Some(location.line()))
+                .args(format_args!("{context}: {error_string}"))
+                .build(),
+        );
     }
 
+    #[track_caller]
     fn log_warning(context: &str, err: Error) {
-        warn!("{}: {}", context, err.root_cause());
+        let location = std::panic::Location::caller();
+        log::logger().log(
+            &Record::builder()
+                .level(log::Level::Warn)
+                .target(module_path!())
+                .file(Some(location.file()))
+                .line(Some(location.line()))
+                .args(format_args!("{}: {}", context, err.root_cause()))
+                .build(),
+        );
     }
 }
