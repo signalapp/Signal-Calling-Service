@@ -1445,17 +1445,21 @@ impl ReceiverReportSender {
 
         // The difference in receive time (interarrival time) converted to the units of the RTP
         // timestamps.
-        let receive_diff_rtp = receive_diff.as_millis() as u32 * payload_freq_hz / 1000;
+        let receive_diff_rtp =
+            (receive_diff.as_millis() as u32).saturating_mul(payload_freq_hz) / 1000;
 
         // The difference in transmission time represented in the units of RTP timestamps.
         let tx_diff_rtp = (receive_diff_rtp as i64)
             .saturating_sub(rtp_timestamp.saturating_sub(self.last_rtp_timestamp) as i64)
             .unsigned_abs() as u32;
 
-        let jitter_diff_q4 = (tx_diff_rtp << 4) as i32 - self.jitter_q4 as i32;
-        self.jitter_q4 = self
-            .jitter_q4
-            .saturating_add_signed((jitter_diff_q4 + 8) >> 4);
+        // If the jump in timestamp is large, ignore the value to avoid skewing the jitter.
+        if tx_diff_rtp < 10 * payload_freq_hz {
+            let jitter_diff_q4 = (tx_diff_rtp << 4) as i32 - self.jitter_q4 as i32;
+            self.jitter_q4 = self
+                .jitter_q4
+                .saturating_add_signed((jitter_diff_q4 + 8) >> 4);
+        }
     }
 
     fn write_receiver_report_block(&mut self, ssrc: Ssrc) -> Option<Vec<u8>> {
