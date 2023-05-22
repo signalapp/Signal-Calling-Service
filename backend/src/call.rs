@@ -367,6 +367,7 @@ impl Call {
     ) {
         time_scope_us!("calling.call.add_client");
 
+        let previous_client_count = self.clients.len();
         self.clients.push(Client::new(
             demux_id,
             user_id,
@@ -377,7 +378,7 @@ impl Call {
         ));
         // An update message to clients about clients will be sent at the next tick().
         let increment = now.saturating_duration_since(self.client_added_or_removed);
-        match self.clients.len() {
+        match previous_client_count {
             0 => self.call_time.empty += increment,
             1 => self.call_time.solo += increment,
             2 => self.call_time.pair += increment,
@@ -397,12 +398,12 @@ impl Call {
             .iter()
             .position(|client| client.demux_id == demux_id)
         {
+            let previous_client_count = self.clients.len();
             self.clients.swap_remove(index);
 
             // An update message to clients about clients will be sent at the next tick().
             let increment = now.saturating_duration_since(self.client_added_or_removed);
-            match self.clients.len() {
-                0 => self.call_time.empty += increment,
+            match previous_client_count {
                 1 => self.call_time.solo += increment,
                 2 => self.call_time.pair += increment,
                 _ => self.call_time.many += increment,
