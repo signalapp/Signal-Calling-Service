@@ -13,7 +13,10 @@ use std::{
         SocketAddr, TcpListener, TcpStream, UdpSocket,
     },
     os::unix::io::{AsRawFd, FromRawFd, RawFd},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        Arc,
+    },
 };
 
 use anyhow::Result;
@@ -26,7 +29,11 @@ use scopeguard::ScopeGuard;
 use unique_id::sequence::SequenceGenerator;
 use unique_id::Generator;
 
-use crate::{metrics::TimingOptions, packet_server::SocketLocator, sfu};
+use crate::{
+    metrics::TimingOptions,
+    packet_server::SocketLocator,
+    sfu::{self, SfuStats},
+};
 
 /// Controls number of sockets a particular thread will handle without going back to epoll.
 ///
@@ -42,7 +49,7 @@ const MAX_EPOLL_EVENTS: usize = 16;
 const CLOSED_SOCKET_EXPIRATION_IN_TICKS: u32 = 10;
 
 /// How long to keep the TCP connection in a connected state without any data.
-const TCP_INACTIVE_CONNECTION_TTL_TICKS: usize = 100;
+const TCP_INACTIVE_CONNECTION_TTL_TICKS: u64 = 100;
 
 /// How many pending connections to allow on the TCP listen connection.
 const TCP_BACKLOG: usize = 128;
@@ -66,13 +73,14 @@ const TCP_SEND_BUFFER_BYTES: usize = 10_000_000 / 8;
 /// closed.
 ///
 /// [epoll]: https://man7.org/linux/man-pages/man7/epoll.7.html
-pub(super) struct PacketServerState {
+pub struct PacketServerState {
     local_addr_udp: SocketAddr,
     new_client_socket: Socket,
     new_tcp_socket: TcpListener,
     all_epoll_fds: Vec<RawFd>,
     all_connections: RwLock<ConnectionMap>,
     tick_interval: Duration,
+    tick_number: AtomicU64, // u64 will never rollover
     tcp_id_generator: SequenceGenerator,
 }
 
@@ -100,6 +108,7 @@ impl PacketServerState {
             all_epoll_fds,
             all_connections: RwLock::new(ConnectionMap::new()),
             tick_interval,
+            tick_number: 0.into(),
             tcp_id_generator,
         };
         result.add_socket_to_poll_for_reads(&result.new_client_socket)?;
@@ -280,6 +289,7 @@ impl PacketServerState {
                                 write_lock.get_or_insert_connected(
                                     client_socket,
                                     SocketLocator::Tcp { id, is_ipv6 },
+                                    Some(self.tick_number.load(AtomicOrdering::Relaxed)),
                                 );
                             }
                         }
@@ -541,7 +551,7 @@ impl PacketServerState {
                                 self.add_socket_to_poll_for_reads(&client_socket)?;
                                 let client_socket = Socket::Udp(client_socket);
                                 let client_socket =
-                                    write_lock.get_or_insert_connected(client_socket, addr);
+                                    write_lock.get_or_insert_connected(client_socket, addr, None);
                                 if !Self::send_and_keep(client_socket, buf) {
                                     write_lock.mark_closed(&addr, Instant::now());
                                 }
@@ -567,6 +577,7 @@ impl PacketServerState {
     /// This includes cleaning up connections for clients that have left or the quiet ones that
     /// reached ttl without having passed any data.
     pub fn tick(&self, mut tick_update: sfu::TickOutput) -> Result<()> {
+        let tick_number = self.tick_number.fetch_add(1, AtomicOrdering::Relaxed);
         time_scope_us!("calling.packet_server.tick");
 
         {
@@ -604,8 +615,8 @@ impl PacketServerState {
         {
             time_scope_us!("calling.packet_server.tick.inactive_sender");
             self.all_connections
-                .write()
-                .for_each_inactive_sender(|locator| {
+                .read()
+                .for_each_inactive_sender(tick_number, |locator| {
                     tick_update.expired_client_addrs.push(*locator)
                 });
         }
@@ -661,6 +672,27 @@ impl PacketServerState {
             }
         }
         Ok(())
+    }
+
+    pub fn get_stats(&self) -> SfuStats {
+        let histograms = HashMap::new();
+        let mut values = HashMap::new();
+        {
+            let connections_lock = self.all_connections.read();
+            values.insert(
+                "calling.packet_server.connection_map.by_fd.count",
+                connections_lock.by_fd.len() as f32,
+            );
+            values.insert(
+                "calling.packet_server.connection_map.by_peer_addr.count",
+                connections_lock.by_peer_addr.len() as f32,
+            );
+            values.insert(
+                "calling.packet_server.connection_map.inactive_ttls.count",
+                connections_lock.inactive_ttls.len() as f32,
+            );
+        }
+        SfuStats { histograms, values }
     }
 }
 
@@ -909,9 +941,8 @@ struct ConnectionMap<T = Socket> {
     /// connection to that socket was closed.
     by_peer_addr: HashMap<SocketLocator, ConnectionState<RawFd>>,
 
-    /// Mapping of connections in Connected state to the number of ticks they are allowed to stay
-    /// alive without receiving any data.
-    inactive_ttls: HashMap<SocketLocator, usize>,
+    /// Mapping of connections in Connected state to the number of the tick after which they expire.
+    inactive_ttls: HashMap<SocketLocator, u64>,
 }
 
 /// Represents the state of a connection in a [ConnectionMap].
@@ -942,7 +973,12 @@ impl<T: AsRawFd> ConnectionMap<T> {
     /// underlying socket closed).
     /// New non-UDP sockets are tracked as inactive, because the SFU only
     /// manages their lifetime once they send a valid ICE binding.
-    fn get_or_insert_connected(&mut self, socket: T, peer_addr: SocketLocator) -> &T {
+    fn get_or_insert_connected(
+        &mut self,
+        socket: T,
+        peer_addr: SocketLocator,
+        current_tick: Option<u64>,
+    ) -> &T {
         let fd = socket.as_raw_fd();
         let is_udp = matches!(peer_addr, SocketLocator::Udp(_));
 
@@ -981,7 +1017,11 @@ impl<T: AsRawFd> ConnectionMap<T> {
         };
         if !is_udp {
             if let hash_map::Entry::Vacant(entry) = self.inactive_ttls.entry(peer_addr) {
-                entry.insert(TCP_INACTIVE_CONNECTION_TTL_TICKS);
+                if let Some(current_tick) = current_tick {
+                    entry.insert(TCP_INACTIVE_CONNECTION_TTL_TICKS + current_tick);
+                } else {
+                    error!("current_tick was not provided to get_or_insert_connected when adding new tcp socket")
+                }
             }
         }
         inserted_socket
@@ -1017,7 +1057,13 @@ impl<T: AsRawFd> ConnectionMap<T> {
             ConnectionState::NotYetConnected => {
                 unreachable!("should not be in the table at all")
             }
-            ConnectionState::Connected(fd) | ConnectionState::New(fd) => {
+            ConnectionState::Connected(fd) => {
+                let socket = self.by_fd.remove(fd);
+                *entry = ConnectionState::Closed(now);
+                socket
+            }
+            ConnectionState::New(fd) => {
+                self.inactive_ttls.remove(peer_addr);
                 let socket = self.by_fd.remove(fd);
                 *entry = ConnectionState::Closed(now);
                 socket
@@ -1081,18 +1127,15 @@ impl<T: AsRawFd> ConnectionMap<T> {
 
     /// Decrements the TTL for each of the inactive candidates, invoking a callback
     /// for all connections that reached end of life and removing them
-    fn for_each_inactive_sender<F>(&mut self, mut f: F)
+    fn for_each_inactive_sender<F>(&self, current_tick: u64, mut f: F)
     where
         F: FnMut(&SocketLocator),
     {
-        self.inactive_ttls.retain(|locator, ttl| {
-            *ttl = ttl.saturating_sub(1);
-            let ttl_reached = *ttl == 0usize;
-            if ttl_reached {
+        for (locator, ttl) in self.inactive_ttls.iter() {
+            if current_tick >= *ttl {
                 f(locator);
             }
-            !ttl_reached
-        });
+        }
     }
 }
 
@@ -1135,7 +1178,7 @@ mod tests {
         let fd = 5;
         let id = 55;
         let socket = FakeSocket { fd, id };
-        let socket_ref = map.get_or_insert_connected(socket, addr);
+        let socket_ref = map.get_or_insert_connected(socket, addr, None);
         assert_eq!(socket_ref.id, id);
 
         assert_eq!(map.get_by_fd(fd).expect("present").id, id);
@@ -1176,12 +1219,12 @@ mod tests {
         let fd = 5;
         let id = 55;
         let socket = FakeSocket { fd, id };
-        let socket_ref = map.get_or_insert_connected(socket, addr);
+        let socket_ref = map.get_or_insert_connected(socket, addr, None);
         assert_eq!(socket_ref.id, id);
 
         // Check that we don't replace an existing connection.
         let new_socket = FakeSocket { fd, id: id + 1 };
-        let socket_ref = map.get_or_insert_connected(new_socket, addr);
+        let socket_ref = map.get_or_insert_connected(new_socket, addr, None);
         assert_eq!(socket_ref.id, id);
 
         assert_eq!(map.get_by_fd(fd).expect("present").id, id);
@@ -1203,14 +1246,14 @@ mod tests {
         let fd = 5;
         let id = 55;
         let socket = FakeSocket { fd, id };
-        let socket_ref = map.get_or_insert_connected(socket, addr);
+        let socket_ref = map.get_or_insert_connected(socket, addr, None);
         assert_eq!(socket_ref.id, id);
 
         map.mark_closed(&addr, Instant::now());
         // But don't remove it!
 
         let new_socket = FakeSocket { fd, id: id + 1 };
-        let socket_ref = map.get_or_insert_connected(new_socket, addr);
+        let socket_ref = map.get_or_insert_connected(new_socket, addr, None);
         assert_eq!(socket_ref.id, id + 1);
     }
 
@@ -1223,7 +1266,7 @@ mod tests {
         let fd = 5;
         let id = 55;
         let socket = FakeSocket { fd, id };
-        let socket_ref = map.get_or_insert_connected(socket, addr);
+        let socket_ref = map.get_or_insert_connected(socket, addr, None);
         assert_eq!(socket_ref.id, id);
 
         // Try to remove.
@@ -1252,18 +1295,11 @@ mod tests {
         let fd = 5;
         let id = 55;
         let socket = FakeSocket { fd, id };
-        let _ = map.get_or_insert_connected(socket, addr);
+        let _ = map.get_or_insert_connected(socket, addr, Some(0));
 
         assert_eq!(
             map.inactive_ttls,
             HashMap::from([(addr, TCP_INACTIVE_CONNECTION_TTL_TICKS)])
-        );
-
-        // Make sure the TTL gets decremented on each tick
-        map.for_each_inactive_sender(|_| {});
-        assert_eq!(
-            map.inactive_ttls[&addr],
-            TCP_INACTIVE_CONNECTION_TTL_TICKS - 1usize
         );
 
         // Simulate getting close to reaching TTL
@@ -1271,14 +1307,12 @@ mod tests {
             .get_mut(&addr)
             .expect("entry should exist") = 1;
         let mut is_callback_invoked = false;
-        map.for_each_inactive_sender(|_| is_callback_invoked = true);
+        map.for_each_inactive_sender(TCP_INACTIVE_CONNECTION_TTL_TICKS, |_| {
+            is_callback_invoked = true
+        });
         assert!(
             is_callback_invoked,
             "Callback should have been called for an inactive"
-        );
-        assert!(
-            map.inactive_ttls.is_empty(),
-            "The only connections should have been removed"
         );
     }
 
@@ -1294,7 +1328,12 @@ mod tests {
         let fd = 5;
         let id = 55;
         let socket = FakeSocket { fd, id };
-        let _ = map.get_or_insert_connected(socket, addr);
+        let _ = map.get_or_insert_connected(socket, addr, Some(0));
+
+        assert_eq!(
+            map.inactive_ttls,
+            HashMap::from([(addr, TCP_INACTIVE_CONNECTION_TTL_TICKS)])
+        );
 
         map.mark_as_active(&addr);
         assert!(

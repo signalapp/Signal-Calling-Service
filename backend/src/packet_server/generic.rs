@@ -4,6 +4,7 @@
 //
 
 use std::{
+    collections::HashMap,
     future::Future,
     net::{SocketAddr, UdpSocket},
     sync::Arc,
@@ -13,14 +14,18 @@ use anyhow::Result;
 use calling_common::Duration;
 use log::*;
 
-use crate::{metrics::TimingOptions, packet_server::SocketLocator, sfu};
+use crate::{
+    metrics::TimingOptions,
+    packet_server::SocketLocator,
+    sfu::{self, SfuStats},
+};
 
 /// The shared state for a generic packet server, only UDP is supported.
 ///
 /// This server is implemented with a single socket for all sends and receives. Multiple threads can
 /// use the socket, but this only helps if packet processing takes a long time. Otherwise they'll
 /// just block in the kernel trying to send.
-pub(super) struct PacketServerState {
+pub struct PacketServerState {
     socket: UdpSocket,
     num_threads: usize,
 }
@@ -112,5 +117,11 @@ impl PacketServerState {
             self.send_packet(&buf, addr);
         }
         Ok(())
+    }
+
+    pub fn get_stats(&self) -> SfuStats {
+        let histograms = HashMap::new();
+        let values = HashMap::new();
+        SfuStats { histograms, values }
     }
 }

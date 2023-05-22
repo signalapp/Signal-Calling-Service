@@ -22,11 +22,11 @@ use tokio::sync::oneshot::Receiver;
 #[cfg(all(feature = "epoll", target_os = "linux"))]
 mod epoll;
 #[cfg(all(feature = "epoll", target_os = "linux"))]
-use epoll::*;
+pub use epoll::PacketServerState;
 #[cfg(not(all(feature = "epoll", target_os = "linux")))]
 mod generic;
 #[cfg(not(all(feature = "epoll", target_os = "linux")))]
-use generic::*;
+pub use generic::PacketServerState;
 
 use calling_common::{Duration, Instant, ThreadPool};
 
@@ -67,13 +67,18 @@ pub async fn start(
         PacketServerState::new(local_addr_udp, local_addr_tcp, num_threads, tick_interval)?;
     let packet_handler_state_for_tick = packet_handler_state.clone();
     let packet_handler_state_for_dequeue = packet_handler_state.clone();
+    let packet_handler_state_for_stats = packet_handler_state.clone();
 
     let sfu_for_tick = sfu.clone();
+    let sfu_for_cleanup = sfu.clone();
 
     info!(
         "packet_server ready: udp {:?}, tcp {:?}; starting {} threads",
         local_addr_udp, local_addr_tcp, num_threads
     );
+
+    sfu.lock()
+        .set_packet_server(Some(packet_handler_state_for_stats));
 
     let thread_pool = ThreadPool::new(num_threads);
 
@@ -168,6 +173,7 @@ pub async fn start(
         _ = packet_ender_rx => {},
     );
 
+    sfu_for_cleanup.lock().set_packet_server(None);
     info!("packet_server shutdown");
     Ok(())
 }

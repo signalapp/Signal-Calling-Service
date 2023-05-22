@@ -30,7 +30,7 @@ use crate::{
     ice::BindingRequest,
     metrics::{Histogram, Timer},
     pacer,
-    packet_server::SocketLocator,
+    packet_server::{PacketServerState, SocketLocator},
     region::Region,
     rtp,
 };
@@ -134,6 +134,8 @@ pub struct Sfu {
     activity_checked: Instant,
     /// The last time diagnostics were logged.
     diagnostics_logged: Instant,
+    /// A reference to the packet server state.
+    packet_server: Option<Arc<PacketServerState>>,
 }
 
 /// The state that results from the SFU receiving a tick event, to be processed by the packet server.
@@ -164,6 +166,7 @@ impl Sfu {
             ),
             activity_checked: now,
             diagnostics_logged: now,
+            packet_server: None,
         })
     }
 
@@ -188,10 +191,20 @@ impl Sfu {
         })
     }
 
+    pub fn set_packet_server(&mut self, server: Option<Arc<PacketServerState>>) {
+        self.packet_server = server;
+    }
+
     /// Gives a snapshot of current metrics, such as call size.
     pub fn get_stats(&self) -> SfuStats {
-        let mut histograms = HashMap::new();
-        let mut values = HashMap::new();
+        let (mut histograms, mut values);
+
+        if let Some(server) = &self.packet_server {
+            SfuStats { histograms, values } = server.get_stats();
+        } else {
+            histograms = HashMap::new();
+            values = HashMap::new();
+        }
 
         let mut all_clients = 0;
         let mut calls_above_one = 0;
