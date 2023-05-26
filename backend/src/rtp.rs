@@ -252,7 +252,7 @@ impl Header {
                     "Invalid RTP: not using 1-byte extensions; profile = 0x{:x}",
                     extensions_profile
                 );
-                warn!("{}", hex::encode(&packet[..packet.len().min(100)]));
+                debug!("{}", hex::encode(&packet[..packet.len().min(100)]));
                 return None;
             }
 
@@ -273,11 +273,11 @@ impl Header {
                 if extension_val.len() < extension_len {
                     warn!(
                         "Invalid RTP: extension too short: {} < {}.  ID = {}",
-                        extension_len,
                         extension_val.len(),
+                        extension_len,
                         extension_id,
                     );
-                    warn!("{}", hex::encode(&packet[..packet.len().min(100)]));
+                    debug!("{}", hex::encode(&packet[..packet.len().min(100)]));
                     return None;
                 }
                 let extension_val = &extension_val[..extension_len];
@@ -314,7 +314,7 @@ impl Header {
                 payload_start,
                 packet.len()
             );
-            warn!("{}", hex::encode(&packet[..packet.len().min(100)]));
+            debug!("{}", hex::encode(&packet[..packet.len().min(100)]));
             return None;
         }
         let payload_end = packet.len() - SRTP_AUTH_TAG_LEN;
