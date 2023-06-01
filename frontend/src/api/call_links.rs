@@ -8,8 +8,9 @@ use std::{fmt::Debug, sync::Arc, time::SystemTime};
 use anyhow::Result;
 use axum::{
     extract::{Path, State},
+    headers::{self, Header, HeaderName, HeaderValue},
     response::IntoResponse,
-    Extension, Json,
+    Extension, Json, TypedHeader,
 };
 use bincode::Options;
 use http::StatusCode;
@@ -24,6 +25,7 @@ use crate::{
     frontend::{self, Frontend},
     storage::{self, CallLinkRestrictions, CallLinkUpdateError},
 };
+static X_ROOM_ID: HeaderName = HeaderName::from_static("x-room-id");
 
 #[serde_as]
 #[derive(Serialize, Debug)]
@@ -49,6 +51,37 @@ impl TryFrom<String> for RoomId {
             return Err(StatusCode::BAD_REQUEST);
         }
         Ok(Self(value.into()))
+    }
+}
+
+impl Header for RoomId {
+    fn name() -> &'static HeaderName {
+        &X_ROOM_ID
+    }
+    fn decode<'i, I>(values: &mut I) -> Result<Self, headers::Error>
+    where
+        I: Iterator<Item = &'i HeaderValue>,
+    {
+        let value = values.next().ok_or_else(headers::Error::invalid)?;
+        if values.next().is_some() {
+            return Err(headers::Error::invalid());
+        }
+        if value.is_empty() || value.len() > 128 {
+            return Err(headers::Error::invalid());
+        }
+        if let Ok(value) = value.to_str() {
+            Ok(Self(value.into()))
+        } else {
+            Err(headers::Error::invalid())
+        }
+    }
+    fn encode<E>(&self, values: &mut E)
+    where
+        E: Extend<HeaderValue>,
+    {
+        if let Ok(value) = HeaderValue::from_str(self.0.as_ref()) {
+            values.extend(std::iter::once(value));
+        }
     }
 }
 
@@ -123,10 +156,19 @@ pub fn verify_auth_credential_against_zkparams(
 }
 
 /// Handler for the GET /call-link/{room_id} route.
+pub async fn read_call_link_with_path(
+    frontend: State<Arc<Frontend>>,
+    auth_credential: Extension<Arc<CallLinkAuthCredentialPresentation>>,
+    Path(room_id): Path<RoomId>,
+) -> Result<impl IntoResponse, StatusCode> {
+    read_call_link(frontend, auth_credential, axum::TypedHeader(room_id)).await
+}
+
+/// Handler for the GET /call-link/{room_id} route.
 pub async fn read_call_link(
     State(frontend): State<Arc<Frontend>>,
     Extension(auth_credential): Extension<Arc<CallLinkAuthCredentialPresentation>>,
-    Path(room_id): Path<RoomId>,
+    TypedHeader(room_id): TypedHeader<RoomId>,
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("read_call_link:");
 
@@ -151,11 +193,29 @@ pub async fn read_call_link(
 }
 
 /// Handler for the PUT /call-link/{room_id} route.
+pub async fn update_call_link_with_path(
+    frontend: State<Arc<Frontend>>,
+    auth_credential: Option<Extension<Arc<CallLinkAuthCredentialPresentation>>>,
+    create_credential: Option<Extension<Arc<CreateCallLinkCredentialPresentation>>>,
+    Path(room_id): Path<RoomId>,
+    update: Json<CallLinkUpdate>,
+) -> Result<impl IntoResponse, StatusCode> {
+    update_call_link(
+        frontend,
+        auth_credential,
+        create_credential,
+        axum::TypedHeader(room_id),
+        update,
+    )
+    .await
+}
+
+/// Handler for the PUT /call-link/{room_id} route.
 pub async fn update_call_link(
     State(frontend): State<Arc<Frontend>>,
     auth_credential: Option<Extension<Arc<CallLinkAuthCredentialPresentation>>>,
     create_credential: Option<Extension<Arc<CreateCallLinkCredentialPresentation>>>,
-    Path(room_id): Path<RoomId>,
+    TypedHeader(room_id): TypedHeader<RoomId>,
     Json(mut update): Json<CallLinkUpdate>,
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("update_call_link:");
@@ -232,7 +292,7 @@ pub async fn update_call_link(
 
         verify_auth_credential_against_zkparams(&auth_credential, &existing_call_link, &frontend)?;
     } else {
-        error!("middleware should have enforced either anon or create auth");
+        error!("neither anon nor create auth provided");
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -297,6 +357,8 @@ pub mod tests {
     pub const USER_ID_1_DOUBLE_ENCODED: &str = "00b033dec3c913aa7d087a49be7bbf4115cd441453778a73d5c705f3515d500841b867748697709fe3f587f796d6c9b20104a27cd1250af6b330fc0dd4eda07005";
     const ROOM_ID: &str = "ff0000dd";
     pub const ADMIN_PASSKEY: &[u8] = b"swordfish";
+
+    pub const X_ROOM_ID: &str = "X-Room-Id";
 
     const DISTANT_FUTURE_IN_EPOCH_SECONDS: u64 = 4133980800; // 2101-01-01
 
@@ -419,6 +481,7 @@ pub mod tests {
         storage
             .expect_get_call_link()
             .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
             .return_once(|_| Ok(None));
         let frontend = create_frontend(storage);
 
@@ -428,7 +491,8 @@ pub mod tests {
         // Create the request.
         let request = Request::builder()
             .method(http::Method::GET)
-            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
             .header(header::USER_AGENT, "test/user/agent")
             .header(
                 header::AUTHORIZATION,
@@ -449,6 +513,7 @@ pub mod tests {
         storage
             .expect_get_call_link()
             .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
             .return_once(|_| {
                 Ok(Some(storage::CallLinkState {
                     zkparams: bincode::serialize(
@@ -467,7 +532,8 @@ pub mod tests {
         // Create the request.
         let request = Request::builder()
             .method(http::Method::GET)
-            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
             .header(header::USER_AGENT, "test/user/agent")
             .header(
                 header::AUTHORIZATION,
@@ -482,12 +548,67 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_missing_room_id() {
+        // Create mocked dependencies with expectations.
+        let storage = Box::new(MockStorage::new());
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/v1/call-link".to_string())
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_multiple_room_id() {
+        // Create mocked dependencies with expectations.
+        let storage = Box::new(MockStorage::new());
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn test_get_success() {
         // Create mocked dependencies with expectations.
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link()
             .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
             .return_once(|_| Ok(Some(default_call_link_state())));
         let frontend = create_frontend(storage);
 
@@ -497,7 +618,8 @@ pub mod tests {
         // Create the request.
         let request = Request::builder()
             .method(http::Method::GET)
-            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
             .header(header::USER_AGENT, "test/user/agent")
             .header(
                 header::AUTHORIZATION,
@@ -511,7 +633,7 @@ pub mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        // Compare as JSON Values to check the encoding of the non-primitive types.
+        // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({
@@ -530,6 +652,7 @@ pub mod tests {
         storage
             .expect_get_call_link()
             .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
             .return_once(|_| {
                 Ok(Some(storage::CallLinkState {
                     encrypted_name: b"abc".to_vec(),
@@ -546,7 +669,8 @@ pub mod tests {
         // Create the request.
         let request = Request::builder()
             .method(http::Method::GET)
-            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
             .header(header::USER_AGENT, "test/user/agent")
             .header(
                 header::AUTHORIZATION,
@@ -560,7 +684,7 @@ pub mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        // Compare as JSON Values to check the encoding of the non-primitive types.
+        // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({
@@ -584,7 +708,8 @@ pub mod tests {
         // Create the request.
         let request = Request::builder()
             .method(http::Method::PUT)
-            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
             .header(header::USER_AGENT, "test/user/agent")
             .header(
                 header::AUTHORIZATION,
@@ -619,7 +744,8 @@ pub mod tests {
         // Create the request.
         let request = Request::builder()
             .method(http::Method::PUT)
-            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
             .header(header::USER_AGENT, "test/user/agent")
             .header(
                 header::AUTHORIZATION,
@@ -641,6 +767,743 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_create_wrong_zkparams() {
+        // Create mocked dependencies with expectations.
+        let storage = Box::new(MockStorage::new());
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let wrong_params = CallLinkSecretParams::derive_from_root_key(b"wrong");
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_creator(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "zkparams": base64::encode(
+                        bincode::serialize(&wrong_params.get_public_params()).unwrap(),
+                    )
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_create_success() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage.expect_update_call_link().once().return_once(
+            |room_id, new_attributes, zkparams_for_creation| {
+                assert_eq!(room_id.as_ref(), ROOM_ID);
+                assert_eq!(
+                    new_attributes,
+                    storage::CallLinkUpdate {
+                        admin_passkey: ADMIN_PASSKEY.into(),
+                        restrictions: None,
+                        encrypted_name: None,
+                        revoked: None,
+                    }
+                );
+                assert!(zkparams_for_creation.is_some());
+                Ok(default_call_link_state())
+            },
+        );
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_creator(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "zkparams": base64::encode(
+                        bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params()).unwrap(),
+                    )
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        // Compare as JSON values to check the encoding of the non-primitive types.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "restrictions": "none",
+                "name": "",
+                "revoked": false,
+                "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_with_initial_values() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage.expect_update_call_link().once().return_once(
+            |room_id, new_attributes, zkparams_for_creation| {
+                assert_eq!(room_id.as_ref(), ROOM_ID);
+                assert_eq!(
+                    new_attributes,
+                    storage::CallLinkUpdate {
+                        admin_passkey: ADMIN_PASSKEY.into(),
+                        restrictions: Some(CallLinkRestrictions::AdminApproval),
+                        encrypted_name: Some(b"abc".to_vec()),
+                        revoked: None,
+                    }
+                );
+                assert!(zkparams_for_creation.is_some());
+                // Remember that we're not testing the storage logic here.
+                // This is the return value the real storage implementation will produce
+                // for a new room, or for an existing room whose parameters all match.
+                Ok(storage::CallLinkState {
+                    encrypted_name: b"abc".to_vec(),
+                    restrictions: CallLinkRestrictions::AdminApproval,
+                    ..default_call_link_state()
+                })
+            },
+        );
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_creator(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "zkparams": base64::encode(
+                        bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params()).unwrap(),
+                    ),
+                    "restrictions": "adminApproval",
+                    "name": base64::encode(b"abc"),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        // Compare as JSON values to check the encoding of the non-primitive types.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "restrictions": "adminApproval",
+                "name": base64::encode(b"abc"),
+                "revoked": false,
+                "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_conflict() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage.expect_update_call_link().once().return_once(
+            |room_id, new_attributes, zkparams_for_creation| {
+                assert_eq!(room_id.as_ref(), ROOM_ID);
+                assert_eq!(
+                    new_attributes,
+                    storage::CallLinkUpdate {
+                        admin_passkey: ADMIN_PASSKEY.into(),
+                        restrictions: None,
+                        encrypted_name: None,
+                        revoked: None,
+                    }
+                );
+                assert!(zkparams_for_creation.is_some());
+                Err(storage::CallLinkUpdateError::AdminPasskeyDidNotMatch)
+            },
+        );
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_creator(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "zkparams": base64::encode(
+                        bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params()).unwrap(),
+                    ),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_update_missing_admin_passkey() {
+        // Create mocked dependencies with expectations.
+        let storage = Box::new(MockStorage::new());
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({})).unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        // This error comes from the Json extractor.
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_update_with_zkparams() {
+        // Create mocked dependencies with expectations.
+        let storage = Box::new(MockStorage::new());
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "zkparams": base64::encode(
+                        bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params()).unwrap(),
+                    ),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_not_found() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link()
+            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
+            .return_once(|_| Ok(None));
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_update_wrong_zkparams() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link()
+            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
+            .return_once(|_| {
+                Ok(Some(storage::CallLinkState {
+                    zkparams: bincode::serialize(
+                        &CallLinkSecretParams::derive_from_root_key(b"different")
+                            .get_public_params(),
+                    )
+                    .unwrap(),
+                    ..default_call_link_state()
+                }))
+            });
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_update_wrong_passkey() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link()
+            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
+            .return_once(|_| Ok(Some(default_call_link_state())));
+        storage.expect_update_call_link().once().return_once(
+            |room_id, new_attributes, zkparams_for_creation| {
+                assert_eq!(room_id.as_ref(), ROOM_ID);
+                assert_eq!(
+                    new_attributes,
+                    storage::CallLinkUpdate {
+                        admin_passkey: b"different".to_vec(),
+                        restrictions: None,
+                        encrypted_name: None,
+                        revoked: None,
+                    }
+                );
+                assert!(zkparams_for_creation.is_none());
+                Err(storage::CallLinkUpdateError::AdminPasskeyDidNotMatch)
+            },
+        );
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": base64::encode(b"different"),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_update_success() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link()
+            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
+            .return_once(|_| Ok(Some(default_call_link_state())));
+        storage.expect_update_call_link().once().return_once(
+            |room_id, new_attributes, zkparams_for_creation| {
+                assert_eq!(room_id.as_ref(), ROOM_ID);
+                assert_eq!(
+                    new_attributes,
+                    storage::CallLinkUpdate {
+                        admin_passkey: ADMIN_PASSKEY.into(),
+                        restrictions: Some(CallLinkRestrictions::AdminApproval),
+                        encrypted_name: Some(b"abc".to_vec()),
+                        revoked: None,
+                    }
+                );
+                assert!(zkparams_for_creation.is_none());
+                // Remember that we're not testing the storage logic here.
+                Ok(storage::CallLinkState {
+                    encrypted_name: b"abc".to_vec(),
+                    restrictions: CallLinkRestrictions::AdminApproval,
+                    ..default_call_link_state()
+                })
+            },
+        );
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "restrictions": "adminApproval",
+                    "name": base64::encode(b"abc"),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        // Compare as JSON values to check the encoding of the non-primitive types.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "restrictions": "adminApproval",
+                "name": base64::encode(b"abc"),
+                "revoked": false,
+                "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+            })
+        );
+    }
+
+    // tests with old style urls
+    #[tokio::test]
+    async fn test_old_get_not_found() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link()
+            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
+            .return_once(|_| Ok(None));
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_old_get_wrong_zkparams() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link()
+            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
+            .return_once(|_| {
+                Ok(Some(storage::CallLinkState {
+                    zkparams: bincode::serialize(
+                        &CallLinkSecretParams::derive_from_root_key(b"different")
+                            .get_public_params(),
+                    )
+                    .unwrap(),
+                    ..default_call_link_state()
+                }))
+            });
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_old_get_success() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link()
+            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
+            .return_once(|_| Ok(Some(default_call_link_state())));
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        // Compare as JSON values to check the encoding of the non-primitive types.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "restrictions": "none",
+                "name": "",
+                "revoked": false,
+                "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_old_get_success_alternate_values() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link()
+            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
+            .return_once(|_| {
+                Ok(Some(storage::CallLinkState {
+                    encrypted_name: b"abc".to_vec(),
+                    revoked: true,
+                    restrictions: CallLinkRestrictions::AdminApproval,
+                    ..default_call_link_state()
+                }))
+            });
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        // Compare as JSON values to check the encoding of the non-primitive types.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "restrictions": "adminApproval",
+                "name": base64::encode(b"abc"),
+                "revoked": true,
+                "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_old_create_missing_admin_passkey() {
+        // Create mocked dependencies with expectations.
+        let storage = Box::new(MockStorage::new());
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_creator(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "zkparams": base64::encode(
+                        bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params()).unwrap(),
+                    )
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        // This error comes from the Json extractor.
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_old_create_missing_zkparams() {
+        // Create mocked dependencies with expectations.
+        let storage = Box::new(MockStorage::new());
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri(format!("/v1/call-link/{ROOM_ID}"))
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_creator(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_old_create_wrong_zkparams() {
         // Create mocked dependencies with expectations.
         let storage = Box::new(MockStorage::new());
         let frontend = create_frontend(storage);
@@ -676,10 +1539,10 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_success() {
+    async fn test_old_create_success() {
         // Create mocked dependencies with expectations.
         let mut storage = Box::new(MockStorage::new());
-        storage.expect_update_call_link().return_once(
+        storage.expect_update_call_link().once().return_once(
             |room_id, new_attributes, zkparams_for_creation| {
                 assert_eq!(room_id.as_ref(), ROOM_ID);
                 assert_eq!(
@@ -726,7 +1589,7 @@ pub mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        // Compare as JSON Values to check the encoding of the non-primitive types.
+        // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({
@@ -739,10 +1602,10 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_with_initial_values() {
+    async fn test_old_create_with_initial_values() {
         // Create mocked dependencies with expectations.
         let mut storage = Box::new(MockStorage::new());
-        storage.expect_update_call_link().return_once(
+        storage.expect_update_call_link().once().return_once(
             |room_id, new_attributes, zkparams_for_creation| {
                 assert_eq!(room_id.as_ref(), ROOM_ID);
                 assert_eq!(
@@ -798,7 +1661,7 @@ pub mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        // Compare as JSON Values to check the encoding of the non-primitive types.
+        // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({
@@ -811,10 +1674,10 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_conflict() {
+    async fn test_old_create_conflict() {
         // Create mocked dependencies with expectations.
         let mut storage = Box::new(MockStorage::new());
-        storage.expect_update_call_link().return_once(
+        storage.expect_update_call_link().once().return_once(
             |room_id, new_attributes, zkparams_for_creation| {
                 assert_eq!(room_id.as_ref(), ROOM_ID);
                 assert_eq!(
@@ -862,7 +1725,7 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_missing_admin_passkey() {
+    async fn test_old_update_missing_admin_passkey() {
         // Create mocked dependencies with expectations.
         let storage = Box::new(MockStorage::new());
         let frontend = create_frontend(storage);
@@ -892,7 +1755,7 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_with_zkparams() {
+    async fn test_old_update_with_zkparams() {
         // Create mocked dependencies with expectations.
         let storage = Box::new(MockStorage::new());
         let frontend = create_frontend(storage);
@@ -927,12 +1790,13 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_not_found() {
+    async fn test_old_update_not_found() {
         // Create mocked dependencies with expectations.
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link()
             .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
             .return_once(|_| Ok(None));
         let frontend = create_frontend(storage);
 
@@ -963,12 +1827,13 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_wrong_zkparams() {
+    async fn test_old_update_wrong_zkparams() {
         // Create mocked dependencies with expectations.
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link()
             .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
             .return_once(|_| {
                 Ok(Some(storage::CallLinkState {
                     zkparams: bincode::serialize(
@@ -1008,14 +1873,15 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_wrong_passkey() {
+    async fn test_old_update_wrong_passkey() {
         // Create mocked dependencies with expectations.
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link()
             .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
             .return_once(|_| Ok(Some(default_call_link_state())));
-        storage.expect_update_call_link().return_once(
+        storage.expect_update_call_link().once().return_once(
             |room_id, new_attributes, zkparams_for_creation| {
                 assert_eq!(room_id.as_ref(), ROOM_ID);
                 assert_eq!(
@@ -1060,14 +1926,15 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_success() {
+    async fn test_old_update_success() {
         // Create mocked dependencies with expectations.
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link()
             .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .once()
             .return_once(|_| Ok(Some(default_call_link_state())));
-        storage.expect_update_call_link().return_once(
+        storage.expect_update_call_link().once().return_once(
             |room_id, new_attributes, zkparams_for_creation| {
                 assert_eq!(room_id.as_ref(), ROOM_ID);
                 assert_eq!(
@@ -1118,7 +1985,7 @@ pub mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        // Compare as JSON Values to check the encoding of the non-primitive types.
+        // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({

@@ -15,7 +15,10 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use crate::frontend::{RoomId, UserId};
+use crate::{
+    authenticator::ParsedHeader::*,
+    frontend::{RoomId, UserId},
+};
 
 pub type HmacSha256 = Hmac<Sha256>;
 
@@ -155,6 +158,12 @@ fn verify_gv2_auth_mac(
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum ParsedHeader<'a> {
+    Basic(String, String),
+    Bearer(&'a str),
+}
+
 impl Authenticator {
     pub fn from_hex_key(hex_key: &str) -> Result<Self> {
         Ok(Self {
@@ -192,37 +201,21 @@ impl Authenticator {
         })
     }
 
-    /// Helper function to parse an authorization header using the basic authentication scheme.
-    /// Returns a tuple of the credentials (username, password).
-    pub fn parse_basic_authorization_header(
-        authorization_header: &str,
-    ) -> Result<(String, String), AuthenticatorError> {
-        // Get the credentials from the Basic authorization header.
-        if let Some(("Basic", credentials_base64)) = authorization_header.split_once(' ') {
-            // Decode the credentials to utf-8 formatted string.
-            let credentials_utf8 = base64::decode(credentials_base64)?;
-            let credentials = std::str::from_utf8(&credentials_utf8)?;
-
-            // Split the credentials into the username and password.
-            let (username, password) = credentials
-                .split_once(':')
-                .ok_or(AuthenticatorError::AuthHeaderNotValid)?;
-            Ok((username.to_string(), password.to_string()))
-        } else {
-            Err(AuthenticatorError::AuthHeaderParseFailure)
-        }
-    }
-
-    /// Helper function to parse an authorization header using the Bearer authentication scheme.
-    ///
-    /// Does not validate that the token is only made up of the required token68 characters.
-    pub fn parse_bearer_authorization_header(
-        authorization_header: &str,
-    ) -> Result<&str, AuthenticatorError> {
+    /// Helper function to parse an authorization header using the Basic or Bearer authentication scheme.
+    pub fn parse_authorization_header(header: &str) -> Result<ParsedHeader, AuthenticatorError> {
         // Get the credentials from the Bearer authorization header.
-        match authorization_header.split_once(' ') {
+        match header.split_once(' ') {
+            Some((scheme, token)) if scheme.eq_ignore_ascii_case("Basic") => {
+                let credentials_utf8 = base64::decode(token)?;
+                let credentials = std::str::from_utf8(&credentials_utf8)?;
+                // Split the credentials into the username and password.
+                let (username, password) = credentials
+                    .split_once(':')
+                    .ok_or(AuthenticatorError::AuthHeaderNotValid)?;
+                Ok(Basic(username.to_string(), password.to_string()))
+            }
             Some((scheme, token)) if scheme.eq_ignore_ascii_case("Bearer") => {
-                Ok(token.trim_start_matches(' '))
+                Ok(Bearer(token.trim_start_matches(' ')))
             }
             _ => Err(AuthenticatorError::AuthHeaderParseFailure),
         }
@@ -262,7 +255,7 @@ mod authenticator_tests {
     fn test_parse_basic_authorization_header() {
         initialize_logging();
 
-        let result = Authenticator::parse_basic_authorization_header("");
+        let result = Authenticator::parse_authorization_header("");
         assert_eq!(result, Err(AuthenticatorError::AuthHeaderParseFailure));
         assert_eq!(
             result.err().unwrap().to_string(),
@@ -270,7 +263,7 @@ mod authenticator_tests {
         );
 
         let is_auth_header_parse_failure = |header: &str| -> bool {
-            Authenticator::parse_basic_authorization_header(header)
+            Authenticator::parse_authorization_header(header)
                 == Err(AuthenticatorError::AuthHeaderParseFailure)
         };
 
@@ -282,26 +275,26 @@ mod authenticator_tests {
 
         // DecodeError: Encoded text cannot have a 6-bit remainder.
         assert_eq!(
-            Authenticator::parse_basic_authorization_header("Basic X"),
+            Authenticator::parse_authorization_header("Basic X"),
             Err(AuthenticatorError::DecodeFailure(InvalidLength))
         );
 
         // DecodeError: Invalid last symbol 90, offset 2.
         assert_eq!(
-            Authenticator::parse_basic_authorization_header("Basic XYZ"),
+            Authenticator::parse_authorization_header("Basic XYZ"),
             Err(AuthenticatorError::DecodeFailure(InvalidLastSymbol(2, 90)))
         );
 
         // Utf8Error: invalid utf-8 sequence of 1 bytes from index 0
-        assert!(Authenticator::parse_basic_authorization_header("Basic //3//Q==").is_err());
+        assert!(Authenticator::parse_authorization_header("Basic //3//Q==").is_err());
 
         // Utf8Error: invalid utf-8 sequence of 1 bytes from index 8
-        assert!(Authenticator::parse_basic_authorization_header(
+        assert!(Authenticator::parse_authorization_header(
             "Basic MTIzNDU2Nzj95v3n/ej96f3q/ev97P3t/e797w=="
         )
         .is_err());
 
-        let result = Authenticator::parse_basic_authorization_header("Basic VGVzdA==");
+        let result = Authenticator::parse_authorization_header("Basic VGVzdA==");
         assert!(result.is_err());
         assert_eq!(
             result.err().unwrap().to_string(),
@@ -309,7 +302,7 @@ mod authenticator_tests {
         );
 
         let is_auth_header_not_valid = |header: &str| -> bool {
-            Authenticator::parse_basic_authorization_header(header)
+            Authenticator::parse_authorization_header(header)
                 == Err(AuthenticatorError::AuthHeaderNotValid)
         };
 
@@ -320,48 +313,45 @@ mod authenticator_tests {
 
         // ":"
         assert_eq!(
-            Authenticator::parse_basic_authorization_header("Basic Og==").unwrap(),
-            ("".to_string(), "".to_string())
+            Authenticator::parse_authorization_header("Basic Og==").unwrap(),
+            Basic("".to_string(), "".to_string())
         );
 
         // "username:password"
         assert_eq!(
-            Authenticator::parse_basic_authorization_header("Basic dXNlcm5hbWU6cGFzc3dvcmQ=")
-                .unwrap(),
-            ("username".to_string(), "password".to_string())
+            Authenticator::parse_authorization_header("Basic dXNlcm5hbWU6cGFzc3dvcmQ=").unwrap(),
+            Basic("username".to_string(), "password".to_string())
         );
 
         // ":password"
         assert_eq!(
-            Authenticator::parse_basic_authorization_header("Basic OnBhc3N3b3Jk").unwrap(),
-            ("".to_string(), "password".to_string())
+            Authenticator::parse_authorization_header("Basic OnBhc3N3b3Jk").unwrap(),
+            Basic("".to_string(), "password".to_string())
         );
 
         // "username:"
         assert_eq!(
-            Authenticator::parse_basic_authorization_header("Basic dXNlcm5hbWU6").unwrap(),
-            ("username".to_string(), "".to_string())
+            Authenticator::parse_authorization_header("Basic dXNlcm5hbWU6").unwrap(),
+            Basic("username".to_string(), "".to_string())
         );
 
         // "::"
         assert_eq!(
-            Authenticator::parse_basic_authorization_header("Basic Ojo=").unwrap(),
-            ("".to_string(), ":".to_string())
+            Authenticator::parse_authorization_header("Basic Ojo=").unwrap(),
+            Basic("".to_string(), ":".to_string())
         );
 
         // ":::::"
         assert_eq!(
-            Authenticator::parse_basic_authorization_header("Basic Ojo6Ojo=").unwrap(),
-            ("".to_string(), "::::".to_string())
+            Authenticator::parse_authorization_header("Basic Ojo6Ojo=").unwrap(),
+            Basic("".to_string(), "::::".to_string())
         );
 
         // "1a2b3c:1a2b3c:1a2b3c:1a2b3c"
         assert_eq!(
-            Authenticator::parse_basic_authorization_header(
-                "Basic MWEyYjNjOjFhMmIzYzoxYTJiM2M6MWEyYjNj"
-            )
-            .unwrap(),
-            ("1a2b3c".to_string(), "1a2b3c:1a2b3c:1a2b3c".to_string())
+            Authenticator::parse_authorization_header("Basic MWEyYjNjOjFhMmIzYzoxYTJiM2M6MWEyYjNj")
+                .unwrap(),
+            Basic("1a2b3c".to_string(), "1a2b3c:1a2b3c:1a2b3c".to_string())
         );
     }
 
@@ -369,7 +359,7 @@ mod authenticator_tests {
     fn test_parse_bearer_authorization_header() {
         initialize_logging();
 
-        let result = Authenticator::parse_bearer_authorization_header("");
+        let result = Authenticator::parse_authorization_header("");
         assert_eq!(result, Err(AuthenticatorError::AuthHeaderParseFailure));
         assert_eq!(
             result.err().unwrap().to_string(),
@@ -377,7 +367,7 @@ mod authenticator_tests {
         );
 
         let is_auth_header_parse_failure = |header: &str| -> bool {
-            Authenticator::parse_bearer_authorization_header(header)
+            Authenticator::parse_authorization_header(header)
                 == Err(AuthenticatorError::AuthHeaderParseFailure)
         };
 
@@ -389,18 +379,18 @@ mod authenticator_tests {
         assert!(is_auth_header_parse_failure("Bearerr XYZ"));
 
         assert_eq!(
-            Authenticator::parse_bearer_authorization_header("Bearer XYZ"),
-            Ok("XYZ")
+            Authenticator::parse_authorization_header("Bearer XYZ"),
+            Ok(Bearer("XYZ"))
         );
 
         assert_eq!(
-            Authenticator::parse_bearer_authorization_header("bEaReR XYZ"),
-            Ok("XYZ")
+            Authenticator::parse_authorization_header("bEaReR XYZ"),
+            Ok(Bearer("XYZ"))
         );
 
         assert_eq!(
-            Authenticator::parse_bearer_authorization_header("Bearer           XYZ"),
-            Ok("XYZ")
+            Authenticator::parse_authorization_header("Bearer           XYZ"),
+            Ok(Bearer("XYZ"))
         );
     }
 

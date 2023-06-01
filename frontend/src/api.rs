@@ -30,7 +30,7 @@ use tower::ServiceBuilder;
 use zkgroup::call_links::CreateCallLinkCredentialPresentation;
 
 use crate::{
-    authenticator::{Authenticator, AuthenticatorError, GroupAuthToken},
+    authenticator::{Authenticator, AuthenticatorError, GroupAuthToken, ParsedHeader::*},
     frontend::{Frontend, FrontendError},
     metrics::histogram::Histogram,
 };
@@ -185,7 +185,7 @@ async fn authorize<B>(
             StatusCode::UNAUTHORIZED
         })?;
 
-    let (_, password) = Authenticator::parse_basic_authorization_header(authorization_header)
+    let authorization_header = Authenticator::parse_authorization_header(authorization_header)
         .map_err(|err| {
             event!("calling.frontend.api.authorization.header.invalid");
             warn!(
@@ -197,38 +197,88 @@ async fn authorize<B>(
             StatusCode::BAD_REQUEST
         })?;
 
-    let user_authorization = frontend
-        .authenticator
-        .verify(
-            GroupAuthToken::from_str(&password).map_err(|err| {
-                event!("calling.frontend.api.authorization.malformed");
+    match authorization_header {
+        Basic(_, password) => {
+            let user_authorization = frontend
+                .authenticator
+                .verify(
+                    GroupAuthToken::from_str(&password).map_err(|err| {
+                        event!("calling.frontend.api.authorization.malformed");
+                        info!(
+                            "authorize: malformed credentials for {} from {}: {}",
+                            req.method(),
+                            user_agent,
+                            err
+                        );
+                        StatusCode::UNAUTHORIZED
+                    })?,
+                    &password,
+                )
+                .map_err(|err| {
+                    event!("calling.frontend.api.authorization.unauthorized");
+
+                    if err != AuthenticatorError::ExpiredCredentials {
+                        info!(
+                            "authorize: {} for {} from {}",
+                            err,
+                            req.method(),
+                            user_agent
+                        );
+                    }
+
+                    StatusCode::UNAUTHORIZED
+                })?;
+            req.extensions_mut().insert(user_authorization);
+            Ok(next.run(req).await)
+        }
+        Bearer(token) => {
+            let fail_malformed = |err: &dyn Display| {
+                event!("calling.frontend.api.authorization.malformed.zkcredential");
                 info!(
                     "authorize: malformed credentials for {} from {}: {}",
                     req.method(),
                     user_agent,
                     err
                 );
-                StatusCode::UNAUTHORIZED
-            })?,
-            &password,
-        )
-        .map_err(|err| {
-            event!("calling.frontend.api.authorization.unauthorized");
+                StatusCode::BAD_REQUEST
+            };
 
-            if err != AuthenticatorError::ExpiredCredentials {
-                info!(
-                    "authorize: {} for {} from {}",
-                    err,
-                    req.method(),
-                    user_agent
-                );
+            // We use '.' as a separator because it matches the "token68" charset expected for Bearer auth.
+            match token.split_once('.') {
+                Some(("auth", credential_base64)) => {
+                    let credential_bytes =
+                        base64::decode(credential_base64).map_err(|e| fail_malformed(&e))?;
+                    let credential: zkgroup::call_links::CallLinkAuthCredentialPresentation =
+                        bincode::deserialize(&credential_bytes).map_err(|e| fail_malformed(&e))?;
+
+                    // We can't verify the credential without the room info, so wait to see how it's used.
+                    // Put the presentation in an Arc to satisfy the Clone requirement on the Extension extractor.
+                    req.extensions_mut().insert(Arc::new(credential));
+                    Ok(next.run(req).await)
+                }
+                Some(("create", credential_base64)) if req.method() == Method::PUT => {
+                    let credential_bytes =
+                        base64::decode(credential_base64).map_err(|e| fail_malformed(&e))?;
+                    let credential: zkgroup::call_links::CreateCallLinkCredentialPresentation =
+                        bincode::deserialize(&credential_bytes).map_err(|e| fail_malformed(&e))?;
+
+                    // We can't verify the credential without the room info, so wait to see how it's used.
+                    // Put the presentation in an Arc to satisfy the Clone requirement on the Extension extractor.
+                    req.extensions_mut().insert(Arc::new(credential));
+                    Ok(next.run(req).await)
+                }
+                _ => {
+                    event!("calling.frontend.api.authorization.header.unrecognized");
+                    warn!(
+                        "authorize: unrecognized token for {} from {}",
+                        req.method(),
+                        user_agent
+                    );
+                    Err(StatusCode::BAD_REQUEST)
+                }
             }
-
-            StatusCode::UNAUTHORIZED
-        })?;
-
-    req.extensions_mut().insert(user_authorization);
-    Ok(next.run(req).await)
+        }
+    }
 }
 
 async fn extra_call_link_metrics<B>(
@@ -250,9 +300,6 @@ async fn extra_call_link_metrics<B>(
 
     let tag = if path.starts_with("/v1/call-links/") {
         "call_links.v1"
-    } else if path.starts_with("/v2/conference/") {
-        // don't add extra metrics for joining with a call link
-        return Ok(next.run(req).await);
     } else {
         "unknown"
     };
@@ -286,90 +333,6 @@ async fn extra_call_link_metrics<B>(
     Ok(response)
 }
 
-/// Middleware to parse the authorization header for the call link endpoints.
-///
-/// We can't actually authenticate now because we need to fetch the room info.
-async fn authorize_call_link<B>(
-    mut req: Request<B>,
-    next: Next<B>,
-) -> Result<axum::response::Response, StatusCode> {
-    trace!("authorize");
-
-    let user_agent = get_user_agent(&req)?;
-
-    let authorization_header = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|header| header.to_str().ok())
-        .ok_or_else(|| {
-            event!("calling.frontend.api.call_links_authorization.header.missing");
-            warn!(
-                "authorize: authorization header missing for {} from {}",
-                req.method(),
-                user_agent
-            );
-            StatusCode::UNAUTHORIZED
-        })?;
-
-    let token =
-        Authenticator::parse_bearer_authorization_header(authorization_header).map_err(|err| {
-            event!("calling.frontend.api.call_links_authorization.header.invalid");
-            warn!(
-                "authorize: {} for {} from {}",
-                err,
-                req.method(),
-                user_agent
-            );
-            StatusCode::BAD_REQUEST
-        })?;
-
-    let fail_malformed = |err: &dyn Display| {
-        event!("calling.frontend.api.authorization.malformed.zkcredential");
-        info!(
-            "authorize: malformed credentials for {} from {}: {}",
-            req.method(),
-            user_agent,
-            err
-        );
-        StatusCode::BAD_REQUEST
-    };
-
-    // We use '.' as a separator because it matches the "token68" charset expected for Bearer auth.
-    match token.split_once('.') {
-        Some(("auth", credential_base64)) => {
-            let credential_bytes =
-                base64::decode(credential_base64).map_err(|e| fail_malformed(&e))?;
-            let credential: zkgroup::call_links::CallLinkAuthCredentialPresentation =
-                bincode::deserialize(&credential_bytes).map_err(|e| fail_malformed(&e))?;
-
-            // We can't verify the credential without the room info, so wait to see how it's used.
-            // Put the presentation in an Arc to satisfy the Clone requirement on the Extension extractor.
-            req.extensions_mut().insert(Arc::new(credential));
-            Ok(next.run(req).await)
-        }
-        Some(("create", credential_base64)) if req.method() == Method::PUT => {
-            let credential_bytes =
-                base64::decode(credential_base64).map_err(|e| fail_malformed(&e))?;
-            let credential: zkgroup::call_links::CreateCallLinkCredentialPresentation =
-                bincode::deserialize(&credential_bytes).map_err(|e| fail_malformed(&e))?;
-
-            // We can't verify the credential without the room info, so wait to see how it's used.
-            // Put the presentation in an Arc to satisfy the Clone requirement on the Extension extractor.
-            req.extensions_mut().insert(Arc::new(credential));
-            Ok(next.run(req).await)
-        }
-        _ => {
-            event!("calling.frontend.api.authorization.header.unrecognized");
-            warn!(
-                "authorize: unrecognized token for {} from {}",
-                req.method(),
-                user_agent
-            );
-            Err(StatusCode::BAD_REQUEST)
-        }
-    }
-}
-
 /// Handler for the GET /health route.
 async fn get_health() {
     trace!("get_health():");
@@ -389,6 +352,10 @@ fn app(frontend: Arc<Frontend>) -> Router {
             "/v2/conference/participants",
             get(v2::get_participants).put(v2::join),
         )
+        .route(
+            "/v2/conference/:room_id/participants",
+            get(v2::get_participants_by_room_id).put(v2::join_by_room_id),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(frontend.clone(), metrics))
@@ -398,20 +365,17 @@ fn app(frontend: Arc<Frontend>) -> Router {
 
     let call_link_routes = Router::new()
         .route(
-            "/v1/call-link/:room_id",
+            "/v1/call-link",
             get(call_links::read_call_link).put(call_links::update_call_link),
         )
         .route(
-            "/v2/conference/:room_id/participants",
-            get(v2::get_participants_by_room_id).put(v2::join_by_room_id),
+            "/v1/call-link/:room_id",
+            get(call_links::read_call_link_with_path).put(call_links::update_call_link_with_path),
         )
         .layer(
             ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(frontend.clone(), metrics))
-                .layer(middleware::from_fn_with_state(
-                    frontend.clone(),
-                    authorize_call_link,
-                ))
+                .layer(middleware::from_fn_with_state(frontend.clone(), authorize))
                 .layer(middleware::from_fn_with_state(
                     frontend.clone(),
                     extra_call_link_metrics,
