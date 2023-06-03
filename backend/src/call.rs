@@ -150,6 +150,12 @@ impl From<DemuxId> for u32 {
 }
 
 impl DemuxId {
+    #[cfg(test)]
+    pub const fn from_const(raw: u32) -> Self {
+        assert!(raw & 0b1111 == 0, "lowest 4 bits must be clear");
+        Self(raw)
+    }
+
     fn from_ssrc(ssrc: rtp::Ssrc) -> Self {
         Self(ssrc & 0b1111_1111_1111_1111_1111_1111_1111_0000)
     }

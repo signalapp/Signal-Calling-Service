@@ -65,6 +65,10 @@ pub struct InfoResponse {
 pub struct ClientsResponse {
     #[serde(rename = "endpointIds")]
     pub client_ids: Vec<String>, // Aka endpoint_id or active_speaker_id, a concatenation of user_id + '-' + resolution_request_id.
+
+    // Parallels the client_ids list.
+    #[serde(rename = "demuxIds", default)]
+    pub demux_ids: Option<Vec<u32>>,
 }
 
 #[derive(Serialize, Debug, PartialEq)]

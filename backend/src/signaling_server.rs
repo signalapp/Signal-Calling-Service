@@ -59,6 +59,9 @@ pub struct InfoResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ClientsResponse {
     pub endpoint_ids: Vec<String>, // Aka active_speaker_ids, a concatenation of user_id + '-' + resolution_request_id.
+
+    // Parallels the endpoint_ids list.
+    pub demux_ids: Vec<u32>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -94,30 +97,33 @@ fn call_id_from_hex(call_id: &str) -> Result<sfu::CallId> {
         .into())
 }
 
-/// Parse a user_id hash and resolution_request_id from the provided endpoint. The endpoint
-/// string has the following format: $hex(sha256(user_id))-$resolution_request_id
+/// Parse an opaque user_id from the provided endpoint_id.
+///
+/// The endpoint string has the following format: `${hex(opaque_user_id)}-${resolution_request_id}`.
+/// If it doesn't have a hyphen, the entire string is considered to be a hex-encoded user ID.
 ///
 /// ```
-/// use calling_backend::signaling_server::parse_user_id_and_resolution_request_id_from_endpoint_id;
+/// use calling_backend::signaling_server::parse_user_id_from_endpoint_id;
 ///
-/// assert!(parse_user_id_and_resolution_request_id_from_endpoint_id("abcdef-0").unwrap() == (vec![171, 205, 239].into(), 0));
-/// assert!(parse_user_id_and_resolution_request_id_from_endpoint_id("abcdef-12345").unwrap() == (vec![171, 205, 239].into(), 12345));
-/// assert_eq!(parse_user_id_and_resolution_request_id_from_endpoint_id("").is_err(), true);
-/// assert_eq!(parse_user_id_and_resolution_request_id_from_endpoint_id("abcdef-").is_err(), true);
-/// assert_eq!(parse_user_id_and_resolution_request_id_from_endpoint_id("abcdef-a").is_err(), true);
-/// assert_eq!(parse_user_id_and_resolution_request_id_from_endpoint_id("abcdef-1-").is_err(), true);
+/// assert!(parse_user_id_from_endpoint_id("abcdef").unwrap() == vec![0xab, 0xcd, 0xef].into());
+/// assert!(parse_user_id_from_endpoint_id("abcdef-0").unwrap() == vec![0xab, 0xcd, 0xef].into());
+/// assert!(parse_user_id_from_endpoint_id("abcdef-12345").unwrap() == vec![0xab, 0xcd, 0xef].into());
+/// assert!(parse_user_id_from_endpoint_id("").is_err());
+/// assert!(parse_user_id_from_endpoint_id("abcdef-").is_err());
+/// assert!(parse_user_id_from_endpoint_id("abcdef-a").is_err());
+/// assert!(parse_user_id_from_endpoint_id("abcdef-1-").is_err());
 /// ```
-pub fn parse_user_id_and_resolution_request_id_from_endpoint_id(
-    endpoint_id: &str,
-) -> Result<(sfu::UserId, u64)> {
-    if let [user_id_hex, suffix] = endpoint_id.splitn(2, '-').collect::<Vec<_>>()[..] {
-        let resolution_request_id = u64::from_str(suffix)?;
-        let user_id = Vec::from_hex(user_id_hex)?;
-
-        Ok((user_id.into(), resolution_request_id))
+pub fn parse_user_id_from_endpoint_id(endpoint_id: &str) -> Result<sfu::UserId> {
+    let user_id_hex = if let Some((user_id_hex, suffix)) = endpoint_id.split_once('-') {
+        let _resolution_request_id = u64::from_str(suffix)?;
+        user_id_hex
     } else {
-        Err(anyhow!("malformed endpoint_id"))
+        endpoint_id
+    };
+    if user_id_hex.is_empty() {
+        return Err(anyhow!("missing user ID"));
     }
+    Ok(Vec::from_hex(user_id_hex)?.into())
 }
 
 /// Return a health response after accessing the SFU and obtaining basic information.
@@ -188,12 +194,14 @@ async fn get_clients(
 
     let sfu = sfu.lock();
     if let Some(signaling) = sfu.get_call_signaling_info(call_id) {
+        let (demux_ids, endpoint_ids) = signaling
+            .client_ids
+            .into_iter()
+            .map(|(demux_id, endpoint_id)| (demux_id.as_u32(), endpoint_id))
+            .unzip();
         let response = ClientsResponse {
-            endpoint_ids: signaling
-                .client_ids
-                .into_iter()
-                .map(|(_demux_id, active_speaker_id)| active_speaker_id)
-                .collect(),
+            endpoint_ids,
+            demux_ids,
         };
 
         Ok(Json(response).into_response())
@@ -218,9 +226,8 @@ async fn join(
         .try_into()
         .map_err(|err: call::Error| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let (user_id, _resolution_request_id) =
-        parse_user_id_and_resolution_request_id_from_endpoint_id(&request.endpoint_id)
-            .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    let user_id = parse_user_id_from_endpoint_id(&request.endpoint_id)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
     let client_dhe_public_key = <[u8; 32]>::from_hex(request.client_dhe_public_key)
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
@@ -387,8 +394,6 @@ fn start_monitor(mut ender_rx: Receiver<()>, cpu_idle_pct: Arc<AtomicU8>) {
 
 #[cfg(test)]
 mod signaling_server_tests {
-    use std::convert::TryInto;
-
     use axum::body::Body;
     use axum::http::{self, Request};
     use calling_common::Instant;
@@ -408,6 +413,10 @@ mod signaling_server_tests {
         "7ab9bbf0b71f81598ae1b592aaf82f9b20b638142a9610c3e37965bec7519112-5287417572362992825";
     const ENDPOINT_ID_2: &str =
         "b25387a93fd65599bacae4a8f8726e9e818ecf0bec3360593fe542cdb8e611a3-7715148009648537058";
+
+    const DEMUX_ID_1: DemuxId = DemuxId::from_const(16);
+    const DEMUX_ID_2: DemuxId = DemuxId::from_const(32);
+
     const UFRAG: &str = "Ouub";
 
     static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(config::default_test_config);
@@ -434,8 +443,7 @@ mod signaling_server_tests {
         client_dhe_pub_key: DhePublicKey,
     ) {
         let call_id = call_id_from_hex(call_id).unwrap();
-        let (user_id, _resolution_request_id) =
-            parse_user_id_and_resolution_request_id_from_endpoint_id(endpoint_id).unwrap();
+        let user_id = parse_user_id_from_endpoint_id(endpoint_id).unwrap();
 
         let _ = sfu
             .lock()
@@ -591,7 +599,7 @@ mod signaling_server_tests {
             sfu.clone(),
             CALL_ID,
             ENDPOINT_ID_1,
-            16u32.try_into().unwrap(),
+            DEMUX_ID_1,
             UFRAG,
             CLIENT_DHE_PUB_KEY,
         );
@@ -614,7 +622,12 @@ mod signaling_server_tests {
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         assert_eq!(
             &body[..],
-            format!(r#"{{"endpointIds":["{}"]}}"#, ENDPOINT_ID_1).as_bytes()
+            format!(
+                r#"{{"endpointIds":["{}"],"demuxIds":[{}]}}"#,
+                ENDPOINT_ID_1,
+                DEMUX_ID_1.as_u32(),
+            )
+            .as_bytes()
         );
 
         // Join with client 32.
@@ -622,7 +635,7 @@ mod signaling_server_tests {
             sfu.clone(),
             CALL_ID,
             ENDPOINT_ID_2,
-            32u32.try_into().unwrap(),
+            DEMUX_ID_2,
             UFRAG,
             CLIENT_DHE_PUB_KEY,
         );
@@ -642,13 +655,16 @@ mod signaling_server_tests {
         assert_eq!(
             &body[..],
             format!(
-                r#"{{"endpointIds":["{}","{}"]}}"#,
-                ENDPOINT_ID_1, ENDPOINT_ID_2
+                r#"{{"endpointIds":["{}","{}"],"demuxIds":[{},{}]}}"#,
+                ENDPOINT_ID_1,
+                ENDPOINT_ID_2,
+                DEMUX_ID_1.as_u32(),
+                DEMUX_ID_2.as_u32(),
             )
             .as_bytes()
         );
 
-        remove_client_from_sfu(sfu.clone(), CALL_ID, 16u32.try_into().unwrap());
+        remove_client_from_sfu(sfu.clone(), CALL_ID, DEMUX_ID_1);
 
         let response = api
             .clone()
@@ -664,10 +680,15 @@ mod signaling_server_tests {
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         assert_eq!(
             &body[..],
-            format!(r#"{{"endpointIds":["{}"]}}"#, ENDPOINT_ID_2).as_bytes()
+            format!(
+                r#"{{"endpointIds":["{}"],"demuxIds":[{}]}}"#,
+                ENDPOINT_ID_2,
+                DEMUX_ID_2.as_u32(),
+            )
+            .as_bytes()
         );
 
-        remove_client_from_sfu(sfu.clone(), CALL_ID, 32u32.try_into().unwrap());
+        remove_client_from_sfu(sfu.clone(), CALL_ID, DEMUX_ID_2);
 
         let response = api
             .clone()
@@ -682,7 +703,7 @@ mod signaling_server_tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        assert_eq!(&body[..], br#"{"endpointIds":[]}"#);
+        assert_eq!(&body[..], br#"{"endpointIds":[],"demuxIds":[]}"#);
     }
 
     #[tokio::test]

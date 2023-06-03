@@ -167,12 +167,14 @@ impl Frontend {
     /// Return the user_id part of the given endpoint_id.
     ///
     /// The user_id is the string before the hyphen in an endpoint_id and must not be empty.
+    /// This function also accepts hyphen-less input, in which case the entire string is treated as
+    /// the user_id.
     ///
     /// ```
     /// use calling_frontend::frontend::Frontend;
     /// use std::convert::TryInto;
     ///
-    /// assert!(Frontend::get_opaque_user_id_from_endpoint_id("abcdef").is_err());
+    /// assert_eq!(Frontend::get_opaque_user_id_from_endpoint_id("abcdef").unwrap(), "abcdef".to_string());
     /// assert_eq!(Frontend::get_opaque_user_id_from_endpoint_id("abcdef-").unwrap(), "abcdef".to_string());
     /// assert_eq!(Frontend::get_opaque_user_id_from_endpoint_id("abcdef-0").unwrap(), "abcdef".to_string());
     /// assert_eq!(Frontend::get_opaque_user_id_from_endpoint_id("abcdef-12345").unwrap(), "abcdef".to_string());
@@ -183,7 +185,7 @@ impl Frontend {
     pub fn get_opaque_user_id_from_endpoint_id(endpoint_id: &str) -> Result<String> {
         let user_id = endpoint_id
             .split_once('-')
-            .ok_or_else(|| anyhow!("failed to split endpoint_id"))?
+            .unwrap_or((endpoint_id, ""))
             .0
             .to_string();
 
@@ -247,7 +249,7 @@ impl Frontend {
     pub async fn get_client_ids_in_call(
         &self,
         call: &CallRecord,
-    ) -> Result<Vec<String>, FrontendError> {
+    ) -> Result<Vec<(UserId, DemuxId)>, FrontendError> {
         // Get the direct address to the Calling Backend.
         let backend_address = backend::Address::try_from(&call.backend_ip).map_err(|err| {
             warn!(
@@ -261,8 +263,33 @@ impl Frontend {
             .backend
             .get_clients(&backend_address, &call.era_id)
             .await
-        {
-            Ok(clients_response) => Ok(clients_response.client_ids),
+            .and_then(|response| {
+                if let Some(demux_ids) = response.demux_ids {
+                    if demux_ids.len() != response.client_ids.len() {
+                        return Err(BackendError::UnexpectedError(anyhow!(
+                            "mismatched lists in ClientResponse"
+                        )));
+                    }
+                    Ok(response
+                        .client_ids
+                        .into_iter()
+                        .zip(demux_ids.into_iter())
+                        .map(|(client_id, raw_demux_id)| {
+                            anyhow::Ok((client_id, DemuxId::try_from(raw_demux_id)?))
+                        })
+                        .collect::<Result<_>>()?)
+                } else {
+                    Ok(response
+                        .client_ids
+                        .into_iter()
+                        .map(|client_id| {
+                            let demux_id = Frontend::get_demux_id_from_endpoint_id(&client_id)?;
+                            anyhow::Ok((client_id, demux_id))
+                        })
+                        .collect::<Result<_>>()?)
+                }
+            }) {
+            Ok(result) => Ok(result),
             Err(BackendError::CallNotFound) => {
                 if let Err(err) = self
                     .storage

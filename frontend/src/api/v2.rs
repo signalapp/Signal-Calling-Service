@@ -153,10 +153,10 @@ pub async fn get_participants(
         .get_client_ids_in_call(&call)
         .await?
         .into_iter()
-        .map(|client_id| {
+        .map(|(client_id, demux_id)| {
             Ok(Participant {
                 opaque_user_id: Frontend::get_opaque_user_id_from_endpoint_id(&client_id)?,
-                demux_id: Frontend::get_demux_id_from_endpoint_id(&client_id)?.as_u32(),
+                demux_id: demux_id.as_u32(),
             })
         })
         .collect::<Result<Vec<_>>>()
@@ -483,10 +483,18 @@ mod api_server_v2_tests {
         }
     }
 
-    fn create_clients_response_two_calls() -> backend::ClientsResponse {
+    fn create_clients_response_two_calls(include_demux_ids: bool) -> backend::ClientsResponse {
         let client_ids = vec![ENDPOINT_ID_1.to_string(), ENDPOINT_ID_2.to_string()];
+        let demux_ids = vec![DEMUX_ID_1, DEMUX_ID_2];
 
-        backend::ClientsResponse { client_ids }
+        backend::ClientsResponse {
+            client_ids,
+            demux_ids: if include_demux_ids {
+                Some(demux_ids)
+            } else {
+                None
+            },
+        }
     }
 
     fn create_mocked_storage_unused() -> Box<MockStorage> {
@@ -536,7 +544,7 @@ mod api_server_v2_tests {
         Box::new(MockBackend::new())
     }
 
-    fn create_mocked_backend_two_calls() -> Box<MockBackend> {
+    fn create_mocked_backend_two_calls(include_demux_ids: bool) -> Box<MockBackend> {
         let mut backend = Box::new(MockBackend::new());
         backend
             .expect_get_clients()
@@ -547,7 +555,7 @@ mod api_server_v2_tests {
             )
             .once()
             // Result<ClientsResponse, BackendError>
-            .returning(|_, _| Ok(create_clients_response_two_calls()));
+            .returning(move |_, _| Ok(create_clients_response_two_calls(include_demux_ids)));
         backend
     }
 
@@ -623,7 +631,59 @@ mod api_server_v2_tests {
 
         // Create mocked dependencies with expectations.
         let storage = create_mocked_storage_with_call_for_region(config.region.to_string());
-        let backend = create_mocked_backend_two_calls();
+        let backend = create_mocked_backend_two_calls(true);
+
+        let frontend = create_frontend(config, storage, backend);
+
+        // Create an axum application.
+        let app = app(frontend);
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/v2/conference/participants")
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(participants_response.era_id, ERA_ID_1);
+        assert_eq!(
+            participants_response.max_devices,
+            config.max_clients_per_call
+        );
+        assert_eq!(participants_response.creator, USER_ID_1);
+        assert_eq!(participants_response.participants.len(), 2);
+
+        assert_eq!(
+            participants_response.participants[0].opaque_user_id,
+            USER_ID_1
+        );
+        assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
+        assert_eq!(
+            participants_response.participants[1].opaque_user_id,
+            USER_ID_2
+        );
+        assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
+    }
+
+    #[tokio::test]
+    async fn test_get_with_call_deriving_demux_ids() {
+        let config = &CONFIG;
+
+        // Create mocked dependencies with expectations.
+        let storage = create_mocked_storage_with_call_for_region(config.region.to_string());
+        let backend = create_mocked_backend_two_calls(false);
 
         let frontend = create_frontend(config, storage, backend);
 
@@ -1605,7 +1665,7 @@ mod api_server_v2_tests {
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
                 ))
             });
-        let backend = create_mocked_backend_two_calls();
+        let backend = create_mocked_backend_two_calls(true);
 
         let frontend = create_frontend(config, storage, backend);
 
@@ -1673,7 +1733,7 @@ mod api_server_v2_tests {
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
                 ))
             });
-        let backend = create_mocked_backend_two_calls();
+        let backend = create_mocked_backend_two_calls(true);
 
         let frontend = create_frontend(config, storage, backend);
 
@@ -1741,7 +1801,7 @@ mod api_server_v2_tests {
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
                 ))
             });
-        let backend = create_mocked_backend_two_calls();
+        let backend = create_mocked_backend_two_calls(true);
 
         let frontend = create_frontend(config, storage, backend);
 
@@ -3172,7 +3232,7 @@ mod api_server_v2_tests {
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
                 ))
             });
-        let backend = create_mocked_backend_two_calls();
+        let backend = create_mocked_backend_two_calls(true);
 
         let frontend = create_frontend(config, storage, backend);
 
@@ -3239,7 +3299,7 @@ mod api_server_v2_tests {
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
                 ))
             });
-        let backend = create_mocked_backend_two_calls();
+        let backend = create_mocked_backend_two_calls(true);
 
         let frontend = create_frontend(config, storage, backend);
 
@@ -3306,7 +3366,7 @@ mod api_server_v2_tests {
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
                 ))
             });
-        let backend = create_mocked_backend_two_calls();
+        let backend = create_mocked_backend_two_calls(true);
 
         let frontend = create_frontend(config, storage, backend);
 
