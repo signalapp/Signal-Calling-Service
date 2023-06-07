@@ -7,7 +7,8 @@
 
 use core::ops::DerefMut;
 use std::{
-    cmp::min, collections::HashMap, convert::TryInto, fmt::Write, sync::Arc, time::SystemTime,
+    cmp::min, collections::HashMap, convert::TryInto, fmt::Write, str::FromStr, sync::Arc,
+    time::SystemTime,
 };
 
 use anyhow::Result;
@@ -136,6 +137,8 @@ pub struct Sfu {
     diagnostics_logged: Instant,
     /// A reference to the packet server state.
     packet_server: Option<Arc<PacketServerState>>,
+    /// The region where the sfu is running.
+    region: Region,
 }
 
 /// The state that results from the SFU receiving a tick event, to be processed by the packet server.
@@ -167,6 +170,7 @@ impl Sfu {
             activity_checked: now,
             diagnostics_logged: now,
             packet_server: None,
+            region: Region::from_str(&config.metrics.region).unwrap_or(Region::Unknown),
         })
     }
 
@@ -363,6 +367,7 @@ impl Sfu {
             ice::join_username(server_ice_ufrag.as_bytes(), client_ice_ufrag.as_bytes());
 
         let now = Instant::now();
+        let created = SystemTime::now();
 
         let connection_id = ConnectionId::from_call_id_and_demux_id(call_id.clone(), demux_id);
 
@@ -378,7 +383,7 @@ impl Sfu {
                     initial_target_send_rate,
                     default_requested_max_send_rate,
                     now,
-                    SystemTime::now(),
+                    created,
                 )))
             });
         {
@@ -393,6 +398,18 @@ impl Sfu {
                 demux_id.as_u32(),
                 region
             );
+
+            if user_id != call.creator_id() || created != call.created() {
+                if self.region == Region::Unknown {
+                    event!("calling.sfu.join.server_region_unknown");
+                } else if region == self.region {
+                    event!("calling.sfu.join.same_region");
+                } else if self.region.same_area(&region) {
+                    event!("calling.sfu.join.same_area");
+                } else {
+                    event!("calling.sfu.join.different_area");
+                }
+            }
 
             call.add_client(
                 demux_id,
@@ -875,6 +892,75 @@ impl Sfu {
                         event!("calling.sfu.call_complete.solo");
                     } else {
                         event!("calling.sfu.call_complete.empty");
+                    }
+
+                    let active_time = (call_time.pair + call_time.many).as_secs();
+                    let inactive_time = (call_time.empty + call_time.solo).as_secs();
+
+                    if active_time == 0 {
+                    } else if active_time < 1 {
+                        event!("calling.sfu.call_complete.active.1sec");
+                    } else if active_time < 10 {
+                        event!("calling.sfu.call_complete.active.10sec");
+                    } else if active_time < 30 {
+                        event!("calling.sfu.call_complete.active.30sec");
+                    } else if active_time < 60 {
+                        event!("calling.sfu.call_complete.active.1min");
+                    } else if active_time < 10 * 60 {
+                        event!("calling.sfu.call_complete.active.10mins");
+                    } else if active_time < 30 * 60 {
+                        event!("calling.sfu.call_complete.active.30mins");
+                    } else if active_time < 60 * 60 {
+                        event!("calling.sfu.call_complete.active.1hr");
+                    } else if active_time < 4 * 60 * 60 {
+                        event!("calling.sfu.call_complete.active.4hrs");
+                    } else if active_time < 12 * 60 * 60 {
+                        event!("calling.sfu.call_complete.active.12hrs");
+                    } else if active_time < 24 * 60 * 60 {
+                        event!("calling.sfu.call_complete.active.24hrs");
+                    } else {
+                        event!("calling.sfu.call_complete.active.days");
+                    }
+
+                    if inactive_time == 0 {
+                    } else if inactive_time < 1 {
+                        event!("calling.sfu.call_complete.inactive.1sec");
+                    } else if inactive_time < 10 {
+                        event!("calling.sfu.call_complete.inactive.10sec");
+                    } else if inactive_time < 30 {
+                        event!("calling.sfu.call_complete.inactive.30sec");
+                    } else if inactive_time < 60 {
+                        event!("calling.sfu.call_complete.inactive.1min");
+                    } else if inactive_time < 10 * 60 {
+                        event!("calling.sfu.call_complete.inactive.10mins");
+                    } else if inactive_time < 30 * 60 {
+                        event!("calling.sfu.call_complete.inactive.30mins");
+                    } else if inactive_time < 60 * 60 {
+                        event!("calling.sfu.call_complete.inactive.1hr");
+                    } else if inactive_time < 4 * 60 * 60 {
+                        event!("calling.sfu.call_complete.inactive.4hrs");
+                    } else if inactive_time < 12 * 60 * 60 {
+                        event!("calling.sfu.call_complete.inactive.12hrs");
+                    } else if inactive_time < 24 * 60 * 60 {
+                        event!("calling.sfu.call_complete.inactive.24hrs");
+                    } else {
+                        event!("calling.sfu.call_complete.inactive.days");
+                    }
+
+                    if active_time > 60 {
+                        if let Ok(seconds) = call_time.pair.as_secs().try_into() {
+                            event!("calling.sfu.call_seconds_over_1m.pair", seconds);
+                        }
+                        if let Ok(seconds) = call_time.many.as_secs().try_into() {
+                            event!("calling.sfu.call_seconds_over_1m.many", seconds);
+                        }
+                    }
+
+                    if let Ok(seconds) = call_time.pair.as_secs().try_into() {
+                        event!("calling.sfu.all_call_seconds.pair", seconds);
+                    }
+                    if let Ok(seconds) = call_time.many.as_secs().try_into() {
+                        event!("calling.sfu.all_call_seconds.many", seconds);
                     }
 
                     false
