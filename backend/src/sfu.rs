@@ -318,7 +318,7 @@ impl Sfu {
     pub fn get_or_create_call_and_add_client(
         &mut self,
         call_id: CallId,
-        user_id: &UserId,
+        user_id: UserId,
         active_speaker_id: String,
         demux_id: DemuxId,
         server_ice_ufrag: String,
@@ -332,7 +332,7 @@ impl Sfu {
         trace!("get_or_create_call_and_add_client():");
 
         trace!("  {:25}{}", "call_id:", loggable_call_id);
-        trace!("  {:25}{}", "user_id:", hex::encode(user_id.as_slice()));
+        trace!("  {:25}{}", "user_id:", user_id.as_str());
         trace!("  {:25}{}", "client_ice_ufrag:", client_ice_ufrag);
         trace!(
             "  {:25}{:?}",
@@ -397,7 +397,7 @@ impl Sfu {
                 region
             );
 
-            if user_id != call.creator_id() || created != call.created() {
+            if &user_id != call.creator_id() || created != call.created() {
                 if self.region == Region::Unknown {
                     event!("calling.sfu.join.server_region_unknown");
                 } else if region == self.region {
@@ -1112,7 +1112,7 @@ mod sfu_tests {
         sync::Arc,
     };
 
-    use hex::{FromHex, ToHex};
+    use hex::FromHex;
     use once_cell::sync::Lazy;
     use parking_lot::Mutex;
     use rand::{thread_rng, Rng};
@@ -1126,14 +1126,6 @@ mod sfu_tests {
             numbers.push(rng.gen());
         }
         numbers
-    }
-
-    fn random_byte_id_vector(n: usize, id_size: usize) -> Vec<Vec<u8>> {
-        let mut vector: Vec<Vec<u8>> = Vec::new();
-        for _ in 0..n {
-            vector.push(random_byte_vector(id_size));
-        }
-        vector
     }
 
     fn custom_config(tick_period_ms: u64, inactivity_timeout: u64) -> config::Config {
@@ -1164,17 +1156,13 @@ mod sfu_tests {
     ) -> Result<(), SfuError> {
         // Generate ids for the client.
         let resolution_request_id = rand::thread_rng().gen::<u64>();
-        let active_speaker_id = format!(
-            "{}-{}",
-            user_id.as_slice().encode_hex::<String>(),
-            resolution_request_id
-        );
+        let active_speaker_id = format!("{}-{}", user_id.as_str(), resolution_request_id);
         let server_ice_ufrag = ice::random_ufrag();
         let server_ice_pwd = ice::random_pwd();
 
         let _ = sfu.get_or_create_call_and_add_client(
             call_id.clone(),
-            user_id,
+            user_id.clone(),
             active_speaker_id,
             demux_id,
             server_ice_ufrag,
@@ -1200,13 +1188,29 @@ mod sfu_tests {
         assert_eq!(0, sfu.call_by_call_id.len());
     }
 
+    fn random_user_id() -> UserId {
+        UserId::from(hex::encode(random_byte_vector(32)))
+    }
+
+    fn random_call_id() -> CallId {
+        CallId::from(random_byte_vector(32))
+    }
+
+    fn random_call_ids(count: usize) -> Vec<CallId> {
+        std::iter::repeat_with(random_call_id).take(count).collect()
+    }
+
+    fn random_user_ids(count: usize) -> Vec<UserId> {
+        std::iter::repeat_with(random_user_id).take(count).collect()
+    }
+
     #[tokio::test]
     async fn test_create_call() {
         let initial_now = Instant::now();
         let sfu = new_sfu(initial_now, &DEFAULT_CONFIG);
 
-        let user_id = UserId::from(random_byte_vector(32));
-        let call_id = CallId::from(random_byte_vector(32));
+        let user_id = random_user_id();
+        let call_id = random_call_id();
         let demux_id = 123392u32.try_into().unwrap();
 
         // We add a client but won't do anything with it in this test.
@@ -1222,28 +1226,6 @@ mod sfu_tests {
 
         assert_eq!(1, sfu.call_by_call_id.len());
         assert_eq!(1, sfu.get_call_signaling_info(call_id).unwrap().size);
-    }
-
-    fn random_user_id() -> UserId {
-        UserId::from(random_byte_vector(32))
-    }
-
-    fn random_call_id() -> CallId {
-        CallId::from(random_byte_vector(32))
-    }
-
-    fn random_call_ids(count: usize) -> Vec<CallId> {
-        random_byte_id_vector(count, 32)
-            .into_iter()
-            .map(CallId::from)
-            .collect()
-    }
-
-    fn random_user_ids(count: usize) -> Vec<UserId> {
-        random_byte_id_vector(count, 32)
-            .into_iter()
-            .map(UserId::from)
-            .collect()
     }
 
     #[tokio::test]
@@ -1314,7 +1296,7 @@ mod sfu_tests {
                 //  - The client should be in all mappings
 
                 let call_info = sfu.get_call_signaling_info(call_id).unwrap();
-                assert_eq!(user_id.as_slice(), call_info.creator_id.as_slice());
+                assert_eq!(user_id.as_str(), call_info.creator_id.as_str());
                 assert_eq!(1, call_info.size);
                 assert_eq!(demux_id, call_info.client_ids[0].0);
                 assert_eq!(1, sfu.call_by_call_id.len());

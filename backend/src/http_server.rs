@@ -137,21 +137,21 @@ fn authenticate(
     _config: &'static config::Config,
     password: &str,
 ) -> Result<(sfu::UserId, sfu::CallId)> {
-    let (user_id_hex, call_id_hex) = match password.split(':').collect::<Vec<_>>()[..] {
-        [user_id_hex, call_id_hex, _timestamp, _mac_hex]
-            if !user_id_hex.is_empty() && !call_id_hex.is_empty() =>
+    let (user_id_str, call_id_hex) = match password.split(':').collect::<Vec<_>>()[..] {
+        [user_id_str, call_id_hex, _timestamp, _mac_hex]
+            if !user_id_str.is_empty() && !call_id_hex.is_empty() =>
         {
-            Ok((user_id_hex, call_id_hex))
+            Ok((user_id_str, call_id_hex))
         }
-        ["2", user_id_hex, call_id_hex, _timestamp, _permission, _mac_hex]
-            if !user_id_hex.is_empty() && !call_id_hex.is_empty() =>
+        ["2", user_id_str, call_id_hex, _timestamp, _permission, _mac_hex]
+            if !user_id_str.is_empty() && !call_id_hex.is_empty() =>
         {
-            Ok((user_id_hex, call_id_hex))
+            Ok((user_id_str, call_id_hex))
         }
         _ => Err(anyhow!("Password not valid")),
     }?;
 
-    let user_id = Vec::from_hex(user_id_hex)?.into();
+    let user_id = user_id_str.to_string().into();
     let call_id = Vec::from_hex(call_id_hex)?.into();
 
     // The http_server is used for testing and therefore will not perform
@@ -188,18 +188,7 @@ async fn get_metrics(
                 .iter()
                 .map(|client| metrics::Client {
                     demux_id: client.demux_id.into(),
-                    // FIXME: Replace with client.user_id.as_slice().escape_ascii().to_string()
-                    // when escape_ascii is stabilized.
-                    user_id: String::from_utf8(
-                        client
-                            .user_id
-                            .as_slice()
-                            .iter()
-                            .copied()
-                            .flat_map(std::ascii::escape_default)
-                            .collect(),
-                    )
-                    .unwrap(),
+                    user_id: client.user_id.as_str().to_string(),
                     target_send_bps: client.target_send_rate.as_bps(),
                     video0_incoming_bps: client.video0_incoming_rate.unwrap_or_default().as_bps(),
                     video1_incoming_bps: client.video1_incoming_rate.unwrap_or_default().as_bps(),
@@ -291,7 +280,7 @@ async fn get_participants(
             conference_id,
             max_devices,
             participants,
-            creator: signaling.creator_id.as_slice().encode_hex(),
+            creator: signaling.creator_id.as_str().to_string(),
         };
 
         Ok(Json(response).into_response())
@@ -352,8 +341,7 @@ async fn join_conference(
     // Generate ids for the client.
     // The endpoint_id is the term currently used on the client side, it is
     // equivalent to the active_speaker_id in the Sfu.
-    let user_id_string = user_id.as_slice().encode_hex::<String>();
-    let endpoint_id = format!("{}-0", user_id_string);
+    let endpoint_id = format!("{}-0", user_id.as_str());
     let demux_id = demux_id_from_endpoint_id(&endpoint_id);
     let server_ice_ufrag = ice::random_ufrag();
     let server_ice_pwd = ice::random_pwd();
@@ -361,7 +349,7 @@ async fn join_conference(
     let mut sfu = sfu.lock();
     match sfu.get_or_create_call_and_add_client(
         call_id,
-        &user_id,
+        user_id,
         endpoint_id,
         demux_id,
         server_ice_ufrag.clone(),
@@ -551,18 +539,12 @@ mod http_server_tests {
         assert!(authenticate(config, "1:2:3").is_err());
         assert!(authenticate(config, "1:2:3:4:5").is_err());
 
-        // Error: Odd number of digits
-        assert!(authenticate(config, "1:2b::").is_err());
+        // Error: Odd number of digits in call ID field
         assert!(authenticate(config, "1a:2::").is_err());
-        assert!(authenticate(config, "1a2:2b:1:3c").is_err());
-        assert!(authenticate(config, "2:1:2b:::").is_err());
-        assert!(authenticate(config, "2:1a:2:::").is_err());
-        assert!(authenticate(config, "2:1a2:2b:1:1:3c").is_err());
+        assert!(authenticate(config, "2:1a:2b2:1:1:3c").is_err());
 
-        // Error: Invalid character 'x' at position 1
-        assert!(authenticate(config, "1x:2b:1:").is_err());
+        // Error: Invalid character 'x' in call ID field
         assert!(authenticate(config, "1a:2x:1:").is_err());
-        assert!(authenticate(config, "2:1x:2b:1::").is_err());
         assert!(authenticate(config, "2:1a:2x:1::").is_err());
 
         // Error: Unknown version
@@ -572,11 +554,21 @@ mod http_server_tests {
 
         assert!(
             authenticate(config, "1a:2b:1:").unwrap()
-                == (sfu::UserId::from(vec![26]), sfu::CallId::from(vec![43]))
+                == (
+                    sfu::UserId::from("1a".to_string()),
+                    sfu::CallId::from(vec![0x2b])
+                )
         );
 
         assert!(
-            authenticate(config, "2:1a:2b:1:2:3").unwrap() == (vec![26].into(), vec![43].into())
+            authenticate(config, "2:1a:2b:1:2:3").unwrap()
+                == ("1a".to_string().into(), vec![0x2b].into())
+        );
+
+        // Even though all user IDs are current hex, we shouldn't be hardcoding that.
+        assert!(
+            authenticate(config, "2:not-hex:2b:1:2:3").unwrap()
+                == ("not-hex".to_string().into(), vec![0x2b].into())
         );
     }
 
@@ -587,12 +579,12 @@ mod http_server_tests {
         // Version 1: "username:1a:2b:1:"
         let result = parse_and_authenticate(config, &Authorization::basic("username", "1a:2b:1:"));
         assert!(result.is_ok());
-        assert!(result.unwrap() == (vec![26].into(), vec![43].into()));
+        assert!(result.unwrap() == ("1a".to_string().into(), vec![0x2b].into()));
 
         // Version 2: "username:2:1a:2b:1:2:3"
         let result =
             parse_and_authenticate(config, &Authorization::basic("username", "2:1a:2b:1:2:3"));
         assert!(result.is_ok());
-        assert!(result.unwrap() == (vec![26].into(), vec![43].into()));
+        assert!(result.unwrap() == ("1a".to_string().into(), vec![0x2b].into()));
     }
 }

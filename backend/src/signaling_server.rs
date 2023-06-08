@@ -99,31 +99,31 @@ fn call_id_from_hex(call_id: &str) -> Result<sfu::CallId> {
 
 /// Parse an opaque user_id from the provided endpoint_id.
 ///
-/// The endpoint string has the following format: `${hex(opaque_user_id)}-${resolution_request_id}`.
-/// If it doesn't have a hyphen, the entire string is considered to be a hex-encoded user ID.
+/// The endpoint string has the following format: `${opaque_user_id}-${resolution_request_id}`.
+/// If it doesn't have a hyphen, the entire string is considered to be the user ID.
 ///
 /// ```
 /// use calling_backend::signaling_server::parse_user_id_from_endpoint_id;
 ///
-/// assert!(parse_user_id_from_endpoint_id("abcdef").unwrap() == vec![0xab, 0xcd, 0xef].into());
-/// assert!(parse_user_id_from_endpoint_id("abcdef-0").unwrap() == vec![0xab, 0xcd, 0xef].into());
-/// assert!(parse_user_id_from_endpoint_id("abcdef-12345").unwrap() == vec![0xab, 0xcd, 0xef].into());
+/// assert!(parse_user_id_from_endpoint_id("abcdef").unwrap() == "abcdef".to_string().into());
+/// assert!(parse_user_id_from_endpoint_id("abcdef-0").unwrap() == "abcdef".to_string().into());
+/// assert!(parse_user_id_from_endpoint_id("abcdef-12345").unwrap() == "abcdef".to_string().into());
 /// assert!(parse_user_id_from_endpoint_id("").is_err());
 /// assert!(parse_user_id_from_endpoint_id("abcdef-").is_err());
 /// assert!(parse_user_id_from_endpoint_id("abcdef-a").is_err());
 /// assert!(parse_user_id_from_endpoint_id("abcdef-1-").is_err());
 /// ```
 pub fn parse_user_id_from_endpoint_id(endpoint_id: &str) -> Result<sfu::UserId> {
-    let user_id_hex = if let Some((user_id_hex, suffix)) = endpoint_id.split_once('-') {
+    let user_id_str = if let Some((user_id_str, suffix)) = endpoint_id.split_once('-') {
         let _resolution_request_id = u64::from_str(suffix)?;
-        user_id_hex
+        user_id_str
     } else {
         endpoint_id
     };
-    if user_id_hex.is_empty() {
+    if user_id_str.is_empty() {
         return Err(anyhow!("missing user ID"));
     }
-    Ok(Vec::from_hex(user_id_hex)?.into())
+    Ok(user_id_str.to_string().into())
 }
 
 /// Return a health response after accessing the SFU and obtaining basic information.
@@ -250,7 +250,7 @@ async fn join(
     let mut sfu = sfu.lock();
     match sfu.get_or_create_call_and_add_client(
         call_id,
-        &user_id,
+        user_id,
         request.endpoint_id,
         demux_id,
         server_ice_ufrag.to_string(),
@@ -449,7 +449,7 @@ mod signaling_server_tests {
             .lock()
             .get_or_create_call_and_add_client(
                 call_id,
-                &user_id,
+                user_id,
                 endpoint_id.to_string(),
                 demux_id,
                 ice::random_ufrag(),
@@ -769,7 +769,7 @@ mod signaling_server_tests {
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
-                            endpoint_id: "MALFORMEDNOHYPHEN".to_string(),
+                            endpoint_id: "".to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
