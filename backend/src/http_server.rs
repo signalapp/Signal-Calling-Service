@@ -23,7 +23,6 @@ use axum::{
 use hex::{FromHex, ToHex};
 use log::*;
 use parking_lot::Mutex;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot::Receiver;
@@ -351,11 +350,10 @@ async fn join_conference(
     };
 
     // Generate ids for the client.
-    let resolution_request_id = rand::thread_rng().gen::<u64>();
     // The endpoint_id is the term currently used on the client side, it is
     // equivalent to the active_speaker_id in the Sfu.
     let user_id_string = user_id.as_slice().encode_hex::<String>();
-    let endpoint_id = format!("{}-{}", user_id_string, resolution_request_id);
+    let endpoint_id = format!("{}-0", user_id_string);
     let demux_id = demux_id_from_endpoint_id(&endpoint_id);
     let server_ice_ufrag = ice::random_ufrag();
     let server_ice_pwd = ice::random_pwd();
@@ -364,7 +362,6 @@ async fn join_conference(
     match sfu.get_or_create_call_and_add_client(
         call_id,
         &user_id,
-        resolution_request_id,
         endpoint_id,
         demux_id,
         server_ice_ufrag.clone(),

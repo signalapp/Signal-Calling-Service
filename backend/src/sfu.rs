@@ -319,7 +319,6 @@ impl Sfu {
         &mut self,
         call_id: CallId,
         user_id: &UserId,
-        resolution_request_id: u64,
         active_speaker_id: String,
         demux_id: DemuxId,
         server_ice_ufrag: String,
@@ -346,7 +345,6 @@ impl Sfu {
             client_hkdf_extra_info
         );
         trace!("  {:25}{:?}", "demux_id:", demux_id);
-        trace!("  {:25}{}", "resolution_request_id:", resolution_request_id);
         trace!("  {:25}{}", "active_speaker_id:", active_speaker_id);
 
         let initial_target_send_rate =
@@ -415,7 +413,6 @@ impl Sfu {
                 demux_id,
                 user_id.clone(),
                 active_speaker_id,
-                resolution_request_id,
                 Instant::now(), // Now after taking the lock
             );
         }
@@ -1178,7 +1175,6 @@ mod sfu_tests {
         let _ = sfu.get_or_create_call_and_add_client(
             call_id.clone(),
             user_id,
-            resolution_request_id,
             active_speaker_id,
             demux_id,
             server_ice_ufrag,

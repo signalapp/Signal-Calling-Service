@@ -10,8 +10,7 @@ package group_call;
 message DeviceToSfu {
   message VideoRequestMessage {
     message VideoRequest {
-      // Functionally the same as a DemuxId, but oddly different.
-      optional uint64 short_device_id = 1;
+      reserved 1;
       optional uint32 height = 2;
       optional fixed32 demux_id = 3;
     }
@@ -33,8 +32,7 @@ message SfuToDevice {
   }
 
   message Speaker {
-    // Functionally the same as a DemuxId, but oddly different.
-    optional string long_device_id = 1;
+    reserved 1;
     optional fixed32 demux_id = 2;
   } 
 
@@ -59,8 +57,11 @@ message SfuToDevice {
     optional uint32 allocated_send_rate_kbps = 3;
   }
 
+  reserved 1;
   optional VideoRequest video_request               = 2;
+  reserved 3;
   optional Speaker speaker                          = 4;
+  reserved 5;
   optional DeviceJoinedOrLeft device_joined_or_left = 6;
   optional CurrentDevices current_devices           = 7;
   optional Stats stats                              = 8;

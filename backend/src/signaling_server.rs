@@ -218,7 +218,7 @@ async fn join(
         .try_into()
         .map_err(|err: call::Error| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let (user_id, resolution_request_id) =
+    let (user_id, _resolution_request_id) =
         parse_user_id_and_resolution_request_id_from_endpoint_id(&request.endpoint_id)
             .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
@@ -244,7 +244,6 @@ async fn join(
     match sfu.get_or_create_call_and_add_client(
         call_id,
         &user_id,
-        resolution_request_id,
         request.endpoint_id,
         demux_id,
         server_ice_ufrag.to_string(),
@@ -435,7 +434,7 @@ mod signaling_server_tests {
         client_dhe_pub_key: DhePublicKey,
     ) {
         let call_id = call_id_from_hex(call_id).unwrap();
-        let (user_id, resolution_request_id) =
+        let (user_id, _resolution_request_id) =
             parse_user_id_and_resolution_request_id_from_endpoint_id(endpoint_id).unwrap();
 
         let _ = sfu
@@ -443,7 +442,6 @@ mod signaling_server_tests {
             .get_or_create_call_and_add_client(
                 call_id,
                 &user_id,
-                resolution_request_id,
                 endpoint_id.to_string(),
                 demux_id,
                 ice::random_ufrag(),
