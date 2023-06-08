@@ -138,11 +138,6 @@ fn authenticate(
     password: &str,
 ) -> Result<(sfu::UserId, sfu::CallId)> {
     let (user_id_str, call_id_hex) = match password.split(':').collect::<Vec<_>>()[..] {
-        [user_id_str, call_id_hex, _timestamp, _mac_hex]
-            if !user_id_str.is_empty() && !call_id_hex.is_empty() =>
-        {
-            Ok((user_id_str, call_id_hex))
-        }
         ["2", user_id_str, call_id_hex, _timestamp, _permission, _mac_hex]
             if !user_id_str.is_empty() && !call_id_hex.is_empty() =>
         {
@@ -540,25 +535,17 @@ mod http_server_tests {
         assert!(authenticate(config, "1:2:3:4:5").is_err());
 
         // Error: Odd number of digits in call ID field
-        assert!(authenticate(config, "1a:2::").is_err());
         assert!(authenticate(config, "2:1a:2b2:1:1:3c").is_err());
 
         // Error: Invalid character 'x' in call ID field
-        assert!(authenticate(config, "1a:2x:1:").is_err());
         assert!(authenticate(config, "2:1a:2x:1::").is_err());
 
         // Error: Unknown version
         assert!(authenticate(config, ":1a:2b:1:2:3").is_err());
         assert!(authenticate(config, "1:1a:2b:1:2:3").is_err());
         assert!(authenticate(config, "3:1a:2b:1:2:3").is_err());
-
-        assert!(
-            authenticate(config, "1a:2b:1:").unwrap()
-                == (
-                    sfu::UserId::from("1a".to_string()),
-                    sfu::CallId::from(vec![0x2b])
-                )
-        );
+        // This was the v1 auth credential format.
+        assert!(authenticate(config, "1a:2b:1:").is_err());
 
         assert!(
             authenticate(config, "2:1a:2b:1:2:3").unwrap()
@@ -575,11 +562,6 @@ mod http_server_tests {
     #[tokio::test]
     async fn test_parse_and_authenticate() {
         let config = &CONFIG;
-
-        // Version 1: "username:1a:2b:1:"
-        let result = parse_and_authenticate(config, &Authorization::basic("username", "1a:2b:1:"));
-        assert!(result.is_ok());
-        assert!(result.unwrap() == ("1a".to_string().into(), vec![0x2b].into()));
 
         // Version 2: "username:2:1a:2b:1:2:3"
         let result =
