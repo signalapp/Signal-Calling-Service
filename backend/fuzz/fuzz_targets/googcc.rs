@@ -45,8 +45,9 @@ fuzz_target!(|data: &[u8]| {
     });
 
     // Consume all available entropy.
-    while let Ok(ack) = make_ack(&mut gen, epoch) {
+    while !gen.is_empty() {
         // Process acks one at a time so that they can't be sorted into a "better" order.
+        let ack = make_ack(&mut gen, epoch).unwrap();
         cc.recalculate_target_send_rate(vec![ack]);
     }
 });
