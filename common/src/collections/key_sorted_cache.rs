@@ -12,7 +12,7 @@ pub struct KeySortedCache<K, V> {
     value_by_key: BTreeMap<K, V>,
 }
 
-impl<K: Ord + Clone, V> KeySortedCache<K, V> {
+impl<K: Ord, V> KeySortedCache<K, V> {
     pub fn new(limit: usize) -> Self {
         Self {
             limit,
@@ -22,10 +22,8 @@ impl<K: Ord + Clone, V> KeySortedCache<K, V> {
 
     pub fn insert(&mut self, key: K, value: V) {
         self.value_by_key.insert(key, value);
-        // TODO: use pop_first when out of experimental
         if self.value_by_key.len() > self.limit {
-            let smallest_key = self.value_by_key.keys().next().unwrap().clone();
-            self.value_by_key.remove(&smallest_key);
+            self.value_by_key.pop_first();
         }
     }
 
