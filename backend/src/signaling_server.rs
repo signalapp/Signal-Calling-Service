@@ -72,6 +72,9 @@ pub struct JoinRequest {
     pub client_dhe_public_key: String,
     pub hkdf_extra_info: Option<String>,
     pub region: Option<String>,
+    #[serde(default)]
+    pub new_clients_require_approval: bool,
+    pub is_admin: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -259,6 +262,8 @@ async fn join(
         client_dhe_public_key,
         client_hkdf_extra_info,
         region,
+        request.new_clients_require_approval,
+        request.is_admin,
     ) {
         Ok(server_dhe_public_key) => {
             let media_server = config::ServerMediaAddress::from(config);
@@ -458,6 +463,8 @@ mod signaling_server_tests {
                 client_dhe_pub_key,
                 vec![],
                 Region::Unset,
+                false,
+                false,
             )
             .unwrap();
     }
@@ -728,6 +735,8 @@ mod signaling_server_tests {
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
+                            new_clients_require_approval: false,
+                            is_admin: false,
                         })
                         .unwrap(),
                     ))
@@ -751,6 +760,8 @@ mod signaling_server_tests {
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
+                            new_clients_require_approval: false,
+                            is_admin: false,
                         })
                         .unwrap(),
                     ))
@@ -774,6 +785,8 @@ mod signaling_server_tests {
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
+                            new_clients_require_approval: false,
+                            is_admin: false,
                         })
                         .unwrap(),
                     ))
@@ -797,6 +810,8 @@ mod signaling_server_tests {
                             client_dhe_public_key: "INVALID".to_string(),
                             hkdf_extra_info: None,
                             region: None,
+                            new_clients_require_approval: false,
+                            is_admin: false,
                         })
                         .unwrap(),
                     ))
@@ -820,6 +835,8 @@ mod signaling_server_tests {
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: Some("G".to_string()),
                             region: None,
+                            new_clients_require_approval: false,
+                            is_admin: false,
                         })
                         .unwrap(),
                     ))
@@ -843,6 +860,8 @@ mod signaling_server_tests {
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
+                            new_clients_require_approval: false,
+                            is_admin: false,
                         })
                         .unwrap(),
                     ))
@@ -882,6 +901,8 @@ mod signaling_server_tests {
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
+                            new_clients_require_approval: false,
+                            is_admin: false,
                         })
                         .unwrap(),
                     ))

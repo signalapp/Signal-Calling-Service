@@ -236,6 +236,29 @@ impl CheckedSplitAtMut for [u8] {
     }
 }
 
+/// Produces an iterator containing the elements of `vector` that match `predicate`.
+///
+/// Matching elements are removed from `vector`.
+///
+/// Based on unstable [`Vec::drain_filter`], but less efficient because removals are done one at a
+/// time instead of in bulk. This means that if many elements match `predicate`, the overall work
+/// done will be quadratic (it is `O(matching elements * total elements)`).
+pub fn drain_filter<'a, T>(
+    vector: &'a mut Vec<T>,
+    mut predicate: impl FnMut(&mut T) -> bool + 'a,
+) -> impl Iterator<Item = T> + 'a {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < vector.len() {
+            if predicate(&mut vector[i]) {
+                return Some(vector.remove(i));
+            }
+            i += 1;
+        }
+        None
+    })
+}
+
 pub fn format_log_line(
     buf: &mut env_logger::fmt::Formatter,
     record: &log::Record<'_>,
@@ -316,5 +339,16 @@ mod test {
         );
         assert_eq!(None, zero_one.checked_split_at_mut(3));
         assert_eq!(None, zero_one.checked_split_at_mut(30));
+    }
+
+    #[test]
+    fn test_drain_filter() {
+        let mut numbers = vec![1, 2, 3, 4, 5, 6, 8, 9, 11, 13, 14, 15];
+
+        let evens = drain_filter(&mut numbers, |x| *x % 2 == 0).collect::<Vec<_>>();
+        let odds = numbers;
+
+        assert_eq!(evens, vec![2, 4, 6, 8, 14]);
+        assert_eq!(odds, vec![1, 3, 5, 9, 11, 13, 15]);
     }
 }

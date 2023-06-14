@@ -342,6 +342,8 @@ async fn join_conference(
     let server_ice_pwd = ice::random_pwd();
 
     let mut sfu = sfu.lock();
+    // Make the first user to join an admin.
+    let is_admin = sfu.get_call_signaling_info(call_id.clone()).is_none();
     match sfu.get_or_create_call_and_add_client(
         call_id,
         user_id,
@@ -353,6 +355,8 @@ async fn join_conference(
         client_dhe_public_key,
         client_hkdf_extra_info,
         Region::Unset,
+        config.new_clients_require_approval,
+        is_admin,
     ) {
         Ok(server_dhe_public_key) => {
             let media_server = config::ServerMediaAddress::from(config);

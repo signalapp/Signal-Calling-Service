@@ -105,6 +105,10 @@ pub struct Config {
     #[clap(long, default_value = "30")]
     pub inactivity_timeout_secs: u64,
 
+    /// Whether new clients require approval. Only used with the testing http_server.
+    #[clap(long, default_value_t = false)]
+    pub new_clients_require_approval: bool,
+
     #[clap(flatten)]
     pub metrics: MetricsOptions,
 }
@@ -186,6 +190,7 @@ pub(crate) fn default_test_config() -> Config {
         active_speaker_message_interval_ms: 1000,
         inactivity_check_interval_secs: 5,
         inactivity_timeout_secs: 30,
+        new_clients_require_approval: false,
         metrics: Default::default(),
     }
 }

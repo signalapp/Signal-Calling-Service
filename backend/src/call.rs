@@ -106,7 +106,7 @@ impl Display for LoggableCallId {
 ///
 /// UserId deliberately does not implement Display or Debug; it will be consistent across calls in
 /// the same group and is thus considered sensitive.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct UserId(String);
 
 impl From<String> for UserId {
@@ -246,7 +246,8 @@ type KeyFrameRequestToSend = (DemuxId, rtp::KeyFrameRequest);
 pub struct Call {
     // Immutable
     loggable_call_id: LoggableCallId,
-    creator_id: UserId,  // AKA the first user to join
+    creator_id: UserId, // AKA the first user to join
+    new_clients_require_approval: bool,
     created: SystemTime, // For knowing how old the call is
     active_speaker_message_interval: Duration,
     initial_target_send_rate: DataRate,
@@ -254,10 +255,17 @@ pub struct Call {
 
     /// Clients (AKA devices) that have joined the call
     clients: Vec<Client>,
-    /// The last time a client was added or removed
+    /// Clients that have yet to be approved by an admin
+    pending_clients: Vec<NonParticipantClient>,
+    /// Clients that have been removed by an admin but haven't yet disconnected
+    removed_clients: Vec<NonParticipantClient>,
+    /// The last time a client was added or removed, including pending clients
     client_added_or_removed: Instant,
     /// The last time a clients update was sent to the clients
     clients_update_sent: Instant,
+
+    /// Clients that have ever been explicitly approved to join the call
+    approved_users: HashSet<UserId>,
 
     /// The active speaker, if there is one
     /// This is calculated based on incoming audio levels
@@ -298,9 +306,11 @@ pub struct SendRateAllocationInfo {
 }
 
 impl Call {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         loggable_call_id: LoggableCallId,
         creator_id: UserId,
+        new_clients_require_approval: bool,
         active_speaker_message_interval: Duration,
         initial_target_send_rate: DataRate,
         default_requested_max_send_rate: DataRate,
@@ -311,14 +321,19 @@ impl Call {
         Self {
             loggable_call_id,
             creator_id,
+            new_clients_require_approval,
             created: system_now,
             active_speaker_message_interval,
             initial_target_send_rate,
             default_requested_max_send_rate,
 
             clients: Vec::new(),
+            pending_clients: Vec::new(),
+            removed_clients: Vec::new(),
             client_added_or_removed: now,
             clients_update_sent: now,
+
+            approved_users: HashSet::new(),
 
             active_speaker_id: None,
             active_speaker_calculated: now - ACTIVE_SPEAKER_CALCULATION_INTERVAL, // easier than using None :)
@@ -369,53 +384,106 @@ impl Call {
     pub fn add_client(
         &mut self,
         demux_id: DemuxId,
-        user_id: UserId, // only used for stats
+        user_id: UserId,
         active_speaker_id: String,
+        is_admin: bool,
         now: Instant,
     ) {
-        time_scope_us!("calling.call.add_client");
-
-        let previous_client_count = self.clients.len();
-        self.clients.push(Client::new(
+        let pending_client = NonParticipantClient {
             demux_id,
             user_id,
             active_speaker_id,
-            self.default_requested_max_send_rate,
-            now,
-        ));
+            is_admin,
+            next_server_to_client_data_rtp_seqnum: 1,
+        };
+        if is_admin
+            || !self.new_clients_require_approval
+            || self.approved_users.contains(&pending_client.user_id)
+        {
+            self.promote_client(pending_client, now);
+        } else {
+            // We use the same event to inform clients about changes in the pending list.
+            self.will_add_or_remove_client(now);
+            self.pending_clients.push(pending_client);
+        }
+    }
+
+    fn will_add_or_remove_client(&mut self, now: Instant) {
         // An update message to clients about clients will be sent at the next tick().
         let increment = now.saturating_duration_since(self.client_added_or_removed);
-        match previous_client_count {
+        match self.clients.len() {
             0 => self.call_time.empty += increment,
             1 => self.call_time.solo += increment,
             2 => self.call_time.pair += increment,
             _ => self.call_time.many += increment,
         }
         self.client_added_or_removed = now;
+    }
+
+    fn promote_client(&mut self, pending_client: NonParticipantClient, now: Instant) {
+        time_scope_us!("calling.call.promote_client");
+
+        self.will_add_or_remove_client(now);
+
+        let demux_id = pending_client.demux_id;
+        self.clients.push(Client::new(
+            pending_client,
+            self.default_requested_max_send_rate,
+            now,
+        ));
         self.allocate_video_layers(demux_id, self.initial_target_send_rate, now);
         // We may have to update the padding SSRCs because there can't be any padding SSRCs until two people join
         self.update_padding_ssrcs();
     }
 
-    pub fn remove_client(&mut self, demux_id: DemuxId, now: Instant) {
-        time_scope_us!("calling.call.remove_client");
+    #[cfg(test)]
+    fn approve_pending_client(&mut self, demux_id: DemuxId, now: Instant) {
+        if let Some(user_id) = self
+            .pending_clients
+            .iter()
+            .find(|client| client.demux_id == demux_id)
+            .map(|client| client.user_id.clone())
+        {
+            // Approve every client with the same user ID.
+            let matching_pending_clients: Vec<_> =
+                calling_common::drain_filter(&mut self.pending_clients, |client| {
+                    client.user_id == user_id
+                })
+                .collect();
+            for pending_client in matching_pending_clients {
+                self.promote_client(pending_client, now);
+            }
+            self.approved_users.insert(user_id);
+        }
+    }
 
+    #[cfg(test)]
+    fn deny_pending_client(&mut self, demux_id: DemuxId, now: Instant) {
+        if let Some(user_id) = self
+            .pending_clients
+            .iter()
+            .find(|client| client.demux_id == demux_id)
+            .map(|client| client.user_id.clone())
+        {
+            self.will_add_or_remove_client(now);
+            // Remove every client with the same user ID.
+            let matching_pending_clients =
+                calling_common::drain_filter(&mut self.pending_clients, |client| {
+                    client.user_id == user_id
+                });
+            self.removed_clients.extend(matching_pending_clients);
+        }
+    }
+
+    fn remove_client(&mut self, demux_id: DemuxId, now: Instant) -> Option<Client> {
         if let Some(index) = self
             .clients
             .iter()
             .position(|client| client.demux_id == demux_id)
         {
-            let previous_client_count = self.clients.len();
-            self.clients.swap_remove(index);
+            self.will_add_or_remove_client(now);
+            let removed_client = self.clients.swap_remove(index);
 
-            // An update message to clients about clients will be sent at the next tick().
-            let increment = now.saturating_duration_since(self.client_added_or_removed);
-            match previous_client_count {
-                1 => self.call_time.solo += increment,
-                2 => self.call_time.pair += increment,
-                _ => self.call_time.many += increment,
-            }
-            self.client_added_or_removed = now;
             self.reallocate_target_send_rates(now);
             self.update_padding_ssrcs();
 
@@ -428,6 +496,39 @@ impl Call {
 
             self.key_frame_request_sent_by_ssrc
                 .retain(|ssrc, _timestamp| DemuxId::from_ssrc(*ssrc) != demux_id);
+
+            Some(removed_client)
+        } else {
+            None
+        }
+    }
+
+    pub fn drop_client(&mut self, demux_id: DemuxId, now: Instant) {
+        time_scope_us!("calling.call.drop_client");
+
+        if self.remove_client(demux_id, now).is_some() {
+            // No additional action necessary.
+        } else if let Some(index) = self
+            .pending_clients
+            .iter()
+            .position(|client| client.demux_id == demux_id)
+        {
+            self.will_add_or_remove_client(now);
+            self.pending_clients.swap_remove(index);
+        } else if let Some(index) = self
+            .removed_clients
+            .iter()
+            .position(|client| client.demux_id == demux_id)
+        {
+            self.removed_clients.swap_remove(index);
+        }
+    }
+
+    // Like `drop_client`, but keeps the client around in the `removed_clients` list until they leave.
+    #[cfg(test)]
+    fn force_remove_client(&mut self, demux_id: DemuxId, now: Instant) {
+        if let Some(client) = self.remove_client(demux_id, now) {
+            self.removed_clients.push(client.into());
         }
     }
 
@@ -481,22 +582,26 @@ impl Call {
             let proto = protos::DeviceToSfu::decode(incoming_rtp.payload())
                 .map_err(|_| Error::InvalidClientToServerProtobuf)?;
 
+            // Check for "Leave" before requiring that the demux ID is valid. We allow it for
+            // pending and removed clients as well, and for some random other demux ID ignoring it
+            // and just closing the connection is safe.
+            if proto.leave.is_some() {
+                // "Leave" is the only message we allow from pending and removed clients.
+                info!(
+                    "call: {} removing client: {} (via RTP)",
+                    self.loggable_call_id(),
+                    sender_demux_id.as_u32()
+                );
+                self.drop_client(sender_demux_id, now);
+                return Err(Error::Leave);
+            }
+
             // Snapshot this so we can get a mutable reference to the sender.
             let default_requested_max_send_rate = self.default_requested_max_send_rate;
 
             let sender = self
                 .find_client_mut(sender_demux_id)
                 .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
-
-            if proto.leave.is_some() {
-                info!(
-                    "call: {} removing client: {} (via RTP)",
-                    self.loggable_call_id(),
-                    sender_demux_id.as_u32()
-                );
-                self.remove_client(sender_demux_id, now);
-                return Err(Error::Leave);
-            }
 
             // The client resends this periodically, so we don't want to do anything
             // if it didn't change.
@@ -670,6 +775,29 @@ impl Call {
                 }
             } else {
                 trace!("No video from the active speaker. Not requesting key frames.");
+            }
+        }
+
+        {
+            let mut update = protos::SfuToDevice::default();
+            for pending_client in &mut self.pending_clients {
+                rtp_to_send.push((
+                    pending_client.demux_id,
+                    Self::encode_sfu_to_device_update(
+                        &update,
+                        &mut pending_client.next_server_to_client_data_rtp_seqnum,
+                    ),
+                ))
+            }
+            update.removed = Some(protos::sfu_to_device::Removed::default());
+            for removed_client in &mut self.removed_clients {
+                rtp_to_send.push((
+                    removed_client.demux_id,
+                    Self::encode_sfu_to_device_update(
+                        &update,
+                        &mut removed_client.next_server_to_client_data_rtp_seqnum,
+                    ),
+                ))
             }
         }
 
@@ -957,22 +1085,9 @@ impl Call {
                     });
                 }
 
-                let mut update_rtp_payload: Vec<u8> = Vec::with_capacity(update.encoded_len());
-                update
-                    .encode(&mut update_rtp_payload)
-                    .expect("Encode protobuf to client");
-
-                let seqnum: rtp::FullSequenceNumber = client.next_server_to_client_data_rtp_seqnum;
-                client.next_server_to_client_data_rtp_seqnum += 1;
-                let timestamp = seqnum as rtp::TruncatedTimestamp;
-
-                let update_rtp = rtp::Packet::with_empty_tag(
-                    CLIENT_SERVER_DATA_PAYLOAD_TYPE,
-                    seqnum,
-                    timestamp,
-                    CLIENT_SERVER_DATA_SSRC,
-                    None,
-                    &update_rtp_payload,
+                let update_rtp = Self::encode_sfu_to_device_update(
+                    &update,
+                    &mut client.next_server_to_client_data_rtp_seqnum,
                 );
                 rtp_to_send.push((client.demux_id, update_rtp))
             }
@@ -981,6 +1096,23 @@ impl Call {
                 self.stats_update_sent = now;
             }
         }
+    }
+
+    fn encode_sfu_to_device_update(
+        update: &protos::SfuToDevice,
+        next_server_to_client_data_rtp_seqnum: &mut rtp::FullSequenceNumber,
+    ) -> rtp::Packet<Vec<u8>> {
+        let seqnum: rtp::FullSequenceNumber = *next_server_to_client_data_rtp_seqnum;
+        *next_server_to_client_data_rtp_seqnum += 1;
+        let timestamp = seqnum as rtp::TruncatedTimestamp;
+        rtp::Packet::with_empty_tag(
+            CLIENT_SERVER_DATA_PAYLOAD_TYPE,
+            seqnum,
+            timestamp,
+            CLIENT_SERVER_DATA_SSRC,
+            None,
+            &update.encode_to_vec(),
+        )
     }
 
     fn calculate_active_speaker(&mut self, now: Instant) -> Option<DemuxId> {
@@ -1083,12 +1215,38 @@ impl Call {
     }
 }
 
+/// Enough information to send RTP data messages to and from the client, but not do any forwarding.
+struct NonParticipantClient {
+    // Immutable
+    demux_id: DemuxId,
+    user_id: UserId,
+    active_speaker_id: String,
+    is_admin: bool,
+
+    // Update with each proto send from server to client
+    next_server_to_client_data_rtp_seqnum: rtp::FullSequenceNumber,
+}
+
+impl From<Client> for NonParticipantClient {
+    fn from(client: Client) -> Self {
+        Self {
+            demux_id: client.demux_id,
+            user_id: client.user_id,
+            active_speaker_id: client.active_speaker_id,
+            is_admin: client.is_admin,
+
+            next_server_to_client_data_rtp_seqnum: client.next_server_to_client_data_rtp_seqnum,
+        }
+    }
+}
+
 /// The per-client state
 struct Client {
     // Immutable
     demux_id: DemuxId,
-    user_id: UserId, // only used for stats
+    user_id: UserId,
     active_speaker_id: String,
+    is_admin: bool,
 
     // Updated by incoming video packets
     incoming_video0: IncomingVideoState,
@@ -1140,16 +1298,15 @@ struct Client {
 
 impl Client {
     fn new(
-        demux_id: DemuxId,
-        user_id: UserId,
-        active_speaker_id: String,
+        pending_client_info: NonParticipantClient,
         requested_max_send_rate: DataRate,
         now: Instant,
     ) -> Self {
         Self {
-            demux_id,
-            user_id,
-            active_speaker_id,
+            demux_id: pending_client_info.demux_id,
+            user_id: pending_client_info.user_id,
+            active_speaker_id: pending_client_info.active_speaker_id,
+            is_admin: pending_client_info.is_admin,
 
             incoming_video0: IncomingVideoState::default(),
             incoming_video1: IncomingVideoState::default(),
@@ -1179,7 +1336,8 @@ impl Client {
             data_forwarder_by_sender_demux_id: HashMap::new(),
             allocated_height_by_sender_demux_id: HashMap::new(),
 
-            next_server_to_client_data_rtp_seqnum: 1,
+            next_server_to_client_data_rtp_seqnum: pending_client_info
+                .next_server_to_client_data_rtp_seqnum,
         }
     }
 
@@ -2773,6 +2931,7 @@ mod call_tests {
         Call::new(
             LoggableCallId::from(call_id),
             creator_id,
+            false,
             active_speaker_message_interval,
             initial_target_send_rate,
             default_requested_max_send_rate,
@@ -2794,7 +2953,20 @@ mod call_tests {
         let demux_id = demux_id_from_unshifted(demux_id_without_shifting);
         let user_id = UserId::from(user_id.to_string());
         let active_speaker_id = format!("{}_active_speaker_id", demux_id_without_shifting);
-        call.add_client(demux_id, user_id, active_speaker_id, now);
+        call.add_client(demux_id, user_id, active_speaker_id, false, now);
+        demux_id
+    }
+
+    fn add_admin(
+        call: &mut Call,
+        user_id: &str,
+        demux_id_without_shifting: u32,
+        now: Instant,
+    ) -> DemuxId {
+        let demux_id = demux_id_from_unshifted(demux_id_without_shifting);
+        let user_id = UserId::from(user_id.to_string());
+        let active_speaker_id = format!("{}_active_speaker_id", demux_id_without_shifting);
+        call.add_client(demux_id, user_id, active_speaker_id, true, now);
         demux_id
     }
 
@@ -3552,7 +3724,7 @@ mod call_tests {
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
         assert_eq!(0, rtp_to_send.len());
 
-        call.remove_client(demux_id1, at(400));
+        call.drop_client(demux_id1, at(400));
 
         let expected_update_payload_just_client2 = encode_proto(create_sfu_to_device(
             true,
@@ -3566,6 +3738,339 @@ mod call_tests {
                 demux_id2,
                 create_server_to_client_rtp(2, &expected_update_payload_just_client2)
             )],
+            rtp_to_send
+        );
+    }
+
+    #[test]
+    fn send_updates_for_pending_clients() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+
+        // It's a little weird that you get updates for when you join, but it doesn't really do any harm and it's much easier to implement.
+        let demux_id1 = add_client(&mut call, "1", 1, at(99));
+
+        let expected_update_payload_just_client1 =
+            encode_proto(create_sfu_to_device(true, Some(demux_id1), &[demux_id1]));
+        let empty_update_payload = encode_proto(protos::SfuToDevice::default());
+
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
+        assert_eq!(
+            vec![(
+                demux_id1,
+                create_server_to_client_rtp(1, &expected_update_payload_just_client1)
+            )],
+            rtp_to_send
+        );
+
+        call.new_clients_require_approval = true;
+        let demux_id2 = add_client(&mut call, "2", 2, at(200));
+
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
+        assert_eq!(
+            vec![
+                (
+                    demux_id1,
+                    create_server_to_client_rtp(2, &expected_update_payload_just_client1)
+                ),
+                (
+                    demux_id2,
+                    create_server_to_client_rtp(1, &empty_update_payload)
+                )
+            ],
+            rtp_to_send
+        );
+
+        call.approve_pending_client(demux_id2, at(300));
+
+        let expected_update_payload_both_clients = encode_proto(create_sfu_to_device(
+            true,
+            Some(demux_id1),
+            &[demux_id1, demux_id2],
+        ));
+
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
+        assert_eq!(
+            vec![
+                (
+                    demux_id1,
+                    create_server_to_client_rtp(3, &expected_update_payload_both_clients)
+                ),
+                (
+                    demux_id2,
+                    create_server_to_client_rtp(2, &expected_update_payload_both_clients)
+                )
+            ],
+            rtp_to_send
+        );
+
+        call.drop_client(demux_id2, at(400));
+
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
+        assert_eq!(
+            vec![(
+                demux_id1,
+                create_server_to_client_rtp(4, &expected_update_payload_just_client1)
+            )],
+            rtp_to_send
+        );
+
+        // Re-add the same user.
+        let demux_id22 = add_client(&mut call, "2", 22, at(500));
+
+        let expected_update_payload_both_clients_after_rejoin = encode_proto(create_sfu_to_device(
+            true,
+            Some(demux_id1),
+            &[demux_id1, demux_id22],
+        ));
+
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500));
+        assert_eq!(
+            vec![
+                (
+                    demux_id1,
+                    create_server_to_client_rtp(
+                        5,
+                        &expected_update_payload_both_clients_after_rejoin
+                    )
+                ),
+                (
+                    demux_id22,
+                    create_server_to_client_rtp(
+                        1,
+                        &expected_update_payload_both_clients_after_rejoin
+                    )
+                )
+            ],
+            rtp_to_send
+        );
+    }
+
+    trait HasDemuxId {
+        fn demux_id(&self) -> DemuxId;
+    }
+    impl HasDemuxId for Client {
+        fn demux_id(&self) -> DemuxId {
+            self.demux_id
+        }
+    }
+    impl HasDemuxId for NonParticipantClient {
+        fn demux_id(&self) -> DemuxId {
+            self.demux_id
+        }
+    }
+
+    fn demux_ids(clients: &[impl HasDemuxId]) -> Vec<DemuxId> {
+        clients.iter().map(|client| client.demux_id()).collect()
+    }
+
+    #[test]
+    fn admin_client_is_not_pending() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+        call.new_clients_require_approval = true;
+
+        let _non_admin = add_client(&mut call, "1", 1, at(100));
+        assert_eq!(0, call.clients.len());
+        let admin = add_admin(&mut call, "2", 2, at(200));
+        assert_eq!(vec![admin], demux_ids(&call.clients));
+    }
+
+    #[test]
+    fn approve_multiple_clients_with_same_user_id() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+        call.new_clients_require_approval = true;
+
+        let client_device_1 = add_client(&mut call, "Them", 1, at(100));
+        let other_device = add_client(&mut call, "Somebody Else", 2, at(200));
+        let client_device_2 = add_client(&mut call, "Them", 3, at(300));
+        assert_eq!(
+            vec![client_device_1, other_device, client_device_2],
+            demux_ids(&call.pending_clients)
+        );
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+
+        call.approve_pending_client(client_device_2, at(400));
+
+        assert_eq!(vec![other_device], demux_ids(&call.pending_clients));
+        assert_eq!(
+            vec![client_device_1, client_device_2],
+            demux_ids(&call.clients)
+        );
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+    }
+
+    #[test]
+    fn deny_multiple_clients_with_same_user_id() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+        call.new_clients_require_approval = true;
+
+        let client_device_1 = add_client(&mut call, "Them", 1, at(100));
+        let other_device = add_client(&mut call, "Somebody Else", 2, at(200));
+        let client_device_2 = add_client(&mut call, "Them", 3, at(300));
+        assert_eq!(
+            vec![client_device_1, other_device, client_device_2],
+            demux_ids(&call.pending_clients)
+        );
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+
+        call.deny_pending_client(client_device_2, at(400));
+
+        assert_eq!(vec![other_device], demux_ids(&call.pending_clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(
+            vec![client_device_1, client_device_2],
+            demux_ids(&call.removed_clients)
+        );
+    }
+
+    #[test]
+    fn pending_client_can_leave() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+        call.new_clients_require_approval = true;
+
+        let non_admin = add_client(&mut call, "1", 1, at(100));
+        assert_eq!(0, call.clients.len());
+        assert_eq!(vec![non_admin], demux_ids(&call.pending_clients));
+
+        let result = call.handle_rtp(
+            non_admin,
+            create_server_to_client_rtp(
+                1,
+                &encode_proto(protos::DeviceToSfu {
+                    leave: Some(protos::device_to_sfu::LeaveMessage::default()),
+                    ..Default::default()
+                }),
+            )
+            .borrow_mut(),
+            at(200),
+        );
+        assert_eq!(Error::Leave, result.unwrap_err());
+        assert_eq!(0, call.clients.len());
+        assert_eq!(0, call.pending_clients.len());
+    }
+
+    #[test]
+    fn send_updates_for_removed_clients() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+
+        // It's a little weird that you get updates for when you join, but it doesn't really do any harm and it's much easier to implement.
+        let demux_id1 = add_client(&mut call, "1", 1, at(99));
+
+        let expected_update_payload_just_client1 =
+            encode_proto(create_sfu_to_device(true, Some(demux_id1), &[demux_id1]));
+
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
+        assert_eq!(
+            vec![(
+                demux_id1,
+                create_server_to_client_rtp(1, &expected_update_payload_just_client1)
+            )],
+            rtp_to_send
+        );
+
+        let demux_id2 = add_client(&mut call, "2", 2, at(200));
+
+        let expected_update_payload_both_clients = encode_proto(create_sfu_to_device(
+            true,
+            Some(demux_id1),
+            &[demux_id1, demux_id2],
+        ));
+
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
+        assert_eq!(
+            vec![
+                (
+                    demux_id1,
+                    create_server_to_client_rtp(2, &expected_update_payload_both_clients)
+                ),
+                (
+                    demux_id2,
+                    create_server_to_client_rtp(1, &expected_update_payload_both_clients)
+                )
+            ],
+            rtp_to_send
+        );
+
+        call.force_remove_client(demux_id2, at(300));
+        let expected_update_payload_for_removed = encode_proto(protos::SfuToDevice {
+            removed: Some(protos::sfu_to_device::Removed::default()),
+            ..Default::default()
+        });
+
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
+        assert_eq!(
+            vec![
+                (
+                    demux_id1,
+                    create_server_to_client_rtp(3, &expected_update_payload_just_client1)
+                ),
+                (
+                    demux_id2,
+                    create_server_to_client_rtp(2, &expected_update_payload_for_removed)
+                )
+            ],
+            rtp_to_send
+        );
+
+        call.drop_client(demux_id2, at(400));
+
+        // Clients leaving the "removed" list don't count as participant changes,
+        // so there's no update for client 1 at this tick.
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
+        assert_eq!(0, rtp_to_send.len());
+
+        // Re-add the same user.
+        let demux_id22 = add_client(&mut call, "2", 22, at(500));
+
+        let expected_update_payload_both_clients_after_rejoin = encode_proto(create_sfu_to_device(
+            true,
+            Some(demux_id1),
+            &[demux_id1, demux_id22],
+        ));
+
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500));
+        assert_eq!(
+            vec![
+                (
+                    demux_id1,
+                    create_server_to_client_rtp(
+                        4,
+                        &expected_update_payload_both_clients_after_rejoin
+                    )
+                ),
+                (
+                    demux_id22,
+                    create_server_to_client_rtp(
+                        1,
+                        &expected_update_payload_both_clients_after_rejoin
+                    )
+                )
+            ],
             rtp_to_send
         );
     }

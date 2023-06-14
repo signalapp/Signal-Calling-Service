@@ -327,6 +327,8 @@ impl Sfu {
         client_dhe_public_key: DhePublicKey,
         client_hkdf_extra_info: Vec<u8>,
         region: Region,
+        new_clients_require_approval: bool,
+        is_admin: bool,
     ) -> Result<DhePublicKey, SfuError> {
         let loggable_call_id = LoggableCallId::from(&call_id);
         trace!("get_or_create_call_and_add_client():");
@@ -377,6 +379,7 @@ impl Sfu {
                 Arc::new(Mutex::new(Call::new(
                     LoggableCallId::from(&call_id),
                     user_id.clone(),
+                    new_clients_require_approval,
                     Duration::from_millis(active_speaker_message_interval_ms),
                     initial_target_send_rate,
                     default_requested_max_send_rate,
@@ -413,6 +416,7 @@ impl Sfu {
                 demux_id,
                 user_id.clone(),
                 active_speaker_id,
+                is_admin,
                 Instant::now(), // Now after taking the lock
             );
         }
@@ -481,7 +485,7 @@ impl Sfu {
             );
 
             let mut call = call.lock();
-            call.remove_client(demux_id, now);
+            call.drop_client(demux_id, now);
         }
 
         if let Some(connection) = self.connection_by_id.remove(&connection_id) {
@@ -859,7 +863,7 @@ impl Sfu {
 
             if let Some(expired_demux_ids) = expired_demux_ids_by_call_id.get(call_id) {
                 for expired_demux_id in expired_demux_ids {
-                    call.remove_client(*expired_demux_id, now);
+                    call.drop_client(*expired_demux_id, now);
                 }
             }
 
@@ -1171,6 +1175,8 @@ mod sfu_tests {
             client_dhe_public_key,
             vec![],
             Region::Unset,
+            false,
+            false,
         )?;
         Ok(())
     }
