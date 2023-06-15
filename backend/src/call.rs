@@ -266,7 +266,9 @@ pub struct Call {
 
     /// Clients that are considered pre-approved to join the call
     approved_users: HashSet<UserId>,
-    /// Clients that have ever been explicitly denied approval to join the call
+    /// Clients that have denied approval to join the call.
+    ///
+    /// Repeated denial is implicitly promoted to a block; approval clears any remembered denial.
     denied_users: HashSet<UserId>,
     /// Clients that have been blocked from joining the call
     ///
@@ -482,6 +484,7 @@ impl Call {
                 );
                 self.promote_client(pending_client, now);
             }
+            self.denied_users.remove(&user_id);
             self.approved_users.insert(user_id);
         }
     }
@@ -4443,6 +4446,83 @@ mod call_tests {
         );
         assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
         assert!(call.approved_users.contains(&alice_user_id));
+    }
+
+    #[test]
+    fn approval_resets_denial() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+        call.new_clients_require_approval = true;
+
+        let alice_user_id = UserId::from("Alice".to_string());
+
+        let alice_device_1 = add_client(&mut call, alice_user_id.as_str(), 1, at(100));
+        assert_eq!(vec![alice_device_1], demux_ids(&call.pending_clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+        assert!(call.approved_users.is_empty());
+        assert!(call.denied_users.is_empty());
+        assert!(call.blocked_users.is_empty());
+
+        call.deny_pending_client(alice_device_1, at(200));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
+        assert!(call.approved_users.is_empty());
+        assert!(call.denied_users.contains(&alice_user_id));
+        assert!(call.blocked_users.is_empty());
+
+        let alice_device_2 = add_client(&mut call, alice_user_id.as_str(), 2, at(300));
+        assert_eq!(vec![alice_device_2], demux_ids(&call.pending_clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
+        assert!(call.approved_users.is_empty());
+        assert!(call.denied_users.contains(&alice_user_id));
+        assert!(call.blocked_users.is_empty());
+
+        call.approve_pending_client(alice_device_2, at(400));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![alice_device_2], demux_ids(&call.clients));
+        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
+        assert!(call.approved_users.contains(&alice_user_id));
+        assert!(call.denied_users.is_empty());
+        assert!(call.blocked_users.is_empty());
+
+        call.force_remove_client(alice_device_2, at(500));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(
+            vec![alice_device_1, alice_device_2],
+            demux_ids(&call.removed_clients)
+        );
+        assert!(call.approved_users.is_empty());
+        assert!(call.denied_users.is_empty());
+        assert!(call.blocked_users.is_empty());
+
+        let alice_device_3 = add_client(&mut call, alice_user_id.as_str(), 3, at(500));
+        assert_eq!(vec![alice_device_3], demux_ids(&call.pending_clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(
+            vec![alice_device_1, alice_device_2],
+            demux_ids(&call.removed_clients)
+        );
+        assert!(call.approved_users.is_empty());
+        assert!(call.denied_users.is_empty());
+        assert!(call.blocked_users.is_empty());
+
+        call.deny_pending_client(alice_device_3, at(600));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(
+            vec![alice_device_1, alice_device_2, alice_device_3],
+            demux_ids(&call.removed_clients)
+        );
+        assert!(call.approved_users.is_empty());
+        assert!(call.denied_users.contains(&alice_user_id));
+        assert!(call.blocked_users.is_empty());
     }
 
     #[test]
