@@ -72,6 +72,7 @@ pub struct ClientsResponse {
 }
 
 #[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct JoinRequest {
     #[serde(rename = "endpointId")]
     pub client_id: String, // Aka endpoint_id or active_speaker_id, a concatenation of user_id + '-' + resolution_request_id.
@@ -79,10 +80,9 @@ pub struct JoinRequest {
     pub ice_ufrag: String,
     #[serde(rename = "clientDhePublicKey")]
     pub dhe_public_key: Option<String>,
-    #[serde(rename = "hkdfExtraInfo")]
     pub hkdf_extra_info: Option<String>,
     pub region: String,
-    #[serde(rename = "isAdmin")]
+    pub new_clients_require_approval: bool,
     pub is_admin: bool,
 }
 

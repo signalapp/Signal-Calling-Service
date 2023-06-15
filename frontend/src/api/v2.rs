@@ -884,6 +884,7 @@ mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: false,
                     is_admin: false,
                 }),
             )
@@ -985,6 +986,7 @@ mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: false,
                     is_admin: false,
                 }),
             )
@@ -1086,6 +1088,7 @@ mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: false,
                     is_admin: false,
                 }),
             )
@@ -2039,6 +2042,134 @@ mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: false,
+                    is_admin: false,
+                }),
+            )
+            .once()
+            // Result<JoinResponse, BackendError>
+            .returning(|_, _, _, _| {
+                Ok(backend::JoinResponse {
+                    ip: "127.0.0.1".to_string(),
+                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    port: 8080,
+                    port_tcp: Some(8080),
+                    ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
+                    ice_pwd: BACKEND_ICE_PWD.to_string(),
+                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                })
+            });
+
+        let frontend = create_frontend_with_id_generator(config, storage, backend, id_generator);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let join_request = create_call_link_join_request(None);
+
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v2/conference/participants".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .header(
+                header::AUTHORIZATION,
+                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
+            )
+            .body(Body::from(join_request))
+            .unwrap();
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(join_response.demux_id, DEMUX_ID_1);
+        assert_eq!(join_response.port, 8080);
+        assert_eq!(join_response.ip, "127.0.0.1".to_string());
+        assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
+        assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
+        assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
+        assert_eq!(
+            join_response.dhe_public_key,
+            BACKEND_DHE_PUBLIC_KEY.to_string()
+        );
+        assert_eq!(&join_response.call_creator, USER_ID_1);
+        assert_eq!(&join_response.era_id, ERA_ID_1);
+    }
+
+    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is no call yet; this time, the call link requires admin approval.
+    #[tokio::test]
+    async fn test_call_link_join_with_no_call_requiring_admin_approval() {
+        let config = &CONFIG;
+
+        // Create mocked dependencies with expectations.
+        let mut seq = Sequence::new();
+        let mut storage = Box::new(MockStorage::new());
+        let mut expected_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
+        expected_call_record.creator = USER_ID_1_DOUBLE_ENCODED.to_string();
+        let resulting_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
+
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(RoomId::from(ROOM_ID)))
+            .once()
+            .return_once(|_| {
+                let mut state = default_call_link_state();
+                state.restrictions = CallLinkRestrictions::AdminApproval;
+                Ok((Some(state), None))
+            })
+            .in_sequence(&mut seq);
+
+        storage
+            .expect_get_or_add_call_record()
+            .with(eq(expected_call_record))
+            .once()
+            .return_once(move |_| Ok(resulting_call_record))
+            .in_sequence(&mut seq);
+
+        let mut backend = Box::new(MockBackend::new());
+        let mut id_generator = Box::new(MockIdGenerator::new());
+
+        // Create additional expectations.
+        backend
+            .expect_select_ip()
+            .once()
+            // Result<String, BackendError>
+            .returning(|| Ok("127.0.0.1".to_string()));
+
+        id_generator
+            .expect_get_random_era_id()
+            .with(eq(16))
+            .once()
+            .returning(|_| ERA_ID_1.to_string());
+
+        id_generator
+            .expect_get_random_demux_id_and_endpoint_id()
+            // user_id: &str
+            .with(eq(USER_ID_1_DOUBLE_ENCODED))
+            .once()
+            // Result<(DemuxId, String), FrontendError>
+            .returning(|_| Ok((DEMUX_ID_1.try_into().unwrap(), ENDPOINT_ID_1.to_string())));
+
+        let expected_demux_id: DemuxId = DEMUX_ID_1.try_into().unwrap();
+
+        backend
+            .expect_join()
+            // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
+            .with(
+                eq(backend::Address::try_from("127.0.0.1").unwrap()),
+                eq(ERA_ID_1),
+                eq(expected_demux_id),
+                eq(backend::JoinRequest {
+                    client_id: ENDPOINT_ID_1.to_string(),
+                    ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
+                    hkdf_extra_info: None,
+                    region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: true,
                     is_admin: false,
                 }),
             )
@@ -2139,6 +2270,7 @@ mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: false,
                     is_admin: false,
                 }),
             )
@@ -2340,6 +2472,7 @@ mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: false,
                     is_admin: true,
                 }),
             )
@@ -2442,6 +2575,7 @@ mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: false,
                     is_admin: false,
                 }),
             )
@@ -3601,6 +3735,7 @@ mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: false,
                     is_admin: false,
                 }),
             )
@@ -3701,6 +3836,7 @@ mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: false,
                     is_admin: false,
                 }),
             )
@@ -3899,6 +4035,7 @@ mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: false,
                     is_admin: true,
                 }),
             )
@@ -4000,6 +4137,7 @@ mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: false,
                     is_admin: false,
                 }),
             )

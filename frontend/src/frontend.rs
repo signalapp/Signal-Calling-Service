@@ -391,6 +391,8 @@ impl Frontend {
                     dhe_public_key: Some(join_request.dhe_public_key),
                     hkdf_extra_info: join_request.hkdf_extra_info,
                     region: join_request.region,
+                    new_clients_require_approval: join_request.restrictions
+                        == CallLinkRestrictions::AdminApproval,
                     is_admin: join_request.is_admin,
                 },
             )
