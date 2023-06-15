@@ -44,6 +44,8 @@ const SEND_RATE_REALLOCATION_INTERVAL: Duration = Duration::from_millis(1000);
 const ACTIVE_SPEAKER_CALCULATION_INTERVAL: Duration = Duration::from_millis(300);
 /// This is how often we send stats down to the client
 const STATS_MESSAGE_INTERVAL: Duration = Duration::from_secs(1);
+/// This is how often we send update messages to removed clients.
+const REMOVED_CLIENTS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A wrapper around Vec<u8> to identify a Call.
 /// It comes from signaling, but isn't known by the clients.
@@ -285,6 +287,8 @@ pub struct Call {
 
     /// The last time a status update was sent to the clients
     stats_update_sent: Instant,
+    /// The last time an update was sent to removed clients
+    removed_clients_update_sent: Instant,
 
     /// The last time key frame requests were sent, in general and specifically for certain SSRCs
     key_frame_requests_sent: Instant,
@@ -350,6 +354,7 @@ impl Call {
             active_speaker_update_sent: now,
 
             stats_update_sent: now, // easier than using None :)
+            removed_clients_update_sent: now - REMOVED_CLIENTS_UPDATE_INTERVAL, // easier than using None :)
 
             key_frame_requests_sent: now - KEY_FRAME_REQUEST_CALCULATION_INTERVAL, // easier than using None :)
             key_frame_request_sent_by_ssrc: HashMap::new(),
@@ -884,6 +889,11 @@ impl Call {
             }
         }
 
+        let client_was_added_or_removed = self.client_added_or_removed > self.clients_update_sent;
+        if client_was_added_or_removed {
+            self.clients_update_sent = now;
+        }
+
         // A change to the layer rate or resolution may impact how the receiver allocates the target sent rate.
         // So can a change in active speaker.
         // So we should reallocate after changing the incoming rates above and active speaker above.
@@ -891,7 +901,14 @@ impl Call {
 
         // Do this after reallocation so it has the latest info about what is being forwarded.
         let mut rtp_to_send = vec![];
-        self.send_update_proto_to_all_clients(new_active_speaker.is_some(), &mut rtp_to_send, now);
+        self.send_update_proto_to_participating_clients(
+            client_was_added_or_removed,
+            new_active_speaker.is_some(),
+            &mut rtp_to_send,
+            now,
+        );
+        self.send_update_proto_to_pending_clients(client_was_added_or_removed, &mut rtp_to_send);
+        self.send_update_proto_to_removed_clients(&mut rtp_to_send, now);
 
         // Reallocation can change what key frames to send, so we should do this after reallocating.
         let mut key_frame_requests_to_send = self.send_key_frame_requests_if_its_been_too_long(now);
@@ -931,29 +948,6 @@ impl Call {
                 }
             } else {
                 trace!("No video from the active speaker. Not requesting key frames.");
-            }
-        }
-
-        {
-            let mut update = protos::SfuToDevice::default();
-            for pending_client in &mut self.pending_clients {
-                rtp_to_send.push((
-                    pending_client.demux_id,
-                    Self::encode_sfu_to_device_update(
-                        &update,
-                        &mut pending_client.next_server_to_client_data_rtp_seqnum,
-                    ),
-                ))
-            }
-            update.removed = Some(protos::sfu_to_device::Removed::default());
-            for removed_client in &mut self.removed_clients {
-                rtp_to_send.push((
-                    removed_client.demux_id,
-                    Self::encode_sfu_to_device_update(
-                        &update,
-                        &mut removed_client.next_server_to_client_data_rtp_seqnum,
-                    ),
-                ))
             }
         }
 
@@ -1169,19 +1163,19 @@ impl Call {
             .find(|client| client.demux_id == demux_id)
     }
 
-    fn send_update_proto_to_all_clients(
+    fn send_update_proto_to_participating_clients(
         &mut self,
+        client_was_added_or_removed: bool,
         active_speaker_just_changed: bool,
         rtp_to_send: &mut Vec<RtpToSend>,
         now: Instant,
     ) {
         let mut update = protos::SfuToDevice::default();
 
-        if self.client_added_or_removed > self.clients_update_sent {
+        if client_was_added_or_removed {
             // The fields aren't used by the client, so they are None.
             update.device_joined_or_left =
                 Some(protos::sfu_to_device::DeviceJoinedOrLeft::default());
-            self.clients_update_sent = now;
         }
 
         if active_speaker_just_changed
@@ -1251,6 +1245,59 @@ impl Call {
             if send_stats {
                 self.stats_update_sent = now;
             }
+        }
+    }
+
+    fn send_update_proto_to_pending_clients(
+        &mut self,
+        client_was_added_or_removed: bool,
+        rtp_to_send: &mut Vec<RtpToSend>,
+    ) {
+        if self.pending_clients.is_empty() || !client_was_added_or_removed {
+            return;
+        }
+
+        let update = protos::SfuToDevice {
+            device_joined_or_left: Some(protos::sfu_to_device::DeviceJoinedOrLeft::default()),
+            ..Default::default()
+        };
+
+        for pending_client in &mut self.pending_clients {
+            rtp_to_send.push((
+                pending_client.demux_id,
+                Self::encode_sfu_to_device_update(
+                    &update,
+                    &mut pending_client.next_server_to_client_data_rtp_seqnum,
+                ),
+            ))
+        }
+    }
+
+    fn send_update_proto_to_removed_clients(
+        &mut self,
+        rtp_to_send: &mut Vec<RtpToSend>,
+        now: Instant,
+    ) {
+        if self.removed_clients.is_empty()
+            || self.removed_clients_update_sent + REMOVED_CLIENTS_UPDATE_INTERVAL > now
+        {
+            return;
+        }
+        self.removed_clients_update_sent = now;
+
+        let update = protos::SfuToDevice {
+            removed: Some(protos::sfu_to_device::Removed {}),
+            ..Default::default()
+        };
+
+        for removed_client in &mut self.removed_clients {
+            rtp_to_send.push((
+                removed_client.demux_id,
+                Self::encode_sfu_to_device_update(
+                    &update,
+                    &mut removed_client.next_server_to_client_data_rtp_seqnum,
+                ),
+            ))
         }
     }
 
@@ -3907,7 +3954,11 @@ mod call_tests {
 
         let expected_update_payload_just_client1 =
             create_sfu_to_device(true, Some(demux_id1), &[demux_id1]).encode_to_vec();
-        let empty_update_payload = protos::SfuToDevice::default().encode_to_vec();
+        let expected_update_payload_for_pending = protos::SfuToDevice {
+            device_joined_or_left: Some(protos::sfu_to_device::DeviceJoinedOrLeft {}),
+            ..Default::default()
+        }
+        .encode_to_vec();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
         assert_eq!(
@@ -3930,7 +3981,7 @@ mod call_tests {
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(1, &empty_update_payload)
+                    create_server_to_client_rtp(1, &expected_update_payload_for_pending)
                 )
             ],
             rtp_to_send
