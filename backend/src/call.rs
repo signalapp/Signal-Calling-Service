@@ -1223,7 +1223,17 @@ impl Call {
                     .unzip();
 
                 update.current_devices = Some(protos::sfu_to_device::CurrentDevices {
-                    all_demux_ids: raw_demux_ids.clone(),
+                    all_demux_ids: if cfg!(test) {
+                        raw_demux_ids.clone()
+                    } else {
+                        // Clients don't make use of this information, so we leave it out when not
+                        // running tests. Note that DeviceAddedOrRemoved is currently used to signal
+                        // updates to both the active clients list and the pending clients list, so
+                        // any changes that make use of this field should consider adding a second
+                        // field for pending devices. The lists may also need to be *sent* to
+                        // pending devices as well, since they also maintain peek info.
+                        vec![]
+                    },
                     demux_ids_with_video,
                     allocated_heights,
                 });
