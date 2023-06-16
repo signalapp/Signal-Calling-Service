@@ -106,7 +106,7 @@ pub struct Config {
     pub inactivity_timeout_secs: u64,
 
     /// Whether new clients require approval. Only used with the testing http_server.
-    #[clap(long, default_value_t = false)]
+    #[clap(long, action)]
     pub new_clients_require_approval: bool,
 
     #[clap(flatten)]

@@ -70,6 +70,7 @@ pub struct JoinResponse {
     pub ice_ufrag: String,
     pub ice_pwd: String,
     pub dhe_public_key: String,
+    pub conference_id: String,
 }
 
 mod metrics {
@@ -130,6 +131,16 @@ pub fn demux_id_from_endpoint_id(endpoint_id: &str) -> sfu::DemuxId {
     (u32::from_be_bytes(hasher.finalize()[0..4].try_into().unwrap()) & 0xfffffff0)
         .try_into()
         .unwrap()
+}
+
+/// Synthesizes a conference ID from the call start timestamp.
+fn conference_id_from_signaling_info(signaling: &sfu::CallSignalingInfo) -> String {
+    signaling
+        .created
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis()
+        .to_string()
 }
 
 /// Authenticate the header and return the (user_id, call_id) tuple or an error.
@@ -264,15 +275,8 @@ async fn get_participants(
             })
             .collect();
 
-        let conference_id = signaling
-            .created
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis()
-            .to_string();
-
         let response = ParticipantsResponse {
-            conference_id,
+            conference_id: conference_id_from_signaling_info(&signaling),
             max_devices,
             participants,
             creator: signaling.creator_id.as_str().to_string(),
@@ -345,7 +349,7 @@ async fn join_conference(
     // Make the first user to join an admin.
     let is_admin = sfu.get_call_signaling_info(call_id.clone()).is_none();
     match sfu.get_or_create_call_and_add_client(
-        call_id,
+        call_id.clone(),
         user_id,
         endpoint_id,
         demux_id,
@@ -361,6 +365,10 @@ async fn join_conference(
         Ok(server_dhe_public_key) => {
             let media_server = config::ServerMediaAddress::from(config);
 
+            let signaling = sfu
+                .get_call_signaling_info(call_id)
+                .expect("just created call");
+
             let response = JoinResponse {
                 demux_id: demux_id.into(),
                 port: media_server.ports.udp,
@@ -374,6 +382,7 @@ async fn join_conference(
                 ice_ufrag: server_ice_ufrag,
                 ice_pwd: server_ice_pwd,
                 dhe_public_key: server_dhe_public_key.encode_hex(),
+                conference_id: conference_id_from_signaling_info(&signaling),
             };
 
             Ok(Json(response).into_response())
