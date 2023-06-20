@@ -8,6 +8,18 @@ Media forwarding server for group calls. Forwards media from 1 to N devices.
 
 Signaling server for group calls that helps direct client requests to appropriate backends.
 
+# Contributing
+
+Signal does accept external contributions to this project. However, unless the change is
+simple and easily understood, for example fixing a bug, adding a new test, or improving performance,
+first open an issue to discuss your intended change as not all changes can be accepted.
+
+Contributions that will not be used directly by one of Signal's official client apps may still be
+considered, but only if they do not pose an undue maintenance burden or conflict with the goals of
+the project.
+
+Signing a [CLA (Contributor License Agreement)](https://signal.org/cla/) is required for all contributions.
+
 # Thanks
 
 We thank WebRTC for the "googcc" congestion control algorithm (see googcc.rs for more details).
