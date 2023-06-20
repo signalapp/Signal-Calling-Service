@@ -7,8 +7,9 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::{
-    error::{DeleteItemError, DeleteItemErrorKind, UpdateItemError, UpdateItemErrorKind},
-    model::{AttributeValue, ReturnValue, Select},
+    operation::delete_item::DeleteItemError,
+    operation::update_item::UpdateItemError,
+    types::{AttributeValue, ReturnValue, Select},
     Client, Config,
 };
 use aws_smithy_async::rt::sleep::default_async_sleep;
@@ -414,10 +415,7 @@ impl Storage for DynamoDb {
         match response {
             Ok(_) => Ok(()),
             Err(err) => match err.into_service_error() {
-                DeleteItemError {
-                    kind: DeleteItemErrorKind::ConditionalCheckFailedException(_),
-                    ..
-                } => Ok(()),
+                DeleteItemError::ConditionalCheckFailedException(_) => Ok(()),
                 err => Err(StorageError::UnexpectedError(err.into())),
             },
         }
@@ -523,10 +521,7 @@ impl Storage for DynamoDb {
             )
             .context("failed to convert item to CallLinkState")?),
             Err(err) => match err.into_service_error() {
-                UpdateItemError {
-                    kind: UpdateItemErrorKind::ConditionalCheckFailedException(_),
-                    ..
-                } => {
+                UpdateItemError::ConditionalCheckFailedException(_) => {
                     if !must_exist {
                         // The only way this could have failed is if there *was* a room but the admin passkey (or zkparams) was wrong.
                         Err(CallLinkUpdateError::AdminPasskeyDidNotMatch)

@@ -4,18 +4,19 @@
 //
 
 use aws_sdk_dynamodb::{
-    client::fluent_builders::CreateTable,
-    model::{
+    config::Region,
+    operation::create_table::builders::CreateTableFluentBuilder,
+    types::{
         AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection,
         ProjectionType, ProvisionedThroughput, ScalarAttributeType,
     },
-    Client, Error, Region,
+    Client, Error,
 };
 
 async fn build_table(
     client: &Client,
     table_name: &str,
-    describe_table: impl FnOnce(CreateTable) -> CreateTable,
+    describe_table: impl FnOnce(CreateTableFluentBuilder) -> CreateTableFluentBuilder,
 ) -> Result<(), Error> {
     println!("Attempting to create table {}; please wait...", table_name);
 
@@ -36,6 +37,7 @@ async fn build_table(
 }
 
 #[tokio::main]
+#[allow(clippy::result_large_err)]
 async fn main() -> Result<(), Error> {
     // Be sure that AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are defined in the environment.
     let sdk_config = aws_config::from_env()
