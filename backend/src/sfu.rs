@@ -319,7 +319,6 @@ impl Sfu {
         &mut self,
         call_id: CallId,
         user_id: UserId,
-        active_speaker_id: String,
         demux_id: DemuxId,
         server_ice_ufrag: String,
         server_ice_pwd: String,
@@ -347,7 +346,6 @@ impl Sfu {
             client_hkdf_extra_info
         );
         trace!("  {:25}{:?}", "demux_id:", demux_id);
-        trace!("  {:25}{}", "active_speaker_id:", active_speaker_id);
 
         let initial_target_send_rate =
             DataRate::from_kbps(self.config.initial_target_send_rate_kbps);
@@ -415,7 +413,6 @@ impl Sfu {
             call.add_client(
                 demux_id,
                 user_id.clone(),
-                active_speaker_id,
                 is_admin,
                 Instant::now(), // Now after taking the lock
             );
@@ -1081,7 +1078,7 @@ pub struct CallSignalingInfo {
     pub size: usize,
     pub created: SystemTime,
     pub creator_id: UserId,
-    pub client_ids: Vec<(DemuxId, String)>,
+    pub client_ids: Vec<(DemuxId, UserId)>,
 }
 
 struct OsRngCompatibleWithDalek;
@@ -1159,15 +1156,12 @@ mod sfu_tests {
         client_dhe_public_key: DhePublicKey,
     ) -> Result<(), SfuError> {
         // Generate ids for the client.
-        let resolution_request_id = rand::thread_rng().gen::<u64>();
-        let active_speaker_id = format!("{}-{}", user_id.as_str(), resolution_request_id);
         let server_ice_ufrag = ice::random_ufrag();
         let server_ice_pwd = ice::random_pwd();
 
         let _ = sfu.get_or_create_call_and_add_client(
             call_id.clone(),
             user_id.clone(),
-            active_speaker_id,
             demux_id,
             server_ice_ufrag,
             server_ice_pwd,

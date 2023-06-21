@@ -117,6 +117,12 @@ impl From<String> for UserId {
     }
 }
 
+impl From<UserId> for String {
+    fn from(value: UserId) -> Self {
+        value.0
+    }
+}
+
 impl UserId {
     pub fn as_str(&self) -> &str {
         self.0.as_str()
@@ -396,18 +402,10 @@ impl Call {
             .any(|client| client.demux_id == demux_id)
     }
 
-    pub fn add_client(
-        &mut self,
-        demux_id: DemuxId,
-        user_id: UserId,
-        active_speaker_id: String,
-        is_admin: bool,
-        now: Instant,
-    ) {
+    pub fn add_client(&mut self, demux_id: DemuxId, user_id: UserId, is_admin: bool, now: Instant) {
         let pending_client = NonParticipantClient {
             demux_id,
             user_id,
-            active_speaker_id,
             is_admin,
             next_server_to_client_data_rtp_seqnum: 1,
         };
@@ -1412,11 +1410,11 @@ impl Call {
         key_frame_requests
     }
 
-    /// Get the DemuxIds and "active speaker ID"s for each client.  These are needed for signaling.
-    pub fn get_client_ids(&self) -> Vec<(DemuxId, String)> {
+    /// Get the DemuxIds and opaque user IDs for each client.  These are needed for signaling.
+    pub fn get_client_ids(&self) -> Vec<(DemuxId, UserId)> {
         self.clients
             .iter()
-            .map(|client| (client.demux_id, client.active_speaker_id.clone()))
+            .map(|client| (client.demux_id, client.user_id.clone()))
             .collect()
     }
 
@@ -1433,7 +1431,6 @@ struct NonParticipantClient {
     // Immutable
     demux_id: DemuxId,
     user_id: UserId,
-    active_speaker_id: String,
     is_admin: bool,
 
     // Update with each proto send from server to client
@@ -1445,7 +1442,6 @@ impl From<Client> for NonParticipantClient {
         Self {
             demux_id: client.demux_id,
             user_id: client.user_id,
-            active_speaker_id: client.active_speaker_id,
             is_admin: client.is_admin,
 
             next_server_to_client_data_rtp_seqnum: client.next_server_to_client_data_rtp_seqnum,
@@ -1458,7 +1454,6 @@ struct Client {
     // Immutable
     demux_id: DemuxId,
     user_id: UserId,
-    active_speaker_id: String,
     is_admin: bool,
 
     // Updated by incoming video packets
@@ -1518,7 +1513,6 @@ impl Client {
         Self {
             demux_id: pending_client_info.demux_id,
             user_id: pending_client_info.user_id,
-            active_speaker_id: pending_client_info.active_speaker_id,
             is_admin: pending_client_info.is_admin,
 
             incoming_video0: IncomingVideoState::default(),
@@ -3165,8 +3159,7 @@ mod call_tests {
     ) -> DemuxId {
         let demux_id = demux_id_from_unshifted(demux_id_without_shifting);
         let user_id = UserId::from(user_id.to_string());
-        let active_speaker_id = format!("{}_active_speaker_id", demux_id_without_shifting);
-        call.add_client(demux_id, user_id, active_speaker_id, false, now);
+        call.add_client(demux_id, user_id, false, now);
         demux_id
     }
 
@@ -3178,8 +3171,7 @@ mod call_tests {
     ) -> DemuxId {
         let demux_id = demux_id_from_unshifted(demux_id_without_shifting);
         let user_id = UserId::from(user_id.to_string());
-        let active_speaker_id = format!("{}_active_speaker_id", demux_id_without_shifting);
-        call.add_client(demux_id, user_id, active_speaker_id, true, now);
+        call.add_client(demux_id, user_id, true, now);
         demux_id
     }
 

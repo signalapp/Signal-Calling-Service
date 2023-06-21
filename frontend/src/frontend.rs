@@ -4,7 +4,7 @@
 //
 
 use std::{
-    convert::{TryFrom, TryInto},
+    convert::TryFrom,
     fmt::{self, Write as _},
 };
 
@@ -15,7 +15,6 @@ use log::*;
 use parking_lot::Mutex;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use urlencoding::encode;
 
 #[cfg(test)]
@@ -102,18 +101,17 @@ impl From<DemuxId> for u32 {
 
 #[cfg_attr(test, automock)]
 pub trait IdGenerator: Sync + Send {
-    fn get_random_demux_id_and_endpoint_id(&self, user_id: &str) -> Result<(DemuxId, String)>;
+    // The user ID isn't used by the real generator, but it's an extra thing we can check in tests.
+    fn get_random_demux_id(&self, user_id: &str) -> DemuxId;
     fn get_random_era_id(&self, n: usize) -> String;
 }
 
 pub struct FrontendIdGenerator;
 
 impl IdGenerator for FrontendIdGenerator {
-    fn get_random_demux_id_and_endpoint_id(&self, user_id: &str) -> Result<(DemuxId, String)> {
-        let resolution_request_id = rand::thread_rng().gen::<u64>();
-        let endpoint_id = format!("{}-{}", user_id, resolution_request_id);
-        let demux_id = Frontend::get_demux_id_from_endpoint_id(&endpoint_id)?;
-        Ok((demux_id, endpoint_id))
+    fn get_random_demux_id(&self, _user_id: &str) -> DemuxId {
+        let unmasked_id = rand::thread_rng().gen::<u32>();
+        DemuxId::try_from(unmasked_id & !0b1111).expect("valid")
     }
 
     fn get_random_era_id(&self, n: usize) -> String {
@@ -196,28 +194,6 @@ impl Frontend {
         Ok(user_id)
     }
 
-    /// Obtain a demux_id from the given endpoint_id.
-    ///
-    /// The demux_id is the first 112 bits of the SHA-256 hash of the endpoint_id string byte
-    /// representation.
-    ///
-    /// ```
-    /// use calling_frontend::frontend::Frontend;
-    /// use std::convert::TryInto;
-    ///
-    /// assert_eq!(Frontend::get_demux_id_from_endpoint_id("abcdef-0").unwrap(), 3487943312.try_into().unwrap());
-    /// assert_eq!(Frontend::get_demux_id_from_endpoint_id("abcdef-12345").unwrap(), 2175944000.try_into().unwrap());
-    /// assert_eq!(Frontend::get_demux_id_from_endpoint_id("").unwrap(), 3820012608.try_into().unwrap());
-    /// ```
-    pub fn get_demux_id_from_endpoint_id(endpoint_id: &str) -> Result<DemuxId> {
-        let mut hasher = Sha256::new();
-        hasher.update(endpoint_id.as_bytes());
-
-        // Get the 32-bit hash but mask out 4 bits since DemuxIDs must leave
-        // these unset for "SSRC space".
-        (u32::from_be_bytes(hasher.finalize()[0..4].try_into()?) & 0xfffffff0).try_into()
-    }
-
     /// Get the uri the call should be redirected to or None. If the local region is not
     /// the region where the call is hosted, create the uri necessary to get there.
     pub fn get_redirect_uri(&self, backend_region: &str, original_uri: &Uri) -> Option<String> {
@@ -264,30 +240,19 @@ impl Frontend {
             .get_clients(&backend_address, &call.era_id)
             .await
             .and_then(|response| {
-                if let Some(demux_ids) = response.demux_ids {
-                    if demux_ids.len() != response.client_ids.len() {
-                        return Err(BackendError::UnexpectedError(anyhow!(
-                            "mismatched lists in ClientResponse"
-                        )));
-                    }
-                    Ok(response
-                        .client_ids
-                        .into_iter()
-                        .zip(demux_ids.into_iter())
-                        .map(|(client_id, raw_demux_id)| {
-                            anyhow::Ok((client_id, DemuxId::try_from(raw_demux_id)?))
-                        })
-                        .collect::<Result<_>>()?)
-                } else {
-                    Ok(response
-                        .client_ids
-                        .into_iter()
-                        .map(|client_id| {
-                            let demux_id = Frontend::get_demux_id_from_endpoint_id(&client_id)?;
-                            anyhow::Ok((client_id, demux_id))
-                        })
-                        .collect::<Result<_>>()?)
+                if response.demux_ids.len() != response.user_ids.len() {
+                    return Err(BackendError::UnexpectedError(anyhow!(
+                        "mismatched lists in ClientResponse"
+                    )));
                 }
+                Ok(response
+                    .user_ids
+                    .into_iter()
+                    .zip(response.demux_ids.into_iter())
+                    .map(|(user_id, raw_demux_id)| {
+                        anyhow::Ok((user_id, DemuxId::try_from(raw_demux_id)?))
+                    })
+                    .collect::<Result<_>>()?)
             }) {
             Ok(result) => Ok(result),
             Err(BackendError::CallNotFound) => {
@@ -365,13 +330,7 @@ impl Frontend {
         call: &CallRecord,
         join_request: JoinRequestWrapper,
     ) -> Result<JoinResponseWrapper, FrontendError> {
-        let (demux_id, client_id) = self
-            .id_generator
-            .get_random_demux_id_and_endpoint_id(user_id)
-            .map_err(|err| {
-                error!("{}", err);
-                FrontendError::InternalError
-            })?;
+        let demux_id = self.id_generator.get_random_demux_id(user_id);
 
         // Get the direct address to the Calling Backend.
         let backend_address = backend::Address::try_from(&call.backend_ip).map_err(|err| {
@@ -386,7 +345,7 @@ impl Frontend {
                 &call.era_id,
                 demux_id,
                 &backend::JoinRequest {
-                    client_id: client_id.to_string(),
+                    user_ids: user_id.to_string(),
                     ice_ufrag: join_request.ice_ufrag,
                     dhe_public_key: Some(join_request.dhe_public_key),
                     hkdf_extra_info: join_request.hkdf_extra_info,

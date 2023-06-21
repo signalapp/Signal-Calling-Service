@@ -58,7 +58,7 @@ pub struct InfoResponse {
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientsResponse {
-    pub endpoint_ids: Vec<String>, // Aka active_speaker_ids, a concatenation of user_id + '-' + resolution_request_id.
+    pub endpoint_ids: Vec<String>, // These are user IDs.
 
     // Parallels the endpoint_ids list.
     pub demux_ids: Vec<u32>,
@@ -67,7 +67,7 @@ pub struct ClientsResponse {
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinRequest {
-    pub endpoint_id: String, // Aka active_speaker_id, a concatenation of user_id + '-' + resolution_request_id.
+    pub endpoint_id: String, // Formerly active_speaker_id, a concatenation of user_id + '-' + resolution_request_id; now just the user ID.
     pub client_ice_ufrag: String,
     pub client_dhe_public_key: String,
     pub hkdf_extra_info: Option<String>,
@@ -197,13 +197,13 @@ async fn get_clients(
 
     let sfu = sfu.lock();
     if let Some(signaling) = sfu.get_call_signaling_info(call_id) {
-        let (demux_ids, endpoint_ids) = signaling
+        let (demux_ids, user_ids) = signaling
             .client_ids
             .into_iter()
-            .map(|(demux_id, endpoint_id)| (demux_id.as_u32(), endpoint_id))
+            .map(|(demux_id, user_id)| (demux_id.as_u32(), user_id.into()))
             .unzip();
         let response = ClientsResponse {
-            endpoint_ids,
+            endpoint_ids: user_ids,
             demux_ids,
         };
 
@@ -254,7 +254,6 @@ async fn join(
     match sfu.get_or_create_call_and_add_client(
         call_id,
         user_id,
-        request.endpoint_id,
         demux_id,
         server_ice_ufrag.to_string(),
         server_ice_pwd.to_string(),
@@ -455,7 +454,6 @@ mod signaling_server_tests {
             .get_or_create_call_and_add_client(
                 call_id,
                 user_id,
-                endpoint_id.to_string(),
                 demux_id,
                 ice::random_ufrag(),
                 ice::random_pwd(),
@@ -631,7 +629,9 @@ mod signaling_server_tests {
             &body[..],
             format!(
                 r#"{{"endpointIds":["{}"],"demuxIds":[{}]}}"#,
-                ENDPOINT_ID_1,
+                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
+                    .unwrap()
+                    .as_str(),
                 DEMUX_ID_1.as_u32(),
             )
             .as_bytes()
@@ -663,8 +663,12 @@ mod signaling_server_tests {
             &body[..],
             format!(
                 r#"{{"endpointIds":["{}","{}"],"demuxIds":[{},{}]}}"#,
-                ENDPOINT_ID_1,
-                ENDPOINT_ID_2,
+                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
+                    .unwrap()
+                    .as_str(),
+                parse_user_id_from_endpoint_id(ENDPOINT_ID_2)
+                    .unwrap()
+                    .as_str(),
                 DEMUX_ID_1.as_u32(),
                 DEMUX_ID_2.as_u32(),
             )
@@ -689,7 +693,9 @@ mod signaling_server_tests {
             &body[..],
             format!(
                 r#"{{"endpointIds":["{}"],"demuxIds":[{}]}}"#,
-                ENDPOINT_ID_2,
+                parse_user_id_from_endpoint_id(ENDPOINT_ID_2)
+                    .unwrap()
+                    .as_str(),
                 DEMUX_ID_2.as_u32(),
             )
             .as_bytes()

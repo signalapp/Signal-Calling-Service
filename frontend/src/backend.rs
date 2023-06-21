@@ -64,18 +64,18 @@ pub struct InfoResponse {
 #[derive(Deserialize, Debug)]
 pub struct ClientsResponse {
     #[serde(rename = "endpointIds")]
-    pub client_ids: Vec<String>, // Aka endpoint_id or active_speaker_id, a concatenation of user_id + '-' + resolution_request_id.
+    pub user_ids: Vec<String>, // Formerly endpoint_id or active_speaker_id, a concatenation of user_id + '-' + resolution_request_id.
 
-    // Parallels the client_ids list.
-    #[serde(rename = "demuxIds", default)]
-    pub demux_ids: Option<Vec<u32>>,
+    // Parallels the user_ids list.
+    #[serde(rename = "demuxIds")]
+    pub demux_ids: Vec<u32>,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinRequest {
     #[serde(rename = "endpointId")]
-    pub client_id: String, // Aka endpoint_id or active_speaker_id, a concatenation of user_id + '-' + resolution_request_id.
+    pub user_ids: String, // Formerly endpoint_id or active_speaker_id, a concatenation of user_id + '-' + resolution_request_id.
     #[serde(rename = "clientIceUfrag")]
     pub ice_ufrag: String,
     #[serde(rename = "clientDhePublicKey")]

@@ -260,26 +260,21 @@ async fn get_participants(
         // call, as nothing we will do later with the reference can affect SFU decisions around call
         // dropping.
 
+        let conference_id = conference_id_from_signaling_info(&signaling);
         let participants = signaling
             .client_ids
-            .iter()
-            .map(|(demux_id, active_speaker_id)| Participant {
-                // This conversion will go away when the signaling api is refactored
-                // to return the opaque_user_id directly.
-                opaque_user_id: active_speaker_id
-                    .split_once('-')
-                    .expect("valid active_speaker_id")
-                    .0
-                    .to_string(),
-                demux_id: u32::from(*demux_id),
+            .into_iter()
+            .map(|(demux_id, user_id)| Participant {
+                opaque_user_id: user_id.into(),
+                demux_id: u32::from(demux_id),
             })
             .collect();
 
         let response = ParticipantsResponse {
-            conference_id: conference_id_from_signaling_info(&signaling),
+            conference_id,
             max_devices,
             participants,
-            creator: signaling.creator_id.as_str().to_string(),
+            creator: signaling.creator_id.into(),
         };
 
         Ok(Json(response).into_response())
@@ -351,7 +346,6 @@ async fn join_conference(
     match sfu.get_or_create_call_and_add_client(
         call_id.clone(),
         user_id,
-        endpoint_id,
         demux_id,
         server_ice_ufrag.clone(),
         server_ice_pwd.clone(),
