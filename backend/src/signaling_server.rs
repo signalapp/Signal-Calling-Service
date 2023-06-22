@@ -24,13 +24,15 @@ use std::{
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{Path, State},
+    headers::{self, Header},
     http::StatusCode,
     middleware,
     response::IntoResponse,
     routing::{get, post},
-    Extension, Json, Router,
+    Extension, Json, Router, TypedHeader,
 };
 use hex::{FromHex, ToHex};
+use hyper::http::{HeaderName, HeaderValue};
 use log::*;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -57,11 +59,21 @@ pub struct InfoResponse {
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct ClientInfo {
+    demux_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientsResponse {
     pub endpoint_ids: Vec<String>, // These are user IDs.
 
     // Parallels the endpoint_ids list.
     pub demux_ids: Vec<u32>,
+
+    pub pending_clients: Vec<ClientInfo>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -87,6 +99,42 @@ pub struct JoinResponse {
     pub server_ice_ufrag: String,
     pub server_ice_pwd: String,
     pub server_dhe_public_key: String,
+}
+
+impl Header for sfu::UserId {
+    fn name() -> &'static HeaderName {
+        static NAME: HeaderName = HeaderName::from_static("x-user-id");
+        &NAME
+    }
+
+    fn decode<'i, I>(values: &mut I) -> Result<Self, headers::Error>
+    where
+        I: Iterator<Item = &'i HeaderValue>,
+    {
+        let value = values.next().ok_or_else(headers::Error::invalid)?;
+        if values.next().is_some() {
+            return Err(headers::Error::invalid());
+        }
+        if value.is_empty() || value.len() > 256 {
+            return Err(headers::Error::invalid());
+        }
+        if let Ok(value) = value.to_str() {
+            // Note that by not doing any other decoding we're assuming all opaque user IDs will be
+            // valid HTTP header values. In practice this is "printable ASCII, no whitespace".
+            Ok(Self::from(value.to_owned()))
+        } else {
+            Err(headers::Error::invalid())
+        }
+    }
+
+    fn encode<E>(&self, values: &mut E)
+    where
+        E: Extend<HeaderValue>,
+    {
+        if let Ok(value) = HeaderValue::from_str(self.as_str()) {
+            values.extend(std::iter::once(value));
+        }
+    }
 }
 
 /// Get a call_id (Vec<u8>) from a string hex value.
@@ -189,6 +237,7 @@ async fn get_info(
 async fn get_clients(
     State(sfu): State<Arc<Mutex<Sfu>>>,
     Path(call_id): Path<String>,
+    requesting_user: Option<TypedHeader<sfu::UserId>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     trace!("get_clients(): {}", call_id);
 
@@ -196,15 +245,26 @@ async fn get_clients(
         call_id_from_hex(&call_id).map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
     let sfu = sfu.lock();
-    if let Some(signaling) = sfu.get_call_signaling_info(call_id) {
+    if let Some(signaling) =
+        sfu.get_call_signaling_info(call_id, requesting_user.as_ref().map(|header| &header.0))
+    {
         let (demux_ids, user_ids) = signaling
             .client_ids
             .into_iter()
             .map(|(demux_id, user_id)| (demux_id.as_u32(), user_id.into()))
             .unzip();
+        let pending_clients = signaling
+            .pending_client_ids
+            .into_iter()
+            .map(|(demux_id, user_id)| ClientInfo {
+                demux_id: demux_id.as_u32(),
+                user_id: user_id.map(String::from),
+            })
+            .collect();
         let response = ClientsResponse {
             endpoint_ids: user_ids,
             demux_ids,
+            pending_clients,
         };
 
         Ok(Json(response).into_response())
@@ -467,6 +527,35 @@ mod signaling_server_tests {
             .unwrap();
     }
 
+    fn add_admin_to_sfu(
+        sfu: Arc<Mutex<Sfu>>,
+        call_id: &str,
+        endpoint_id: &str,
+        demux_id: DemuxId,
+        client_ice_ufrag: &str,
+        client_dhe_pub_key: DhePublicKey,
+    ) {
+        let call_id = call_id_from_hex(call_id).unwrap();
+        let user_id = parse_user_id_from_endpoint_id(endpoint_id).unwrap();
+
+        let _ = sfu
+            .lock()
+            .get_or_create_call_and_add_client(
+                call_id,
+                user_id,
+                demux_id,
+                ice::random_ufrag(),
+                ice::random_pwd(),
+                client_ice_ufrag.to_string(),
+                client_dhe_pub_key,
+                vec![],
+                Region::Unset,
+                true,
+                true,
+            )
+            .unwrap();
+    }
+
     fn remove_client_from_sfu(sfu: Arc<Mutex<Sfu>>, call_id: &str, demux_id: DemuxId) {
         let call_id = call_id_from_hex(call_id).unwrap();
 
@@ -476,14 +565,14 @@ mod signaling_server_tests {
 
     fn check_call_exists_in_sfu(sfu: Arc<Mutex<Sfu>>, call_id: &str) -> bool {
         sfu.lock()
-            .get_call_signaling_info(call_id_from_hex(call_id).unwrap())
+            .get_call_signaling_info(call_id_from_hex(call_id).unwrap(), None)
             .is_some()
     }
 
     fn get_client_count_in_call_from_sfu(sfu: Arc<Mutex<Sfu>>, call_id: &str) -> usize {
         if let Some(signaling) = sfu
             .lock()
-            .get_call_signaling_info(call_id_from_hex(call_id).unwrap())
+            .get_call_signaling_info(call_id_from_hex(call_id).unwrap(), None)
         {
             signaling.size
         } else {
@@ -628,7 +717,7 @@ mod signaling_server_tests {
         assert_eq!(
             &body[..],
             format!(
-                r#"{{"endpointIds":["{}"],"demuxIds":[{}]}}"#,
+                r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[]}}"#,
                 parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
                     .unwrap()
                     .as_str(),
@@ -662,7 +751,7 @@ mod signaling_server_tests {
         assert_eq!(
             &body[..],
             format!(
-                r#"{{"endpointIds":["{}","{}"],"demuxIds":[{},{}]}}"#,
+                r#"{{"endpointIds":["{}","{}"],"demuxIds":[{},{}],"pendingClients":[]}}"#,
                 parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
                     .unwrap()
                     .as_str(),
@@ -692,7 +781,7 @@ mod signaling_server_tests {
         assert_eq!(
             &body[..],
             format!(
-                r#"{{"endpointIds":["{}"],"demuxIds":[{}]}}"#,
+                r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[]}}"#,
                 parse_user_id_from_endpoint_id(ENDPOINT_ID_2)
                     .unwrap()
                     .as_str(),
@@ -716,7 +805,173 @@ mod signaling_server_tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        assert_eq!(&body[..], br#"{"endpointIds":[],"demuxIds":[]}"#);
+        assert_eq!(
+            &body[..],
+            br#"{"endpointIds":[],"demuxIds":[],"pendingClients":[]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_clients_with_pending() {
+        let config = &DEFAULT_CONFIG;
+        let sfu = new_sfu(Instant::now(), config);
+        let is_healthy = Arc::new(AtomicBool::new(true));
+        let cpu_idle_pct = Arc::new(AtomicU8::new(100));
+
+        let api = signaling_api(config, sfu.clone(), is_healthy, cpu_idle_pct);
+
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // No clients were added.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Join with client 16.
+        add_admin_to_sfu(
+            sfu.clone(),
+            CALL_ID,
+            ENDPOINT_ID_1,
+            DEMUX_ID_1,
+            UFRAG,
+            CLIENT_DHE_PUB_KEY,
+        );
+
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(
+            &body[..],
+            format!(
+                r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[]}}"#,
+                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
+                    .unwrap()
+                    .as_str(),
+                DEMUX_ID_1.as_u32(),
+            )
+            .as_bytes()
+        );
+
+        // Join with client 32.
+        add_client_to_sfu(
+            sfu.clone(),
+            CALL_ID,
+            ENDPOINT_ID_2,
+            DEMUX_ID_2,
+            UFRAG,
+            CLIENT_DHE_PUB_KEY,
+        );
+
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(
+            &body[..],
+            format!(
+                r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[{{"demuxId":{}}}]}}"#,
+                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
+                    .unwrap()
+                    .as_str(),
+                DEMUX_ID_1.as_u32(),
+                DEMUX_ID_2.as_u32(),
+            )
+            .as_bytes()
+        );
+
+        // Non-admins get the same response.
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                    .header(
+                        sfu::UserId::name(),
+                        parse_user_id_from_endpoint_id(ENDPOINT_ID_2)
+                            .unwrap()
+                            .as_str(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(
+            &body[..],
+            format!(
+                r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[{{"demuxId":{}}}]}}"#,
+                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
+                    .unwrap()
+                    .as_str(),
+                DEMUX_ID_1.as_u32(),
+                DEMUX_ID_2.as_u32(),
+            )
+            .as_bytes()
+        );
+
+        // Admins also get user IDs.
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                    .header(
+                        sfu::UserId::name(),
+                        parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
+                            .unwrap()
+                            .as_str(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(
+            &body[..],
+            format!(
+                r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[{{"demuxId":{},"userId":"{}"}}]}}"#,
+                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
+                    .unwrap()
+                    .as_str(),
+                DEMUX_ID_1.as_u32(),
+                DEMUX_ID_2.as_u32(),
+                parse_user_id_from_endpoint_id(ENDPOINT_ID_2)
+                    .unwrap()
+                    .as_str()
+            )
+            .as_bytes()
+        );
     }
 
     #[tokio::test]

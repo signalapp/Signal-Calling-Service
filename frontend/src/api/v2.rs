@@ -30,7 +30,8 @@ use crate::{
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Participant {
-    pub opaque_user_id: UserId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opaque_user_id: Option<UserId>,
     pub demux_id: u32,
 }
 
@@ -42,6 +43,8 @@ pub struct ParticipantsResponse {
     pub max_devices: u32,
     pub participants: Vec<Participant>,
     pub creator: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub pending_clients: Vec<Participant>,
 }
 
 #[serde_as]
@@ -88,6 +91,11 @@ fn not_found(reason: &str) -> axum::response::Response {
     (StatusCode::NOT_FOUND, Json(ErrorResponse { reason })).into_response()
 }
 
+fn user_id_from_uuid_ciphertext(ciphertext: &zkgroup::groups::UuidCiphertext) -> UserId {
+    // Encode as hex for compatibility with existing user ids
+    bincode::serialize(&ciphertext).unwrap().encode_hex()
+}
+
 /// Handler for the GET /conference/:room_id/participants route.
 pub async fn get_participants_by_room_id(
     frontend: State<Arc<Frontend>>,
@@ -115,12 +123,13 @@ pub async fn get_participants(
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("get_participants:");
 
-    let call = match (group_auth, call_links_auth, room_id) {
-        (Some(Extension(user_authorization)), None, None) => {
+    let (call, user_id) = match (group_auth, call_links_auth, room_id) {
+        (Some(Extension(user_authorization)), None, None) => (
             frontend
                 .get_call_record(&user_authorization.room_id)
-                .await?
-        }
+                .await?,
+            user_authorization.user_id,
+        ),
         (None, Some(Extension(auth_credential)), Some(TypedHeader(room_id))) => {
             let room_id = room_id.into();
 
@@ -128,7 +137,10 @@ pub async fn get_participants(
                 Ok((Some(state), call)) => {
                     verify_auth_credential_against_zkparams(&auth_credential, &state, &frontend)?;
                     if let Some(call) = call {
-                        call
+                        (
+                            call,
+                            user_id_from_uuid_ciphertext(&auth_credential.get_user_id()),
+                        )
                     } else if state.revoked || state.expiration < SystemTime::now() {
                         return Ok(not_found("expired"));
                     } else {
@@ -149,30 +161,30 @@ pub async fn get_participants(
         return temporary_redirect(&redirect_uri);
     }
 
-    let participants = frontend
-        .get_client_ids_in_call(&call)
-        .await?
+    let clients_response = frontend.get_client_ids_in_call(&call, &user_id).await?;
+    let participants = clients_response
+        .active_clients
         .into_iter()
-        .map(|(user_ids, demux_id)| {
-            Ok(Participant {
-                opaque_user_id: Frontend::get_opaque_user_id_from_endpoint_id(&user_ids)?,
-                demux_id: demux_id.as_u32(),
-            })
+        .map(|client| Participant {
+            opaque_user_id: client.opaque_user_id,
+            demux_id: client.demux_id.as_u32(),
         })
-        .collect::<Result<Vec<_>>>()
-        .map_err(|err| {
-            error!(
-                "get_participants: could not generate participants list: {}",
-                err
-            );
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .collect();
+    let pending_clients = clients_response
+        .pending_clients
+        .into_iter()
+        .map(|client| Participant {
+            opaque_user_id: client.opaque_user_id,
+            demux_id: client.demux_id.as_u32(),
+        })
+        .collect();
 
     Ok(Json(ParticipantsResponse {
         era_id: call.era_id,
         max_devices: frontend.config.max_clients_per_call,
         participants,
         creator: call.creator,
+        pending_clients,
     })
     .into_response())
 }
@@ -260,9 +272,7 @@ pub async fn join(
                         } else {
                             false
                         };
-                        let user_id = auth_credential.get_user_id();
-                        // Encode as hex for compatability with existing user ids
-                        let user_id = bincode::serialize(&user_id).unwrap().encode_hex();
+                        let user_id = user_id_from_uuid_ciphertext(&auth_credential.get_user_id());
                         let call = match call {
                             Some(call) => call,
                             None => {
@@ -490,6 +500,7 @@ mod api_server_v2_tests {
         backend::ClientsResponse {
             user_ids: client_ids,
             demux_ids,
+            pending_clients: vec![],
         }
     }
 
@@ -544,14 +555,16 @@ mod api_server_v2_tests {
         let mut backend = Box::new(MockBackend::new());
         backend
             .expect_get_clients()
-            // backend_address: &BackendAddress, call_id: &str,
-            .with(
-                eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(ERA_ID_1),
-            )
+            // backend_address: &BackendAddress, call_id: &str, user_id: Option<&UserId>,
+            // We have to use 'withf' because of the nested reference in 'user_id'.
+            .withf(|backend_address, call_id, user_id| {
+                backend_address == &backend::Address::try_from("127.0.0.1").unwrap()
+                    && call_id == ERA_ID_1
+                    && user_id.is_some()
+            })
             .once()
             // Result<ClientsResponse, BackendError>
-            .returning(move |_, _| Ok(create_clients_response_two_calls()));
+            .returning(move |_, _, _| Ok(create_clients_response_two_calls()));
         backend
     }
 
@@ -662,13 +675,17 @@ mod api_server_v2_tests {
         assert_eq!(participants_response.participants.len(), 2);
 
         assert_eq!(
-            participants_response.participants[0].opaque_user_id,
-            USER_ID_1
+            participants_response.participants[0]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_1)
         );
         assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
         assert_eq!(
-            participants_response.participants[1].opaque_user_id,
-            USER_ID_2
+            participants_response.participants[1]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_2)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
     }
@@ -741,14 +758,16 @@ mod api_server_v2_tests {
 
         backend
             .expect_get_clients()
-            // backend_address: &BackendAddress, call_id: &str,
-            .with(
-                eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(ERA_ID_1),
-            )
+            // backend_address: &BackendAddress, call_id: &str, user_id: Option<&UserId>,
+            // We have to use 'withf' because of the nested reference in 'user_id'.
+            .withf(|backend_address, call_id, user_id| {
+                backend_address == &backend::Address::try_from("127.0.0.1").unwrap()
+                    && call_id == ERA_ID_1
+                    && user_id.map(|user_id| user_id.as_str()) == Some(USER_ID_1)
+            })
             .once()
             // Result<ClientsResponse, BackendError>
-            .returning(|_, _| Err(BackendError::CallNotFound))
+            .returning(|_, _, _| Err(BackendError::CallNotFound))
             .in_sequence(&mut seq);
 
         storage
@@ -1648,15 +1667,208 @@ mod api_server_v2_tests {
         assert_eq!(participants_response.participants.len(), 2);
 
         assert_eq!(
-            participants_response.participants[0].opaque_user_id,
-            USER_ID_1
+            participants_response.participants[0]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_1)
         );
         assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
         assert_eq!(
-            participants_response.participants[1].opaque_user_id,
-            USER_ID_2
+            participants_response.participants[1]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_2)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
+    }
+
+    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call
+    /// with one active participant and one pending client.
+    #[tokio::test]
+    async fn test_call_link_get_with_pending_client() {
+        let config = &CONFIG;
+
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(RoomId::from(ROOM_ID)))
+            .once()
+            .return_once(|_| {
+                Ok((
+                    Some(default_call_link_state()),
+                    Some(create_call_record(ROOM_ID, LOCAL_REGION)),
+                ))
+            });
+
+        let mut backend = Box::new(MockBackend::new());
+        backend
+            .expect_get_clients()
+            // backend_address: &BackendAddress, call_id: &str, user_id: Option<&UserId>,
+            // We have to use 'withf' because of the nested reference in 'user_id'.
+            .withf(|backend_address, call_id, user_id| {
+                backend_address == &backend::Address::try_from("127.0.0.1").unwrap()
+                    && call_id == ERA_ID_1
+                    && user_id.is_some()
+            })
+            .once()
+            // Result<ClientsResponse, BackendError>
+            .returning(move |_, _, _| {
+                Ok(backend::ClientsResponse {
+                    user_ids: vec![ENDPOINT_ID_1.into()],
+                    demux_ids: vec![DEMUX_ID_1],
+                    pending_clients: vec![backend::ClientInfo {
+                        demux_id: DEMUX_ID_2,
+                        user_id: Some(USER_ID_2.into()),
+                    }],
+                })
+            });
+
+        let frontend = create_frontend(config, storage, backend);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/v2/conference/participants".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(participants_response.era_id, ERA_ID_1);
+        assert_eq!(
+            participants_response.max_devices,
+            config.max_clients_per_call
+        );
+        assert_eq!(participants_response.creator, USER_ID_1);
+        assert_eq!(participants_response.participants.len(), 1);
+
+        assert_eq!(
+            participants_response.participants[0]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_1)
+        );
+        assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
+        assert_eq!(participants_response.pending_clients.len(), 1);
+        assert_eq!(
+            participants_response.pending_clients[0]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_2)
+        );
+        assert_eq!(
+            participants_response.pending_clients[0].demux_id,
+            DEMUX_ID_2
+        );
+    }
+
+    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call with
+    /// one active participant and one pending client, but the requester is not an admin and so gets
+    /// no user IDs for the pending clients.
+    #[tokio::test]
+    async fn test_call_link_get_with_pending_client_for_non_admin() {
+        let config = &CONFIG;
+
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(RoomId::from(ROOM_ID)))
+            .once()
+            .return_once(|_| {
+                Ok((
+                    Some(default_call_link_state()),
+                    Some(create_call_record(ROOM_ID, LOCAL_REGION)),
+                ))
+            });
+
+        let mut backend = Box::new(MockBackend::new());
+        backend
+            .expect_get_clients()
+            // backend_address: &BackendAddress, call_id: &str, user_id: Option<&UserId>,
+            // We have to use 'withf' because of the nested reference in 'user_id'.
+            .withf(|backend_address, call_id, user_id| {
+                backend_address == &backend::Address::try_from("127.0.0.1").unwrap()
+                    && call_id == ERA_ID_1
+                    && user_id.is_some()
+            })
+            .once()
+            // Result<ClientsResponse, BackendError>
+            .returning(move |_, _, _| {
+                Ok(backend::ClientsResponse {
+                    user_ids: vec![ENDPOINT_ID_1.into()],
+                    demux_ids: vec![DEMUX_ID_1],
+                    pending_clients: vec![backend::ClientInfo {
+                        demux_id: DEMUX_ID_2,
+                        user_id: None,
+                    }],
+                })
+            });
+
+        let frontend = create_frontend(config, storage, backend);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/v2/conference/participants".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(participants_response.era_id, ERA_ID_1);
+        assert_eq!(
+            participants_response.max_devices,
+            config.max_clients_per_call
+        );
+        assert_eq!(participants_response.creator, USER_ID_1);
+        assert_eq!(participants_response.participants.len(), 1);
+
+        assert_eq!(
+            participants_response.participants[0]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_1)
+        );
+        assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
+        assert_eq!(participants_response.pending_clients.len(), 1);
+        assert_eq!(
+            participants_response.pending_clients[0].opaque_user_id,
+            None
+        );
+        assert_eq!(
+            participants_response.pending_clients[0].demux_id,
+            DEMUX_ID_2
+        );
     }
 
     /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call
@@ -1716,13 +1928,17 @@ mod api_server_v2_tests {
         assert_eq!(participants_response.participants.len(), 2);
 
         assert_eq!(
-            participants_response.participants[0].opaque_user_id,
-            USER_ID_1
+            participants_response.participants[0]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_1)
         );
         assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
         assert_eq!(
-            participants_response.participants[1].opaque_user_id,
-            USER_ID_2
+            participants_response.participants[1]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_2)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
     }
@@ -1784,13 +2000,17 @@ mod api_server_v2_tests {
         assert_eq!(participants_response.participants.len(), 2);
 
         assert_eq!(
-            participants_response.participants[0].opaque_user_id,
-            USER_ID_1
+            participants_response.participants[0]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_1)
         );
         assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
         assert_eq!(
-            participants_response.participants[1].opaque_user_id,
-            USER_ID_2
+            participants_response.participants[1]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_2)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
     }
@@ -1879,14 +2099,16 @@ mod api_server_v2_tests {
 
         backend
             .expect_get_clients()
-            // backend_address: &BackendAddress, call_id: &str,
-            .with(
-                eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(ERA_ID_1),
-            )
+            // backend_address: &BackendAddress, call_id: &str, user_id: Option<&UserId>,
+            // We have to use 'withf' because of the nested reference in 'user_id'.
+            .withf(|backend_address, call_id, user_id| {
+                backend_address == &backend::Address::try_from("127.0.0.1").unwrap()
+                    && call_id == ERA_ID_1
+                    && user_id.is_some()
+            })
             .once()
             // Result<ClientsResponse, BackendError>
-            .returning(|_, _| Err(BackendError::CallNotFound))
+            .returning(|_, _, _| Err(BackendError::CallNotFound))
             .in_sequence(&mut seq);
 
         storage
@@ -3345,13 +3567,17 @@ mod api_server_v2_tests {
         assert_eq!(participants_response.participants.len(), 2);
 
         assert_eq!(
-            participants_response.participants[0].opaque_user_id,
-            USER_ID_1
+            participants_response.participants[0]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_1)
         );
         assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
         assert_eq!(
-            participants_response.participants[1].opaque_user_id,
-            USER_ID_2
+            participants_response.participants[1]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_2)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
     }
@@ -3412,13 +3638,17 @@ mod api_server_v2_tests {
         assert_eq!(participants_response.participants.len(), 2);
 
         assert_eq!(
-            participants_response.participants[0].opaque_user_id,
-            USER_ID_1
+            participants_response.participants[0]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_1)
         );
         assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
         assert_eq!(
-            participants_response.participants[1].opaque_user_id,
-            USER_ID_2
+            participants_response.participants[1]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_2)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
     }
@@ -3479,13 +3709,17 @@ mod api_server_v2_tests {
         assert_eq!(participants_response.participants.len(), 2);
 
         assert_eq!(
-            participants_response.participants[0].opaque_user_id,
-            USER_ID_1
+            participants_response.participants[0]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_1)
         );
         assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
         assert_eq!(
-            participants_response.participants[1].opaque_user_id,
-            USER_ID_2
+            participants_response.participants[1]
+                .opaque_user_id
+                .as_deref(),
+            Some(USER_ID_2)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
     }
@@ -3573,14 +3807,16 @@ mod api_server_v2_tests {
 
         backend
             .expect_get_clients()
-            // backend_address: &BackendAddress, call_id: &str,
-            .with(
-                eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(ERA_ID_1),
-            )
+            // backend_address: &BackendAddress, call_id: &str, user_id: Option<&UserId>,
+            // We have to use 'withf' because of the nested reference in 'user_id'.
+            .withf(|backend_address, call_id, user_id| {
+                backend_address == &backend::Address::try_from("127.0.0.1").unwrap()
+                    && call_id == ERA_ID_1
+                    && user_id.is_some()
+            })
             .once()
             // Result<ClientsResponse, BackendError>
-            .returning(|_, _| Err(BackendError::CallNotFound))
+            .returning(|_, _, _| Err(BackendError::CallNotFound))
             .in_sequence(&mut seq);
 
         storage

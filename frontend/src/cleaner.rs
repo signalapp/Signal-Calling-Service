@@ -28,7 +28,7 @@ async fn does_call_exist_on_backend(call_record: &CallRecord, backend: &BackendH
         }
         Ok(backend_address) => {
             if let Err(err) = backend
-                .get_clients(&backend_address, &call_record.era_id)
+                .get_clients(&backend_address, &call_record.era_id, None)
                 .await
             {
                 match err {

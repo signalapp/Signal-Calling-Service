@@ -20,7 +20,11 @@ use tokio::time::{error::Elapsed, timeout, Duration};
 #[cfg(test)]
 use mockall::{automock, predicate::*};
 
-use crate::{config, frontend::DemuxId, load_balancer::LoadBalancer};
+use crate::{
+    config,
+    frontend::{self, DemuxId},
+    load_balancer::LoadBalancer,
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -62,6 +66,12 @@ pub struct InfoResponse {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct ClientInfo {
+    pub demux_id: u32,
+    pub user_id: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct ClientsResponse {
     #[serde(rename = "endpointIds")]
     pub user_ids: Vec<String>, // Formerly endpoint_id or active_speaker_id, a concatenation of user_id + '-' + resolution_request_id.
@@ -69,6 +79,9 @@ pub struct ClientsResponse {
     // Parallels the user_ids list.
     #[serde(rename = "demuxIds")]
     pub demux_ids: Vec<u32>,
+
+    #[serde(rename = "pendingClients", default)]
+    pub pending_clients: Vec<ClientInfo>,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -119,10 +132,11 @@ pub enum BackendError {
 pub trait Backend: Sync + Send {
     async fn select_ip(&self) -> Result<String, BackendError>;
     async fn get_info(&self) -> Result<InfoResponse, BackendError>;
-    async fn get_clients(
+    async fn get_clients<'a>(
         &self,
         backend_address: &Address,
         call_id: &str,
+        user_id: Option<&'a frontend::UserId>,
     ) -> Result<ClientsResponse, BackendError>;
     async fn join(
         &self,
@@ -228,10 +242,11 @@ impl Backend for BackendHttpClient {
         }
     }
 
-    async fn get_clients(
+    async fn get_clients<'a>(
         &self,
         backend_address: &Address,
         call_id: &str,
+        user_id: Option<&'a frontend::UserId>,
     ) -> Result<ClientsResponse, BackendError> {
         let uri_string = format!(
             "http://{}:{}/v1/call/{}/clients",
@@ -240,11 +255,15 @@ impl Backend for BackendHttpClient {
             call_id
         );
 
-        let uri = uri_string
-            .parse()
-            .context("failed to parse get clients uri for backend")?;
+        let mut request = Request::get(uri_string);
+        if let Some(user_id) = user_id {
+            request = request.header("X-User-Id", user_id.as_str());
+        }
+        let request = request
+            .body(Body::empty())
+            .context("failed to build request")?;
 
-        let response = timeout(DEFAULT_TIMEOUT, self.http_client.get(uri))
+        let response = timeout(DEFAULT_TIMEOUT, self.http_client.request(request))
             .await?
             .context(format!(
                 "failed to make backend request `get clients` to `{}`",

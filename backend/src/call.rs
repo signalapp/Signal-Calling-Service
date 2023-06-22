@@ -402,6 +402,12 @@ impl Call {
             .any(|client| client.demux_id == demux_id)
     }
 
+    pub fn is_admin(&self, user_id: &UserId) -> bool {
+        self.clients
+            .iter()
+            .any(|client| client.is_admin && &client.user_id == user_id)
+    }
+
     pub fn add_client(&mut self, demux_id: DemuxId, user_id: UserId, is_admin: bool, now: Instant) {
         let pending_client = NonParticipantClient {
             demux_id,
@@ -1415,6 +1421,23 @@ impl Call {
         self.clients
             .iter()
             .map(|client| (client.demux_id, client.user_id.clone()))
+            .collect()
+    }
+
+    /// Get the DemuxIds and user IDs for each pending client.  These are needed for signaling.
+    pub fn get_pending_client_ids(&self, include_user_ids: bool) -> Vec<(DemuxId, Option<UserId>)> {
+        self.pending_clients
+            .iter()
+            .map(|client| {
+                (
+                    client.demux_id,
+                    if include_user_ids {
+                        Some(client.user_id.clone())
+                    } else {
+                        None
+                    },
+                )
+            })
             .collect()
     }
 

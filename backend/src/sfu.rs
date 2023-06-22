@@ -184,14 +184,21 @@ impl Sfu {
     }
 
     /// Get info about a call that is relevant to call signaling.
-    pub fn get_call_signaling_info(&self, call_id: CallId) -> Option<CallSignalingInfo> {
-        let call = self.call_by_call_id.get(&Arc::new(call_id))?;
+    pub fn get_call_signaling_info(
+        &self,
+        call_id: CallId,
+        user_id: Option<&UserId>,
+    ) -> Option<CallSignalingInfo> {
+        let call = self.call_by_call_id.get(&call_id)?;
         let call = call.lock();
+        let should_include_pending_user_ids =
+            user_id.map_or(false, |user_id| call.is_admin(user_id));
         Some(CallSignalingInfo {
             size: call.size(),
             created: call.created(),
             creator_id: call.creator_id().clone(),
             client_ids: call.get_client_ids(),
+            pending_client_ids: call.get_pending_client_ids(should_include_pending_user_ids),
         })
     }
 
@@ -1079,6 +1086,7 @@ pub struct CallSignalingInfo {
     pub created: SystemTime,
     pub creator_id: UserId,
     pub client_ids: Vec<(DemuxId, UserId)>,
+    pub pending_client_ids: Vec<(DemuxId, Option<UserId>)>,
 }
 
 struct OsRngCompatibleWithDalek;
@@ -1225,7 +1233,7 @@ mod sfu_tests {
         );
 
         assert_eq!(1, sfu.call_by_call_id.len());
-        assert_eq!(1, sfu.get_call_signaling_info(call_id).unwrap().size);
+        assert_eq!(1, sfu.get_call_signaling_info(call_id, None).unwrap().size);
     }
 
     #[tokio::test]
@@ -1261,7 +1269,7 @@ mod sfu_tests {
         // Make sure there were no collisions to skew results.
         assert_eq!(count, sfu.call_by_call_id.len());
         for call_id in call_ids {
-            assert_eq!(1, sfu.get_call_signaling_info(call_id).unwrap().size);
+            assert_eq!(1, sfu.get_call_signaling_info(call_id, None).unwrap().size);
         }
 
         println!(
@@ -1295,7 +1303,7 @@ mod sfu_tests {
                 //  - A client should have been created
                 //  - The client should be in all mappings
 
-                let call_info = sfu.get_call_signaling_info(call_id).unwrap();
+                let call_info = sfu.get_call_signaling_info(call_id, None).unwrap();
                 assert_eq!(user_id.as_str(), call_info.creator_id.as_str());
                 assert_eq!(1, call_info.size);
                 assert_eq!(demux_id, call_info.client_ids[0].0);
@@ -1350,7 +1358,7 @@ mod sfu_tests {
         for call_id in call_ids {
             assert_eq!(
                 user_count,
-                sfu.get_call_signaling_info(call_id).unwrap().size
+                sfu.get_call_signaling_info(call_id, None).unwrap().size
             );
         }
 
@@ -1436,7 +1444,7 @@ mod sfu_tests {
             for call_id in call_ids {
                 assert_eq!(
                     user_ids.len(),
-                    sfu.get_call_signaling_info(call_id).unwrap().size,
+                    sfu.get_call_signaling_info(call_id, None).unwrap().size,
                 );
             }
         }

@@ -38,7 +38,8 @@ use crate::{
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Participant {
-    pub opaque_user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opaque_user_id: Option<String>,
     pub demux_id: u32,
 }
 
@@ -49,6 +50,7 @@ pub struct ParticipantsResponse {
     pub max_devices: u32,
     pub participants: Vec<Participant>,
     pub creator: String,
+    pub pending_clients: Vec<Participant>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -243,8 +245,8 @@ async fn get_participants(
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("get_participants():");
 
-    let call_id = match parse_and_authenticate(config, &authorization_header) {
-        Ok((_, call_id)) => call_id,
+    let (user_id, call_id) = match parse_and_authenticate(config, &authorization_header) {
+        Ok((user_id, call_id)) => (user_id, call_id),
         Err(err) => {
             warn!("get(): unauthorized {}", err);
             return Ok((StatusCode::UNAUTHORIZED, err.to_string()).into_response());
@@ -253,7 +255,7 @@ async fn get_participants(
 
     let sfu = sfu.lock();
 
-    if let Some(signaling) = sfu.get_call_signaling_info(call_id) {
+    if let Some(signaling) = sfu.get_call_signaling_info(call_id, Some(&user_id)) {
         let max_devices = sfu.config.max_clients_per_call;
         drop(sfu);
         // Release the SFU lock as early as possible. Before call lock is fine for a imut ref to a
@@ -265,8 +267,16 @@ async fn get_participants(
             .client_ids
             .into_iter()
             .map(|(demux_id, user_id)| Participant {
-                opaque_user_id: user_id.into(),
+                opaque_user_id: Some(user_id.into()),
                 demux_id: u32::from(demux_id),
+            })
+            .collect();
+        let pending_clients = signaling
+            .pending_client_ids
+            .into_iter()
+            .map(|(demux_id, user_id)| Participant {
+                opaque_user_id: user_id.map(String::from),
+                demux_id: demux_id.as_u32(),
             })
             .collect();
 
@@ -275,6 +285,7 @@ async fn get_participants(
             max_devices,
             participants,
             creator: signaling.creator_id.into(),
+            pending_clients,
         };
 
         Ok(Json(response).into_response())
@@ -342,7 +353,7 @@ async fn join_conference(
 
     let mut sfu = sfu.lock();
     // Make the first user to join an admin.
-    let is_admin = sfu.get_call_signaling_info(call_id.clone()).is_none();
+    let is_admin = sfu.get_call_signaling_info(call_id.clone(), None).is_none();
     match sfu.get_or_create_call_and_add_client(
         call_id.clone(),
         user_id,
@@ -360,7 +371,7 @@ async fn join_conference(
             let media_server = config::ServerMediaAddress::from(config);
 
             let signaling = sfu
-                .get_call_signaling_info(call_id)
+                .get_call_signaling_info(call_id, None)
                 .expect("just created call");
 
             let response = JoinResponse {

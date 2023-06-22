@@ -139,6 +139,16 @@ pub struct JoinResponseWrapper {
     pub dhe_public_key: String,
 }
 
+pub struct ClientInfo {
+    pub opaque_user_id: Option<UserId>,
+    pub demux_id: DemuxId,
+}
+
+pub struct ClientsResponseWrapper {
+    pub active_clients: Vec<ClientInfo>,
+    pub pending_clients: Vec<ClientInfo>,
+}
+
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
 pub enum FrontendError {
     #[error("CallNotFound")]
@@ -225,7 +235,8 @@ impl Frontend {
     pub async fn get_client_ids_in_call(
         &self,
         call: &CallRecord,
-    ) -> Result<Vec<(UserId, DemuxId)>, FrontendError> {
+        user_id: &UserId,
+    ) -> Result<ClientsResponseWrapper, FrontendError> {
         // Get the direct address to the Calling Backend.
         let backend_address = backend::Address::try_from(&call.backend_ip).map_err(|err| {
             warn!(
@@ -237,7 +248,7 @@ impl Frontend {
 
         match self
             .backend
-            .get_clients(&backend_address, &call.era_id)
+            .get_clients(&backend_address, &call.era_id, Some(user_id))
             .await
             .and_then(|response| {
                 if response.demux_ids.len() != response.user_ids.len() {
@@ -245,14 +256,33 @@ impl Frontend {
                         "mismatched lists in ClientResponse"
                     )));
                 }
-                Ok(response
+                let active_clients = response
                     .user_ids
                     .into_iter()
                     .zip(response.demux_ids.into_iter())
                     .map(|(user_id, raw_demux_id)| {
-                        anyhow::Ok((user_id, DemuxId::try_from(raw_demux_id)?))
+                        let opaque_user_id =
+                            Frontend::get_opaque_user_id_from_endpoint_id(&user_id)?;
+                        anyhow::Ok(ClientInfo {
+                            opaque_user_id: Some(opaque_user_id),
+                            demux_id: DemuxId::try_from(raw_demux_id)?,
+                        })
                     })
-                    .collect::<Result<_>>()?)
+                    .collect::<Result<_>>()?;
+                let pending_clients = response
+                    .pending_clients
+                    .into_iter()
+                    .map(|client| {
+                        anyhow::Ok(ClientInfo {
+                            opaque_user_id: client.user_id,
+                            demux_id: DemuxId::try_from(client.demux_id)?,
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+                Ok(ClientsResponseWrapper {
+                    active_clients,
+                    pending_clients,
+                })
             }) {
             Ok(result) => Ok(result),
             Err(BackendError::CallNotFound) => {
