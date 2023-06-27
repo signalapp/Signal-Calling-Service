@@ -400,6 +400,14 @@ impl Call {
         self.clients
             .iter()
             .any(|client| client.demux_id == demux_id)
+            || self
+                .pending_clients
+                .iter()
+                .any(|client| client.demux_id == demux_id)
+            || self
+                .removed_clients
+                .iter()
+                .any(|client| client.demux_id == demux_id)
     }
 
     pub fn is_admin(&self, user_id: &UserId) -> bool {
