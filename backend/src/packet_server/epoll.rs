@@ -446,7 +446,19 @@ impl PacketServerState {
                     event!("calling.udp.epoll.socket_error.packet_too_big");
                 } else {
                     event!("calling.udp.epoll.socket_error");
-                    warn!("socket_error: {}", err);
+                    // Work around missing https://github.com/rust-lang/log/pull/410. Once that's
+                    // supported, the `#[track_caller]` on this function will be sufficient for
+                    // plain `warn!` to work.
+                    let location = std::panic::Location::caller();
+                    log::logger().log(
+                        &log::Record::builder()
+                            .args(format_args!("socket_error: {err}"))
+                            .level(log::Level::Warn)
+                            .target(std::module_path!())
+                            .file(Some(location.file()))
+                            .line(Some(location.line()))
+                            .build(),
+                    );
                 }
             }
         }
