@@ -33,13 +33,10 @@ message DeviceToSfu {
   optional VideoRequestMessage video_request = 1;
   optional LeaveMessage leave = 2;
 
-  // Grouped to save space in-memory.
-  oneof admin_action {
-    GenericAdminAction approve = 3;
-    GenericAdminAction deny = 4;
-    GenericAdminAction remove = 5;
-    GenericAdminAction block = 6;
-  }
+  repeated GenericAdminAction approve = 3;
+  repeated GenericAdminAction deny = 4;
+  repeated GenericAdminAction remove = 5;
+  repeated GenericAdminAction block = 6;
 }
 
 message SfuToDevice {

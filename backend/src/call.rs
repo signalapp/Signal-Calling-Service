@@ -769,40 +769,57 @@ impl Call {
                 }
             }
 
-            if let Some(admin_action) = proto.admin_action {
+            if !proto.approve.is_empty()
+                || !proto.deny.is_empty()
+                || !proto.remove.is_empty()
+                || !proto.block.is_empty()
+            {
                 if sender_is_admin {
-                    use protos::device_to_sfu::{AdminAction, GenericAdminAction};
-                    match admin_action {
-                        AdminAction::Approve(GenericAdminAction {
-                            target_demux_id: Some(demux_id),
-                        }) => {
-                            if let Ok(demux_id) = DemuxId::try_from(demux_id) {
-                                self.approve_pending_client(demux_id, now);
-                            }
+                    fn record_malformed_admin_action() {
+                        event!("calling.call.handle_rtp.malformed_admin_action");
+                    }
+
+                    for action in proto.approve {
+                        if let Some(demux_id) = action
+                            .target_demux_id
+                            .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
+                        {
+                            self.approve_pending_client(demux_id, now);
+                        } else {
+                            record_malformed_admin_action();
                         }
-                        AdminAction::Deny(GenericAdminAction {
-                            target_demux_id: Some(demux_id),
-                        }) => {
-                            if let Ok(demux_id) = DemuxId::try_from(demux_id) {
-                                self.deny_pending_client(demux_id, now);
-                            }
+                    }
+
+                    for action in proto.deny {
+                        if let Some(demux_id) = action
+                            .target_demux_id
+                            .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
+                        {
+                            self.deny_pending_client(demux_id, now);
+                        } else {
+                            record_malformed_admin_action();
                         }
-                        AdminAction::Remove(GenericAdminAction {
-                            target_demux_id: Some(demux_id),
-                        }) => {
-                            if let Ok(demux_id) = DemuxId::try_from(demux_id) {
-                                self.force_remove_client(demux_id, now);
-                            }
+                    }
+
+                    for action in proto.remove {
+                        if let Some(demux_id) = action
+                            .target_demux_id
+                            .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
+                        {
+                            self.force_remove_client(demux_id, now);
+                        } else {
+                            record_malformed_admin_action();
                         }
-                        AdminAction::Block(GenericAdminAction {
-                            target_demux_id: Some(demux_id),
-                        }) => {
-                            if let Ok(demux_id) = DemuxId::try_from(demux_id) {
-                                self.block_client(demux_id, now);
-                            }
-                        }
-                        _ => {
-                            event!("calling.call.handle_rtp.malformed_admin_action");
+                    }
+
+                    for action in proto.block {
+                        if let Some(demux_id) = action
+                            .target_demux_id
+                            .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
+                        {
+                            self.block_client(demux_id, now);
+                        } else {
+                            record_malformed_admin_action();
                         }
                     }
                 } else {
@@ -5190,11 +5207,9 @@ mod call_tests {
                 create_server_to_client_rtp(
                     1,
                     &protos::DeviceToSfu {
-                        admin_action: Some(protos::device_to_sfu::AdminAction::Approve(
-                            protos::device_to_sfu::GenericAdminAction {
-                                target_demux_id: Some(bob_device_1.as_u32()),
-                            },
-                        )),
+                        approve: vec![protos::device_to_sfu::GenericAdminAction {
+                            target_demux_id: Some(bob_device_1.as_u32()),
+                        }],
                         ..Default::default()
                     }
                     .encode_to_vec(),
@@ -5216,11 +5231,9 @@ mod call_tests {
                 create_server_to_client_rtp(
                     2,
                     &protos::DeviceToSfu {
-                        admin_action: Some(protos::device_to_sfu::AdminAction::Remove(
-                            protos::device_to_sfu::GenericAdminAction {
-                                target_demux_id: Some(bob_device_1.as_u32()),
-                            },
-                        )),
+                        remove: vec![protos::device_to_sfu::GenericAdminAction {
+                            target_demux_id: Some(bob_device_1.as_u32()),
+                        }],
                         ..Default::default()
                     }
                     .encode_to_vec(),
@@ -5247,11 +5260,9 @@ mod call_tests {
                 create_server_to_client_rtp(
                     3,
                     &protos::DeviceToSfu {
-                        admin_action: Some(protos::device_to_sfu::AdminAction::Deny(
-                            protos::device_to_sfu::GenericAdminAction {
-                                target_demux_id: Some(carol_device_1.as_u32()),
-                            },
-                        )),
+                        deny: vec![protos::device_to_sfu::GenericAdminAction {
+                            target_demux_id: Some(carol_device_1.as_u32()),
+                        }],
                         ..Default::default()
                     }
                     .encode_to_vec(),
@@ -5287,11 +5298,9 @@ mod call_tests {
                 create_server_to_client_rtp(
                     5,
                     &protos::DeviceToSfu {
-                        admin_action: Some(protos::device_to_sfu::AdminAction::Block(
-                            protos::device_to_sfu::GenericAdminAction {
-                                target_demux_id: Some(damien_device_1.as_u32()),
-                            },
-                        )),
+                        block: vec![protos::device_to_sfu::GenericAdminAction {
+                            target_demux_id: Some(damien_device_1.as_u32()),
+                        }],
                         ..Default::default()
                     }
                     .encode_to_vec(),
@@ -5339,11 +5348,9 @@ mod call_tests {
                 create_server_to_client_rtp(
                     1,
                     &protos::DeviceToSfu {
-                        admin_action: Some(protos::device_to_sfu::AdminAction::Approve(
-                            protos::device_to_sfu::GenericAdminAction {
-                                target_demux_id: Some(bob_device_1.as_u32()),
-                            },
-                        )),
+                        approve: vec![protos::device_to_sfu::GenericAdminAction {
+                            target_demux_id: Some(bob_device_1.as_u32()),
+                        }],
                         ..Default::default()
                     }
                     .encode_to_vec(),
