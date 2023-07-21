@@ -253,6 +253,11 @@ fn get_process_metrics() -> Vec<(&'static str, f32)> {
                 open_files.len() as f32,
             ));
         }
+        Err(psutil::process::ProcessError::NoSuchProcess { .. }) => {
+            // This is really "no such *file*", which can happen if a file descriptor is closed
+            // while open_files() runs. See https://github.com/rust-psutil/rust-psutil/issues/106.
+            // We could retry, but it's fine to just skip the metric until next time.
+        }
         Err(e) => {
             warn!("Error getting fd count {:?}", e)
         }
