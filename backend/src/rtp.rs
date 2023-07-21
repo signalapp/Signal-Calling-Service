@@ -248,7 +248,8 @@ impl Header {
             if extensions_profile != RTP_ONE_BYTE_EXTENSIONS_PROFILE {
                 // 2-byte header extension is only needed for extensions of size = 0
                 // size > 16, and we don't use any such extensions.
-                warn!(
+                event!("calling.rtp.invalid.not_one_byte_extensions_profile");
+                debug!(
                     "Invalid RTP: not using 1-byte extensions; profile = 0x{:x}",
                     extensions_profile
                 );
@@ -271,7 +272,8 @@ impl Header {
                 }
                 let extension_len = ((extension_header[0] & 0x0F) as usize) + 1;
                 if extension_val.len() < extension_len {
-                    warn!(
+                    event!("calling.rtp.invalid.extension_too_short");
+                    debug!(
                         "Invalid RTP: extension too short: {} < {}.  ID = {}",
                         extension_val.len(),
                         extension_len,
@@ -309,7 +311,8 @@ impl Header {
         };
 
         if packet.len() < (payload_start + SRTP_AUTH_TAG_LEN) {
-            warn!(
+            event!("calling.rtp.invalid.too_small_for_srtp_auth_tag");
+            debug!(
                 "Invalid RTP: too small for SRTP auth tag; payload_start = {}; packet len = {}",
                 payload_start,
                 packet.len()
@@ -934,7 +937,8 @@ impl<'packet> ControlPacket<'packet> {
         salt: &Salt,
     ) -> Option<Self> {
         if serialized.len() < RTCP_HEADER_LEN + SRTP_AUTH_TAG_LEN + SRTCP_FOOTER_LEN {
-            warn!("RTCP packet too small: {}", serialized.len());
+            event!("calling.rtp.invalid.rtcp_too_small");
+            debug!("RTCP packet too small: {}", serialized.len());
             return None;
         }
         let sender_ssrc = parse_u32(&serialized[RTCP_SENDER_SSRC_RANGE.clone()]);
@@ -955,7 +959,7 @@ impl<'packet> ControlPacket<'packet> {
             // otherwise we'd have to encrypt all fuzz inputs.
             #[cfg(not(fuzzing))]
             {
-                event!("calling.sfu.unencrypted_rtp");
+                event!("calling.rtp.unencrypted");
                 return None;
             }
         }
@@ -1659,6 +1663,7 @@ impl Endpoint {
             .decrypt_in_place(&self.decrypt.rtp.key, &self.decrypt.rtp.salt)
             .is_none();
         if decrypt_failed {
+            event!("calling.rtp.decryption_failed");
             debug!(
                 "Invalid RTP: decryption failed; ssrc: {}, seqnum: {}, pt: {}, payload_range: {:?}",
                 incoming.ssrc(),
