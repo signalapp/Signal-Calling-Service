@@ -330,6 +330,50 @@ pub async fn update_call_link(
     }
 }
 
+/// Handler for the POST /call-link/reset-expiration route, used only for testing.
+#[cfg(any(debug_assertions, feature = "testing"))]
+pub async fn reset_call_link_expiration(
+    State(frontend): State<Arc<Frontend>>,
+    Extension(auth_credential): Extension<Arc<CallLinkAuthCredentialPresentation>>,
+    TypedHeader(room_id): TypedHeader<RoomId>,
+) -> Result<impl IntoResponse, StatusCode> {
+    trace!("reset_call_link_expiration:");
+
+    // Require that call link room IDs are valid hex.
+    let _ = hex::decode(room_id.as_ref()).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let existing_call_link = frontend
+        .storage
+        .get_call_link(&room_id.clone().into())
+        .await
+        .map_err(|err| {
+            error!("reset_call_link_expiration: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    verify_auth_credential_against_zkparams(&auth_credential, &existing_call_link, &frontend)?;
+
+    match frontend
+        .storage
+        .reset_call_link_expiration(&room_id.into(), SystemTime::now())
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(CallLinkUpdateError::AdminPasskeyDidNotMatch) => {
+            unreachable!("not checked by this entry point");
+        }
+        Err(CallLinkUpdateError::RoomDoesNotExist) => {
+            // We just checked, though there could be a race.
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(CallLinkUpdateError::UnexpectedError(err)) => {
+            error!("reset_call_link_expiration: {err}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;

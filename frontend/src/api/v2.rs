@@ -232,6 +232,8 @@ pub async fn join(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let now = SystemTime::now();
+
     let region = if let Some(region) = region.region {
         region
     } else {
@@ -264,7 +266,7 @@ pub async fn join(
                 Ok((Some(state), call)) => {
                     verify_auth_credential_against_zkparams(&auth_credential, &state, &frontend)?;
 
-                    if state.revoked || state.expiration < SystemTime::now() {
+                    if state.revoked || state.expiration < now {
                         return Ok(not_found("expired"));
                     } else {
                         let is_admin = if let Some(provided_passkey) = request.admin_passkey {
@@ -283,6 +285,26 @@ pub async fn join(
                                     .get_or_create_call_record(&room_id, can_create, &user_id)
                                     .await?;
                                 get_or_create_timer.stop();
+
+                                // Reset the expiration when a call link call is started for the first time.
+                                // We do this in a separate tokio task to avoid additional latency for the user trying to start a call.
+                                let frontend_for_task = frontend.clone();
+                                tokio::spawn(async move {
+                                    time_scope_us!("calling.frontend.api.v2.join_by_room_id.reset_call_link_expiration_in_background.timed");
+                                    match frontend_for_task
+                                        .storage
+                                        .reset_call_link_expiration(&room_id, now)
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            debug!("successfully reset call link expiration")
+                                        }
+                                        Err(err) => {
+                                            warn!("failed to reset call link expiration on create: {err}");
+                                        }
+                                    }
+                                });
+
                                 call
                             }
                         };

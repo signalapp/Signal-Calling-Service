@@ -371,7 +371,13 @@ fn app(frontend: Arc<Frontend>) -> Router {
         .route(
             "/v1/call-link/:room_id",
             get(call_links::read_call_link_with_path).put(call_links::update_call_link_with_path),
-        )
+        );
+    #[cfg(any(debug_assertions, feature = "testing"))]
+    let call_link_routes = call_link_routes.route(
+        "/v1/call-link/reset-expiration",
+        axum::routing::post(call_links::reset_call_link_expiration),
+    );
+    let call_link_routes = call_link_routes
         .layer(
             ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(frontend.clone(), metrics))

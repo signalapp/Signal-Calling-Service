@@ -21,7 +21,7 @@ use hyper::{Body, Method, Request};
 use log::*;
 use serde::{Deserialize, Serialize};
 use serde_dynamo::{from_item, to_item, Item};
-use serde_with::serde_as;
+use serde_with::{ser::SerializeAsWrap, serde_as};
 use tokio::{io::AsyncWriteExt, sync::oneshot::Receiver};
 
 use std::{collections::HashMap, path::PathBuf, time::SystemTime};
@@ -94,6 +94,8 @@ pub struct CallLinkState {
 }
 
 impl CallLinkState {
+    const EXPIRATION_TIMER: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24 * 90);
+
     pub fn new(
         room_id: RoomId,
         admin_passkey: Vec<u8>,
@@ -107,7 +109,7 @@ impl CallLinkState {
             restrictions: CallLinkRestrictions::None,
             encrypted_name: vec![],
             revoked: false,
-            expiration: now + std::time::Duration::from_secs(60 * 60 * 24 * 90),
+            expiration: now + Self::EXPIRATION_TIMER,
         }
     }
 }
@@ -172,6 +174,12 @@ pub trait Storage: Sync + Send {
         new_attributes: CallLinkUpdate,
         zkparams_for_creation: Option<Vec<u8>>,
     ) -> Result<CallLinkState, CallLinkUpdateError>;
+    /// Updates some or all of a call link's attributes.
+    async fn reset_call_link_expiration(
+        &self,
+        room_id: &RoomId,
+        now: SystemTime,
+    ) -> Result<(), CallLinkUpdateError>;
     /// Fetches both the current state for a call link and the call record
     async fn get_call_link_and_record(
         &self,
@@ -540,6 +548,45 @@ impl Storage for DynamoDb {
                 err => Err(CallLinkUpdateError::UnexpectedError(
                     anyhow::Error::from(err)
                         .context("failed to update_item in storage for update_call_link"),
+                )),
+            },
+        }
+    }
+
+    async fn reset_call_link_expiration(
+        &self,
+        room_id: &RoomId,
+        now: SystemTime,
+    ) -> Result<(), CallLinkUpdateError> {
+        let expiration = now + CallLinkState::EXPIRATION_TIMER;
+        // Must match the serialization used by CallLinkState's expiration property.
+        let attribute_value: AttributeValue =
+            serde_dynamo::to_attribute_value(
+                SerializeAsWrap::<_, serde_with::TimestampSeconds<i64>>::new(&expiration),
+            )
+            .expect("failed to convert timestamp to attribute");
+
+        let response = self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key("roomId", AttributeValue::S(room_id.as_ref().to_string()))
+            .key("recordType", AttributeValue::S("CallLinkState".to_string()))
+            .update_expression("SET expiration = :newExpiration")
+            .condition_expression("attribute_exists(recordType)")
+            .expression_attribute_values(":newExpiration", attribute_value)
+            .send()
+            .await;
+
+        match response {
+            Ok(_) => Ok(()),
+            Err(err) => match err.into_service_error() {
+                UpdateItemError::ConditionalCheckFailedException(_) => {
+                    Err(CallLinkUpdateError::RoomDoesNotExist)
+                }
+                err => Err(CallLinkUpdateError::UnexpectedError(
+                    anyhow::Error::from(err)
+                        .context("failed to update_item in storage for reset_call_link_expiration"),
                 )),
             },
         }
