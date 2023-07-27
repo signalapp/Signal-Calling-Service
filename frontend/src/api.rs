@@ -363,15 +363,10 @@ fn app(frontend: Arc<Frontend>) -> Router {
         )
         .with_state(frontend.clone());
 
-    let call_link_routes = Router::new()
-        .route(
-            "/v1/call-link",
-            get(call_links::read_call_link).put(call_links::update_call_link),
-        )
-        .route(
-            "/v1/call-link/:room_id",
-            get(call_links::read_call_link_with_path).put(call_links::update_call_link_with_path),
-        );
+    let call_link_routes = Router::new().route(
+        "/v1/call-link",
+        get(call_links::read_call_link).put(call_links::update_call_link),
+    );
     #[cfg(any(debug_assertions, feature = "testing"))]
     let call_link_routes = call_link_routes.route(
         "/v1/call-link/reset-expiration",
