@@ -107,7 +107,7 @@ async fn metrics<B>(
     let path = get_request_path(&req);
     let user_agent = get_user_agent(&req)?.to_string();
 
-    let tag = if path.starts_with("/v1/call-links/") {
+    let tag = if path == "/v1/call-link" || path.starts_with("/v1/call-link/") {
         "call_links.v1"
     } else if path.starts_with("/v2/") {
         "v2"
@@ -298,7 +298,7 @@ async fn extra_call_link_metrics<B>(
     let path = get_request_path(&req);
     let user_agent = get_user_agent(&req)?.to_string();
 
-    let tag = if path.starts_with("/v1/call-links/") {
+    let tag = if path == "/v1/call-link" || path.starts_with("/v1/call-link/") {
         "call_links.v1"
     } else {
         "unknown"
