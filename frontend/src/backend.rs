@@ -66,6 +66,7 @@ pub struct InfoResponse {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientInfo {
     pub demux_id: u32,
     pub user_id: Option<String>,
