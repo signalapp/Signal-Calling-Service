@@ -361,7 +361,7 @@ pub async fn join(
 }
 
 #[cfg(test)]
-mod api_server_v2_tests {
+pub mod api_server_v2_tests {
     use super::*;
 
     use std::str;
@@ -476,7 +476,7 @@ mod api_server_v2_tests {
         create_authorization_header(user_id, "0")
     }
 
-    fn create_call_record(room_id: &str, backend_region: &str) -> CallRecord {
+    pub fn create_call_record(room_id: &str, backend_region: &str) -> CallRecord {
         CallRecord {
             room_id: room_id.into(),
             era_id: ERA_ID_1.to_string(),
