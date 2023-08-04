@@ -35,6 +35,9 @@ use crate::{
     metrics::Timer,
 };
 
+const ROOM_ID_KEY: &str = "roomId";
+const RECORD_TYPE_KEY: &str = "recordType";
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CallRecord {
@@ -56,6 +59,10 @@ pub struct CallRecord {
     ///
     /// This will not be a plain UUID; it will be encoded in some way that clients can identify.
     pub creator: UserId,
+}
+
+impl CallRecord {
+    const RECORD_TYPE: &str = "ActiveCall";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -93,6 +100,7 @@ pub struct CallLinkState {
 }
 
 impl CallLinkState {
+    const RECORD_TYPE: &str = "CallLinkState";
     const EXPIRATION_TIMER: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24 * 90);
 
     pub fn new(admin_passkey: Vec<u8>, zkparams: Vec<u8>, now: SystemTime) -> Self {
@@ -328,8 +336,11 @@ impl Storage for DynamoDb {
             .client
             .get_item()
             .table_name(&self.table_name)
-            .key("roomId", AttributeValue::S(room_id.as_ref().to_string()))
-            .key("recordType", AttributeValue::S("ActiveCall".to_string()))
+            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(
+                RECORD_TYPE_KEY,
+                AttributeValue::S(CallRecord::RECORD_TYPE.to_string()),
+            )
             .consistent_read(true)
             .send()
             .await
@@ -351,10 +362,13 @@ impl Storage for DynamoDb {
             .table_name(&self.table_name)
             .update_expression(call_as_item.generate_update_expression())
             .key(
-                "roomId",
+                ROOM_ID_KEY,
                 AttributeValue::S(call.room_id.as_ref().to_string()),
             )
-            .key("recordType", AttributeValue::S("ActiveCall".to_string()))
+            .key(
+                RECORD_TYPE_KEY,
+                AttributeValue::S(CallRecord::RECORD_TYPE.to_string()),
+            )
             .set_expression_attribute_names(Some(call_as_item.generate_attribute_names()))
             .set_expression_attribute_values(Some(call_as_item.into_attribute_values()))
             .return_values(ReturnValue::AllNew)
@@ -379,8 +393,11 @@ impl Storage for DynamoDb {
             .delete_item()
             .table_name(&self.table_name)
             // Delete the item for the given key.
-            .key("roomId", AttributeValue::S(room_id.as_ref().to_string()))
-            .key("recordType", AttributeValue::S("ActiveCall".to_string()))
+            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(
+                RECORD_TYPE_KEY,
+                AttributeValue::S(CallRecord::RECORD_TYPE.to_string()),
+            )
             // But only if the given era_id matches the expected value, otherwise the
             // previous call was removed and a new one created already.
             .condition_expression("eraId = :value")
@@ -409,7 +426,10 @@ impl Storage for DynamoDb {
             .key_condition_expression("#region = :value and recordType = :recordType")
             .expression_attribute_names("#region", "region")
             .expression_attribute_values(":value", AttributeValue::S(region.to_string()))
-            .expression_attribute_values(":recordType", AttributeValue::S("ActiveCall".to_string()))
+            .expression_attribute_values(
+                ":recordType",
+                AttributeValue::S(CallRecord::RECORD_TYPE.to_string()),
+            )
             .consistent_read(false)
             .select(Select::AllAttributes)
             .send()
@@ -431,8 +451,11 @@ impl Storage for DynamoDb {
             .client
             .get_item()
             .table_name(&self.table_name)
-            .key("roomId", AttributeValue::S(room_id.as_ref().to_string()))
-            .key("recordType", AttributeValue::S("CallLinkState".to_string()))
+            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(
+                RECORD_TYPE_KEY,
+                AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
+            )
             .consistent_read(true)
             .send()
             .await
@@ -478,8 +501,11 @@ impl Storage for DynamoDb {
             .client
             .update_item()
             .table_name(&self.table_name)
-            .key("roomId", AttributeValue::S(room_id.as_ref().to_string()))
-            .key("recordType", AttributeValue::S("CallLinkState".to_string()))
+            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(
+                RECORD_TYPE_KEY,
+                AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
+            )
             .update_expression(call_as_item.generate_update_expression())
             .condition_expression(condition)
             .set_expression_attribute_names(Some(call_as_item.generate_attribute_names()))
@@ -535,8 +561,11 @@ impl Storage for DynamoDb {
             .client
             .update_item()
             .table_name(&self.table_name)
-            .key("roomId", AttributeValue::S(room_id.as_ref().to_string()))
-            .key("recordType", AttributeValue::S("CallLinkState".to_string()))
+            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(
+                RECORD_TYPE_KEY,
+                AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
+            )
             .update_expression("SET expiration = :newExpiration")
             .condition_expression("attribute_exists(recordType)")
             .expression_attribute_values(":newExpiration", attribute_value)
@@ -565,8 +594,7 @@ impl Storage for DynamoDb {
             .client
             .query()
             .table_name(&self.table_name)
-            .key_condition_expression("#roomId = :value")
-            .expression_attribute_names("#roomId", "roomId")
+            .key_condition_expression("roomId = :value")
             .expression_attribute_values(":value", AttributeValue::S(room_id.as_ref().to_string()))
             .consistent_read(true)
             .select(Select::AllAttributes)
@@ -579,20 +607,20 @@ impl Storage for DynamoDb {
 
         if let Some(items) = response.items {
             for item in items {
-                if let Some(AttributeValue::S(record_type)) = item.get("recordType") {
+                if let Some(AttributeValue::S(record_type)) = item.get(RECORD_TYPE_KEY) {
                     match record_type.as_str() {
-                        "ActiveCall" => {
+                        CallRecord::RECORD_TYPE => {
                             call_record = Some(
                                 from_item(item).context("failed to convert item to CallRecord")?,
                             )
                         }
-                        "CallLinkState" => {
+                        CallLinkState::RECORD_TYPE => {
                             link_state = Some(
                                 from_item(item)
                                     .context("failed to convert item to CallLinkState")?,
                             )
                         }
-                        &_ => {
+                        _ => {
                             warn!("unexpected record_type: {}", record_type);
                         }
                     }
