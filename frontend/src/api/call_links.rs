@@ -494,7 +494,6 @@ pub mod tests {
 
     pub fn default_call_link_state() -> storage::CallLinkState {
         storage::CallLinkState {
-            room_id: ROOM_ID.into(),
             admin_passkey: ADMIN_PASSKEY.into(),
             zkparams: bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params())
                 .expect("can serialize"),

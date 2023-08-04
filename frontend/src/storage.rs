@@ -36,10 +36,11 @@ use crate::{
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", tag = "recordType", rename = "ActiveCall")]
+#[serde(rename_all = "camelCase")]
 pub struct CallRecord {
     /// The room that the client is authorized to join.
     /// Provided to the frontend by the client.
+    #[serde(skip_serializing)]
     pub room_id: RoomId,
     /// A random id generated and sent back to the client to let it know
     /// about the specific call "in" the room.
@@ -66,10 +67,8 @@ pub enum CallLinkRestrictions {
 
 #[serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", tag = "recordType")]
+#[serde(rename_all = "camelCase")]
 pub struct CallLinkState {
-    /// Uniquely identifies the call link / the room.
-    pub room_id: RoomId,
     /// Bytes chosen by the room creator to identify admins.
     #[serde(with = "serde_bytes")]
     pub admin_passkey: Vec<u8>,
@@ -96,14 +95,8 @@ pub struct CallLinkState {
 impl CallLinkState {
     const EXPIRATION_TIMER: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24 * 90);
 
-    pub fn new(
-        room_id: RoomId,
-        admin_passkey: Vec<u8>,
-        zkparams: Vec<u8>,
-        now: SystemTime,
-    ) -> Self {
+    pub fn new(admin_passkey: Vec<u8>, zkparams: Vec<u8>, now: SystemTime) -> Self {
         Self {
-            room_id,
             admin_passkey,
             zkparams,
             restrictions: CallLinkRestrictions::None,
@@ -116,7 +109,7 @@ impl CallLinkState {
 
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", tag = "recordType", rename = "CallLinkState")]
+#[serde(rename_all = "camelCase")]
 pub struct CallLinkUpdate {
     /// Bytes chosen by the room creator to identify admins.
     #[serde(with = "serde_bytes")]
@@ -259,53 +252,35 @@ impl DynamoDb {
 /// SET #foo = if_not_exists(#foo, :foo), #bar = if_not_exists(#bar, :bar)
 /// ```
 struct UpsertableItem {
-    partition_key: &'static str,
-    sort_key: &'static str,
     update_attributes: Item,
     default_attributes: Item,
 }
 
 impl UpsertableItem {
-    fn with_updates(partition_key: &'static str, sort_key: &'static str, attributes: Item) -> Self {
-        Self::new(partition_key, sort_key, attributes, Default::default())
+    fn with_updates(attributes: Item) -> Self {
+        Self::new(attributes, Default::default())
     }
 
-    fn with_defaults(
-        partition_key: &'static str,
-        sort_key: &'static str,
-        attributes: Item,
-    ) -> Self {
-        Self::new(partition_key, sort_key, Default::default(), attributes)
+    fn with_defaults(attributes: Item) -> Self {
+        Self::new(Default::default(), attributes)
     }
 
-    fn new(
-        partition_key: &'static str,
-        sort_key: &'static str,
-        update_attributes: Item,
-        default_attributes: Item,
-    ) -> Self {
+    fn new(update_attributes: Item, default_attributes: Item) -> Self {
         Self {
-            partition_key,
-            sort_key,
             update_attributes,
             default_attributes,
         }
-    }
-
-    fn is_primary_key(&self, k: &str) -> bool {
-        k == self.partition_key || k == self.sort_key
     }
 
     fn generate_update_expression(&self) -> String {
         let update_expressions = self
             .update_attributes
             .keys()
-            .filter(|k| !self.is_primary_key(k))
             .map(|k| format!("#{k} = :{k}"));
         let default_expressions = self
             .default_attributes
             .keys()
-            .filter(|k| !self.is_primary_key(k) && !self.update_attributes.contains_key(k.as_str()))
+            .filter(|k| !self.update_attributes.contains_key(k.as_str()))
             .map(|k| format!("#{k} = if_not_exists(#{k}, :{k})"));
 
         // We don't technically need to sort the expressions, but it's better to be deterministic.
@@ -325,7 +300,6 @@ impl UpsertableItem {
         self.update_attributes
             .keys()
             .chain(self.default_attributes.keys())
-            .filter(|k| !self.is_primary_key(k))
             .map(|k| (format!("#{k}"), k.to_string()))
             .collect()
     }
@@ -342,7 +316,6 @@ impl UpsertableItem {
         // field.
         default_attributes
             .chain(update_attributes)
-            .filter(|(k, _v)| !self.is_primary_key(k))
             .map(|(k, v)| (format!(":{k}"), v.into()))
             .collect()
     }
@@ -370,8 +343,6 @@ impl Storage for DynamoDb {
 
     async fn get_or_add_call_record(&self, call: CallRecord) -> Result<CallRecord, StorageError> {
         let call_as_item = UpsertableItem::with_defaults(
-            "roomId",
-            "recordType",
             to_item(&call).expect("failed to convert CallRecord to item"),
         );
         let response = self
@@ -380,13 +351,10 @@ impl Storage for DynamoDb {
             .table_name(&self.table_name)
             .update_expression(call_as_item.generate_update_expression())
             .key(
-                call_as_item.partition_key,
+                "roomId",
                 AttributeValue::S(call.room_id.as_ref().to_string()),
             )
-            .key(
-                call_as_item.sort_key,
-                AttributeValue::S("ActiveCall".to_string()),
-            )
+            .key("recordType", AttributeValue::S("ActiveCall".to_string()))
             .set_expression_attribute_names(Some(call_as_item.generate_attribute_names()))
             .set_expression_attribute_values(Some(call_as_item.into_attribute_values()))
             .return_values(ReturnValue::AllNew)
@@ -484,8 +452,6 @@ impl Storage for DynamoDb {
         zkparams_for_creation: Option<Vec<u8>>,
     ) -> Result<CallLinkState, CallLinkUpdateError> {
         let mut call_as_item = UpsertableItem::with_updates(
-            "roomId",
-            "recordType",
             to_item(&new_attributes).expect("failed to convert CallLinkUpdate to item"),
         );
 
@@ -493,7 +459,6 @@ impl Storage for DynamoDb {
         let condition;
         if let Some(zkparams_for_creation) = zkparams_for_creation {
             call_as_item.default_attributes = to_item(CallLinkState::new(
-                room_id.clone(),
                 new_attributes.admin_passkey,
                 zkparams_for_creation,
                 SystemTime::now(),
@@ -734,25 +699,12 @@ mod tests {
 
     #[test]
     fn upsertable_item_attribute_merging() {
-        let default_attributes = make_item(&[
-            ("partitionKey", "p"),
-            ("sortKey", "s"),
-            ("defaultOnly", "default"),
-            ("defaultAndUpdate", "default"),
-        ]);
-        let update_attributes = make_item(&[
-            ("partitionKey", "p"),
-            ("sortKey", "s"),
-            ("updateOnly", "update"),
-            ("defaultAndUpdate", "update"),
-        ]);
+        let default_attributes =
+            make_item(&[("defaultOnly", "default"), ("defaultAndUpdate", "default")]);
+        let update_attributes =
+            make_item(&[("updateOnly", "update"), ("defaultAndUpdate", "update")]);
 
-        let item = UpsertableItem::new(
-            "partitionKey",
-            "sortKey",
-            update_attributes,
-            default_attributes,
-        );
+        let item = UpsertableItem::new(update_attributes, default_attributes);
         assert_eq!(
             item.generate_update_expression(),
             "SET #defaultAndUpdate = :defaultAndUpdate,#defaultOnly = if_not_exists(#defaultOnly, :defaultOnly),#updateOnly = :updateOnly"
