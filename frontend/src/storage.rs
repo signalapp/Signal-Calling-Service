@@ -194,7 +194,7 @@ pub struct DynamoDb {
 }
 
 impl DynamoDb {
-    pub async fn new(config: &'static config::Config) -> Result<Self> {
+    pub async fn new(config: &config::Config) -> Result<Self> {
         let sleep_impl =
             default_async_sleep().ok_or_else(|| anyhow!("failed to create sleep_impl"))?;
 
@@ -209,7 +209,7 @@ impl DynamoDb {
                     .credentials_provider(Credentials::from_keys(KEY, PASSWORD, None))
                     .endpoint_url(endpoint)
                     .sleep_impl(sleep_impl)
-                    .region(Region::new(&config.storage_region))
+                    .region(Region::new(config.storage_region.clone()))
                     .build();
                 Client::from_conf(aws_config)
             }
@@ -235,7 +235,7 @@ impl DynamoDb {
                     .sleep_impl(sleep_impl)
                     .retry_config(retry_config)
                     .timeout_config(timeout_config)
-                    .region(Region::new(&config.storage_region))
+                    .region(Region::new(config.storage_region.clone()))
                     .load()
                     .await;
 
@@ -710,6 +710,13 @@ impl IdentityFetcher {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_dynamodb::types::{DeleteRequest, PutRequest, WriteRequest};
+    use futures::FutureExt;
+
+    use std::future::Future;
+
+    use crate::config::default_test_config;
+
     use super::*;
 
     fn make_item(kv_pairs: &[(&'static str, &'static str)]) -> Item {
@@ -761,5 +768,135 @@ mod tests {
             .map(|(k, v)| (k, v.into()))
             .collect()
         );
+    }
+
+    fn timestamp_to_string(timestamp: SystemTime) -> String {
+        timestamp
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string()
+    }
+
+    async fn with_db_items<R>(
+        storage: &DynamoDb,
+        items: impl IntoIterator<Item = serde_json::Value>,
+        test: impl Future<Output = R>,
+    ) -> R {
+        let (deletes, puts) = items
+            .into_iter()
+            .map(|item| {
+                (
+                    WriteRequest::builder()
+                        .delete_request(
+                            DeleteRequest::builder()
+                                .key(
+                                    ROOM_ID_KEY,
+                                    serde_json::from_value::<serde_dynamo::AttributeValue>(
+                                        item.as_object().unwrap().get(ROOM_ID_KEY).unwrap().clone(),
+                                    )
+                                    .unwrap()
+                                    .into(),
+                                )
+                                .key(
+                                    RECORD_TYPE_KEY,
+                                    serde_json::from_value::<serde_dynamo::AttributeValue>(
+                                        item.as_object()
+                                            .unwrap()
+                                            .get(RECORD_TYPE_KEY)
+                                            .unwrap()
+                                            .clone(),
+                                    )
+                                    .unwrap()
+                                    .into(),
+                                )
+                                .build(),
+                        )
+                        .build(),
+                    WriteRequest::builder()
+                        .put_request(
+                            PutRequest::builder()
+                                .set_item(Some(
+                                    serde_json::from_value::<Item>(item).unwrap().into(),
+                                ))
+                                .build(),
+                        )
+                        .build(),
+                )
+            })
+            .unzip();
+        storage
+            .client
+            .batch_write_item()
+            .request_items(&storage.table_name, puts)
+            .send()
+            .await
+            .expect("can initialize table");
+
+        // Why is this safe?
+        // Well, the only thing we do after panicking is run the cleanup code.
+        // But if the panic comes from the DynamoDB client, this might not actually be safe.
+        // There's not really anything we can do about that (short of reinitializing the client).
+        let result = std::panic::AssertUnwindSafe(test).catch_unwind().await;
+
+        storage
+            .client
+            .batch_write_item()
+            .request_items(&storage.table_name, deletes)
+            .send()
+            .await
+            .expect("can clean up table");
+
+        result.unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_absent_call_link() -> Result<()> {
+        let storage = DynamoDb::new(&default_test_config()).await?;
+        assert_eq!(
+            storage
+                .get_call_link(&RoomId::from("testing-nonexistent".to_string()))
+                .await?,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_present_call_link() -> Result<()> {
+        let storage = DynamoDb::new(&default_test_config()).await?;
+        let expiration = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2524608000); // 2050-01-01
+        with_db_items(
+            &storage,
+            [serde_json::json!({
+                ROOM_ID_KEY: {"S": "testing-room"},
+                RECORD_TYPE_KEY: {"S": CallLinkState::RECORD_TYPE},
+                "adminPasskey": {"B": base64::encode([1, 2, 3])},
+                "zkparams": {"B": ""},
+                "restrictions": {"S": "adminApproval"},
+                "encryptedName": {"B": base64::encode(b"abc")},
+                "revoked": {"BOOL": false},
+                "expiration": {"N": timestamp_to_string(expiration)},
+            })],
+            async {
+                assert_eq!(
+                    storage
+                        .get_call_link(&RoomId::from("testing-room".to_string()))
+                        .await?,
+                    Some(CallLinkState {
+                        admin_passkey: vec![1, 2, 3],
+                        zkparams: vec![],
+                        restrictions: CallLinkRestrictions::AdminApproval,
+                        encrypted_name: b"abc".to_vec(),
+                        revoked: false,
+                        expiration,
+                    })
+                );
+                Ok(())
+            },
+        )
+        .await
     }
 }

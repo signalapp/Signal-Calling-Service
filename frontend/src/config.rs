@@ -115,7 +115,7 @@ pub fn default_test_config() -> Config {
         backend_ip: None,
         storage_table: "Rooms".to_string(),
         storage_region: "us-east-1".to_string(),
-        storage_endpoint: Some("localhost:9010".to_string()),
+        storage_endpoint: Some("http://localhost:8000".to_string()),
         metrics_datadog_host: None,
     }
 }
