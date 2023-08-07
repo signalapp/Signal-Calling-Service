@@ -352,10 +352,6 @@ fn app(frontend: Arc<Frontend>) -> Router {
             "/v2/conference/participants",
             get(v2::get_participants).put(v2::join),
         )
-        .route(
-            "/v2/conference/:room_id/participants",
-            get(v2::get_participants_by_room_id).put(v2::join_by_room_id),
-        )
         .layer(
             ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(frontend.clone(), metrics))

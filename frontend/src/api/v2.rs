@@ -7,7 +7,7 @@ use std::{str, sync::Arc, time::SystemTime};
 
 use anyhow::Result;
 use axum::{
-    extract::{OriginalUri, Path, Query, State},
+    extract::{OriginalUri, Query, State},
     response::{IntoResponse, Redirect},
     Extension, Json, TypedHeader,
 };
@@ -96,23 +96,6 @@ fn user_id_from_uuid_ciphertext(ciphertext: &zkgroup::groups::UuidCiphertext) ->
     bincode::serialize(&ciphertext).unwrap().encode_hex()
 }
 
-/// Handler for the GET /conference/:room_id/participants route.
-pub async fn get_participants_by_room_id(
-    frontend: State<Arc<Frontend>>,
-    maybe_auth_credential: Option<Extension<Arc<CallLinkAuthCredentialPresentation>>>,
-    Path(room_id): Path<RoomId>,
-    original_uri: OriginalUri,
-) -> Result<impl IntoResponse, StatusCode> {
-    get_participants(
-        frontend,
-        None,
-        maybe_auth_credential,
-        Some(axum::TypedHeader(room_id)),
-        original_uri,
-    )
-    .await
-}
-
 /// Handler for the GET /conference/participants route.
 pub async fn get_participants(
     State(frontend): State<Arc<Frontend>>,
@@ -192,27 +175,6 @@ pub async fn get_participants(
 #[derive(Deserialize)]
 pub struct Region {
     region: Option<String>,
-}
-
-/// Handler for the PUT /conference/:room_id/participants route.
-pub async fn join_by_room_id(
-    frontend: State<Arc<Frontend>>,
-    maybe_auth_credential: Option<Extension<Arc<CallLinkAuthCredentialPresentation>>>,
-    Path(room_id): Path<RoomId>,
-    original_uri: OriginalUri,
-    region: Query<Region>,
-    request: Json<JoinRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
-    join(
-        frontend,
-        None,
-        maybe_auth_credential,
-        Some(axum::TypedHeader(room_id)),
-        original_uri,
-        region,
-        request,
-    )
-    .await
 }
 
 /// Handler for the PUT /conference/participants route.
@@ -406,8 +368,6 @@ pub mod api_server_v2_tests {
     const ALT_REGION: &str = "asia-northeast3";
     const REDIRECTED_URL: &str =
         "https://asia-northeast3.test.com/v2/conference/participants?region=us-west1";
-    const REDIRECTED_CALL_LINKS_URL: &str =
-        "https://asia-northeast3.test.com/v2/conference/ff0000dd/participants?region=us-west1";
     const CLIENT_ICE_UFRAG: &str = "client-ufrag";
     const CLIENT_DHE_PUBLIC_KEY: &str = "f924028e9b8021b77eb97b36f1d43e63";
     const BACKEND_ICE_UFRAG: &str = "backend-ufrag";
@@ -1430,7 +1390,7 @@ pub mod api_server_v2_tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is no call.
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is no call.
     #[tokio::test]
     async fn test_call_link_get_with_no_call() {
         let config = &CONFIG;
@@ -1469,7 +1429,7 @@ pub mod api_server_v2_tests {
         assert!(body.is_empty());
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is no call, and the call link is expired.
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is no call, and the call link is expired.
     #[tokio::test]
     async fn test_call_link_get_with_no_call_expired() {
         let config = &CONFIG;
@@ -1512,7 +1472,7 @@ pub mod api_server_v2_tests {
         assert_eq!(error_response.reason, "expired");
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is no call, and the call link is revoked.
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is no call, and the call link is revoked.
     #[tokio::test]
     async fn test_call_link_get_with_no_call_revoked() {
         let config = &CONFIG;
@@ -1555,7 +1515,7 @@ pub mod api_server_v2_tests {
         assert_eq!(error_response.reason, "expired");
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is no call_link.
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is no call_link.
     #[tokio::test]
     async fn test_call_link_get_with_no_call_link() {
         let config = &CONFIG;
@@ -1595,7 +1555,7 @@ pub mod api_server_v2_tests {
         assert_eq!(error_response.reason, "invalid");
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is no call_link, but the room id collides with a group call.
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is no call_link, but the room id collides with a group call.
     #[tokio::test]
     async fn test_call_link_get_with_no_call_link_collision_with_call() {
         let config = &CONFIG;
@@ -1635,7 +1595,7 @@ pub mod api_server_v2_tests {
         assert_eq!(error_response.reason, "invalid");
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is a call
     /// with two participants.
     #[tokio::test]
     async fn test_call_link_get_with_call() {
@@ -1704,7 +1664,7 @@ pub mod api_server_v2_tests {
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is a call
     /// with one active participant and one pending client.
     #[tokio::test]
     async fn test_call_link_get_with_pending_client() {
@@ -1799,7 +1759,7 @@ pub mod api_server_v2_tests {
         );
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call with
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is a call with
     /// one active participant and one pending client, but the requester is not an admin and so gets
     /// no user IDs for the pending clients.
     #[tokio::test]
@@ -1893,7 +1853,7 @@ pub mod api_server_v2_tests {
         );
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is a call
     /// with two participants, but the call link is revoked
     #[tokio::test]
     async fn test_call_link_get_with_call_link_revoked() {
@@ -1965,7 +1925,7 @@ pub mod api_server_v2_tests {
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is a call
     /// with two participants, but the call link is expired
     #[tokio::test]
     async fn test_call_link_get_with_call_link_expired() {
@@ -2037,7 +1997,7 @@ pub mod api_server_v2_tests {
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where the call is in a
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where the call is in a
     /// different region.
     #[tokio::test]
     async fn test_call_link_get_with_call_in_different_region() {
@@ -2089,7 +2049,7 @@ pub mod api_server_v2_tests {
         );
     }
 
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call in storage
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is a call in storage
     /// but it is no longer present on the backend (for example it just expired).
     #[tokio::test]
     async fn test_call_link_get_with_call_but_expired_on_backend() {
@@ -2165,7 +2125,7 @@ pub mod api_server_v2_tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is no call yet.
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where there is no call yet.
     #[tokio::test]
     async fn test_call_link_join_with_no_call() {
         let config = &CONFIG;
@@ -2288,7 +2248,7 @@ pub mod api_server_v2_tests {
         assert_eq!(&join_response.era_id, ERA_ID_1);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is no call yet; this time, the call link requires admin approval.
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where there is no call yet; this time, the call link requires admin approval.
     #[tokio::test]
     async fn test_call_link_join_with_no_call_requiring_admin_approval() {
         let config = &CONFIG;
@@ -2415,7 +2375,7 @@ pub mod api_server_v2_tests {
         assert_eq!(&join_response.era_id, ERA_ID_1);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is a call.
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where there is a call.
     #[tokio::test]
     async fn test_call_link_join_with_call() {
         let config = &CONFIG;
@@ -2517,7 +2477,7 @@ pub mod api_server_v2_tests {
         assert_eq!(&join_response.era_id, ERA_ID_1);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is a call, and the call link is expired.
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where there is a call, and the call link is expired.
     #[tokio::test]
     async fn test_call_link_join_with_call_expired() {
         let config = &CONFIG;
@@ -2566,7 +2526,7 @@ pub mod api_server_v2_tests {
         let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error_response.reason, "expired");
     }
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is a call, and the call link is revoked.
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where there is a call, and the call link is revoked.
     #[tokio::test]
     async fn test_call_link_join_with_call_revoked() {
         let config = &CONFIG;
@@ -2616,7 +2576,7 @@ pub mod api_server_v2_tests {
         assert_eq!(error_response.reason, "expired");
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is a call and user is admin.
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where there is a call and user is admin.
     #[tokio::test]
     async fn test_call_link_join_with_call_as_admin() {
         let config = &CONFIG;
@@ -2719,7 +2679,7 @@ pub mod api_server_v2_tests {
         assert_eq!(&join_response.era_id, ERA_ID_1);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is a call and user has the wrong admin passkey.
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where there is a call and user has the wrong admin passkey.
     #[tokio::test]
     async fn test_call_link_join_with_call_wrong_admin() {
         let config = &CONFIG;
@@ -2822,7 +2782,7 @@ pub mod api_server_v2_tests {
         assert_eq!(&join_response.era_id, ERA_ID_1);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" in the case where there is no call, and the call link is expired.
+    /// Invoke the "PUT /v2/conference/participants" for a call link in the case where there is no call, and the call link is expired.
     #[tokio::test]
     async fn test_call_link_join_with_no_call_expired() {
         let config = &CONFIG;
@@ -2868,7 +2828,7 @@ pub mod api_server_v2_tests {
         assert_eq!(error_response.reason, "expired");
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" in the case where there is no call, and the call link is revoked.
+    /// Invoke the "PUT /v2/conference/participants" for a call link in the case where there is no call, and the call link is revoked.
     #[tokio::test]
     async fn test_call_link_join_with_no_call_revoked() {
         let config = &CONFIG;
@@ -2914,7 +2874,7 @@ pub mod api_server_v2_tests {
         assert_eq!(error_response.reason, "expired");
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" in the case where there is no call, and no call link.
+    /// Invoke the "PUT /v2/conference/participants" for a call link in the case where there is no call, and no call link.
     #[tokio::test]
     async fn test_call_link_join_with_no_call_link() {
         let config = &CONFIG;
@@ -2958,7 +2918,7 @@ pub mod api_server_v2_tests {
         assert_eq!(error_response.reason, "invalid");
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" in the case where there is no call link, but there is a call on the room id.
+    /// Invoke the "PUT /v2/conference/participants" for a call link in the case where there is no call link, but there is a call on the room id.
     #[tokio::test]
     async fn test_call_link_join_with_no_call_link_collision_with_call() {
         let config = &CONFIG;
@@ -3002,7 +2962,7 @@ pub mod api_server_v2_tests {
         assert_eq!(error_response.reason, "invalid");
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the call is
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where the call is
     /// in a different region.
     #[tokio::test]
     async fn test_call_link_join_with_call_in_different_region() {
@@ -3056,7 +3016,7 @@ pub mod api_server_v2_tests {
         );
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join with an empty DHE public key.
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join with an empty DHE public key.
     #[tokio::test]
     async fn test_call_link_join_with_empty_dhe_public_key() {
         let config = &CONFIG;
@@ -3099,7 +3059,7 @@ pub mod api_server_v2_tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the request is
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where the request is
     /// missing the authorization header.
     #[tokio::test]
     async fn test_call_link_join_with_no_authorization_header() {
@@ -3131,7 +3091,7 @@ pub mod api_server_v2_tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where the authorization
     /// header is empty.
     #[tokio::test]
     async fn test_call_link_join_with_empty_authorization_header() {
@@ -3164,7 +3124,7 @@ pub mod api_server_v2_tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where the authorization
     /// header is invalid.
     #[tokio::test]
     async fn test_call_link_join_with_invalid_authorization_header() {
@@ -3197,7 +3157,7 @@ pub mod api_server_v2_tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where the authorization
     /// header is a group call header instead of a CallLinkAuthCredential.
     #[tokio::test]
     async fn test_call_link_join_with_group_call_auth() {
@@ -3233,7 +3193,7 @@ pub mod api_server_v2_tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where the authorization
     /// header is a CreateCallLinkCredential instead of a CallLinkAuthCredential.
     #[tokio::test]
     async fn test_call_link_join_with_group_creator_auth() {
@@ -3269,7 +3229,7 @@ pub mod api_server_v2_tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where the authorization
     /// header has a missing token.
     #[tokio::test]
     async fn test_call_link_join_with_authorization_header_missing_token() {
@@ -3302,7 +3262,7 @@ pub mod api_server_v2_tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where the authorization
     /// header has an invalid token.
     #[tokio::test]
     async fn test_call_link_join_with_authorization_header_invalid_token() {
@@ -3324,1568 +3284,6 @@ pub mod api_server_v2_tests {
             .method(http::Method::PUT)
             .uri("/v2/conference/participants".to_string())
             .header(X_ROOM_ID, ROOM_ID)
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(header::AUTHORIZATION, "Bearer Auth.12345")
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// tests with old style urls
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is no call.
-    #[tokio::test]
-    async fn test_call_link_old_get_with_no_call() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| Ok((Some(default_call_link_state()), None)));
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let request = Request::builder()
-            .method(http::Method::GET)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::empty())
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        assert!(body.is_empty());
-    }
-
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is no call, and the call link is expired.
-    #[tokio::test]
-    async fn test_call_link_old_get_with_no_call_expired() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        let mut call_link_state = default_call_link_state();
-        call_link_state.expiration = SystemTime::UNIX_EPOCH;
-
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| Ok((Some(call_link_state), None)));
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let request = Request::builder()
-            .method(http::Method::GET)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::empty())
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error_response.reason, "expired");
-    }
-
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is no call, and the call link is revoked.
-    #[tokio::test]
-    async fn test_call_link_old_get_with_no_call_revoked() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        let mut call_link_state = default_call_link_state();
-        call_link_state.revoked = true;
-
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| Ok((Some(call_link_state), None)));
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let request = Request::builder()
-            .method(http::Method::GET)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::empty())
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error_response.reason, "expired");
-    }
-
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is no call_link.
-    #[tokio::test]
-    async fn test_call_link_old_get_with_no_call_link() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| Ok((None, None)));
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let request = Request::builder()
-            .method(http::Method::GET)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::empty())
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error_response.reason, "invalid");
-    }
-
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is no call_link, but the room id collides with a group call.
-    #[tokio::test]
-    async fn test_call_link_old_get_with_no_call_link_collision_with_call() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| Ok((None, Some(create_call_record(ROOM_ID, LOCAL_REGION)))));
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let request = Request::builder()
-            .method(http::Method::GET)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::empty())
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error_response.reason, "invalid");
-    }
-
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call
-    /// with two participants.
-    #[tokio::test]
-    async fn test_call_link_old_get_with_call() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| {
-                Ok((
-                    Some(default_call_link_state()),
-                    Some(create_call_record(ROOM_ID, LOCAL_REGION)),
-                ))
-            });
-        let backend = create_mocked_backend_two_calls();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let request = Request::builder()
-            .method(http::Method::GET)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::empty())
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
-
-        assert_eq!(participants_response.era_id, ERA_ID_1);
-        assert_eq!(
-            participants_response.max_devices,
-            config.max_clients_per_call
-        );
-        assert_eq!(participants_response.creator, USER_ID_1);
-        assert_eq!(participants_response.participants.len(), 2);
-
-        assert_eq!(
-            participants_response.participants[0]
-                .opaque_user_id
-                .as_deref(),
-            Some(USER_ID_1)
-        );
-        assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
-        assert_eq!(
-            participants_response.participants[1]
-                .opaque_user_id
-                .as_deref(),
-            Some(USER_ID_2)
-        );
-        assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
-    }
-
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call
-    /// with two participants, but the call link is revoked
-    #[tokio::test]
-    async fn test_call_link_old_get_with_call_link_revoked() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut call_link_state = default_call_link_state();
-        call_link_state.revoked = true;
-
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| {
-                Ok((
-                    Some(call_link_state),
-                    Some(create_call_record(ROOM_ID, LOCAL_REGION)),
-                ))
-            });
-        let backend = create_mocked_backend_two_calls();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let request = Request::builder()
-            .method(http::Method::GET)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::empty())
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
-
-        assert_eq!(participants_response.era_id, ERA_ID_1);
-        assert_eq!(
-            participants_response.max_devices,
-            config.max_clients_per_call
-        );
-        assert_eq!(participants_response.creator, USER_ID_1);
-        assert_eq!(participants_response.participants.len(), 2);
-
-        assert_eq!(
-            participants_response.participants[0]
-                .opaque_user_id
-                .as_deref(),
-            Some(USER_ID_1)
-        );
-        assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
-        assert_eq!(
-            participants_response.participants[1]
-                .opaque_user_id
-                .as_deref(),
-            Some(USER_ID_2)
-        );
-        assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
-    }
-
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call
-    /// with two participants, but the call link is expired
-    #[tokio::test]
-    async fn test_call_link_old_get_with_call_link_expired() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut call_link_state = default_call_link_state();
-        call_link_state.expiration = SystemTime::UNIX_EPOCH;
-
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| {
-                Ok((
-                    Some(call_link_state),
-                    Some(create_call_record(ROOM_ID, LOCAL_REGION)),
-                ))
-            });
-        let backend = create_mocked_backend_two_calls();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let request = Request::builder()
-            .method(http::Method::GET)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::empty())
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
-
-        assert_eq!(participants_response.era_id, ERA_ID_1);
-        assert_eq!(
-            participants_response.max_devices,
-            config.max_clients_per_call
-        );
-        assert_eq!(participants_response.creator, USER_ID_1);
-        assert_eq!(participants_response.participants.len(), 2);
-
-        assert_eq!(
-            participants_response.participants[0]
-                .opaque_user_id
-                .as_deref(),
-            Some(USER_ID_1)
-        );
-        assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
-        assert_eq!(
-            participants_response.participants[1]
-                .opaque_user_id
-                .as_deref(),
-            Some(USER_ID_2)
-        );
-        assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
-    }
-
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where the call is in a
-    /// different region.
-    #[tokio::test]
-    async fn test_call_link_old_get_with_call_in_different_region() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| {
-                Ok((
-                    Some(default_call_link_state()),
-                    Some(create_call_record(ROOM_ID, ALT_REGION)),
-                ))
-            });
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let request = Request::builder()
-            .method(http::Method::GET)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::empty())
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(
-            response
-                .headers()
-                .get("Location")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            REDIRECTED_CALL_LINKS_URL
-        );
-    }
-
-    /// Invoke the "GET /v2/conference/:room_id/participants" in the case where there is a call in storage
-    /// but it is no longer present on the backend (for example it just expired).
-    #[tokio::test]
-    async fn test_call_link_old_get_with_call_but_expired_on_backend() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies.
-        let mut storage = Box::new(MockStorage::new());
-        let mut backend = Box::new(MockBackend::new());
-
-        // For this test, we'll make sure the calls are in sequence and make sure that
-        // the call is being deleted from the database at the end since it is no longer
-        // present on the backend.
-        let mut seq = Sequence::new();
-
-        // Create expectations.
-        storage
-            .expect_get_call_link_and_record()
-            // room_id: &RoomId
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            // Result<Option<CallRecord>>
-            .returning(move |_| {
-                Ok((
-                    Some(default_call_link_state()),
-                    Some(create_call_record(ROOM_ID, &config.region)),
-                ))
-            })
-            .in_sequence(&mut seq);
-
-        backend
-            .expect_get_clients()
-            // backend_address: &BackendAddress, call_id: &str, user_id: Option<&UserId>,
-            // We have to use 'withf' because of the nested reference in 'user_id'.
-            .withf(|backend_address, call_id, user_id| {
-                backend_address == &backend::Address::try_from("127.0.0.1").unwrap()
-                    && call_id == ERA_ID_1
-                    && user_id.is_some()
-            })
-            .once()
-            // Result<ClientsResponse, BackendError>
-            .returning(|_, _, _| Err(BackendError::CallNotFound))
-            .in_sequence(&mut seq);
-
-        storage
-            .expect_remove_call_record()
-            // room_id: &RoomId, era_id: &str
-            .with(eq(RoomId::from(ROOM_ID)), eq(ERA_ID_1))
-            .once()
-            // Result<()>
-            .returning(|_, _| Ok(()))
-            .in_sequence(&mut seq);
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let request = Request::builder()
-            .method(http::Method::GET)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::empty())
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is no call yet.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_no_call() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut seq = Sequence::new();
-        let mut storage = Box::new(MockStorage::new());
-        let mut expected_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
-        expected_call_record.creator = USER_ID_1_DOUBLE_ENCODED.to_string();
-        let resulting_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
-
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| Ok((Some(default_call_link_state()), None)))
-            .in_sequence(&mut seq);
-
-        storage
-            .expect_get_or_add_call_record()
-            .with(eq(expected_call_record))
-            .once()
-            .return_once(move |_| Ok(resulting_call_record))
-            .in_sequence(&mut seq);
-
-        let mut backend = Box::new(MockBackend::new());
-        let mut id_generator = Box::new(MockIdGenerator::new());
-
-        // Create additional expectations.
-        backend
-            .expect_select_ip()
-            .once()
-            // Result<String, BackendError>
-            .returning(|| Ok("127.0.0.1".to_string()));
-
-        id_generator
-            .expect_get_random_era_id()
-            .with(eq(16))
-            .once()
-            .returning(|_| ERA_ID_1.to_string());
-
-        id_generator
-            .expect_get_random_demux_id()
-            // user_id: &str
-            .with(eq(USER_ID_1_DOUBLE_ENCODED))
-            .once()
-            // DemuxId
-            .returning(|_| DEMUX_ID_1.try_into().unwrap());
-
-        let expected_demux_id: DemuxId = DEMUX_ID_1.try_into().unwrap();
-
-        backend
-            .expect_join()
-            // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
-            .with(
-                eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(ERA_ID_1),
-                eq(expected_demux_id),
-                eq(backend::JoinRequest {
-                    user_ids: USER_ID_1_DOUBLE_ENCODED.to_string(),
-                    ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
-                    dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
-                    hkdf_extra_info: None,
-                    region: LOCAL_REGION.to_string(),
-                    new_clients_require_approval: false,
-                    is_admin: false,
-                }),
-            )
-            .once()
-            // Result<JoinResponse, BackendError>
-            .returning(|_, _, _, _| {
-                Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
-                    port: 8080,
-                    port_tcp: Some(8080),
-                    ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
-                    ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
-                })
-            });
-
-        let frontend = create_frontend_with_id_generator(config, storage, backend, id_generator);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(join_response.demux_id, DEMUX_ID_1);
-        assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
-        assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
-        assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
-        assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
-        assert_eq!(
-            join_response.dhe_public_key,
-            BACKEND_DHE_PUBLIC_KEY.to_string()
-        );
-        assert_eq!(&join_response.call_creator, USER_ID_1);
-        assert_eq!(&join_response.era_id, ERA_ID_1);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is a call.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_call() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| {
-                Ok((
-                    Some(default_call_link_state()),
-                    Some(create_call_record(ROOM_ID, LOCAL_REGION)),
-                ))
-            });
-        let mut backend = Box::new(MockBackend::new());
-        let mut id_generator = Box::new(MockIdGenerator::new());
-
-        // Create additional expectations.
-        id_generator
-            .expect_get_random_demux_id()
-            // user_id: &str
-            .with(eq(USER_ID_1_DOUBLE_ENCODED))
-            .once()
-            // DemuxId
-            .returning(|_| DEMUX_ID_2.try_into().unwrap());
-
-        let expected_demux_id: DemuxId = DEMUX_ID_2.try_into().unwrap();
-
-        backend
-            .expect_join()
-            // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
-            .with(
-                eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(ERA_ID_1),
-                eq(expected_demux_id),
-                eq(backend::JoinRequest {
-                    user_ids: USER_ID_1_DOUBLE_ENCODED.to_string(),
-                    ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
-                    dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
-                    hkdf_extra_info: None,
-                    region: LOCAL_REGION.to_string(),
-                    new_clients_require_approval: false,
-                    is_admin: false,
-                }),
-            )
-            .once()
-            // Result<JoinResponse, BackendError>
-            .returning(|_, _, _, _| {
-                Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
-                    port: 8080,
-                    port_tcp: Some(8080),
-                    ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
-                    ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
-                })
-            });
-
-        let frontend = create_frontend_with_id_generator(config, storage, backend, id_generator);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(join_response.demux_id, DEMUX_ID_2);
-        assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
-        assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
-        assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
-        assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
-        assert_eq!(
-            join_response.dhe_public_key,
-            BACKEND_DHE_PUBLIC_KEY.to_string()
-        );
-        assert_eq!(&join_response.call_creator, USER_ID_1);
-        assert_eq!(&join_response.era_id, ERA_ID_1);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is a call, and the call link is expired.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_call_expired() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut call_link_state = default_call_link_state();
-        call_link_state.expiration = SystemTime::UNIX_EPOCH;
-
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| {
-                Ok((
-                    Some(call_link_state),
-                    Some(create_call_record(ROOM_ID, LOCAL_REGION)),
-                ))
-            });
-        let backend = create_mocked_backend_unused();
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error_response.reason, "expired");
-    }
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is a call, and the call link is revoked.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_call_revoked() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations
-        let mut call_link_state = default_call_link_state();
-        call_link_state.revoked = true;
-
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| {
-                Ok((
-                    Some(call_link_state),
-                    Some(create_call_record(ROOM_ID, LOCAL_REGION)),
-                ))
-            });
-        let backend = create_mocked_backend_unused();
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error_response.reason, "expired");
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is a call and user is admin.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_call_as_admin() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| {
-                Ok((
-                    Some(default_call_link_state()),
-                    Some(create_call_record(ROOM_ID, LOCAL_REGION)),
-                ))
-            });
-        let mut backend = Box::new(MockBackend::new());
-        let mut id_generator = Box::new(MockIdGenerator::new());
-
-        // Create additional expectations.
-        id_generator
-            .expect_get_random_demux_id()
-            // user_id: &str
-            .with(eq(USER_ID_1_DOUBLE_ENCODED))
-            .once()
-            // DemuxId
-            .returning(|_| DEMUX_ID_2.try_into().unwrap());
-
-        let expected_demux_id: DemuxId = DEMUX_ID_2.try_into().unwrap();
-
-        backend
-            .expect_join()
-            // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
-            .with(
-                eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(ERA_ID_1),
-                eq(expected_demux_id),
-                eq(backend::JoinRequest {
-                    user_ids: USER_ID_1_DOUBLE_ENCODED.to_string(),
-                    ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
-                    dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
-                    hkdf_extra_info: None,
-                    region: LOCAL_REGION.to_string(),
-                    new_clients_require_approval: false,
-                    is_admin: true,
-                }),
-            )
-            .once()
-            // Result<JoinResponse, BackendError>
-            .returning(|_, _, _, _| {
-                Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
-                    port: 8080,
-                    port_tcp: Some(8080),
-                    ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
-                    ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
-                })
-            });
-
-        let frontend = create_frontend_with_id_generator(config, storage, backend, id_generator);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(Some(ADMIN_PASSKEY));
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(join_response.demux_id, DEMUX_ID_2);
-        assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
-        assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
-        assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
-        assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
-        assert_eq!(
-            join_response.dhe_public_key,
-            BACKEND_DHE_PUBLIC_KEY.to_string()
-        );
-        assert_eq!(&join_response.call_creator, USER_ID_1);
-        assert_eq!(&join_response.era_id, ERA_ID_1);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where there is a call and user has the wrong admin passkey.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_call_wrong_admin() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| {
-                Ok((
-                    Some(default_call_link_state()),
-                    Some(create_call_record(ROOM_ID, LOCAL_REGION)),
-                ))
-            });
-        let mut backend = Box::new(MockBackend::new());
-        let mut id_generator = Box::new(MockIdGenerator::new());
-
-        // Create additional expectations.
-        id_generator
-            .expect_get_random_demux_id()
-            // user_id: &str
-            .with(eq(USER_ID_1_DOUBLE_ENCODED))
-            .once()
-            // DemuxId
-            .returning(|_| DEMUX_ID_2.try_into().unwrap());
-
-        let expected_demux_id: DemuxId = DEMUX_ID_2.try_into().unwrap();
-
-        backend
-            .expect_join()
-            // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
-            .with(
-                eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(ERA_ID_1),
-                eq(expected_demux_id),
-                eq(backend::JoinRequest {
-                    user_ids: USER_ID_1_DOUBLE_ENCODED.to_string(),
-                    ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
-                    dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
-                    hkdf_extra_info: None,
-                    region: LOCAL_REGION.to_string(),
-                    new_clients_require_approval: false,
-                    is_admin: false,
-                }),
-            )
-            .once()
-            // Result<JoinResponse, BackendError>
-            .returning(|_, _, _, _| {
-                Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
-                    port: 8080,
-                    port_tcp: Some(8080),
-                    ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
-                    ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
-                })
-            });
-
-        let frontend = create_frontend_with_id_generator(config, storage, backend, id_generator);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(Some(b"joshua"));
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(join_response.demux_id, DEMUX_ID_2);
-        assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
-        assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
-        assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
-        assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
-        assert_eq!(
-            join_response.dhe_public_key,
-            BACKEND_DHE_PUBLIC_KEY.to_string()
-        );
-        assert_eq!(&join_response.call_creator, USER_ID_1);
-        assert_eq!(&join_response.era_id, ERA_ID_1);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" in the case where there is no call, and the call link is expired.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_no_call_expired() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        let mut call_link_state = default_call_link_state();
-        call_link_state.expiration = SystemTime::UNIX_EPOCH;
-
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| Ok((Some(call_link_state), None)));
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(Some(ADMIN_PASSKEY));
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error_response.reason, "expired");
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" in the case where there is no call, and the call link is revoked.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_no_call_revoked() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        let mut call_link_state = default_call_link_state();
-        call_link_state.revoked = true;
-
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| Ok((Some(call_link_state), None)));
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(Some(ADMIN_PASSKEY));
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error_response.reason, "expired");
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" in the case where there is no call, and no call link.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_no_call_link() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| Ok((None, None)));
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(Some(ADMIN_PASSKEY));
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error_response.reason, "invalid");
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" in the case where there is no call link, but there is a call on the room id.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_no_call_link_collision_with_call() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| Ok((None, Some(create_call_record(ROOM_ID, LOCAL_REGION)))));
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(Some(ADMIN_PASSKEY));
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
-        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error_response.reason, "invalid");
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the call is
-    /// in a different region.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_call_in_different_region() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let mut storage = Box::new(MockStorage::new());
-        storage
-            .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .once()
-            .return_once(|_| {
-                Ok((
-                    Some(default_call_link_state()),
-                    Some(create_call_record(ROOM_ID, ALT_REGION)),
-                ))
-            });
-        let backend = create_mocked_backend_unused();
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(
-            response
-                .headers()
-                .get("Location")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            REDIRECTED_CALL_LINKS_URL
-        );
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join with an empty DHE public key.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_empty_dhe_public_key() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_unused();
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = JoinRequest {
-            admin_passkey: None,
-            ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
-            dhe_public_key: "".to_string(),
-            hkdf_extra_info: None,
-        };
-        let join_request = serde_json::to_vec(&join_request).unwrap();
-
-        create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the request is
-    /// missing the authorization header.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_no_authorization_header() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_unused();
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend);
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
-    /// header is empty.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_empty_authorization_header() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_unused();
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend);
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(header::AUTHORIZATION, "")
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
-    /// header is invalid.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_invalid_authorization_header() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_unused();
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend);
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(header::AUTHORIZATION, "Nope")
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
-    /// header is a group call header instead of a CallLinkAuthCredential.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_group_call_auth() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_unused();
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend);
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_authorization_header_for_user(USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
-    /// header is a CreateCallLinkCredential instead of a CallLinkAuthCredential.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_group_creator_auth() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_unused();
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend.clone());
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_authorization_header_for_creator(&frontend, CALL_LINKS_USER_ID_1),
-            )
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
-    /// header has a missing token.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_authorization_header_missing_token() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_unused();
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend);
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(header::AUTHORIZATION, "Bearer auth.")
-            .body(Body::from(join_request))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// Invoke the "PUT /v2/conference/:room_id/participants" to join in the case where the authorization
-    /// header has an invalid token.
-    #[tokio::test]
-    async fn test_call_link_old_join_with_authorization_header_invalid_token() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_unused();
-        let backend = create_mocked_backend_unused();
-
-        let frontend = create_frontend(config, storage, backend);
-
-        // Create an axum application.
-        let app = app(frontend);
-
-        // Create the request.
-        let join_request = create_call_link_join_request(None);
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri(format!("/v2/conference/{ROOM_ID}/participants"))
             .header(header::USER_AGENT, "test/user/agent")
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .header(header::AUTHORIZATION, "Bearer Auth.12345")
