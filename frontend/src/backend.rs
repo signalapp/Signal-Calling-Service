@@ -75,7 +75,7 @@ pub struct ClientInfo {
 #[derive(Deserialize, Debug)]
 pub struct ClientsResponse {
     #[serde(rename = "endpointIds")]
-    pub user_ids: Vec<String>, // Formerly endpoint_id or active_speaker_id, a concatenation of user_id + '-' + resolution_request_id.
+    pub user_ids: Vec<String>,
 
     // Parallels the user_ids list.
     #[serde(rename = "demuxIds")]
@@ -89,7 +89,7 @@ pub struct ClientsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct JoinRequest {
     #[serde(rename = "endpointId")]
-    pub user_ids: String, // Formerly endpoint_id or active_speaker_id, a concatenation of user_id + '-' + resolution_request_id.
+    pub user_id: String,
     #[serde(rename = "clientIceUfrag")]
     pub ice_ufrag: String,
     #[serde(rename = "clientDhePublicKey")]

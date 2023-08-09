@@ -172,38 +172,6 @@ pub struct Frontend {
 }
 
 impl Frontend {
-    /// Return the user_id part of the given endpoint_id.
-    ///
-    /// The user_id is the string before the hyphen in an endpoint_id and must not be empty.
-    /// This function also accepts hyphen-less input, in which case the entire string is treated as
-    /// the user_id.
-    ///
-    /// ```
-    /// use calling_frontend::frontend::Frontend;
-    /// use std::convert::TryInto;
-    ///
-    /// assert_eq!(Frontend::get_opaque_user_id_from_endpoint_id("abcdef").unwrap(), "abcdef".to_string());
-    /// assert_eq!(Frontend::get_opaque_user_id_from_endpoint_id("abcdef-").unwrap(), "abcdef".to_string());
-    /// assert_eq!(Frontend::get_opaque_user_id_from_endpoint_id("abcdef-0").unwrap(), "abcdef".to_string());
-    /// assert_eq!(Frontend::get_opaque_user_id_from_endpoint_id("abcdef-12345").unwrap(), "abcdef".to_string());
-    /// assert!(Frontend::get_opaque_user_id_from_endpoint_id("").is_err());
-    /// assert!(Frontend::get_opaque_user_id_from_endpoint_id("-").is_err());
-    /// assert!(Frontend::get_opaque_user_id_from_endpoint_id("-12345").is_err());
-    /// ```
-    pub fn get_opaque_user_id_from_endpoint_id(endpoint_id: &str) -> Result<String> {
-        let user_id = endpoint_id
-            .split_once('-')
-            .unwrap_or((endpoint_id, ""))
-            .0
-            .to_string();
-
-        if user_id.is_empty() {
-            return Err(anyhow!("invalid user_id from endpoint_id"));
-        }
-
-        Ok(user_id)
-    }
-
     /// Get the uri the call should be redirected to or None. If the local region is not
     /// the region where the call is hosted, create the uri necessary to get there.
     pub fn get_redirect_uri(&self, backend_region: &str, original_uri: &Uri) -> Option<String> {
@@ -261,10 +229,8 @@ impl Frontend {
                     .into_iter()
                     .zip(response.demux_ids.into_iter())
                     .map(|(user_id, raw_demux_id)| {
-                        let opaque_user_id =
-                            Frontend::get_opaque_user_id_from_endpoint_id(&user_id)?;
                         anyhow::Ok(ClientInfo {
-                            opaque_user_id: Some(opaque_user_id),
+                            opaque_user_id: Some(user_id),
                             demux_id: DemuxId::try_from(raw_demux_id)?,
                         })
                     })
@@ -375,7 +341,7 @@ impl Frontend {
                 &call.era_id,
                 demux_id,
                 &backend::JoinRequest {
-                    user_ids: user_id.to_string(),
+                    user_id: user_id.to_string(),
                     ice_ufrag: join_request.ice_ufrag,
                     dhe_public_key: Some(join_request.dhe_public_key),
                     hkdf_extra_info: join_request.hkdf_extra_info,

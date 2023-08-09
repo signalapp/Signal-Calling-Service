@@ -111,22 +111,22 @@ mod metrics {
     }
 }
 
-/// Obtain a demux_id from the given endpoint_id.
+/// Obtain a demux_id from the given user_id.
 ///
-/// The demux_id is the first 112 bits of the SHA-256 hash of the endpoint_id string byte
+/// The demux_id is the first 112 bits of the SHA-256 hash of the user_id string byte
 /// representation.
 ///
 /// ```
-/// use calling_backend::http_server::demux_id_from_endpoint_id;
+/// use calling_backend::http_server::demux_id_from_user_id;
 /// use std::convert::TryInto;
 ///
-/// assert_eq!(demux_id_from_endpoint_id("abcdef-0"), 3487943312.try_into().unwrap());
-/// assert_eq!(demux_id_from_endpoint_id("abcdef-12345"), 2175944000.try_into().unwrap());
-/// assert_eq!(demux_id_from_endpoint_id(""), 3820012608.try_into().unwrap());
+/// assert_eq!(demux_id_from_user_id("abcdef-0"), 3487943312.try_into().unwrap());
+/// assert_eq!(demux_id_from_user_id("abcdef-12345"), 2175944000.try_into().unwrap());
+/// assert_eq!(demux_id_from_user_id(""), 3820012608.try_into().unwrap());
 /// ```
-pub fn demux_id_from_endpoint_id(endpoint_id: &str) -> sfu::DemuxId {
+pub fn demux_id_from_user_id(user_id: &str) -> sfu::DemuxId {
     let mut hasher = Sha256::new();
-    hasher.update(endpoint_id.as_bytes());
+    hasher.update(user_id.as_bytes());
 
     // Get the 32-bit hash but mask out 4 bits since DemuxIDs must leave
     // these unset for "SSRC space".
@@ -344,10 +344,7 @@ async fn join_conference(
     };
 
     // Generate ids for the client.
-    // The endpoint_id is the term currently used on the client side, it is
-    // equivalent to the active_speaker_id in the Sfu.
-    let endpoint_id = format!("{}-0", user_id.as_str());
-    let demux_id = demux_id_from_endpoint_id(&endpoint_id);
+    let demux_id = demux_id_from_user_id(user_id.as_str());
     let server_ice_ufrag = ice::random_ufrag();
     let server_ice_pwd = ice::random_pwd();
 

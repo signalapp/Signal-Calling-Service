@@ -360,9 +360,7 @@ pub mod api_server_v2_tests {
     const USER_ID_2: &str = "2222222222222222";
     const GROUP_ID_1: &str = "aaaaaaaaaaaaaaaa";
     const ERA_ID_1: &str = "a1a1a1a1";
-    const ENDPOINT_ID_1: &str = "1111111111111111-123456";
     const DEMUX_ID_1: u32 = 1070920496;
-    const ENDPOINT_ID_2: &str = "2222222222222222-987654";
     const DEMUX_ID_2: u32 = 1778901216;
     const LOCAL_REGION: &str = "us-west1";
     const ALT_REGION: &str = "asia-northeast3";
@@ -476,7 +474,7 @@ pub mod api_server_v2_tests {
     }
 
     fn create_clients_response_two_calls() -> backend::ClientsResponse {
-        let client_ids = vec![ENDPOINT_ID_1.to_string(), ENDPOINT_ID_2.to_string()];
+        let client_ids = vec![USER_ID_1.to_string(), USER_ID_2.to_string()];
         let demux_ids = vec![DEMUX_ID_1, DEMUX_ID_2];
 
         backend::ClientsResponse {
@@ -824,7 +822,7 @@ pub mod api_server_v2_tests {
                 eq(ERA_ID_1),
                 eq(expected_demux_id),
                 eq(backend::JoinRequest {
-                    user_ids: USER_ID_1.to_string(),
+                    user_id: USER_ID_1.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
@@ -926,7 +924,7 @@ pub mod api_server_v2_tests {
                 eq(ERA_ID_1),
                 eq(expected_demux_id),
                 eq(backend::JoinRequest {
-                    user_ids: USER_ID_2.to_string(),
+                    user_id: USER_ID_2.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
@@ -1028,7 +1026,7 @@ pub mod api_server_v2_tests {
                 eq(ERA_ID_1),
                 eq(expected_demux_id),
                 eq(backend::JoinRequest {
-                    user_ids: USER_ID_2.to_string(),
+                    user_id: USER_ID_2.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
@@ -1697,7 +1695,7 @@ pub mod api_server_v2_tests {
             // Result<ClientsResponse, BackendError>
             .returning(move |_, _, _| {
                 Ok(backend::ClientsResponse {
-                    user_ids: vec![ENDPOINT_ID_1.into()],
+                    user_ids: vec![USER_ID_1.into()],
                     demux_ids: vec![DEMUX_ID_1],
                     pending_clients: vec![backend::ClientInfo {
                         demux_id: DEMUX_ID_2,
@@ -1793,7 +1791,7 @@ pub mod api_server_v2_tests {
             // Result<ClientsResponse, BackendError>
             .returning(move |_, _, _| {
                 Ok(backend::ClientsResponse {
-                    user_ids: vec![ENDPOINT_ID_1.into()],
+                    user_ids: vec![USER_ID_1.into()],
                     demux_ids: vec![DEMUX_ID_1],
                     pending_clients: vec![backend::ClientInfo {
                         demux_id: DEMUX_ID_2,
@@ -2185,7 +2183,7 @@ pub mod api_server_v2_tests {
                 eq(ERA_ID_1),
                 eq(expected_demux_id),
                 eq(backend::JoinRequest {
-                    user_ids: USER_ID_1_DOUBLE_ENCODED.to_string(),
+                    user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
@@ -2312,7 +2310,7 @@ pub mod api_server_v2_tests {
                 eq(ERA_ID_1),
                 eq(expected_demux_id),
                 eq(backend::JoinRequest {
-                    user_ids: USER_ID_1_DOUBLE_ENCODED.to_string(),
+                    user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
@@ -2413,7 +2411,7 @@ pub mod api_server_v2_tests {
                 eq(ERA_ID_1),
                 eq(expected_demux_id),
                 eq(backend::JoinRequest {
-                    user_ids: USER_ID_1_DOUBLE_ENCODED.to_string(),
+                    user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
@@ -2615,7 +2613,7 @@ pub mod api_server_v2_tests {
                 eq(ERA_ID_1),
                 eq(expected_demux_id),
                 eq(backend::JoinRequest {
-                    user_ids: USER_ID_1_DOUBLE_ENCODED.to_string(),
+                    user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
@@ -2718,7 +2716,7 @@ pub mod api_server_v2_tests {
                 eq(ERA_ID_1),
                 eq(expected_demux_id),
                 eq(backend::JoinRequest {
-                    user_ids: USER_ID_1_DOUBLE_ENCODED.to_string(),
+                    user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,

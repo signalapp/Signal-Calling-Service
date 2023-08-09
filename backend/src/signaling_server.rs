@@ -68,9 +68,10 @@ pub struct ClientInfo {
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientsResponse {
-    pub endpoint_ids: Vec<String>, // These are user IDs.
+    #[serde(rename = "endpointIds")]
+    pub user_ids: Vec<String>, // These are user IDs.
 
-    // Parallels the endpoint_ids list.
+    // Parallels the user_ids list.
     pub demux_ids: Vec<u32>,
 
     pub pending_clients: Vec<ClientInfo>,
@@ -79,7 +80,8 @@ pub struct ClientsResponse {
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinRequest {
-    pub endpoint_id: String, // Formerly active_speaker_id, a concatenation of user_id + '-' + resolution_request_id; now just the user ID.
+    #[serde(rename = "endpointId")]
+    pub user_id: String,
     pub client_ice_ufrag: String,
     pub client_dhe_public_key: String,
     pub hkdf_extra_info: Option<String>,
@@ -148,29 +150,17 @@ fn call_id_from_hex(call_id: &str) -> Result<sfu::CallId> {
         .into())
 }
 
-/// Parse an opaque user_id from the provided endpoint_id.
+/// Validates a user ID, converting it to our strong [`sfu::UserId`] type.
 ///
-/// The endpoint string has the following format: `${opaque_user_id}-${resolution_request_id}`.
-/// If it doesn't have a hyphen, the entire string is considered to be the user ID.
+/// Currently any non-empty string is considered a valid user ID.
 ///
 /// ```
-/// use calling_backend::signaling_server::parse_user_id_from_endpoint_id;
+/// use calling_backend::signaling_server::validate_user_id;
 ///
-/// assert!(parse_user_id_from_endpoint_id("abcdef").unwrap() == "abcdef".to_string().into());
-/// assert!(parse_user_id_from_endpoint_id("abcdef-0").unwrap() == "abcdef".to_string().into());
-/// assert!(parse_user_id_from_endpoint_id("abcdef-12345").unwrap() == "abcdef".to_string().into());
-/// assert!(parse_user_id_from_endpoint_id("").is_err());
-/// assert!(parse_user_id_from_endpoint_id("abcdef-").is_err());
-/// assert!(parse_user_id_from_endpoint_id("abcdef-a").is_err());
-/// assert!(parse_user_id_from_endpoint_id("abcdef-1-").is_err());
+/// assert!(validate_user_id("abcdef").unwrap() == "abcdef".to_string().into());
+/// assert!(validate_user_id("").is_err());
 /// ```
-pub fn parse_user_id_from_endpoint_id(endpoint_id: &str) -> Result<sfu::UserId> {
-    let user_id_str = if let Some((user_id_str, suffix)) = endpoint_id.split_once('-') {
-        let _resolution_request_id = u64::from_str(suffix)?;
-        user_id_str
-    } else {
-        endpoint_id
-    };
+pub fn validate_user_id(user_id_str: &str) -> Result<sfu::UserId> {
     if user_id_str.is_empty() {
         return Err(anyhow!("missing user ID"));
     }
@@ -262,7 +252,7 @@ async fn get_clients(
             })
             .collect();
         let response = ClientsResponse {
-            endpoint_ids: user_ids,
+            user_ids,
             demux_ids,
             pending_clients,
         };
@@ -289,7 +279,7 @@ async fn join(
         .try_into()
         .map_err(|err: call::Error| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let user_id = parse_user_id_from_endpoint_id(&request.endpoint_id)
+    let user_id = validate_user_id(&request.user_id)
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
     let client_dhe_public_key = <[u8; 32]>::from_hex(request.client_dhe_public_key)
@@ -473,10 +463,8 @@ mod signaling_server_tests {
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
         26, 27, 28, 29, 30, 31, 32,
     ];
-    const ENDPOINT_ID_1: &str =
-        "7ab9bbf0b71f81598ae1b592aaf82f9b20b638142a9610c3e37965bec7519112-5287417572362992825";
-    const ENDPOINT_ID_2: &str =
-        "b25387a93fd65599bacae4a8f8726e9e818ecf0bec3360593fe542cdb8e611a3-7715148009648537058";
+    const USER_ID_1: &str = "7ab9bbf0b71f81598ae1b592aaf82f9b20b638142a9610c3e37965bec7519112";
+    const USER_ID_2: &str = "b25387a93fd65599bacae4a8f8726e9e818ecf0bec3360593fe542cdb8e611a3";
 
     const DEMUX_ID_1: DemuxId = DemuxId::from_const(16);
     const DEMUX_ID_2: DemuxId = DemuxId::from_const(32);
@@ -501,13 +489,13 @@ mod signaling_server_tests {
     fn add_client_to_sfu(
         sfu: Arc<Mutex<Sfu>>,
         call_id: &str,
-        endpoint_id: &str,
+        user_id: &str,
         demux_id: DemuxId,
         client_ice_ufrag: &str,
         client_dhe_pub_key: DhePublicKey,
     ) {
         let call_id = call_id_from_hex(call_id).unwrap();
-        let user_id = parse_user_id_from_endpoint_id(endpoint_id).unwrap();
+        let user_id = validate_user_id(user_id).unwrap();
 
         let _ = sfu
             .lock()
@@ -530,13 +518,13 @@ mod signaling_server_tests {
     fn add_admin_to_sfu(
         sfu: Arc<Mutex<Sfu>>,
         call_id: &str,
-        endpoint_id: &str,
+        user_id: &str,
         demux_id: DemuxId,
         client_ice_ufrag: &str,
         client_dhe_pub_key: DhePublicKey,
     ) {
         let call_id = call_id_from_hex(call_id).unwrap();
-        let user_id = parse_user_id_from_endpoint_id(endpoint_id).unwrap();
+        let user_id = validate_user_id(user_id).unwrap();
 
         let _ = sfu
             .lock()
@@ -692,7 +680,7 @@ mod signaling_server_tests {
         add_client_to_sfu(
             sfu.clone(),
             CALL_ID,
-            ENDPOINT_ID_1,
+            USER_ID_1,
             DEMUX_ID_1,
             UFRAG,
             CLIENT_DHE_PUB_KEY,
@@ -718,9 +706,7 @@ mod signaling_server_tests {
             &body[..],
             format!(
                 r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[]}}"#,
-                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
-                    .unwrap()
-                    .as_str(),
+                validate_user_id(USER_ID_1).unwrap().as_str(),
                 DEMUX_ID_1.as_u32(),
             )
             .as_bytes()
@@ -730,7 +716,7 @@ mod signaling_server_tests {
         add_client_to_sfu(
             sfu.clone(),
             CALL_ID,
-            ENDPOINT_ID_2,
+            USER_ID_2,
             DEMUX_ID_2,
             UFRAG,
             CLIENT_DHE_PUB_KEY,
@@ -752,12 +738,8 @@ mod signaling_server_tests {
             &body[..],
             format!(
                 r#"{{"endpointIds":["{}","{}"],"demuxIds":[{},{}],"pendingClients":[]}}"#,
-                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
-                    .unwrap()
-                    .as_str(),
-                parse_user_id_from_endpoint_id(ENDPOINT_ID_2)
-                    .unwrap()
-                    .as_str(),
+                validate_user_id(USER_ID_1).unwrap().as_str(),
+                validate_user_id(USER_ID_2).unwrap().as_str(),
                 DEMUX_ID_1.as_u32(),
                 DEMUX_ID_2.as_u32(),
             )
@@ -782,9 +764,7 @@ mod signaling_server_tests {
             &body[..],
             format!(
                 r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[]}}"#,
-                parse_user_id_from_endpoint_id(ENDPOINT_ID_2)
-                    .unwrap()
-                    .as_str(),
+                validate_user_id(USER_ID_2).unwrap().as_str(),
                 DEMUX_ID_2.as_u32(),
             )
             .as_bytes()
@@ -837,7 +817,7 @@ mod signaling_server_tests {
         add_admin_to_sfu(
             sfu.clone(),
             CALL_ID,
-            ENDPOINT_ID_1,
+            USER_ID_1,
             DEMUX_ID_1,
             UFRAG,
             CLIENT_DHE_PUB_KEY,
@@ -863,9 +843,7 @@ mod signaling_server_tests {
             &body[..],
             format!(
                 r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[]}}"#,
-                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
-                    .unwrap()
-                    .as_str(),
+                validate_user_id(USER_ID_1).unwrap().as_str(),
                 DEMUX_ID_1.as_u32(),
             )
             .as_bytes()
@@ -875,7 +853,7 @@ mod signaling_server_tests {
         add_client_to_sfu(
             sfu.clone(),
             CALL_ID,
-            ENDPOINT_ID_2,
+            USER_ID_2,
             DEMUX_ID_2,
             UFRAG,
             CLIENT_DHE_PUB_KEY,
@@ -897,9 +875,7 @@ mod signaling_server_tests {
             &body[..],
             format!(
                 r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[{{"demuxId":{}}}]}}"#,
-                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
-                    .unwrap()
-                    .as_str(),
+                validate_user_id(USER_ID_1).unwrap().as_str(),
                 DEMUX_ID_1.as_u32(),
                 DEMUX_ID_2.as_u32(),
             )
@@ -913,9 +889,7 @@ mod signaling_server_tests {
                 Request::get(&format!("/v1/call/{}/clients", CALL_ID))
                     .header(
                         sfu::UserId::name(),
-                        parse_user_id_from_endpoint_id(ENDPOINT_ID_2)
-                            .unwrap()
-                            .as_str(),
+                        validate_user_id(USER_ID_2).unwrap().as_str(),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -929,9 +903,7 @@ mod signaling_server_tests {
             &body[..],
             format!(
                 r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[{{"demuxId":{}}}]}}"#,
-                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
-                    .unwrap()
-                    .as_str(),
+                validate_user_id(USER_ID_1).unwrap().as_str(),
                 DEMUX_ID_1.as_u32(),
                 DEMUX_ID_2.as_u32(),
             )
@@ -945,9 +917,7 @@ mod signaling_server_tests {
                 Request::get(&format!("/v1/call/{}/clients", CALL_ID))
                     .header(
                         sfu::UserId::name(),
-                        parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
-                            .unwrap()
-                            .as_str(),
+                        validate_user_id(USER_ID_1).unwrap().as_str(),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -961,12 +931,12 @@ mod signaling_server_tests {
             &body[..],
             format!(
                 r#"{{"endpointIds":["{}"],"demuxIds":[{}],"pendingClients":[{{"demuxId":{},"userId":"{}"}}]}}"#,
-                parse_user_id_from_endpoint_id(ENDPOINT_ID_1)
+                validate_user_id(USER_ID_1)
                     .unwrap()
                     .as_str(),
                 DEMUX_ID_1.as_u32(),
                 DEMUX_ID_2.as_u32(),
-                parse_user_id_from_endpoint_id(ENDPOINT_ID_2)
+                validate_user_id(USER_ID_2)
                     .unwrap()
                     .as_str()
             )
@@ -991,7 +961,7 @@ mod signaling_server_tests {
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
-                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
@@ -1016,7 +986,7 @@ mod signaling_server_tests {
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
-                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
@@ -1033,7 +1003,7 @@ mod signaling_server_tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        // Join with an invalid endpoint_id.
+        // Join with an invalid user ID.
         let response = api
             .clone()
             .oneshot(
@@ -1041,7 +1011,7 @@ mod signaling_server_tests {
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
-                            endpoint_id: "".to_string(),
+                            user_id: "".to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
@@ -1066,7 +1036,7 @@ mod signaling_server_tests {
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
-                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: "INVALID".to_string(),
                             hkdf_extra_info: None,
@@ -1091,7 +1061,7 @@ mod signaling_server_tests {
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
-                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: Some("G".to_string()),
@@ -1116,7 +1086,7 @@ mod signaling_server_tests {
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
-                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
@@ -1157,7 +1127,7 @@ mod signaling_server_tests {
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
-                            endpoint_id: ENDPOINT_ID_1.to_string(),
+                            user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
