@@ -124,7 +124,7 @@ mod metrics {
 /// assert_eq!(demux_id_from_user_id("abcdef-12345"), 2175944000.try_into().unwrap());
 /// assert_eq!(demux_id_from_user_id(""), 3820012608.try_into().unwrap());
 /// ```
-pub fn demux_id_from_user_id(user_id: &str) -> sfu::DemuxId {
+pub fn demux_id_from_user_id(user_id: &str) -> calling_common::DemuxId {
     let mut hasher = Sha256::new();
     hasher.update(user_id.as_bytes());
 

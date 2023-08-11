@@ -12,7 +12,7 @@ use std::{
     time::SystemTime,
 };
 
-use calling_common::{DataRate, DataSize, Duration, Instant, PixelSize, VideoHeight};
+use calling_common::{DataRate, DataSize, DemuxId, Duration, Instant, PixelSize, VideoHeight};
 use hex::ToHex;
 use log::*;
 use prost::Message;
@@ -129,46 +129,13 @@ impl UserId {
     }
 }
 
-/// A wrapper around a u32 with the 4 LSBs set to 0.
-/// Uniquely identifies a client within a call (scoped to the CallId).
-/// Used for generating SSRCs, and can be inferred from an SSRC.
-#[derive(Clone, Debug, Eq, PartialEq, Copy, Hash, PartialOrd, Ord)]
-pub struct DemuxId(u32);
-
-impl DemuxId {
-    pub fn as_u32(self) -> u32 {
-        self.0
-    }
+trait DemuxIdExt {
+    fn from_ssrc(ssrc: rtp::Ssrc) -> Self;
 }
-
-impl TryFrom<u32> for DemuxId {
-    type Error = Error;
-    fn try_from(demux_id: u32) -> Result<Self, Error> {
-        if demux_id & 0b1111 == 0 {
-            Ok(Self(demux_id))
-        } else {
-            Err(Error::InvalidDemuxId(demux_id))
-        }
-    }
-}
-
-pub const DUMMY_DEMUX_ID: DemuxId = DemuxId(0);
-
-impl From<DemuxId> for u32 {
-    fn from(demux_id: DemuxId) -> u32 {
-        demux_id.0
-    }
-}
-
-impl DemuxId {
-    #[cfg(test)]
-    pub const fn from_const(raw: u32) -> Self {
-        assert!(raw & 0b1111 == 0, "lowest 4 bits must be clear");
-        Self(raw)
-    }
-
+impl DemuxIdExt for DemuxId {
     fn from_ssrc(ssrc: rtp::Ssrc) -> Self {
-        Self(ssrc & 0b1111_1111_1111_1111_1111_1111_1111_0000)
+        Self::try_from(ssrc & 0b1111_1111_1111_1111_1111_1111_1111_0000)
+            .expect("valid with low bits masked")
     }
 }
 
@@ -231,8 +198,6 @@ pub enum Error {
     InvalidRtpLayerId,
     #[error("unknown demux ID: {0:?}")]
     UnknownDemuxId(DemuxId),
-    #[error("Invalid demux ID: {0:?}")]
-    InvalidDemuxId(u32),
     #[error("received RTP leave")]
     Leave,
 }
@@ -2807,11 +2772,11 @@ mod call_tests {
         let layer1 = layer(800, VideoHeight::from(360));
         let layer2 = layer(2000, VideoHeight::from(720));
         let dropped = layer(0, VideoHeight::from(1080));
-        let video0 = video(DemuxId(0), [&nothing, &nothing, &nothing]);
-        let video1 = video(DemuxId(1), [&layer0, &dropped, &nothing]);
-        let video2 = video(DemuxId(2), [&layer0, &layer1, &nothing]);
-        let video3 = video(DemuxId(3), [&layer0, &layer1, &layer2]);
-        let video4 = video(DemuxId(4), [&layer0, &layer1, &layer2]);
+        let video0 = video(DemuxId::from_const(0x00), [&nothing, &nothing, &nothing]);
+        let video1 = video(DemuxId::from_const(0x10), [&layer0, &dropped, &nothing]);
+        let video2 = video(DemuxId::from_const(0x20), [&layer0, &layer1, &nothing]);
+        let video3 = video(DemuxId::from_const(0x30), [&layer0, &layer1, &layer2]);
+        let video4 = video(DemuxId::from_const(0x40), [&layer0, &layer1, &layer2]);
         let no_max = 100000;
 
         // Can't send and nothing to receive
@@ -2845,7 +2810,7 @@ mod call_tests {
 
         // Finally can send, receive, and have requested
         assert_eq!(
-            (200, vec![(1, 0, 200)]),
+            (200, vec![(0x10, 0, 200)]),
             allocate(
                 1000,
                 0,
@@ -2854,7 +2819,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (200, vec![(1, 0, 200)]),
+            (200, vec![(0x10, 0, 200)]),
             allocate(
                 1000,
                 200,
@@ -2878,7 +2843,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (3000, vec![(3, 0, 200)]),
+            (3000, vec![(0x30, 0, 200)]),
             allocate(
                 400,
                 200,
@@ -2891,7 +2856,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (3000, vec![(2, 0, 200), (3, 0, 200)]),
+            (3000, vec![(0x20, 0, 200), (0x30, 0, 200)]),
             allocate(
                 400,
                 0,
@@ -2904,7 +2869,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (3000, vec![(1, 0, 200), (2, 0, 200), (3, 0, 200)]),
+            (3000, vec![(0x10, 0, 200), (0x20, 0, 200), (0x30, 0, 200)]),
             allocate(
                 600,
                 0,
@@ -2917,7 +2882,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (3000, vec![(1, 0, 200), (2, 0, 200), (3, 1, 800)]),
+            (3000, vec![(0x10, 0, 200), (0x20, 0, 200), (0x30, 1, 800)]),
             allocate(
                 1200,
                 0,
@@ -2930,7 +2895,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (3000, vec![(1, 0, 200), (2, 1, 800), (3, 1, 800)]),
+            (3000, vec![(0x10, 0, 200), (0x20, 1, 800), (0x30, 1, 800)]),
             allocate(
                 1800,
                 0,
@@ -2943,7 +2908,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (3000, vec![(1, 0, 200), (2, 1, 800), (3, 2, 2000)]),
+            (3000, vec![(0x10, 0, 200), (0x20, 1, 800), (0x30, 2, 2000)]),
             allocate(
                 3000,
                 0,
@@ -2958,7 +2923,7 @@ mod call_tests {
 
         // We ignore higher bitrates available if we request a max
         assert_eq!(
-            (1200, vec![(1, 0, 200), (2, 0, 200), (3, 1, 800)]),
+            (1200, vec![(0x10, 0, 200), (0x20, 0, 200), (0x30, 1, 800)]),
             allocate(
                 3000,
                 0,
@@ -2973,7 +2938,7 @@ mod call_tests {
 
         // If we have extra, nothing changes.
         assert_eq!(
-            (3000, vec![(1, 0, 200), (2, 1, 800), (3, 2, 2000)]),
+            (3000, vec![(0x10, 0, 200), (0x20, 1, 800), (0x30, 2, 2000)]),
             allocate(
                 5000,
                 0,
@@ -2988,7 +2953,7 @@ mod call_tests {
 
         // If we request less, things drop off, including the ideal rate
         assert_eq!(
-            (600, vec![(1, 0, 200), (2, 0, 200), (3, 0, 200)]),
+            (600, vec![(0x10, 0, 200), (0x20, 0, 200), (0x30, 0, 200)]),
             allocate(
                 5000,
                 0,
@@ -3003,7 +2968,7 @@ mod call_tests {
 
         // If all requests are the same, the interest time determines fill order
         assert_eq!(
-            (3000, vec![(1, 0, 200)]),
+            (3000, vec![(0x10, 0, 200)]),
             allocate(
                 200,
                 0,
@@ -3016,7 +2981,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (3000, vec![(1, 0, 200), (2, 0, 200)]),
+            (3000, vec![(0x10, 0, 200), (0x20, 0, 200)]),
             allocate(
                 400,
                 0,
@@ -3029,7 +2994,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (5000, vec![(1, 0, 200), (2, 0, 200), (4, 0, 200)]),
+            (5000, vec![(0x10, 0, 200), (0x20, 0, 200), (0x40, 0, 200)]),
             allocate(
                 600,
                 0,
@@ -3045,7 +3010,12 @@ mod call_tests {
         assert_eq!(
             (
                 5000,
-                vec![(1, 0, 200), (2, 0, 200), (3, 0, 200), (4, 0, 200)]
+                vec![
+                    (0x10, 0, 200),
+                    (0x20, 0, 200),
+                    (0x30, 0, 200),
+                    (0x40, 0, 200)
+                ]
             ),
             allocate(
                 800,
@@ -3060,7 +3030,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (4000, vec![(3, 0, 200), (4, 1, 800)]),
+            (4000, vec![(0x30, 0, 200), (0x40, 1, 800)]),
             allocate(
                 1000,
                 0,
@@ -3072,7 +3042,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (4000, vec![(3, 1, 800), (4, 2, 2000)]),
+            (4000, vec![(0x30, 1, 800), (0x40, 2, 2000)]),
             allocate(
                 2800,
                 0,
@@ -3084,7 +3054,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (4000, vec![(3, 2, 2000), (4, 2, 2000)]),
+            (4000, vec![(0x30, 2, 2000), (0x40, 2, 2000)]),
             allocate(
                 10000,
                 0,
@@ -3098,7 +3068,7 @@ mod call_tests {
 
         // And make sure interest doesn't override resolution
         assert_eq!(
-            (600, vec![(3, 0, 200)]),
+            (600, vec![(0x30, 0, 200)]),
             allocate(
                 200,
                 0,
@@ -3111,7 +3081,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (600, vec![(2, 0, 200), (3, 0, 200)]),
+            (600, vec![(0x20, 0, 200), (0x30, 0, 200)]),
             allocate(
                 400,
                 0,
@@ -3124,7 +3094,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (600, vec![(1, 0, 200), (2, 0, 200), (3, 0, 200)]),
+            (600, vec![(0x10, 0, 200), (0x20, 0, 200), (0x30, 0, 200)]),
             allocate(
                 600,
                 0,
@@ -3141,7 +3111,7 @@ mod call_tests {
         let screenshare_layer1 = layer(1500, VideoHeight::from(1080));
         let screenshare_layer2 = layer(0, VideoHeight::from(1080));
         let screenshare = video(
-            DemuxId(4),
+            DemuxId::from_const(0x40),
             [
                 &screenshare_layer0,
                 &screenshare_layer1,
@@ -3159,7 +3129,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (1500, vec![(4, 0, 100)]),
+            (1500, vec![(0x40, 0, 100)]),
             allocate(
                 600,
                 0,
@@ -3168,7 +3138,7 @@ mod call_tests {
             )
         );
         assert_eq!(
-            (1500, vec![(4, 1, 1500)]),
+            (1500, vec![(0x40, 1, 1500)]),
             allocate(
                 2000,
                 0,

@@ -11,7 +11,6 @@
 //!   POST /v1/call/$call_id/client/$demux_id (join)
 
 use std::{
-    convert::TryInto,
     net::SocketAddr,
     str::{self, FromStr},
     sync::{
@@ -31,6 +30,7 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router, TypedHeader,
 };
+use calling_common::DemuxId;
 use hex::{FromHex, ToHex};
 use hyper::http::{HeaderName, HeaderValue};
 use log::*;
@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot::{self, Receiver};
 use tower::ServiceBuilder;
 
-use crate::{call, config, ice, middleware::log_response, region::Region, sfu, sfu::Sfu};
+use crate::{config, ice, middleware::log_response, region::Region, sfu, sfu::Sfu};
 
 const SYSTEM_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -275,9 +275,8 @@ async fn join(
     let call_id =
         call_id_from_hex(&call_id).map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let demux_id = demux_id
-        .try_into()
-        .map_err(|err: call::Error| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    let demux_id =
+        DemuxId::try_from(demux_id).map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
     let user_id = validate_user_id(&request.user_id)
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
@@ -450,13 +449,13 @@ fn start_monitor(mut ender_rx: Receiver<()>, cpu_idle_pct: Arc<AtomicU8>) {
 mod signaling_server_tests {
     use axum::body::Body;
     use axum::http::{self, Request};
-    use calling_common::Instant;
+    use calling_common::{DemuxId, Instant};
     use once_cell::sync::Lazy;
     use tokio::sync::oneshot;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::sfu::{DemuxId, DhePublicKey};
+    use crate::sfu::DhePublicKey;
 
     const CALL_ID: &str = "fe076d76bffb54b1";
     const CLIENT_DHE_PUB_KEY: [u8; 32] = [

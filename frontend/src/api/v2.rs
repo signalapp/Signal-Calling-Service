@@ -329,6 +329,7 @@ pub mod api_server_v2_tests {
     use std::str;
     use std::time::SystemTime;
 
+    use calling_common::DemuxId;
     use hex::{FromHex, ToHex};
     use hmac::Mac;
     use http::{header, Request};
@@ -349,7 +350,7 @@ pub mod api_server_v2_tests {
         authenticator::{Authenticator, HmacSha256, GV2_AUTH_MATCH_LIMIT},
         backend::{self, BackendError, MockBackend},
         config,
-        frontend::{DemuxId, FrontendIdGenerator, MockIdGenerator, RoomId},
+        frontend::{FrontendIdGenerator, MockIdGenerator, RoomId},
         storage::{CallRecord, MockStorage},
     };
 

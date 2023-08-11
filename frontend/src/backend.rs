@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{anyhow, Context, Error};
 use async_trait::async_trait;
+use calling_common::DemuxId;
 use http::{header, Method, Request, StatusCode};
 use hyper::{
     body::Buf,
@@ -20,11 +21,7 @@ use tokio::time::{error::Elapsed, timeout, Duration};
 #[cfg(test)]
 use mockall::{automock, predicate::*};
 
-use crate::{
-    config,
-    frontend::{self, DemuxId},
-    load_balancer::LoadBalancer,
-};
+use crate::{config, frontend, load_balancer::LoadBalancer};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 

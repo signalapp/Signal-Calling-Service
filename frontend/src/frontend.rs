@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Error, Result};
-use calling_common::random_hex_string;
+use calling_common::{random_hex_string, DemuxId};
 use http::Uri;
 use log::*;
 use parking_lot::Mutex;
@@ -68,34 +68,6 @@ impl fmt::Display for RoomId {
 impl fmt::Debug for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:.4}", self.0)
-    }
-}
-
-/// A wrapper around a u32 with the 4 LSBs set to 0.
-/// Uniquely identifies a client within a call (scoped to the call era).
-#[derive(Clone, Debug, Eq, PartialEq, Copy, Hash, PartialOrd, Ord)]
-pub struct DemuxId(u32);
-
-impl DemuxId {
-    pub fn as_u32(self) -> u32 {
-        self.0
-    }
-}
-
-impl TryFrom<u32> for DemuxId {
-    type Error = anyhow::Error;
-    fn try_from(demux_id: u32) -> Result<Self> {
-        if demux_id & 0b1111 == 0 {
-            Ok(Self(demux_id))
-        } else {
-            Err(anyhow!("value provided for demux_id is not valid"))
-        }
-    }
-}
-
-impl From<DemuxId> for u32 {
-    fn from(demux_id: DemuxId) -> u32 {
-        demux_id.0
     }
 }
 

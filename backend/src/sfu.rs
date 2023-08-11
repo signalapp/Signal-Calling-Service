@@ -13,7 +13,8 @@ use std::{
 
 use anyhow::Result;
 use calling_common::{
-    DataRate, DataSize, Duration, Instant, TwoGenerationCacheWithManualRemoveOld,
+    DataRate, DataSize, DemuxId, Duration, Instant, TwoGenerationCacheWithManualRemoveOld,
+    DUMMY_DEMUX_ID,
 };
 use hkdf::Hkdf;
 use log::*;
@@ -24,7 +25,7 @@ use thiserror::Error;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::{
-    call::{self, Call, LoggableCallId, DUMMY_DEMUX_ID},
+    call::{self, Call, LoggableCallId},
     config,
     connection::{self, AddressType, Connection, HandleRtcpResult, PacketToSend},
     googcc, ice,
@@ -36,7 +37,7 @@ use crate::{
     rtp,
 };
 pub use crate::{
-    call::{CallId, DemuxId, UserId},
+    call::{CallId, UserId},
     connection::DhePublicKey,
 };
 
