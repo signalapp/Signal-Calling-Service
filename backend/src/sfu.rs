@@ -50,12 +50,12 @@ pub enum SfuError {
     #[error("packet with unknown type from {0}")]
     UnknownPacketType(SocketLocator),
     #[error(
-        "connection with (CallId={:?} DemuxId={:?}) went missing",
+        "connection with (CallId={} DemuxId={:?}) went missing",
         LoggableCallId::from(.0),
         .1
     )]
     MissingConnection(CallId, DemuxId),
-    #[error("call {:?} went missing", LoggableCallId::from(.0))]
+    #[error("call {} went missing", LoggableCallId::from(.0))]
     MissingCall(CallId),
     #[error("parsing ICE binding request failed: {0}")]
     ParseIceBindingRequest(ice::ParseError),
