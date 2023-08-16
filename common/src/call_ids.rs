@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
 /// A wrapper around a u32 with the 4 LSBs set to 0.
 /// Uniquely identifies a client within a call (scoped to the call era).
 #[derive(Clone, Debug, Eq, PartialEq, Copy, Hash, PartialOrd, Ord)]
@@ -40,5 +44,46 @@ pub const DUMMY_DEMUX_ID: DemuxId = DemuxId(0);
 impl From<DemuxId> for u32 {
     fn from(demux_id: DemuxId) -> u32 {
         demux_id.0
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize, Eq, PartialEq)]
+pub struct RoomId(String);
+
+impl From<String> for RoomId {
+    fn from(room_id_string: String) -> Self {
+        Self(room_id_string)
+    }
+}
+
+impl From<&str> for RoomId {
+    fn from(room_id: &str) -> Self {
+        Self(room_id.to_string())
+    }
+}
+
+impl From<RoomId> for String {
+    fn from(room_id: RoomId) -> Self {
+        room_id.0
+    }
+}
+
+impl AsRef<str> for RoomId {
+    fn as_ref(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+/// Implement Display for RoomId to redact most of the string.
+impl fmt::Display for RoomId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:.4}", self.0)
+    }
+}
+
+/// Implement Debug for RoomId to redact most of the string.
+impl fmt::Debug for RoomId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:.4}", self.0)
     }
 }

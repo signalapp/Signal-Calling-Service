@@ -22,7 +22,7 @@ use zkgroup::call_links::{
 };
 
 use crate::{
-    frontend::{self, Frontend},
+    frontend::Frontend,
     storage::{self, CallLinkRestrictions, CallLinkUpdateError},
 };
 static X_ROOM_ID: HeaderName = HeaderName::from_static("x-room-id");
@@ -38,10 +38,11 @@ struct CallLinkState {
     expiration: SystemTime,
 }
 
-/// A light wrapper around frontend::RoomId that limits the maximum size when deserializing.
+/// A light wrapper around [`calling_common::RoomId`] that limits the maximum size when
+/// deserializing.
 #[derive(Deserialize, Clone, PartialEq, Eq)]
 #[serde(try_from = "String")]
-pub struct RoomId(frontend::RoomId);
+pub struct RoomId(calling_common::RoomId);
 
 impl TryFrom<String> for RoomId {
     type Error = StatusCode;
@@ -91,7 +92,7 @@ impl AsRef<str> for RoomId {
     }
 }
 
-impl From<RoomId> for frontend::RoomId {
+impl From<RoomId> for calling_common::RoomId {
     fn from(value: RoomId) -> Self {
         value.0
     }
@@ -255,7 +256,7 @@ pub async fn update_call_link(
 
         let (maybe_existing_call_link, maybe_current_call_record) = frontend
             .storage
-            .get_call_link_and_record(&room_id.clone().into())
+            .get_call_link_and_record(&room_id.clone().into(), true)
             .await
             .map_err(|err| {
                 error!("update_call_link: {err}");
@@ -356,6 +357,50 @@ pub async fn reset_call_link_expiration(
         }
         Err(CallLinkUpdateError::UnexpectedError(err)) => {
             error!("reset_call_link_expiration: {err}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Handler for the DELETE /call-link/approvals route, used only for testing.
+#[cfg(any(debug_assertions, feature = "testing"))]
+pub async fn reset_call_link_approvals(
+    State(frontend): State<Arc<Frontend>>,
+    Extension(auth_credential): Extension<Arc<CallLinkAuthCredentialPresentation>>,
+    TypedHeader(room_id): TypedHeader<RoomId>,
+) -> Result<impl IntoResponse, StatusCode> {
+    trace!("reset_call_link_approvals:");
+
+    // Require that call link room IDs are valid hex.
+    let _ = hex::decode(room_id.as_ref()).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let existing_call_link = frontend
+        .storage
+        .get_call_link(&room_id.clone().into())
+        .await
+        .map_err(|err| {
+            error!("reset_call_link_approvals: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    verify_auth_credential_against_zkparams(&auth_credential, &existing_call_link, &frontend)?;
+
+    match frontend
+        .storage
+        .update_call_link_approved_users(&room_id.into(), vec![])
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(CallLinkUpdateError::AdminPasskeyDidNotMatch) => {
+            unreachable!("not checked by this entry point");
+        }
+        Err(CallLinkUpdateError::RoomDoesNotExist) => {
+            // We just checked, though there could be a race.
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(CallLinkUpdateError::UnexpectedError(err)) => {
+            error!("reset_call_link_approvals: {err}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -501,6 +546,7 @@ pub mod tests {
             encrypted_name: vec![],
             revoked: false,
             expiration: *DISTANT_FUTURE,
+            approved_users: vec![],
         }
     }
 
@@ -510,7 +556,7 @@ pub mod tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link()
-            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .with(eq(calling_common::RoomId::from(ROOM_ID)))
             .once()
             .return_once(|_| Ok(None));
         let frontend = create_frontend(storage);
@@ -542,7 +588,7 @@ pub mod tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link()
-            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .with(eq(calling_common::RoomId::from(ROOM_ID)))
             .once()
             .return_once(|_| {
                 Ok(Some(storage::CallLinkState {
@@ -637,7 +683,7 @@ pub mod tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link()
-            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .with(eq(calling_common::RoomId::from(ROOM_ID)))
             .once()
             .return_once(|_| Ok(Some(default_call_link_state())));
         let frontend = create_frontend(storage);
@@ -681,7 +727,7 @@ pub mod tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link()
-            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .with(eq(calling_common::RoomId::from(ROOM_ID)))
             .once()
             .return_once(|_| {
                 Ok(Some(storage::CallLinkState {
@@ -1094,9 +1140,9 @@ pub mod tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| Ok((None, None)));
+            .return_once(|_, _| Ok((None, None)));
         let frontend = create_frontend(storage);
 
         // Create an axum application.
@@ -1132,9 +1178,9 @@ pub mod tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(storage::CallLinkState {
                         zkparams: bincode::serialize(
@@ -1182,9 +1228,9 @@ pub mod tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| Ok((Some(default_call_link_state()), None)));
+            .return_once(|_, _| Ok((Some(default_call_link_state()), None)));
         storage.expect_update_call_link().once().return_once(
             |room_id, new_attributes, zkparams_for_creation| {
                 assert_eq!(room_id.as_ref(), ROOM_ID);
@@ -1236,9 +1282,9 @@ pub mod tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| Ok((Some(default_call_link_state()), None)));
+            .return_once(|_, _| Ok((Some(default_call_link_state()), None)));
         storage.expect_update_call_link().once().return_once(
             |room_id, new_attributes, zkparams_for_creation| {
                 assert_eq!(room_id.as_ref(), ROOM_ID);
@@ -1309,9 +1355,9 @@ pub mod tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, "pangaea")),
@@ -1386,9 +1432,9 @@ pub mod tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, "pangaea")),
@@ -1464,9 +1510,9 @@ pub mod tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(frontend::RoomId::from(ROOM_ID)))
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, "pangaea")),

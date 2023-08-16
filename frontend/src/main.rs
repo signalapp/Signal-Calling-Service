@@ -15,7 +15,7 @@ use calling_frontend::{
     cleaner, config,
     frontend::Frontend,
     frontend::FrontendIdGenerator,
-    metrics,
+    internal_api, metrics,
     storage::{DynamoDb, IdentityFetcher},
 };
 use clap::Parser;
@@ -117,11 +117,13 @@ fn main() -> Result<()> {
     let threaded_rt = runtime::Runtime::new()?;
 
     let (api_ender_tx, api_ender_rx) = oneshot::channel();
+    let (internal_api_ender_tx, internal_api_ender_rx) = oneshot::channel();
     let (cleaner_ender_tx, cleaner_ender_rx) = oneshot::channel();
     let (metrics_ender_tx, metrics_ender_rx) = oneshot::channel();
     let (identity_fetcher_ender_tx, identity_fetcher_ender_rx) = oneshot::channel();
     let (signal_canceller_tx, signal_canceller_rx) = mpsc::channel(1);
 
+    let signal_canceller_tx_clone_for_internal_api = signal_canceller_tx.clone();
     let signal_canceller_tx_clone_for_cleaner = signal_canceller_tx.clone();
     let signal_canceller_tx_clone_for_metrics = signal_canceller_tx.clone();
     let signal_canceller_tx_clone_for_identity_fetcher = signal_canceller_tx.clone();
@@ -161,6 +163,7 @@ fn main() -> Result<()> {
         });
 
         let frontend_clone_for_metrics = frontend.clone();
+        let frontend_clone_for_internal_api = frontend.clone();
 
         // Start the api server.
         let api_handle = tokio::spawn(async move {
@@ -168,6 +171,16 @@ fn main() -> Result<()> {
                 error!("api start error: {}", err);
             }
             let _ = signal_canceller_tx.send(()).await;
+        });
+
+        // Start the internal api server.
+        let internal_api_handle = tokio::spawn(async move {
+            if let Err(err) =
+                internal_api::start(frontend_clone_for_internal_api, internal_api_ender_rx).await
+            {
+                error!("api start error: {}", err);
+            }
+            let _ = signal_canceller_tx_clone_for_internal_api.send(()).await;
         });
 
         // Start the cleaner server.
@@ -196,12 +209,19 @@ fn main() -> Result<()> {
 
         // Gracefully exit the servers if needed.
         let _ = api_ender_tx.send(());
+        let _ = internal_api_ender_tx.send(());
         let _ = cleaner_ender_tx.send(());
         let _ = metrics_ender_tx.send(());
         let _ = identity_fetcher_ender_tx.send(());
 
         // Wait for the servers to exit.
-        let _ = tokio::join!(api_handle, cleaner_handle, metrics_handle, fetcher_handle);
+        let _ = tokio::join!(
+            api_handle,
+            internal_api_handle,
+            cleaner_handle,
+            metrics_handle,
+            fetcher_handle
+        );
     });
 
     info!("shutting down the runtime");

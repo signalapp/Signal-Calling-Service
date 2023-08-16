@@ -12,10 +12,14 @@ use std::{
     time::SystemTime,
 };
 
-use calling_common::{DataRate, DataSize, DemuxId, Duration, Instant, PixelSize, VideoHeight};
+use calling_common::{
+    DataRate, DataSize, DemuxId, Duration, Instant, PixelSize, RoomId, VideoHeight,
+};
 use hex::ToHex;
+use hyper::Uri;
 use log::*;
 use prost::Message;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
@@ -23,6 +27,9 @@ use crate::{
     rtp::{self, VideoRotation},
     vp8,
 };
+
+mod approval_persistence;
+use approval_persistence::ApprovedUsers;
 
 pub const CLIENT_SERVER_DATA_SSRC: rtp::Ssrc = 1;
 pub const CLIENT_SERVER_DATA_PAYLOAD_TYPE: rtp::PayloadType = 101;
@@ -108,7 +115,8 @@ impl Display for LoggableCallId {
 ///
 /// UserId deliberately does not implement Display or Debug; it will be consistent across calls in
 /// the same group and is thus considered sensitive.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
 pub struct UserId(String);
 
 impl From<String> for UserId {
@@ -128,6 +136,13 @@ impl UserId {
         self.0.as_str()
     }
 }
+
+serde_with::serde_conv!(
+    pub UserIdAsStr,
+    UserId,
+    UserId::as_str,
+    |value: String| -> Result<_, std::convert::Infallible> { Ok(value.into()) }
+);
 
 trait DemuxIdExt {
     fn from_ssrc(ssrc: rtp::Ssrc) -> Self;
@@ -221,6 +236,7 @@ pub struct Call {
     loggable_call_id: LoggableCallId,
     creator_id: UserId, // AKA the first user to join
     new_clients_require_approval: bool,
+    persist_approval_for_all_users_who_join: bool,
     created: SystemTime, // For knowing how old the call is
     active_speaker_message_interval: Duration,
     initial_target_send_rate: DataRate,
@@ -238,7 +254,7 @@ pub struct Call {
     clients_update_sent: Instant,
 
     /// Clients that are considered pre-approved to join the call
-    approved_users: HashSet<UserId>,
+    approved_users: ApprovedUsers,
     /// Clients that have denied approval to join the call.
     ///
     /// Repeated denial is implicitly promoted to a block; approval clears any remembered denial.
@@ -292,19 +308,24 @@ impl Call {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         loggable_call_id: LoggableCallId,
+        room_id: Option<RoomId>,
         creator_id: UserId,
         new_clients_require_approval: bool,
+        persist_approval_for_all_users_who_join: bool,
         active_speaker_message_interval: Duration,
         initial_target_send_rate: DataRate,
         default_requested_max_send_rate: DataRate,
         now: Instant,
         system_now: SystemTime,
+        approved_users: Option<Vec<UserId>>,
+        approved_users_persistence_url: Option<&'static Uri>,
     ) -> Self {
         info!("call: {} creating", loggable_call_id);
         Self {
             loggable_call_id,
             creator_id,
             new_clients_require_approval,
+            persist_approval_for_all_users_who_join,
             created: system_now,
             active_speaker_message_interval,
             initial_target_send_rate,
@@ -316,7 +337,10 @@ impl Call {
             client_added_or_removed: now,
             clients_update_sent: now,
 
-            approved_users: HashSet::new(),
+            approved_users: ApprovedUsers::new(
+                approved_users.unwrap_or_default(),
+                approved_users_persistence_url.zip(room_id),
+            ),
             denied_users: HashSet::new(),
             blocked_users: HashSet::new(),
 
@@ -349,8 +373,15 @@ impl Call {
         self.clients.len()
     }
 
-    pub fn client_added_or_removed(&self) -> Instant {
-        self.client_added_or_removed
+    pub fn is_inactive(&mut self, now: &Instant, inactivity_timeout: &Duration) -> bool {
+        self.approved_users.tick();
+        self.is_empty()
+            && !self.approved_users.is_busy()
+            && *now >= self.client_added_or_removed + *inactivity_timeout
+    }
+
+    pub fn is_approved_users_busy(&self) -> bool {
+        self.approved_users.is_busy()
     }
 
     pub fn created(&self) -> SystemTime {
@@ -404,6 +435,9 @@ impl Call {
                 self.loggable_call_id(),
                 demux_id.as_u32()
             );
+            if self.persist_approval_for_all_users_who_join {
+                self.approved_users.insert(pending_client.user_id.clone());
+            }
             self.promote_client(pending_client, now);
         } else {
             debug!(
@@ -622,6 +656,7 @@ impl Call {
                 self.removed_clients.push(removed_client.into());
             }
             self.update_for_removed_clients(&removed_demux_ids, now);
+            self.approved_users.remove(&user_id);
             self.blocked_users.insert(user_id);
         }
     }
@@ -863,6 +898,8 @@ impl Call {
     /// such as key frame requests and active speaker changes.
     pub fn tick(&mut self, now: Instant) -> (Vec<RtpToSend>, Vec<KeyFrameRequestToSend>) {
         time_scope_us!("calling.call.tick");
+
+        self.approved_users.tick();
 
         for sender in &mut self.clients {
             sender.incoming_video0.rate_tracker.update(now);
@@ -3155,13 +3192,17 @@ mod call_tests {
         let default_requested_max_send_rate = DataRate::from_kbps(20000);
         Call::new(
             LoggableCallId::from(call_id),
+            None,
             creator_id,
+            false,
             false,
             active_speaker_message_interval,
             initial_target_send_rate,
             default_requested_max_send_rate,
             now,
             system_now,
+            None,
+            None,
         )
     }
 
@@ -4517,6 +4558,45 @@ mod call_tests {
         );
         assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
         assert!(call.approved_users.contains(&alice_user_id));
+    }
+
+    #[test]
+    fn blocking_resets_approval() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+        call.new_clients_require_approval = true;
+
+        let alice_user_id = UserId::from("Alice".to_string());
+
+        let alice_device_1 = add_client(&mut call, alice_user_id.as_str(), 1, at(100));
+        assert_eq!(vec![alice_device_1], demux_ids(&call.pending_clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+        assert!(call.approved_users.is_empty());
+
+        call.approve_pending_client(alice_device_1, at(200));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+        assert!(call.approved_users.contains(&alice_user_id));
+
+        call.block_client(alice_device_1, at(300));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
+        assert!(call.approved_users.is_empty());
+
+        let alice_device_2 = add_client(&mut call, alice_user_id.as_str(), 2, at(400));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
+        assert_eq!(
+            vec![alice_device_1, alice_device_2],
+            demux_ids(&call.removed_clients)
+        );
+        assert!(call.approved_users.is_empty());
     }
 
     #[test]

@@ -30,16 +30,22 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router, TypedHeader,
 };
-use calling_common::DemuxId;
+use calling_common::{DemuxId, RoomId};
 use hex::{FromHex, ToHex};
 use hyper::http::{HeaderName, HeaderValue};
 use log::*;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 use tokio::sync::oneshot::{self, Receiver};
 use tower::ServiceBuilder;
 
-use crate::{config, ice, middleware::log_response, region::Region, sfu, sfu::Sfu};
+use crate::{
+    call, config, ice,
+    middleware::log_response,
+    region::Region,
+    sfu::{self, Sfu, UserId},
+};
 
 const SYSTEM_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -77,7 +83,8 @@ pub struct ClientsResponse {
     pub pending_clients: Vec<ClientInfo>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[serde_as]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinRequest {
     #[serde(rename = "endpointId")]
@@ -89,6 +96,10 @@ pub struct JoinRequest {
     #[serde(default)]
     pub new_clients_require_approval: bool,
     pub is_admin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<RoomId>,
+    #[serde_as(as = "Option<Vec<call::UserIdAsStr>>")]
+    pub approved_users: Option<Vec<UserId>>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -302,6 +313,7 @@ async fn join(
     let mut sfu = sfu.lock();
     match sfu.get_or_create_call_and_add_client(
         call_id,
+        request.room_id,
         user_id,
         demux_id,
         server_ice_ufrag.to_string(),
@@ -312,6 +324,7 @@ async fn join(
         region,
         request.new_clients_require_approval,
         request.is_admin,
+        request.approved_users,
     ) {
         Ok(server_dhe_public_key) => {
             let media_server = config::ServerMediaAddress::from(config);
@@ -457,6 +470,7 @@ mod signaling_server_tests {
     use super::*;
     use crate::sfu::DhePublicKey;
 
+    const ROOM_ID: &str = "ff0000dd";
     const CALL_ID: &str = "fe076d76bffb54b1";
     const CLIENT_DHE_PUB_KEY: [u8; 32] = [
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -500,6 +514,7 @@ mod signaling_server_tests {
             .lock()
             .get_or_create_call_and_add_client(
                 call_id,
+                None,
                 user_id,
                 demux_id,
                 ice::random_ufrag(),
@@ -510,6 +525,7 @@ mod signaling_server_tests {
                 Region::Unset,
                 false,
                 false,
+                None,
             )
             .unwrap();
     }
@@ -529,6 +545,7 @@ mod signaling_server_tests {
             .lock()
             .get_or_create_call_and_add_client(
                 call_id,
+                None,
                 user_id,
                 demux_id,
                 ice::random_ufrag(),
@@ -539,6 +556,7 @@ mod signaling_server_tests {
                 Region::Unset,
                 true,
                 true,
+                None,
             )
             .unwrap();
     }
@@ -967,6 +985,8 @@ mod signaling_server_tests {
                             region: None,
                             new_clients_require_approval: false,
                             is_admin: false,
+                            room_id: Some(ROOM_ID.into()),
+                            approved_users: None,
                         })
                         .unwrap(),
                     ))
@@ -992,6 +1012,8 @@ mod signaling_server_tests {
                             region: None,
                             new_clients_require_approval: false,
                             is_admin: false,
+                            room_id: Some(ROOM_ID.into()),
+                            approved_users: None,
                         })
                         .unwrap(),
                     ))
@@ -1017,6 +1039,8 @@ mod signaling_server_tests {
                             region: None,
                             new_clients_require_approval: false,
                             is_admin: false,
+                            room_id: None,
+                            approved_users: None,
                         })
                         .unwrap(),
                     ))
@@ -1042,6 +1066,8 @@ mod signaling_server_tests {
                             region: None,
                             new_clients_require_approval: false,
                             is_admin: false,
+                            room_id: None,
+                            approved_users: None,
                         })
                         .unwrap(),
                     ))
@@ -1067,6 +1093,8 @@ mod signaling_server_tests {
                             region: None,
                             new_clients_require_approval: false,
                             is_admin: false,
+                            room_id: None,
+                            approved_users: None,
                         })
                         .unwrap(),
                     ))
@@ -1092,6 +1120,8 @@ mod signaling_server_tests {
                             region: None,
                             new_clients_require_approval: false,
                             is_admin: false,
+                            room_id: None,
+                            approved_users: None,
                         })
                         .unwrap(),
                     ))
@@ -1133,6 +1163,8 @@ mod signaling_server_tests {
                             region: None,
                             new_clients_require_approval: false,
                             is_admin: false,
+                            room_id: None,
+                            approved_users: None,
                         })
                         .unwrap(),
                     ))
@@ -1143,5 +1175,37 @@ mod signaling_server_tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(get_client_count_in_call_from_sfu(sfu.clone(), CALL_ID), 1);
+    }
+
+    #[test]
+    fn check_raw_join_request_json() {
+        assert_eq!(
+            serde_json::json!({
+                "endpointId": USER_ID_1,
+                "clientIceUfrag": UFRAG,
+                "clientDhePublicKey": CLIENT_DHE_PUB_KEY.encode_hex::<String>(),
+                "hkdfExtraInfo": null,
+                "region": "pangaea",
+                "newClientsRequireApproval": false,
+                "isAdmin": false,
+                "roomId": ROOM_ID,
+                "approvedUsers": ["A", "B"],
+            }),
+            serde_json::to_value(JoinRequest {
+                user_id: USER_ID_1.to_string(),
+                client_ice_ufrag: UFRAG.to_string(),
+                client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
+                hkdf_extra_info: None,
+                region: Some("pangaea".to_string()),
+                new_clients_require_approval: false,
+                is_admin: false,
+                room_id: Some(RoomId::from(ROOM_ID)),
+                approved_users: Some(vec![
+                    UserId::from("A".to_string()),
+                    UserId::from("B".to_string())
+                ]),
+            })
+            .unwrap()
+        )
     }
 }

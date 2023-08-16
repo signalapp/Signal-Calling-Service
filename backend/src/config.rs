@@ -109,6 +109,16 @@ pub struct Config {
     #[clap(long, action)]
     pub new_clients_require_approval: bool,
 
+    /// The URL to PUT the list of approved users to.
+    #[clap(long)]
+    pub approved_users_persistence_url: Option<hyper::Uri>,
+
+    /// Whether to save any users who join to the approved users list.
+    ///
+    /// ...as opposed to only those who are explicitly approved. Only used for testing.
+    #[clap(long, action)]
+    pub persist_approval_for_all_users_who_join: bool,
+
     #[clap(flatten)]
     pub metrics: MetricsOptions,
 }
@@ -191,6 +201,8 @@ pub(crate) fn default_test_config() -> Config {
         inactivity_check_interval_secs: 5,
         inactivity_timeout_secs: 30,
         new_clients_require_approval: false,
+        approved_users_persistence_url: Default::default(),
+        persist_approval_for_all_users_who_join: false,
         metrics: Default::default(),
     }
 }

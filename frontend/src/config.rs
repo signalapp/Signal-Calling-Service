@@ -4,21 +4,29 @@
 //
 
 use clap::ArgGroup;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 /// Configuration options from command line arguments.
-#[derive(Default, clap::Parser, Debug, Clone)]
+#[derive(clap::Parser, Debug, Clone)]
 #[clap(name = "calling_frontend")]
 #[clap(group(ArgGroup::new("backend").required(true).multiple(true).args(&["calling-server-url", "backend-list-instances-url", "backend-ip"])))]
 #[clap(group(ArgGroup::new("new_backend").required(false).args(&["backend-list-instances-url", "backend-ip"])))]
 pub struct Config {
     /// The IP address to bind to for the server.
     #[clap(long, default_value = "0.0.0.0")]
-    pub server_ip: String,
+    pub server_ip: IpAddr,
 
     /// The port to use to access the server.
     #[clap(long, default_value = "8080")]
     pub server_port: u16,
+
+    /// The IP address to bind to for the backend to frontend API.
+    #[clap(long, default_value = "0.0.0.0")]
+    pub internal_api_ip: IpAddr,
+
+    /// The port to use for the backend to frontend API. Default is to not run the internal API server.
+    #[clap(long)]
+    pub internal_api_port: Option<u16>,
 
     /// GCP region of the frontend. Appears as a tag in metrics and logging.
     #[clap(long)]
@@ -97,8 +105,10 @@ pub struct Config {
 #[cfg(test)]
 pub fn default_test_config() -> Config {
     Config {
-        server_ip: "127.0.0.1".to_string(),
+        server_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         server_port: 8080,
+        internal_api_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        internal_api_port: None,
         max_clients_per_call: 8,
         cleanup_interval_ms: 5000,
         identity_fetcher_interval_ms: 1000 * 60 * 10,

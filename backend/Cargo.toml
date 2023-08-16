@@ -41,6 +41,8 @@ base64 = "0.13"
 byteorder = "1"
 hex = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_with = { version = "2.3.2", features = ["base64"] }
 prost = "0.11"
 strum = "0.24"
 strum_macros = "0.24"
@@ -87,17 +89,15 @@ accounting-allocator = "0.1"
 prost-build = "0.11"
 
 [dev-dependencies]
+hex-literal = "0.3.2"
 unzip3 = "1.0"
 
 # For simulating passage of time in timing tests
 mock_instant = { version = "0.2" }
-hex-literal = "0.3.2"
+tokio = { version = "1", features = ["test-util"] }
 
 # For matching WebRTC's randomness
 rand_distr = "0.4.1"
-
-# For testing axum responses
-serde_json = "1.0"
 
 [features]
 default = ["epoll"]

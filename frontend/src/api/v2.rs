@@ -116,7 +116,11 @@ pub async fn get_participants(
         (None, Some(Extension(auth_credential)), Some(TypedHeader(room_id))) => {
             let room_id = room_id.into();
 
-            match frontend.storage.get_call_link_and_record(&room_id).await {
+            match frontend
+                .storage
+                .get_call_link_and_record(&room_id, true)
+                .await
+            {
                 Ok((Some(state), call)) => {
                     verify_auth_credential_against_zkparams(&auth_credential, &state, &frontend)?;
                     if let Some(call) = call {
@@ -202,7 +206,11 @@ pub async fn join(
         frontend.config.region.clone()
     };
 
-    let (call, user_id, restrictions, is_admin) = match (group_auth, call_links_auth, room_id) {
+    let (call, user_id, restrictions, is_admin, approved_users) = match (
+        group_auth,
+        call_links_auth,
+        room_id,
+    ) {
         (Some(Extension(user_authorization)), None, None) => {
             let get_or_create_timer =
                 start_timer_us!("calling.frontend.api.v2.join.get_or_create_call_record.timed");
@@ -219,12 +227,17 @@ pub async fn join(
                 user_authorization.user_id,
                 CallLinkRestrictions::None,
                 false,
+                None,
             )
         }
         (None, Some(Extension(auth_credential)), Some(TypedHeader(room_id))) => {
             let room_id = room_id.into();
 
-            match frontend.storage.get_call_link_and_record(&room_id).await {
+            match frontend
+                .storage
+                .get_call_link_and_record(&room_id, false)
+                .await
+            {
                 Ok((Some(state), call)) => {
                     verify_auth_credential_against_zkparams(&auth_credential, &state, &frontend)?;
 
@@ -271,7 +284,13 @@ pub async fn join(
                             }
                         };
 
-                        (call, user_id, state.restrictions, is_admin)
+                        (
+                            call,
+                            user_id,
+                            state.restrictions,
+                            is_admin,
+                            Some(state.approved_users),
+                        )
                     }
                 }
                 Ok((None, _)) => return Ok(not_found("invalid")),
@@ -302,6 +321,7 @@ pub async fn join(
                 region,
                 restrictions,
                 is_admin,
+                approved_users,
             },
         )
         .await?;
@@ -329,7 +349,7 @@ pub mod api_server_v2_tests {
     use std::str;
     use std::time::SystemTime;
 
-    use calling_common::DemuxId;
+    use calling_common::{DemuxId, RoomId};
     use hex::{FromHex, ToHex};
     use hmac::Mac;
     use http::{header, Request};
@@ -350,25 +370,25 @@ pub mod api_server_v2_tests {
         authenticator::{Authenticator, HmacSha256, GV2_AUTH_MATCH_LIMIT},
         backend::{self, BackendError, MockBackend},
         config,
-        frontend::{FrontendIdGenerator, MockIdGenerator, RoomId},
+        frontend::{FrontendIdGenerator, MockIdGenerator},
         storage::{CallRecord, MockStorage},
     };
 
     const AUTH_KEY: &str = "f00f0014fe091de31827e8d686969fad65013238aadd25ef8629eb8a9e5ef69b";
     const ZKPARAMS: &str = "AMJqvmQRYwEGlm0MSy6QFPIAvgOVsqRASNX1meQyCOYHJFqxO8lITPkow5kmhPrsNbu9JhVfKFwesVSKhdZaqQko3IZlJZMqP7DDw0DgTWpdnYzSt0XBWT50DM1cw1nCUXXBZUiijdaFs+JRlTKdh54M7sf43pFxyMHlS3URH50LOeR8jVQKaUHi1bDP2GR9ZXp3Ot9Fsp0pM4D/vjL5PwoOUuzNNdpIqUSFhKVrtazwuHNn9ecHMsFsN0QPzByiDA8nhKcGpdzyWUvGjEDBvpKkBtqjo8QuXWjyS3jSl2oJ/Z4Fh3o2N1YfD2aWV/K88o+TN2/j2/k+KbaIZgmiWwppLU+SYGwthxdDfZgnbaaGT/vMYX9P5JlUWSuP3xIxDzPzxBEFho67BP0Pvux+0a5nEOEVEpfRSs61MMvwNXEKZtzkO0QFbOrFYrPntyb7ToqNi66OQNyTfl/J7kqFZg2MTm3CKjHTAIvVMFAGCIamsrT9sWXOtuNeMS94xazxDA==";
 
-    const USER_ID_1: &str = "1111111111111111";
+    pub const USER_ID_1: &str = "1111111111111111";
     const USER_ID_2: &str = "2222222222222222";
-    const GROUP_ID_1: &str = "aaaaaaaaaaaaaaaa";
-    const ERA_ID_1: &str = "a1a1a1a1";
-    const DEMUX_ID_1: u32 = 1070920496;
+    pub const GROUP_ID_1: &str = "aaaaaaaaaaaaaaaa";
+    pub const ERA_ID_1: &str = "a1a1a1a1";
+    pub const DEMUX_ID_1: u32 = 1070920496;
     const DEMUX_ID_2: u32 = 1778901216;
-    const LOCAL_REGION: &str = "us-west1";
+    pub const LOCAL_REGION: &str = "us-west1";
     const ALT_REGION: &str = "asia-northeast3";
     const REDIRECTED_URL: &str =
         "https://asia-northeast3.test.com/v2/conference/participants?region=us-west1";
-    const CLIENT_ICE_UFRAG: &str = "client-ufrag";
-    const CLIENT_DHE_PUBLIC_KEY: &str = "f924028e9b8021b77eb97b36f1d43e63";
+    pub const CLIENT_ICE_UFRAG: &str = "client-ufrag";
+    pub const CLIENT_DHE_PUBLIC_KEY: &str = "f924028e9b8021b77eb97b36f1d43e63";
     const BACKEND_ICE_UFRAG: &str = "backend-ufrag";
     const BACKEND_ICE_PWD: &str = "backend-password";
     const BACKEND_DHE_PUBLIC_KEY: &str = "24c41251f82b1f3481cce4bdaab8976a";
@@ -830,6 +850,8 @@ pub mod api_server_v2_tests {
                     region: LOCAL_REGION.to_string(),
                     new_clients_require_approval: false,
                     is_admin: false,
+                    room_id: RoomId::from(GROUP_ID_1),
+                    approved_users: None,
                 }),
             )
             .once()
@@ -932,6 +954,8 @@ pub mod api_server_v2_tests {
                     region: LOCAL_REGION.to_string(),
                     new_clients_require_approval: false,
                     is_admin: false,
+                    room_id: RoomId::from(GROUP_ID_1),
+                    approved_users: None,
                 }),
             )
             .once()
@@ -1034,6 +1058,8 @@ pub mod api_server_v2_tests {
                     region: LOCAL_REGION.to_string(),
                     new_clients_require_approval: false,
                     is_admin: false,
+                    room_id: RoomId::from(GROUP_ID_1),
+                    approved_users: None,
                 }),
             )
             .once()
@@ -1398,9 +1424,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| Ok((Some(default_call_link_state()), None)));
+            .return_once(|_, _| Ok((Some(default_call_link_state()), None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -1440,9 +1466,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| Ok((Some(call_link_state), None)));
+            .return_once(|_, _| Ok((Some(call_link_state), None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -1483,9 +1509,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| Ok((Some(call_link_state), None)));
+            .return_once(|_, _| Ok((Some(call_link_state), None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -1523,9 +1549,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| Ok((None, None)));
+            .return_once(|_, _| Ok((None, None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -1563,9 +1589,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| Ok((None, Some(create_call_record(ROOM_ID, LOCAL_REGION)))));
+            .return_once(|_, _| Ok((None, Some(create_call_record(ROOM_ID, LOCAL_REGION)))));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -1604,9 +1630,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -1673,9 +1699,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -1769,9 +1795,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -1865,9 +1891,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -1937,9 +1963,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -2006,9 +2032,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, ALT_REGION)),
@@ -2067,10 +2093,10 @@ pub mod api_server_v2_tests {
         storage
             .expect_get_call_link_and_record()
             // room_id: &RoomId
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(true))
             .once()
             // Result<Option<CallRecord>>
-            .returning(move |_| {
+            .returning(move |_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, &config.region)),
@@ -2138,9 +2164,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
             .once()
-            .return_once(|_| Ok((Some(default_call_link_state()), None)))
+            .return_once(|_, _| Ok((Some(default_call_link_state()), None)))
             .in_sequence(&mut seq);
 
         storage
@@ -2191,6 +2217,8 @@ pub mod api_server_v2_tests {
                     region: LOCAL_REGION.to_string(),
                     new_clients_require_approval: false,
                     is_admin: false,
+                    room_id: RoomId::from(ROOM_ID),
+                    approved_users: Some(vec![]),
                 }),
             )
             .once()
@@ -2261,9 +2289,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 let mut state = default_call_link_state();
                 state.restrictions = CallLinkRestrictions::AdminApproval;
                 Ok((Some(state), None))
@@ -2318,6 +2346,138 @@ pub mod api_server_v2_tests {
                     region: LOCAL_REGION.to_string(),
                     new_clients_require_approval: true,
                     is_admin: false,
+                    room_id: RoomId::from(ROOM_ID),
+                    approved_users: Some(vec![]),
+                }),
+            )
+            .once()
+            // Result<JoinResponse, BackendError>
+            .returning(|_, _, _, _| {
+                Ok(backend::JoinResponse {
+                    ip: "127.0.0.1".to_string(),
+                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    port: 8080,
+                    port_tcp: Some(8080),
+                    ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
+                    ice_pwd: BACKEND_ICE_PWD.to_string(),
+                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                })
+            });
+
+        let frontend = create_frontend_with_id_generator(config, storage, backend, id_generator);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let join_request = create_call_link_join_request(None);
+
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v2/conference/participants".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .header(
+                header::AUTHORIZATION,
+                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
+            )
+            .body(Body::from(join_request))
+            .unwrap();
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(join_response.demux_id, DEMUX_ID_1);
+        assert_eq!(join_response.port, 8080);
+        assert_eq!(join_response.ip, "127.0.0.1".to_string());
+        assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
+        assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
+        assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
+        assert_eq!(
+            join_response.dhe_public_key,
+            BACKEND_DHE_PUBLIC_KEY.to_string()
+        );
+        assert_eq!(&join_response.call_creator, USER_ID_1);
+        assert_eq!(&join_response.era_id, ERA_ID_1);
+    }
+
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where there is no call yet; this time, the call link requires admin approval and has a list of approved users.
+    #[tokio::test]
+    async fn test_call_link_join_with_no_call_and_approved_users() {
+        let config = &CONFIG;
+
+        // Create mocked dependencies with expectations.
+        let mut seq = Sequence::new();
+        let mut storage = Box::new(MockStorage::new());
+        let mut expected_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
+        expected_call_record.creator = USER_ID_1_DOUBLE_ENCODED.to_string();
+        let resulting_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
+
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .once()
+            .return_once(|_, _| {
+                let mut state = default_call_link_state();
+                state.restrictions = CallLinkRestrictions::AdminApproval;
+                state.approved_users = vec!["11223344".to_string(), "aabbccdd".to_string()];
+                Ok((Some(state), None))
+            })
+            .in_sequence(&mut seq);
+
+        storage
+            .expect_get_or_add_call_record()
+            .with(eq(expected_call_record))
+            .once()
+            .return_once(move |_| Ok(resulting_call_record))
+            .in_sequence(&mut seq);
+
+        let mut backend = Box::new(MockBackend::new());
+        let mut id_generator = Box::new(MockIdGenerator::new());
+
+        // Create additional expectations.
+        backend
+            .expect_select_ip()
+            .once()
+            // Result<String, BackendError>
+            .returning(|| Ok("127.0.0.1".to_string()));
+
+        id_generator
+            .expect_get_random_era_id()
+            .with(eq(16))
+            .once()
+            .returning(|_| ERA_ID_1.to_string());
+
+        id_generator
+            .expect_get_random_demux_id()
+            // user_id: &str
+            .with(eq(USER_ID_1_DOUBLE_ENCODED))
+            .once()
+            // DemuxId
+            .returning(|_| DEMUX_ID_1.try_into().unwrap());
+
+        let expected_demux_id: DemuxId = DEMUX_ID_1.try_into().unwrap();
+
+        backend
+            .expect_join()
+            // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
+            .with(
+                eq(backend::Address::try_from("127.0.0.1").unwrap()),
+                eq(ERA_ID_1),
+                eq(expected_demux_id),
+                eq(backend::JoinRequest {
+                    user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
+                    ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
+                    hkdf_extra_info: None,
+                    region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: true,
+                    is_admin: false,
+                    room_id: RoomId::from(ROOM_ID),
+                    approved_users: Some(vec!["11223344".to_string(), "aabbccdd".to_string()]),
                 }),
             )
             .once()
@@ -2383,8 +2543,8 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
-            .return_once(|_| {
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .return_once(|_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -2419,6 +2579,112 @@ pub mod api_server_v2_tests {
                     region: LOCAL_REGION.to_string(),
                     new_clients_require_approval: false,
                     is_admin: false,
+                    room_id: RoomId::from(ROOM_ID),
+                    approved_users: Some(vec![]),
+                }),
+            )
+            .once()
+            // Result<JoinResponse, BackendError>
+            .returning(|_, _, _, _| {
+                Ok(backend::JoinResponse {
+                    ip: "127.0.0.1".to_string(),
+                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    port: 8080,
+                    port_tcp: Some(8080),
+                    ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
+                    ice_pwd: BACKEND_ICE_PWD.to_string(),
+                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                })
+            });
+
+        let frontend = create_frontend_with_id_generator(config, storage, backend, id_generator);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let join_request = create_call_link_join_request(None);
+
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/v2/conference/participants".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .header(
+                header::AUTHORIZATION,
+                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
+            )
+            .body(Body::from(join_request))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(join_response.demux_id, DEMUX_ID_2);
+        assert_eq!(join_response.port, 8080);
+        assert_eq!(join_response.ip, "127.0.0.1".to_string());
+        assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
+        assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
+        assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
+        assert_eq!(
+            join_response.dhe_public_key,
+            BACKEND_DHE_PUBLIC_KEY.to_string()
+        );
+        assert_eq!(&join_response.call_creator, USER_ID_1);
+        assert_eq!(&join_response.era_id, ERA_ID_1);
+    }
+
+    /// Invoke the "PUT /v2/conference/participants" for a call link to join in the case where there is a call, and there are also approved users.
+    #[tokio::test]
+    async fn test_call_link_join_with_call_and_approved_users() {
+        let config = &CONFIG;
+
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .return_once(|_, _| {
+                let mut state = default_call_link_state();
+                state.restrictions = CallLinkRestrictions::AdminApproval;
+                state.approved_users = vec!["11223344".to_string(), "aabbccdd".to_string()];
+                Ok((Some(state), Some(create_call_record(ROOM_ID, LOCAL_REGION))))
+            });
+        let mut backend = Box::new(MockBackend::new());
+        let mut id_generator = Box::new(MockIdGenerator::new());
+
+        // Create additional expectations.
+        id_generator
+            .expect_get_random_demux_id()
+            // user_id: &str
+            .with(eq(USER_ID_1_DOUBLE_ENCODED))
+            .once()
+            // DemuxId
+            .returning(|_| DEMUX_ID_2.try_into().unwrap());
+
+        let expected_demux_id: DemuxId = DEMUX_ID_2.try_into().unwrap();
+
+        backend
+            .expect_join()
+            // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
+            .with(
+                eq(backend::Address::try_from("127.0.0.1").unwrap()),
+                eq(ERA_ID_1),
+                eq(expected_demux_id),
+                eq(backend::JoinRequest {
+                    user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
+                    ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
+                    hkdf_extra_info: None,
+                    region: LOCAL_REGION.to_string(),
+                    new_clients_require_approval: true,
+                    is_admin: false,
+                    room_id: RoomId::from(ROOM_ID),
+                    approved_users: Some(vec!["11223344".to_string(), "aabbccdd".to_string()]),
                 }),
             )
             .once()
@@ -2488,9 +2754,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -2537,9 +2803,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -2584,9 +2850,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -2621,6 +2887,8 @@ pub mod api_server_v2_tests {
                     region: LOCAL_REGION.to_string(),
                     new_clients_require_approval: false,
                     is_admin: true,
+                    room_id: RoomId::from(ROOM_ID),
+                    approved_users: Some(vec![]),
                 }),
             )
             .once()
@@ -2687,9 +2955,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -2724,6 +2992,8 @@ pub mod api_server_v2_tests {
                     region: LOCAL_REGION.to_string(),
                     new_clients_require_approval: false,
                     is_admin: false,
+                    room_id: RoomId::from(ROOM_ID),
+                    approved_users: Some(vec![]),
                 }),
             )
             .once()
@@ -2793,9 +3063,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
             .once()
-            .return_once(|_| Ok((Some(call_link_state), None)));
+            .return_once(|_, _| Ok((Some(call_link_state), None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -2839,9 +3109,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
             .once()
-            .return_once(|_| Ok((Some(call_link_state), None)));
+            .return_once(|_, _| Ok((Some(call_link_state), None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -2883,9 +3153,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
             .once()
-            .return_once(|_| Ok((None, None)));
+            .return_once(|_, _| Ok((None, None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -2927,9 +3197,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
             .once()
-            .return_once(|_| Ok((None, Some(create_call_record(ROOM_ID, LOCAL_REGION)))));
+            .return_once(|_, _| Ok((None, Some(create_call_record(ROOM_ID, LOCAL_REGION)))));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -2971,9 +3241,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)))
+            .with(eq(RoomId::from(ROOM_ID)), eq(false))
             .once()
-            .return_once(|_| {
+            .return_once(|_, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, ALT_REGION)),

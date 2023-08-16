@@ -203,10 +203,10 @@ macro_rules! start_timer_us {
 #[macro_export]
 macro_rules! event {
     ($name:expr) => {
-        event_reporter!($name).count();
+        event_reporter!($name).count()
     };
     ($name:expr, $count:expr) => {
-        event_reporter!($name).count_n($count);
+        event_reporter!($name).count_n($count)
     };
 }
 

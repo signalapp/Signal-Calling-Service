@@ -3,18 +3,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::{
-    convert::TryFrom,
-    fmt::{self, Write as _},
-};
+use std::{convert::TryFrom, fmt::Write};
 
 use anyhow::{anyhow, Error, Result};
-use calling_common::{random_hex_string, DemuxId};
+use calling_common::{random_hex_string, DemuxId, RoomId};
 use http::Uri;
 use log::*;
 use parking_lot::Mutex;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
 use urlencoding::encode;
 
 #[cfg(test)]
@@ -29,47 +25,6 @@ use crate::{
 };
 
 pub type UserId = String;
-
-#[derive(Clone, Deserialize, Serialize, Eq, PartialEq)]
-pub struct RoomId(String);
-
-impl From<String> for RoomId {
-    fn from(room_id_string: String) -> Self {
-        Self(room_id_string)
-    }
-}
-
-impl From<&str> for RoomId {
-    fn from(room_id: &str) -> Self {
-        Self(room_id.to_string())
-    }
-}
-
-impl From<RoomId> for String {
-    fn from(room_id: RoomId) -> Self {
-        room_id.0
-    }
-}
-
-impl AsRef<str> for RoomId {
-    fn as_ref(&self) -> &str {
-        self.0.as_ref()
-    }
-}
-
-/// Implement Display for RoomId to redact most of the string.
-impl fmt::Display for RoomId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:.4}", self.0)
-    }
-}
-
-/// Implement Debug for RoomId to redact most of the string.
-impl fmt::Debug for RoomId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:.4}", self.0)
-    }
-}
 
 #[cfg_attr(test, automock)]
 pub trait IdGenerator: Sync + Send {
@@ -98,6 +53,7 @@ pub struct JoinRequestWrapper {
     pub region: String,
     pub restrictions: CallLinkRestrictions,
     pub is_admin: bool,
+    pub approved_users: Option<Vec<UserId>>,
 }
 
 pub struct JoinResponseWrapper {
@@ -321,6 +277,8 @@ impl Frontend {
                     new_clients_require_approval: join_request.restrictions
                         == CallLinkRestrictions::AdminApproval,
                     is_admin: join_request.is_admin,
+                    room_id: call.room_id.clone(),
+                    approved_users: join_request.approved_users,
                 },
             )
             .await

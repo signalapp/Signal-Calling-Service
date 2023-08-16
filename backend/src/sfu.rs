@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::Result;
 use calling_common::{
-    DataRate, DataSize, DemuxId, Duration, Instant, TwoGenerationCacheWithManualRemoveOld,
+    DataRate, DataSize, DemuxId, Duration, Instant, RoomId, TwoGenerationCacheWithManualRemoveOld,
     DUMMY_DEMUX_ID,
 };
 use hkdf::Hkdf;
@@ -227,6 +227,8 @@ impl Sfu {
         let mut call_size_above_one = Histogram::default();
         let mut call_size_squared_above_one = Histogram::default();
         let mut call_age_minutes_above_one = Histogram::default();
+        let mut calls_persisting_approved_users = 0;
+
         for call in self.call_by_call_id.values() {
             let call = call.lock();
             let clients = call.size();
@@ -244,6 +246,9 @@ impl Sfu {
                 call_age_minutes_above_one.push(call_duration);
                 calls_above_one += 1;
                 clients_in_calls_above_one += clients;
+            }
+            if call.is_approved_users_busy() {
+                calls_persisting_approved_users += 1;
             }
         }
         histograms.insert("calling.sfu.call_size", call_size);
@@ -264,6 +269,10 @@ impl Sfu {
         values.insert(
             "calling.sfu.calls.above_one.clients.count",
             clients_in_calls_above_one as f32,
+        );
+        values.insert(
+            "calling.sfu.calls.persisiting_approved_users.count",
+            calls_persisting_approved_users as f32,
         );
 
         let mut remembered_packet_count = Histogram::default();
@@ -326,6 +335,7 @@ impl Sfu {
     pub fn get_or_create_call_and_add_client(
         &mut self,
         call_id: CallId,
+        room_id: Option<RoomId>,
         user_id: UserId,
         demux_id: DemuxId,
         server_ice_ufrag: String,
@@ -336,6 +346,7 @@ impl Sfu {
         region: Region,
         new_clients_require_approval: bool,
         is_admin: bool,
+        approved_users: Option<Vec<UserId>>,
     ) -> Result<DhePublicKey, SfuError> {
         let loggable_call_id = LoggableCallId::from(&call_id);
         trace!("get_or_create_call_and_add_client():");
@@ -378,21 +389,22 @@ impl Sfu {
         let connection_id = ConnectionId::from_call_id_and_demux_id(call_id.clone(), demux_id);
 
         let active_speaker_message_interval_ms = self.config.active_speaker_message_interval_ms;
-        let call = self
-            .call_by_call_id
-            .entry(call_id.clone())
-            .or_insert_with(|| {
-                Arc::new(Mutex::new(Call::new(
-                    LoggableCallId::from(&call_id),
-                    user_id.clone(),
-                    new_clients_require_approval,
-                    Duration::from_millis(active_speaker_message_interval_ms),
-                    initial_target_send_rate,
-                    default_requested_max_send_rate,
-                    now,
-                    created,
-                )))
-            });
+        let call = self.call_by_call_id.entry(call_id).or_insert_with(|| {
+            Arc::new(Mutex::new(Call::new(
+                loggable_call_id.clone(),
+                room_id.clone(),
+                user_id.clone(),
+                new_clients_require_approval,
+                self.config.persist_approval_for_all_users_who_join,
+                Duration::from_millis(active_speaker_message_interval_ms),
+                initial_target_send_rate,
+                default_requested_max_send_rate,
+                now,
+                created,
+                approved_users,
+                self.config.approved_users_persistence_url.as_ref(),
+            )))
+        });
         {
             let mut call = call.lock();
             if call.has_client(demux_id) {
@@ -860,6 +872,7 @@ impl Sfu {
         });
 
         let mut call_tick_results = vec![];
+        let inactivity_timeout = Duration::from_secs(config.inactivity_timeout_secs);
         // Iterate all calls, maybe dropping some that are inactive.
         let outgoing_queue_drain_duration =
             Duration::from_millis(self.config.outgoing_queue_drain_ms);
@@ -874,10 +887,7 @@ impl Sfu {
 
             if call.is_empty() {
                 // If the call is empty there is nothing to send out.
-                if now
-                    >= call.client_added_or_removed()
-                        + Duration::from_secs(config.inactivity_timeout_secs)
-                {
+                if call.is_inactive(&now, &inactivity_timeout) {
                     // If the call hasn't had any activity recently, remove it.
                     let call_time = call.call_time();
                     info!(
@@ -1170,6 +1180,7 @@ mod sfu_tests {
 
         let _ = sfu.get_or_create_call_and_add_client(
             call_id.clone(),
+            None,
             user_id.clone(),
             demux_id,
             server_ice_ufrag,
@@ -1180,6 +1191,7 @@ mod sfu_tests {
             Region::Unset,
             false,
             false,
+            None,
         )?;
         Ok(())
     }

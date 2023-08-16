@@ -96,6 +96,7 @@ services:
     ports:
       # Note: The frontend can be accessed via port 8090 externally.
       - "8090:8080"
+      - "8100:8100"
     entrypoint: calling_frontend
     command:
       - --region
@@ -121,6 +122,8 @@ services:
       - "http://dynamodb:8000"
       - --storage-region
       - "us-west-1"
+      - --internal-api-port
+      - "8100"
 
   calling-backend:
     build:
@@ -156,6 +159,9 @@ services:
       - "60"
       - --diagnostics-interval-secs
       - "10"
+      - --approved-users-persistence-url
+      - "http://calling-frontend:8100/v1/call-link-approvals"
+
 
   # Go here on the host to find out the ngrok tunnel URL: http://localhost:4551
   ngrok-frontend:

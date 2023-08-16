@@ -3,16 +3,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-mod call_links;
+pub mod call_links;
 mod v2;
 
+#[cfg(test)]
+pub use v2::api_server_v2_tests as v2_tests;
+
 use std::{
-    collections::HashMap,
-    fmt::Display,
-    net::{IpAddr, SocketAddr},
-    str::FromStr,
-    sync::Arc,
-    time::Instant,
+    collections::HashMap, fmt::Display, net::SocketAddr, str::FromStr, sync::Arc, time::Instant,
 };
 
 use anyhow::Result;
@@ -364,10 +362,15 @@ fn app(frontend: Arc<Frontend>) -> Router {
         get(call_links::read_call_link).put(call_links::update_call_link),
     );
     #[cfg(any(debug_assertions, feature = "testing"))]
-    let call_link_routes = call_link_routes.route(
-        "/v1/call-link/reset-expiration",
-        axum::routing::post(call_links::reset_call_link_expiration),
-    );
+    let call_link_routes = call_link_routes
+        .route(
+            "/v1/call-link/reset-expiration",
+            axum::routing::post(call_links::reset_call_link_expiration),
+        )
+        .route(
+            "/v1/call-link/approvals",
+            axum::routing::delete(call_links::reset_call_link_approvals),
+        );
     let call_link_routes = call_link_routes
         .layer(
             ServiceBuilder::new()
@@ -388,10 +391,7 @@ fn app(frontend: Arc<Frontend>) -> Router {
 }
 
 pub async fn start(frontend: Arc<Frontend>, ender_rx: Receiver<()>) -> Result<()> {
-    let addr = SocketAddr::new(
-        IpAddr::from_str(&frontend.config.server_ip)?,
-        frontend.config.server_port,
-    );
+    let addr = SocketAddr::new(frontend.config.server_ip, frontend.config.server_port);
 
     let server = axum::Server::try_bind(&addr)?
         .serve(app(frontend).into_make_service())

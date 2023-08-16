@@ -667,6 +667,7 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_json",
+ "serde_with",
  "sha-1 0.10.1",
  "sha2 0.10.6",
  "strum",
@@ -692,6 +693,7 @@ dependencies = [
  "hex-literal",
  "log",
  "rand",
+ "serde",
  "sha2 0.10.6",
  "thiserror",
 ]
@@ -729,7 +731,6 @@ dependencies = [
  "psutil",
  "rand",
  "serde",
- "serde_bytes",
  "serde_dynamo",
  "serde_json",
  "serde_with",
@@ -2363,15 +2364,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71b2f6e1ab5c2b98c05f0f35b236b22e8df7ead6ffbf51d7808da7f8817e7ab6"
 dependencies = [
  "serde_derive",
-]
-
-[[package]]
-name = "serde_bytes"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "416bda436f9aab92e02c8e10d49a15ddd339cea90b6e340fe51ed97abb548294"
-dependencies = [
- "serde",
 ]
 
 [[package]]

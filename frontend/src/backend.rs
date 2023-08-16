@@ -7,7 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{anyhow, Context, Error};
 use async_trait::async_trait;
-use calling_common::DemuxId;
+use calling_common::{DemuxId, RoomId};
 use http::{header, Method, Request, StatusCode};
 use hyper::{
     body::Buf,
@@ -95,6 +95,9 @@ pub struct JoinRequest {
     pub region: String,
     pub new_clients_require_approval: bool,
     pub is_admin: bool,
+    pub room_id: RoomId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_users: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -302,6 +305,12 @@ impl Backend for BackendHttpClient {
             demux_id.as_u32(),
         );
 
+        if let Some(approved_users) = &join_request.approved_users {
+            if approved_users.len() > 100 {
+                warn!("more than 100 approved users in join");
+            }
+        }
+
         let request_body =
             serde_json::to_vec(join_request).context("failed to convert join request to body")?;
 
@@ -335,5 +344,43 @@ impl Backend for BackendHttpClient {
                 response.status()
             )))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::api::v2_tests::{
+        CLIENT_DHE_PUBLIC_KEY, CLIENT_ICE_UFRAG, GROUP_ID_1, LOCAL_REGION, USER_ID_1,
+    };
+
+    #[test]
+    fn check_raw_join_request_json() {
+        assert_eq!(
+            serde_json::json!({
+                "endpointId": USER_ID_1,
+                "clientIceUfrag": CLIENT_ICE_UFRAG,
+                "clientDhePublicKey": CLIENT_DHE_PUBLIC_KEY,
+                "hkdfExtraInfo": null,
+                "region": LOCAL_REGION,
+                "newClientsRequireApproval": false,
+                "isAdmin": false,
+                "roomId": GROUP_ID_1,
+                "approvedUsers": ["A", "B"],
+            }),
+            serde_json::to_value(JoinRequest {
+                user_id: USER_ID_1.to_string(),
+                ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
+                hkdf_extra_info: None,
+                region: LOCAL_REGION.to_string(),
+                new_clients_require_approval: false,
+                is_admin: false,
+                room_id: RoomId::from(GROUP_ID_1),
+                approved_users: Some(vec!["A".to_string(), "B".to_string()]),
+            })
+            .unwrap()
+        )
     }
 }

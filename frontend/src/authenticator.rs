@@ -10,15 +10,13 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use calling_common::RoomId;
 use hex::FromHex;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use crate::{
-    authenticator::ParsedHeader::*,
-    frontend::{RoomId, UserId},
-};
+use crate::{authenticator::ParsedHeader::*, frontend::UserId};
 
 pub type HmacSha256 = Hmac<Sha256>;
 

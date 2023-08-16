@@ -353,6 +353,7 @@ async fn join_conference(
     let is_admin = sfu.get_call_signaling_info(call_id.clone(), None).is_none();
     match sfu.get_or_create_call_and_add_client(
         call_id.clone(),
+        None,
         user_id,
         demux_id,
         server_ice_ufrag.clone(),
@@ -363,6 +364,7 @@ async fn join_conference(
         Region::Unset,
         config.new_clients_require_approval,
         is_admin,
+        None,
     ) {
         Ok(server_dhe_public_key) => {
             let media_server = config::ServerMediaAddress::from(config);
