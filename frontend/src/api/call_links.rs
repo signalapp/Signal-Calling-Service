@@ -410,6 +410,8 @@ pub async fn reset_call_link_approvals(
 pub mod tests {
     use super::*;
 
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
     use calling_common::Duration;
     use hex::FromHex;
     use http::{header, Request};
@@ -467,7 +469,7 @@ pub mod tests {
         Arc::new(Frontend {
             config: &CONFIG,
             authenticator: Authenticator::from_hex_key(AUTH_KEY).unwrap(),
-            zkparams: bincode::deserialize(&base64::decode(ZKPARAMS).unwrap()).unwrap(),
+            zkparams: bincode::deserialize(&STANDARD.decode(ZKPARAMS).unwrap()).unwrap(),
             storage,
             backend: Box::new(MockBackend::new()),
             id_generator: Box::new(FrontendIdGenerator),
@@ -504,7 +506,7 @@ pub mod tests {
         );
         format!(
             "Bearer auth.{}",
-            base64::encode(bincode::serialize(&credential).expect("can serialize"))
+            STANDARD.encode(bincode::serialize(&credential).expect("can serialize"))
         )
     }
 
@@ -533,7 +535,7 @@ pub mod tests {
             );
         format!(
             "Bearer create.{}",
-            base64::encode(bincode::serialize(&credential).expect("can serialize"))
+            STANDARD.encode(bincode::serialize(&credential).expect("can serialize"))
         )
     }
 
@@ -765,7 +767,7 @@ pub mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({
                 "restrictions": "adminApproval",
-                "name": base64::encode(b"abc"),
+                "name": STANDARD.encode(b"abc"),
                 "revoked": true,
                 "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
             })
@@ -794,7 +796,7 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "zkparams": base64::encode(
+                    "zkparams": STANDARD.encode(
                         bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params()).unwrap(),
                     )
                 }))
@@ -830,7 +832,7 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
                 }))
                 .unwrap(),
             ))
@@ -864,8 +866,8 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
-                    "zkparams": base64::encode(
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                    "zkparams": STANDARD.encode(
                         bincode::serialize(&wrong_params.get_public_params()).unwrap(),
                     )
                 }))
@@ -916,8 +918,8 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
-                    "zkparams": base64::encode(
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                    "zkparams": STANDARD.encode(
                         bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params()).unwrap(),
                     )
                 }))
@@ -987,12 +989,12 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
-                    "zkparams": base64::encode(
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                    "zkparams": STANDARD.encode(
                         bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params()).unwrap(),
                     ),
                     "restrictions": "adminApproval",
-                    "name": base64::encode(b"abc"),
+                    "name": STANDARD.encode(b"abc"),
                 }))
                 .unwrap(),
             ))
@@ -1008,7 +1010,7 @@ pub mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({
                 "restrictions": "adminApproval",
-                "name": base64::encode(b"abc"),
+                "name": STANDARD.encode(b"abc"),
                 "revoked": false,
                 "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
             })
@@ -1053,8 +1055,8 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
-                    "zkparams": base64::encode(
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                    "zkparams": STANDARD.encode(
                         bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params()).unwrap(),
                     ),
                 }))
@@ -1120,8 +1122,8 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
-                    "zkparams": base64::encode(
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                    "zkparams": STANDARD.encode(
                         bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params()).unwrap(),
                     ),
                 }))
@@ -1161,7 +1163,7 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
                 }))
                 .unwrap(),
             ))
@@ -1211,7 +1213,7 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
                 }))
                 .unwrap(),
             ))
@@ -1265,7 +1267,7 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(b"different"),
+                    "adminPasskey": STANDARD.encode(b"different"),
                 }))
                 .unwrap(),
             ))
@@ -1324,9 +1326,9 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
                     "restrictions": "adminApproval",
-                    "name": base64::encode(b"abc"),
+                    "name": STANDARD.encode(b"abc"),
                 }))
                 .unwrap(),
             ))
@@ -1342,7 +1344,7 @@ pub mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({
                 "restrictions": "adminApproval",
-                "name": base64::encode(b"abc"),
+                "name": STANDARD.encode(b"abc"),
                 "revoked": false,
                 "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
             })
@@ -1402,8 +1404,8 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
-                    "name": base64::encode(b"abc"),
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                    "name": STANDARD.encode(b"abc"),
                 }))
                 .unwrap(),
             ))
@@ -1419,7 +1421,7 @@ pub mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({
                 "restrictions": "none",
-                "name": base64::encode(b"abc"),
+                "name": STANDARD.encode(b"abc"),
                 "revoked": false,
                 "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
             })
@@ -1480,7 +1482,7 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
                     "revoked": true,
                 }))
                 .unwrap(),
@@ -1536,7 +1538,7 @@ pub mod tests {
             .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
-                    "adminPasskey": base64::encode(ADMIN_PASSKEY),
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
                     "restrictions": "adminApproval",
                 }))
                 .unwrap(),

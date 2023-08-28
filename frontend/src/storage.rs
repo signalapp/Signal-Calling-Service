@@ -781,6 +781,8 @@ impl IdentityFetcher {
 #[cfg(test)]
 mod tests {
     use aws_sdk_dynamodb::types::{DeleteRequest, PutRequest, WriteRequest};
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
     use futures::FutureExt;
     use once_cell::sync::Lazy;
 
@@ -856,10 +858,10 @@ mod tests {
         serde_json::json!({
             ROOM_ID_KEY: {"S": room_id},
             RECORD_TYPE_KEY: {"S": CallLinkState::RECORD_TYPE},
-            "adminPasskey": {"B": base64::encode([1, 2, 3])},
+            "adminPasskey": {"B": STANDARD.encode([1, 2, 3])},
             "zkparams": {"B": ""},
             "restrictions": {"S": "adminApproval"},
-            "encryptedName": {"B": base64::encode(b"abc")},
+            "encryptedName": {"B": STANDARD.encode(b"abc")},
             "revoked": {"BOOL": false},
             "expiration": {"N": timestamp_to_string(*TESTING_EXPIRATION)},
         })

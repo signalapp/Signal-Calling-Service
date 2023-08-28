@@ -20,7 +20,7 @@ thiserror = "1.0"
 
 # For logging and command line operations
 log = "0.4"
-env_logger = "0.9"
+env_logger = "0.10.0"
 clap = { version = "3.0", features = ["derive"] }
 
 # For runtime and threading
@@ -30,18 +30,18 @@ futures = "0.3"
 async-trait = "0.1.53"
 
 # For general conversions
-base64 = "0.13"
+base64 = "0.21.3"
 hex = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_with = { version = "2.3.2", features = ["base64"] }
+serde_with = { version = "3.3.0", features = ["base64"] }
 urlencoding = "2.1.2"
 
 # For common and authentication
 rand = "0.8"
 sha2 = "0.10"
 hmac = "0.12"
-subtle = "2.4.0"
+subtle = "2.5.0"
 
 # For http client and server
 hyper = { version = "0.14", features = ["full"] }
@@ -57,8 +57,8 @@ aws-credential-types = { version = "0.56", features = ["hardcoded-credentials"] 
 aws-smithy-types = "0.56"
 aws-smithy-async = "0.56"
 aws-config = "0.56"
-aws-sdk-dynamodb = "0.29"
-serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+0_29"] }
+aws-sdk-dynamodb = "0.30"
+serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+0_30"] }
 
 # For metrics
 parking_lot = "0.12"
@@ -70,7 +70,7 @@ zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.23.1" }
 
 [dev-dependencies]
 mockall = "0.11.0"
-mock_instant = { version = "0.2" }
+mock_instant = { version = "0.3" }
 
 [features]
 testing = []

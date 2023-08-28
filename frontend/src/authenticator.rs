@@ -10,6 +10,8 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use calling_common::RoomId;
 use hex::FromHex;
 use hmac::{Hmac, Mac};
@@ -204,7 +206,7 @@ impl Authenticator {
         // Get the credentials from the Bearer authorization header.
         match header.split_once(' ') {
             Some((scheme, token)) if scheme.eq_ignore_ascii_case("Basic") => {
-                let credentials_utf8 = base64::decode(token)?;
+                let credentials_utf8 = STANDARD.decode(token)?;
                 let credentials = std::str::from_utf8(&credentials_utf8)?;
                 // Split the credentials into the username and password.
                 let (username, password) = credentials
@@ -223,7 +225,7 @@ impl Authenticator {
 #[cfg(test)]
 mod authenticator_tests {
     use super::*;
-    use base64::DecodeError::{InvalidLastSymbol, InvalidLength};
+    use base64::DecodeError::{InvalidLength, InvalidPadding};
     use env_logger::Env;
     use hex::ToHex;
 
@@ -277,10 +279,10 @@ mod authenticator_tests {
             Err(AuthenticatorError::DecodeFailure(InvalidLength))
         );
 
-        // DecodeError: Invalid last symbol 90, offset 2.
+        // DecodeError: Invalid padding.
         assert_eq!(
             Authenticator::parse_authorization_header("Basic XYZ"),
-            Err(AuthenticatorError::DecodeFailure(InvalidLastSymbol(2, 90)))
+            Err(AuthenticatorError::DecodeFailure(InvalidPadding))
         );
 
         // Utf8Error: invalid utf-8 sequence of 1 bytes from index 0

@@ -21,6 +21,8 @@ use axum::{
     routing::get,
     Extension, Router,
 };
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use http::{header, Method, Request, StatusCode};
 use log::*;
 use tokio::sync::oneshot::Receiver;
@@ -244,8 +246,9 @@ async fn authorize<B>(
             // We use '.' as a separator because it matches the "token68" charset expected for Bearer auth.
             match token.split_once('.') {
                 Some(("auth", credential_base64)) => {
-                    let credential_bytes =
-                        base64::decode(credential_base64).map_err(|e| fail_malformed(&e))?;
+                    let credential_bytes = STANDARD
+                        .decode(credential_base64)
+                        .map_err(|e| fail_malformed(&e))?;
                     let credential: zkgroup::call_links::CallLinkAuthCredentialPresentation =
                         bincode::deserialize(&credential_bytes).map_err(|e| fail_malformed(&e))?;
 
@@ -255,8 +258,9 @@ async fn authorize<B>(
                     Ok(next.run(req).await)
                 }
                 Some(("create", credential_base64)) if req.method() == Method::PUT => {
-                    let credential_bytes =
-                        base64::decode(credential_base64).map_err(|e| fail_malformed(&e))?;
+                    let credential_bytes = STANDARD
+                        .decode(credential_base64)
+                        .map_err(|e| fail_malformed(&e))?;
                     let credential: zkgroup::call_links::CreateCallLinkCredentialPresentation =
                         bincode::deserialize(&credential_bytes).map_err(|e| fail_malformed(&e))?;
 

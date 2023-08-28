@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use accounting_allocator::{AccountingAlloc, AllocCounts};
+use accounting_allocator::AccountingAlloc;
 use anyhow::Result;
 use log::*;
 use once_cell::sync::Lazy;
@@ -82,7 +82,10 @@ pub async fn start(
                         datadog.count(report.name(), report.event_count() as f64, &None);
                     }
 
-                    let AllocCounts { alloc, dealloc } = GLOBAL_ALLOCATOR.count();
+                    let stats = GLOBAL_ALLOCATOR.count();
+                    let alloc = stats.all_time.alloc;
+                    let dealloc = stats.all_time.dealloc;
+
                     datadog.count(
                         "calling.system.memory.new_alloc_bytes",
                         (alloc - last_alloc) as f64,

@@ -17,6 +17,8 @@ mod slice;
 mod thread_pool;
 mod time;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use std::{cmp::PartialEq, convert::TryInto, io::Write};
 
 pub use bits::*;
@@ -111,7 +113,7 @@ pub fn random_hex_string(n: usize) -> String {
 /// Const generic expressions may replace this in future, but for now we must have a macro
 macro_rules! random_base64_string_of_length {
     ($string_length:expr) => {{
-        base64::encode(thread_rng().gen::<[u8; $string_length * 6 / 8]>())
+        STANDARD.encode(thread_rng().gen::<[u8; $string_length * 6 / 8]>())
     }};
 }
 

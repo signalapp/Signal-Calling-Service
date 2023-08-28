@@ -7,6 +7,8 @@
 extern crate log;
 
 use anyhow::Result;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use calling_common::Duration;
 use calling_frontend::{
     api,
@@ -130,7 +132,7 @@ fn main() -> Result<()> {
 
     // Create frontend entities that might fail.
     let authenticator = Authenticator::from_hex_key(&config.authentication_key)?;
-    let zkparams = bincode::deserialize(&base64::decode(&config.zkparams)?)?;
+    let zkparams = bincode::deserialize(&STANDARD.decode(&config.zkparams)?)?;
     let identity_fetcher = if config.storage_endpoint.is_some() {
         // Create an identity fetcher with a dummy token path, which isn't used
         // for testing with a storage endpoint and won't be fetched.

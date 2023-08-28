@@ -349,6 +349,8 @@ pub mod api_server_v2_tests {
     use std::str;
     use std::time::SystemTime;
 
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
     use calling_common::{DemuxId, RoomId};
     use hex::{FromHex, ToHex};
     use hmac::Mac;
@@ -443,7 +445,7 @@ pub mod api_server_v2_tests {
         // with 'Basic' for a valid authorization_header.
         format!(
             "Basic {}",
-            base64::encode(format!("{}:{}", user_id, password))
+            STANDARD.encode(format!("{}:{}", user_id, password))
         )
     }
 
@@ -577,7 +579,7 @@ pub mod api_server_v2_tests {
         Arc::new(Frontend {
             config,
             authenticator: Authenticator::from_hex_key(AUTH_KEY).unwrap(),
-            zkparams: bincode::deserialize(&base64::decode(ZKPARAMS).unwrap()).unwrap(),
+            zkparams: bincode::deserialize(&STANDARD.decode(ZKPARAMS).unwrap()).unwrap(),
             storage,
             backend,
             id_generator: Box::new(FrontendIdGenerator),
@@ -594,7 +596,7 @@ pub mod api_server_v2_tests {
         Arc::new(Frontend {
             config,
             authenticator: Authenticator::from_hex_key(AUTH_KEY).unwrap(),
-            zkparams: bincode::deserialize(&base64::decode(ZKPARAMS).unwrap()).unwrap(),
+            zkparams: bincode::deserialize(&STANDARD.decode(ZKPARAMS).unwrap()).unwrap(),
             storage,
             backend,
             id_generator,
