@@ -27,7 +27,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 use crate::{
     call::{self, Call, LoggableCallId},
     config,
-    connection::{self, AddressType, Connection, HandleRtcpResult, PacketToSend},
+    connection::{self, AddressType, Connection, ConnectionRates, HandleRtcpResult, PacketToSend},
     googcc, ice,
     ice::BindingRequest,
     metrics::{Histogram, Timer},
@@ -713,8 +713,8 @@ impl Sfu {
 
                     time_scope_us!("calling.sfu.handle_packet.rtcp.in_outgoing_connection_lock");
 
-                    if let Some(key_frame_request) =
-                        outgoing_connection.send_key_frame_request(key_frame_request)
+                    if let Some(key_frame_request) = outgoing_connection
+                        .send_key_frame_request(key_frame_request, Instant::now())
                     {
                         outgoing_packets.push(key_frame_request);
                     };
@@ -791,7 +791,7 @@ impl Sfu {
                                 0
                             };
 
-                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), target: {}, requested_base: {}, ideal: {}, allocated: {}, queue_drain: {}, max_requested_height: {}, rtt_ms: {} }}",
+                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), incoming_audio: {}, incoming_rtx: {}, incoming_non_media: {}, incoming_discard: {}, target: {}, requested_base: {}, ideal: {}, allocated: {}, queue_drain: {}, max_requested_height: {}, rtt_ms: {}, video_rate: {}, audio_rate: {}, rtx_rate: {}, padding_rate: {}, non_media_rate: {} }}",
                                   client.demux_id.as_u32(),
                                   client.video0_incoming_height.unwrap_or_default().as_u16(),
                                   client.video1_incoming_height.unwrap_or_default().as_u16(),
@@ -799,6 +799,10 @@ impl Sfu {
                                   client.video0_incoming_rate.unwrap_or_default().as_kbps(),
                                   client.video1_incoming_rate.unwrap_or_default().as_kbps(),
                                   client.video2_incoming_rate.unwrap_or_default().as_kbps(),
+                                  client.connection_rates.incoming_audio_rate.as_kbps(),
+                                  client.connection_rates.incoming_rtx_rate.as_kbps(),
+                                  client.connection_rates.incoming_non_media_rate.as_kbps(),
+                                  client.connection_rates.incoming_discard_rate.as_kbps(),
                                   client.target_send_rate.as_kbps(),
                                   client.requested_base_rate.as_kbps(),
                                   client.ideal_send_rate.as_kbps(),
@@ -806,6 +810,11 @@ impl Sfu {
                                   client.outgoing_queue_drain_rate.as_kbps(),
                                   client.max_requested_height.unwrap_or_default().as_u16(),
                                   rtt,
+                                  client.connection_rates.video_rate.as_kbps(),
+                                  client.connection_rates.audio_rate.as_kbps(),
+                                  client.connection_rates.rtx_rate.as_kbps(),
+                                  client.connection_rates.padding_rate.as_kbps(),
+                                  client.connection_rates.non_media_rate.as_kbps(),
                             );
                         }
 
@@ -834,6 +843,9 @@ impl Sfu {
         let mut expired_demux_ids_by_call_id: HashMap<CallId, Vec<DemuxId>> = HashMap::new();
         let mut outgoing_queue_sizes_by_call_id: HashMap<CallId, Vec<(DemuxId, DataSize)>> =
             HashMap::new();
+        let mut connection_rates_by_call_id: HashMap<CallId, Vec<(DemuxId, ConnectionRates)>> =
+            HashMap::new();
+
         self.connection_by_id.retain(|connection_id, connection| {
             let mut connection = connection.lock();
             if check_for_inactivity && connection.inactive(now) {
@@ -867,6 +879,10 @@ impl Sfu {
                     .entry(connection_id.call_id.clone())
                     .or_default()
                     .push((connection_id.demux_id, connection.outgoing_queue_size()));
+                connection_rates_by_call_id
+                    .entry(connection_id.call_id.clone())
+                    .or_default()
+                    .push((connection_id.demux_id, connection.current_rates(now)));
                 true
             }
         });
@@ -998,6 +1014,12 @@ impl Sfu {
                             .set_outgoing_queue_drain_rate(*demux_id, outgoing_queue_drain_rate);
                     }
                 }
+
+                if let Some(connection_rates) = connection_rates_by_call_id.get(call_id) {
+                    for (demux_id, rates) in connection_rates {
+                        let _ = call.set_connection_rates(*demux_id, *rates);
+                    }
+                }
                 // Don't remove the call; there are still clients!
                 let (outgoing_rtp, outgoing_key_frame_requests) = call.tick(now);
                 let send_rate_allocation_infos =
@@ -1055,7 +1077,7 @@ impl Sfu {
                 {
                     let mut outgoing_connection = outgoing_connection.lock();
                     if let Some(key_frame_request) =
-                        outgoing_connection.send_key_frame_request(key_frame_request)
+                        outgoing_connection.send_key_frame_request(key_frame_request, now)
                     {
                         packets_to_send.push(key_frame_request);
                     };

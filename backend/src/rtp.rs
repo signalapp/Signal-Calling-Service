@@ -60,10 +60,15 @@ pub const RTCP_FORMAT_TRANSPORT_CC: u8 = 15;
 pub const RTCP_TYPE_SPECIFIC_FEEDBACK: u8 = 206;
 pub const RTCP_FORMAT_PLI: u8 = 1;
 const RTCP_FORMAT_LOSS_NOTIFICATION: u8 = 15;
+const PADDING_PAYLOAD_TYPE: PayloadType = 99;
 const OPUS_PAYLOAD_TYPE: PayloadType = 102;
 pub const VP8_PAYLOAD_TYPE: PayloadType = 108;
 const RTX_PAYLOAD_TYPE_OFFSET: PayloadType = 10;
 const RTX_SSRC_OFFSET: Ssrc = 1;
+
+// Discard outgoing packets after this time.
+// 1 second lifteime matches WebRTC's RTX history
+const PACKET_LIFETIME: Duration = Duration::from_secs(1);
 
 pub type Key = Zeroizing<[u8; SRTP_KEY_LEN]>;
 pub type Salt = [u8; SRTP_SALT_LEN];
@@ -356,6 +361,18 @@ fn is_media_payload_type(pt: PayloadType) -> bool {
     pt == OPUS_PAYLOAD_TYPE || pt == VP8_PAYLOAD_TYPE
 }
 
+fn is_audio_payload_type(pt: PayloadType) -> bool {
+    pt == OPUS_PAYLOAD_TYPE
+}
+
+fn is_video_payload_type(pt: PayloadType) -> bool {
+    pt == VP8_PAYLOAD_TYPE
+}
+
+fn is_padding_payload_type(pt: PayloadType) -> bool {
+    pt == PADDING_PAYLOAD_TYPE
+}
+
 fn is_rtx_payload_type(pt: PayloadType) -> bool {
     is_rtxable_payload_type(from_rtx_payload_type(pt))
 }
@@ -416,11 +433,14 @@ pub struct Packet<T> {
     // the payload and header can be written to.
     encrypted: bool,
 
+    // If the packet isn't sent by the deadline, discard it
+    deadline: Option<Instant>,
+
     serialized: T,
 }
 
 impl<T> Packet<T> {
-    fn is_rtx(&self) -> bool {
+    pub fn is_rtx(&self) -> bool {
         self.seqnum_in_payload.is_some()
     }
 
@@ -459,6 +479,25 @@ impl<T> Packet<T> {
     pub fn into_serialized(self) -> T {
         self.serialized
     }
+
+    pub fn is_audio(&self) -> bool {
+        is_audio_payload_type(self.payload_type())
+    }
+
+    pub fn is_padding(&self) -> bool {
+        is_padding_payload_type(self.payload_type())
+    }
+
+    pub fn is_video(&self) -> bool {
+        is_video_payload_type(self.payload_type())
+    }
+
+    pub fn is_past_deadline(&self, now: Instant) -> bool {
+        match self.deadline {
+            None => true,
+            Some(deadline) => now > deadline,
+        }
+    }
 }
 
 impl<T: Borrow<[u8]>> Packet<T> {
@@ -492,6 +531,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
             encrypted: self.encrypted,
+            deadline: self.deadline,
 
             serialized: self.serialized.borrow(),
         }
@@ -511,6 +551,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
             encrypted: self.encrypted,
+            deadline: self.deadline,
 
             serialized: self.serialized.borrow().to_vec(),
         }
@@ -683,6 +724,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
             encrypted: self.encrypted,
+            deadline: self.deadline,
 
             serialized: self.serialized.borrow_mut(),
         }
@@ -763,6 +805,7 @@ impl Packet<Vec<u8>> {
         timestamp: TruncatedTimestamp,
         ssrc: Ssrc,
         tcc_seqnum: Option<FullSequenceNumber>,
+        deadline_start: Option<Instant>,
         payload: &[u8],
     ) -> Self {
         let marker = false;
@@ -790,6 +833,7 @@ impl Packet<Vec<u8>> {
             },
             payload_range_in_header: payload_range,
             encrypted: false,
+            deadline: deadline_start.map(|deadline_start| deadline_start + PACKET_LIFETIME),
             serialized,
         }
     }
@@ -852,6 +896,7 @@ pub fn parse_and_forward_rtp_for_fuzzing(data: Vec<u8>) -> Option<Vec<u8>> {
         tcc_seqnum_range: header.tcc_seqnum_range,
         payload_range_in_header: header.payload_range,
         encrypted: true,
+        deadline: None,
         serialized: data,
     };
 
@@ -1288,26 +1333,33 @@ impl RtxSender {
     }
 
     fn remember_sent(&mut self, outgoing: Packet<Vec<u8>>, departed: Instant) {
-        self.previously_sent_by_seqnum.insert(
-            (
-                outgoing.ssrc(),
-                outgoing.seqnum() as TruncatedSequenceNumber,
-            ),
-            outgoing,
-            departed,
-        );
+        if !outgoing.is_past_deadline(departed) {
+            self.previously_sent_by_seqnum.insert(
+                (
+                    outgoing.ssrc(),
+                    outgoing.seqnum() as TruncatedSequenceNumber,
+                ),
+                outgoing,
+                departed,
+            );
+        }
     }
 
     fn resend_as_rtx(
         &mut self,
         ssrc: Ssrc,
         seqnum: TruncatedSequenceNumber,
+        now: Instant,
         get_tcc_seqnum: impl FnOnce() -> tcc::FullSequenceNumber,
     ) -> Option<Packet<Vec<u8>>> {
         let rtx_ssrc = to_rtx_ssrc(ssrc);
         let rtx_seqnum = *self.get_next_seqnum_mut(rtx_ssrc);
 
         let previously_sent = self.previously_sent_by_seqnum.get(&(ssrc, seqnum))?;
+        if previously_sent.is_past_deadline(now) {
+            event!("calling.rtp.rtx_resend_skip");
+            return None;
+        }
         let mut rtx = previously_sent.to_rtx(rtx_seqnum);
         // This has to go after the use of previously_sent.to_rtx because previously_sent
         // has a ref to self.previously_sent_by_seqnum until then, and so we can't
@@ -1339,6 +1391,7 @@ impl RtxSender {
             PADDING_TIMESTAMP,
             rtx_ssrc,
             Some(tcc_seqnum),
+            None,
             &PADDING_PAYLOAD[..],
         )
     }
@@ -1597,8 +1650,7 @@ impl Endpoint {
             tcc_receiver: tcc::Receiver::new(ack_sender_ssrc, now),
             max_received_tcc_seqnum: 0,
 
-            // 10 seconds of RTX history should be enough for anyone
-            rtx_sender: RtxSender::new(Duration::from_secs(10)),
+            rtx_sender: RtxSender::new(PACKET_LIFETIME),
         }
     }
 
@@ -1656,6 +1708,7 @@ impl Endpoint {
             tcc_seqnum_range: header.tcc_seqnum_range,
             payload_range_in_header: header.payload_range,
             encrypted: true,
+            deadline: Some(now + PACKET_LIFETIME),
             serialized: encrypted,
         };
 
@@ -1784,7 +1837,7 @@ impl Endpoint {
     ) -> Option<Packet<Vec<u8>>> {
         let tcc_sender = &mut self.tcc_sender;
         let rtx_sender = &mut self.rtx_sender;
-        let rtx = rtx_sender.resend_as_rtx(ssrc, seqnum, || tcc_sender.increment_seqnum())?;
+        let rtx = rtx_sender.resend_as_rtx(ssrc, seqnum, now, || tcc_sender.increment_seqnum())?;
         self.encrypt_and_send_rtp(rtx, now)
     }
 
@@ -2055,7 +2108,7 @@ mod test {
             packet[RTP_PAYLOAD_TYPE_OFFSET] ^= 0b1000_0000;
         }
 
-        let mut packet = Packet::with_empty_tag(1, 2, 3, 4, None, &[]).into_serialized();
+        let mut packet = Packet::with_empty_tag(1, 2, 3, 4, None, None, &[]).into_serialized();
         run_tests(&mut packet, false);
 
         // Packet types only matter in that they can't be claimed by RTCP.
@@ -2073,7 +2126,7 @@ mod test {
     #[test]
     fn test_parse_rtp_header() {
         assert_eq!(None, Header::parse(&[]));
-        let mut packet = Packet::with_empty_tag(1, 2, 3, 4, None, &[]).into_serialized();
+        let mut packet = Packet::with_empty_tag(1, 2, 3, 4, None, None, &[]).into_serialized();
         assert_eq!(
             Some(Header {
                 marker: false,
@@ -2106,7 +2159,7 @@ mod test {
     #[test]
     fn test_parse_rtp_header_with_seqnum() {
         let mut packet =
-            Packet::with_empty_tag(1, 2, 3, 4, Some(0x12345678), &[]).into_serialized();
+            Packet::with_empty_tag(1, 2, 3, 4, Some(0x12345678), None, &[]).into_serialized();
         let expected_payload_start = RTP_MIN_HEADER_LEN + RTP_EXTENSIONS_HEADER_LEN + 4;
         assert_eq!(
             Some(Header {
@@ -2429,7 +2482,7 @@ mod test {
         let history_limit = Duration::from_millis(10000);
         let mut rtx_sender = RtxSender::new(history_limit);
 
-        fn sent_packet(ssrc: Ssrc, seqnum: FullSequenceNumber) -> Packet<Vec<u8>> {
+        fn sent_packet(ssrc: Ssrc, seqnum: FullSequenceNumber, now: Instant) -> Packet<Vec<u8>> {
             let timestamp = seqnum as TruncatedTimestamp;
             let tcc_seqnum = seqnum;
             let payload = &[];
@@ -2439,6 +2492,7 @@ mod test {
                 timestamp,
                 ssrc,
                 Some(tcc_seqnum),
+                Some(now),
                 payload,
             )
         }
@@ -2448,6 +2502,7 @@ mod test {
             seqnum: FullSequenceNumber,
             rtx_seqnum: FullSequenceNumber,
             tcc_seqnum: tcc::FullSequenceNumber,
+            now: Instant,
         ) -> Packet<Vec<u8>> {
             let timestamp = seqnum as TruncatedTimestamp;
             let payload = &(seqnum as u16).to_be_bytes();
@@ -2457,6 +2512,7 @@ mod test {
                 timestamp,
                 ssrc + 1,
                 Some(tcc_seqnum),
+                Some(now),
                 payload,
             );
             rtx.seqnum_in_payload = Some(seqnum);
@@ -2476,58 +2532,98 @@ mod test {
                 timestamp,
                 rtx_ssrc,
                 Some(tcc_seqnum),
+                None,
                 &PAYLOAD[..],
             )
         }
 
         let now = Instant::now();
-        rtx_sender.remember_sent(sent_packet(2, 11), now);
-        rtx_sender.remember_sent(sent_packet(4, 21), now + Duration::from_millis(2000));
+        rtx_sender.remember_sent(sent_packet(2, 11, now), now);
+        rtx_sender.remember_sent(sent_packet(4, 21, now), now + Duration::from_millis(2000));
         assert_eq!(
-            Some(rtx_packet(2, 11, 1, 101)),
-            rtx_sender.resend_as_rtx(2, 11, || 101)
+            Some(rtx_packet(2, 11, 1, 101, now)),
+            rtx_sender.resend_as_rtx(2, 11, now, || 101)
         );
         // Make sure we can send more than once.
         assert_eq!(
-            Some(rtx_packet(2, 11, 2, 102)),
-            rtx_sender.resend_as_rtx(2, 11, || 102)
+            Some(rtx_packet(2, 11, 2, 102, now)),
+            rtx_sender.resend_as_rtx(2, 11, now, || 102)
         );
         // Make sure wrong SSRC or seqnum is ignored.
-        assert_eq!(None, rtx_sender.resend_as_rtx(0, 11, || 101));
-        assert_eq!(None, rtx_sender.resend_as_rtx(2, 12, || 101));
+        assert_eq!(None, rtx_sender.resend_as_rtx(0, 11, now, || 101));
+        assert_eq!(None, rtx_sender.resend_as_rtx(2, 12, now, || 101));
 
         // Push some things out of the history
-        rtx_sender.remember_sent(sent_packet(2, 12), now + Duration::from_millis(14000));
-        rtx_sender.remember_sent(sent_packet(4, 22), now + Duration::from_millis(16000));
-        rtx_sender.remember_sent(sent_packet(2, 13), now + Duration::from_millis(18000));
-        rtx_sender.remember_sent(sent_packet(4, 23), now + Duration::from_millis(20000));
-        rtx_sender.remember_sent(sent_packet(2, 14), now + Duration::from_millis(22000));
-        rtx_sender.remember_sent(sent_packet(4, 24), now + Duration::from_millis(24000));
+        rtx_sender.remember_sent(
+            sent_packet(2, 12, now + Duration::from_millis(14000)),
+            now + Duration::from_millis(14000),
+        );
+        rtx_sender.remember_sent(
+            sent_packet(4, 22, now + Duration::from_millis(16000)),
+            now + Duration::from_millis(16000),
+        );
+        rtx_sender.remember_sent(
+            sent_packet(2, 13, now + Duration::from_millis(18000)),
+            now + Duration::from_millis(18000),
+        );
+        rtx_sender.remember_sent(
+            sent_packet(4, 23, now + Duration::from_millis(20000)),
+            now + Duration::from_millis(20000),
+        );
+        rtx_sender.remember_sent(
+            sent_packet(2, 14, now + Duration::from_millis(22000)),
+            now + Duration::from_millis(22000),
+        );
+        rtx_sender.remember_sent(
+            sent_packet(4, 24, now + Duration::from_millis(24000)),
+            now + Duration::from_millis(24000),
+        );
 
-        assert_eq!(None, rtx_sender.resend_as_rtx(2, 11, || 103));
-        assert_eq!(None, rtx_sender.resend_as_rtx(4, 21, || 103));
+        assert_eq!(None, rtx_sender.resend_as_rtx(2, 11, now, || 103));
+        assert_eq!(None, rtx_sender.resend_as_rtx(4, 21, now, || 103));
         assert_eq!(
-            Some(rtx_packet(2, 12, 3, 103)),
-            rtx_sender.resend_as_rtx(2, 12, || 103)
+            Some(rtx_packet(
+                2,
+                12,
+                3,
+                103,
+                now + Duration::from_millis(14000)
+            )),
+            rtx_sender.resend_as_rtx(2, 12, now, || 103)
         );
         assert_eq!(
-            Some(rtx_packet(4, 22, 1, 104)),
-            rtx_sender.resend_as_rtx(4, 22, || 104)
+            Some(rtx_packet(
+                4,
+                22,
+                1,
+                104,
+                now + Duration::from_millis(16000)
+            )),
+            rtx_sender.resend_as_rtx(4, 22, now, || 104)
         );
         assert_eq!(
-            Some(rtx_packet(4, 24, 2, 105)),
-            rtx_sender.resend_as_rtx(4, 24, || 105)
+            Some(rtx_packet(
+                4,
+                24,
+                2,
+                105,
+                now + Duration::from_millis(24000)
+            )),
+            rtx_sender.resend_as_rtx(4, 24, now, || 105)
         );
 
         // Make sure the marker bit survives the process
-        let mut sent = sent_packet(2, 15);
+        let mut sent = sent_packet(2, 15, now + Duration::from_millis(16000));
         sent.marker = true;
         sent.serialized_mut()[1] = (1 << 7) | VP8_PAYLOAD_TYPE;
-        let mut rtx = rtx_packet(2, 15, 4, 106);
+        let mut rtx = rtx_packet(2, 15, 4, 106, now + Duration::from_millis(16000));
         rtx.marker = true;
         rtx.serialized_mut()[1] = (1 << 7) | VP8_RTX_PAYLOAD_TYPE;
         rtx_sender.remember_sent(sent, now + Duration::from_millis(16000));
-        assert_eq!(Some(rtx), rtx_sender.resend_as_rtx(2, 15, || 106));
+        assert_eq!(
+            Some(rtx),
+            rtx_sender.resend_as_rtx(2, 15, now + Duration::from_millis(16000), || 106)
+        );
 
         // Make sure the padding RTX seqnums are not reused
         assert_eq!(padding_packet(3, 5, 107), rtx_sender.send_padding(3, 107));
@@ -2536,12 +2632,18 @@ mod test {
 
         // Try resending an RTX packet.
         rtx_sender.remember_sent(
-            rtx_packet(2, 16, 37, 40),
+            rtx_packet(2, 16, 37, 40, now + Duration::from_millis(17_000)),
             now + Duration::from_millis(17_000),
         );
         assert_eq!(
-            Some(rtx_packet(2, 16, 6, 107)),
-            rtx_sender.resend_as_rtx(2, 16, || 107)
+            Some(rtx_packet(
+                2,
+                16,
+                6,
+                107,
+                now + Duration::from_millis(17_000)
+            )),
+            rtx_sender.resend_as_rtx(2, 16, now + Duration::from_millis(17_000), || 107)
         );
     }
 
@@ -2559,7 +2661,15 @@ mod test {
 
         let mut sent1 = sender
             .send_rtp(
-                Packet::with_empty_tag(VP8_PAYLOAD_TYPE, 1, 2, 3, Some(0), &[4, 5, 6]),
+                Packet::with_empty_tag(
+                    VP8_PAYLOAD_TYPE,
+                    1,
+                    2,
+                    3,
+                    Some(0),
+                    Some(at(10)),
+                    &[4, 5, 6],
+                ),
                 at(10),
             )
             .unwrap();
@@ -2575,7 +2685,15 @@ mod test {
 
         let mut sent2 = sender
             .send_rtp(
-                Packet::with_empty_tag(VP8_PAYLOAD_TYPE, 2, 4, 3, Some(0), &[5, 6, 7]),
+                Packet::with_empty_tag(
+                    VP8_PAYLOAD_TYPE,
+                    2,
+                    4,
+                    3,
+                    Some(0),
+                    Some(at(20)),
+                    &[5, 6, 7],
+                ),
                 at(20),
             )
             .unwrap();
@@ -2586,7 +2704,15 @@ mod test {
 
         let mut sent3 = sender
             .send_rtp(
-                Packet::with_empty_tag(VP8_PAYLOAD_TYPE, 3, 6, 3, Some(0), &[6, 7, 8]),
+                Packet::with_empty_tag(
+                    VP8_PAYLOAD_TYPE,
+                    3,
+                    6,
+                    3,
+                    Some(0),
+                    Some(at(20)),
+                    &[6, 7, 8],
+                ),
                 at(30),
             )
             .unwrap();
@@ -2616,7 +2742,8 @@ mod test {
             .receive_rtp(resent2.serialized.borrow_mut(), at(60))
             .unwrap();
         resent2.encrypted = false; // Got decrypted by the above
-        let received2 = received2.to_owned();
+        let mut received2 = received2.to_owned();
+        received2.deadline = resent2.deadline; // tweak deadline to match
         assert_eq!(resent2, received2);
         assert_eq!(sent2.payload_type(), resent2.payload_type());
         assert_eq!(VP8_RTX_PAYLOAD_TYPE, resent2.payload_type_in_header);
@@ -2757,7 +2884,7 @@ mod test {
 
         let mut sent1a = sender
             .send_rtp(
-                Packet::with_empty_tag(VP8_PAYLOAD_TYPE, 1, 2, 3, Some(0), &[4, 5, 6]),
+                Packet::with_empty_tag(VP8_PAYLOAD_TYPE, 1, 2, 3, Some(0), None, &[4, 5, 6]),
                 at(10),
             )
             .unwrap();
@@ -2765,7 +2892,7 @@ mod test {
         let mut sent1c = sent1a.clone();
         let mut sent2a = sender
             .send_rtp(
-                Packet::with_empty_tag(VP8_PAYLOAD_TYPE, 2, 2, 3, Some(0), &[4, 5, 6]),
+                Packet::with_empty_tag(VP8_PAYLOAD_TYPE, 2, 2, 3, Some(0), None, &[4, 5, 6]),
                 at(10),
             )
             .unwrap();
@@ -2773,7 +2900,7 @@ mod test {
         let mut sent2c = sent2a.clone();
         let mut sent200a = sender
             .send_rtp(
-                Packet::with_empty_tag(VP8_PAYLOAD_TYPE, 200, 2, 3, Some(0), &[4, 5, 6]),
+                Packet::with_empty_tag(VP8_PAYLOAD_TYPE, 200, 2, 3, Some(0), None, &[4, 5, 6]),
                 at(10),
             )
             .unwrap();

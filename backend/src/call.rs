@@ -5,7 +5,7 @@
 
 use std::{
     cmp::min,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     convert::{From, TryFrom},
     fmt::{self, Display, Formatter},
     sync::Arc,
@@ -13,7 +13,7 @@ use std::{
 };
 
 use calling_common::{
-    DataRate, DataSize, DemuxId, Duration, Instant, PixelSize, RoomId, VideoHeight,
+    DataRate, DataRateTracker, DemuxId, Duration, Instant, PixelSize, RoomId, VideoHeight,
 };
 use hex::ToHex;
 use hyper::Uri;
@@ -23,7 +23,9 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
-    audio, protos,
+    audio,
+    connection::ConnectionRates,
+    protos,
     rtp::{self, VideoRotation},
     vp8,
 };
@@ -1011,6 +1013,18 @@ impl Call {
         Ok(())
     }
 
+    pub fn set_connection_rates(
+        &mut self,
+        receiver_demux_id: DemuxId,
+        connection_rates: ConnectionRates,
+    ) -> Result<(), Error> {
+        let receiver = self
+            .find_client_mut(receiver_demux_id)
+            .ok_or(Error::UnknownDemuxId(receiver_demux_id))?;
+        receiver.connection_rates = connection_rates;
+        Ok(())
+    }
+
     pub fn get_send_rate_allocation_info(
         &self,
     ) -> impl Iterator<Item = SendRateAllocationInfo> + '_ {
@@ -1114,6 +1128,7 @@ impl Call {
             requested_base_rate(&allocatable_videos, receiver.requested_max_send_rate);
         let ideal_send_rate =
             ideal_send_rate(&allocatable_videos, receiver.requested_max_send_rate);
+
         let allocated_video_by_sender_demux_id = allocate_send_rate(
             new_target_send_rate,
             ideal_send_rate,
@@ -1355,6 +1370,7 @@ impl Call {
             timestamp,
             CLIENT_SERVER_DATA_SSRC,
             None,
+            None,
             &update.encode_to_vec(),
         )
     }
@@ -1537,6 +1553,9 @@ struct Client {
     ideal_send_rate: DataRate,
     allocated_send_rate: DataRate,
 
+    // Updated during sfu tick
+    connection_rates: ConnectionRates,
+
     // Updated by Call::update_padding_ssrc()
     padding_ssrc: Option<rtp::Ssrc>,
 
@@ -1585,6 +1604,7 @@ impl Client {
             requested_base_rate: DataRate::default(),
             ideal_send_rate: DataRate::default(),
             allocated_send_rate: DataRate::default(),
+            connection_rates: ConnectionRates::default(),
 
             padding_ssrc: None,
 
@@ -1725,6 +1745,7 @@ impl Client {
             target_send_rate: self.target_send_rate,
             ideal_send_rate: self.ideal_send_rate,
             allocated_send_rate: self.allocated_send_rate,
+            connection_rates: self.connection_rates,
             outgoing_queue_drain_rate: self.outgoing_queue_drain_rate,
             max_requested_height: self.requested_height_by_demux_id.values().max().copied(),
         }
@@ -1733,7 +1754,7 @@ impl Client {
 
 #[derive(Default)]
 struct IncomingVideoState {
-    rate_tracker: IncomingDataRateTracker,
+    rate_tracker: DataRateTracker,
     /// The resolution of the video, ignoring rotation.
     original_resolution: Option<PixelSize>,
     /// The height of the video, taking rotation into account.
@@ -1766,56 +1787,6 @@ impl IncomingVideoState {
         AllocatableVideoLayer {
             incoming_rate: self.rate().unwrap_or_default(),
             incoming_height: self.height.unwrap_or_default(),
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct IncomingDataRateTracker {
-    // Oldest is at the back. The newest is at the front. This makes it easier
-    // to do removal using VecDeque::split_off.
-    history: VecDeque<(Instant, DataSize)>,
-    accumulated_size: DataSize,
-    rate: Option<DataRate>,
-}
-
-impl IncomingDataRateTracker {
-    const MAX_DURATION: Duration = Duration::from_millis(5000);
-    const MIN_DURATION: Duration = Duration::from_millis(500);
-
-    fn rate(&self) -> Option<DataRate> {
-        self.rate
-    }
-
-    /// Old values don't get pushed off unless update() is called periodically.
-    fn push(&mut self, size: DataSize, time: Instant) {
-        self.history.push_front((time, size));
-        self.accumulated_size += size;
-    }
-
-    fn update(&mut self, now: Instant) {
-        let deadline = now - Self::MAX_DURATION;
-        let count_to_remove = self
-            .history
-            .iter()
-            .rev()
-            .take_while(|(old, _)| *old < deadline)
-            .count();
-        let removed = self.history.split_off(self.history.len() - count_to_remove);
-        for (_, removed_size) in removed {
-            self.accumulated_size -= removed_size;
-        }
-
-        let duration = if let Some((oldest, _)) = self.history.back() {
-            now.saturating_duration_since(*oldest)
-        } else {
-            Duration::ZERO
-        };
-        self.rate = if duration >= Self::MIN_DURATION {
-            Some(self.accumulated_size / duration)
-        } else {
-            // Wait for more info
-            None
         }
     }
 }
@@ -2342,6 +2313,7 @@ pub struct ClientStats {
     pub requested_base_rate: DataRate,
     pub ideal_send_rate: DataRate,
     pub allocated_send_rate: DataRate,
+    pub connection_rates: ConnectionRates,
     pub outgoing_queue_drain_rate: DataRate,
     pub max_requested_height: Option<VideoHeight>,
 }
@@ -2415,34 +2387,6 @@ mod loggable_call_id_tests {
 mod call_tests {
     use super::*;
     use calling_common::PixelSize;
-
-    #[test]
-    fn test_rate_tracker() {
-        let now = Instant::now();
-        let at = |millis| now + Duration::from_millis(millis);
-
-        let mut tracker = IncomingDataRateTracker::default();
-        assert_eq!(None, tracker.rate());
-
-        tracker.push(DataSize::from_bits(1000), at(0));
-        tracker.update(at(1));
-        // We get ignore values until 500ms have passed
-        assert_eq!(None, tracker.rate());
-
-        tracker.update(at(500));
-        assert_eq!(Some(DataRate::from_bps(2000)), tracker.rate());
-
-        tracker.push(DataSize::from_bits(1000), at(500));
-        tracker.push(DataSize::from_bits(1000), at(1000));
-        tracker.update(at(1000));
-        assert_eq!(Some(DataRate::from_bps(3000)), tracker.rate());
-
-        for i in 2..100 {
-            tracker.push(DataSize::from_bits(1000), at(i * 1000));
-        }
-        tracker.update(at(100000));
-        assert_eq!(Some(DataRate::from_bps(1000)), tracker.rate());
-    }
 
     #[test]
     fn test_forward_audio() {
@@ -2523,7 +2467,7 @@ mod call_tests {
                 Self {
                     ssrc,
                     index,
-                    rtp: rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, None, &[]),
+                    rtp: rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, None, None, &[]),
                     vp8: vp8::ParsedHeader {
                         picture_id: Some(((1000 * ssrc) + index) as u16),
                         tl0_pic_idx: Some(((100 * ssrc) + index) as u8),
@@ -3250,7 +3194,7 @@ mod call_tests {
         let timestamp = seqnum as rtp::TruncatedTimestamp;
         // This only gets filled in by the Connection.
         let tcc_seqnum = None;
-        rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, tcc_seqnum, payload)
+        rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, tcc_seqnum, None, payload)
     }
 
     fn create_data_rtp(
@@ -3329,7 +3273,7 @@ mod call_tests {
         let pt = CLIENT_SERVER_DATA_PAYLOAD_TYPE;
         let tcc_seqnum = None;
         let timestamp = seqnum as rtp::TruncatedTimestamp;
-        rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, tcc_seqnum, payload)
+        rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, tcc_seqnum, None, payload)
     }
 
     fn create_sfu_to_device(

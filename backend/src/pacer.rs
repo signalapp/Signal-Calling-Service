@@ -21,6 +21,8 @@ pub struct Config {
 
 pub type Scheduler = dyn Fn(Instant) + Send;
 
+type Queue = VecDeque<rtp::Packet<Vec<u8>>>;
+
 /// A Pacer smooths out the sending of packets such that we send packets at a regular interval
 /// instead of in bursts.  It does so by queuing packets and then leaking them out.  If there
 /// is nothing to leak out, it generates padding.  The padding send rate can be lower than the
@@ -32,7 +34,8 @@ pub struct Pacer {
 
     config: Config,
 
-    queue: VecDeque<rtp::Packet<Vec<u8>>>,
+    video_queue: Queue,
+    rtx_queue: Queue,
     queued_size: DataSize,
     last_sent: Option<(DataSize, Instant)>,
 }
@@ -42,9 +45,9 @@ impl Pacer {
     pub fn new(config: Config) -> Self {
         Self {
             dequeue_scheduler: None,
-
             config,
-            queue: Default::default(),
+            video_queue: Default::default(),
+            rtx_queue: Default::default(),
             queued_size: Default::default(),
             last_sent: None,
         }
@@ -58,13 +61,17 @@ impl Pacer {
     fn reschedule_dequeue(&mut self, now: Instant) {
         if let Some(dequeue_scheduler) = self.dequeue_scheduler.as_ref() {
             if let Some(next_send_time) = self.calculate_next_send_time(now) {
-                dequeue_scheduler(next_send_time);
+                if next_send_time < now {
+                    dequeue_scheduler(now);
+                } else {
+                    dequeue_scheduler(next_send_time);
+                }
             }
         }
     }
 
     fn calculate_next_send_time(&self, now: Instant) -> Option<Instant> {
-        if self.queue.is_empty() {
+        if self.queue_is_empty() {
             self.calculate_next_padding_send_time(now)
         } else {
             self.calculate_next_media_send_time(now)
@@ -97,7 +104,7 @@ impl Pacer {
         }
     }
 
-    fn past_send_time(&self, send_time: Option<Instant>, now: Instant) -> bool {
+    fn past_send_time(send_time: Option<Instant>, now: Instant) -> bool {
         if let Some(send_time) = send_time {
             now >= send_time
         } else {
@@ -112,15 +119,18 @@ impl Pacer {
         now: Instant,
     ) -> Option<rtp::Packet<Vec<u8>>> {
         let next_media_send_time = self.calculate_next_media_send_time(now);
-        if self.queue.is_empty() && self.past_send_time(next_media_send_time, now) {
+        let was_empty = self.queue_is_empty();
+        if was_empty && Self::past_send_time(next_media_send_time, now) {
             // Skip the queue
             self.last_sent = Some((media.size(), now));
             self.reschedule_dequeue(now);
             Some(media)
         } else {
-            let was_empty = self.queue.is_empty();
             self.queued_size += media.size();
-            self.queue.push_back(media);
+            match media.is_rtx() {
+                false => self.video_queue.push_back(media),
+                true => self.rtx_queue.push_back(media),
+            }
             if was_empty {
                 self.reschedule_dequeue(now);
             } else {
@@ -131,8 +141,35 @@ impl Pacer {
         }
     }
 
+    fn queue_is_empty(&self) -> bool {
+        self.video_queue.is_empty() && self.rtx_queue.is_empty()
+    }
+
     pub fn queued_size(&self) -> DataSize {
         self.queued_size
+    }
+
+    fn pop_queue(
+        queue: &mut Queue,
+        queued_size: &mut DataSize,
+        now: Instant,
+    ) -> Option<rtp::Packet<Vec<u8>>> {
+        while let Some(media) = queue.pop_front() {
+            *queued_size = queued_size.saturating_sub(media.size());
+            if media.is_past_deadline(now) {
+                event!("calling.pacer.pop_queue_skip");
+            } else {
+                return Some(media);
+            }
+        }
+        None
+    }
+
+    fn pop_rtx(&mut self, now: Instant) -> Option<rtp::Packet<Vec<u8>>> {
+        Self::pop_queue(&mut self.rtx_queue, &mut self.queued_size, now)
+    }
+    fn pop_video(&mut self, now: Instant) -> Option<rtp::Packet<Vec<u8>>> {
+        Self::pop_queue(&mut self.video_queue, &mut self.queued_size, now)
     }
 
     pub fn dequeue(
@@ -140,19 +177,44 @@ impl Pacer {
         generate_padding: impl FnOnce(rtp::Ssrc) -> Option<rtp::Packet<Vec<u8>>>,
         now: Instant,
     ) -> Option<rtp::Packet<Vec<u8>>> {
-        if !self.queue.is_empty() {
+        let was_empty = self.queue_is_empty();
+        if !was_empty {
             // Maybe send media
             let next_media_send_time = self.calculate_next_media_send_time(now);
-            if self.past_send_time(next_media_send_time, now) {
-                // Shouldn't fail because we checked !is_empty() above.
-                let media = self.queue.pop_front()?;
-                let media_size = media.size();
-                self.queued_size = self.queued_size.saturating_sub(media_size);
-                self.last_sent = Some((media_size, now));
-                self.reschedule_dequeue(now);
-                Some(media)
+            if Self::past_send_time(next_media_send_time, now) {
+                if let Some(media) = self.pop_rtx(now).or_else(|| self.pop_video(now)) {
+                    self.last_sent = Some((media.size(), now));
+                    self.reschedule_dequeue(now);
+                    return Some(media);
+                }
             } else {
                 // Wait to send the front of the queue.
+                // This doesn't require a reschedule because this can only happen if
+                // a dequeue happened too early, which can only happen if we have more than
+                // one outstanding scheduled dequeue, in which case there should be
+                // another one coming up.
+                return None;
+            }
+        }
+
+        // Maybe send padding
+        if let Some(padding_ssrc) = self.config.padding_ssrc {
+            let next_padding_send_time = self.calculate_next_padding_send_time(now);
+            if Self::past_send_time(next_padding_send_time, now) {
+                if let Some(padding) = generate_padding(padding_ssrc) {
+                    self.last_sent = Some((padding.size(), now));
+                    self.reschedule_dequeue(now);
+                    Some(padding)
+                } else {
+                    // For some reason padding generation failed.
+                    None
+                }
+            } else if !was_empty {
+                // Reschedule, we're too early for padding, because we thought we had media, but it expired
+                self.reschedule_dequeue(now);
+                None
+            } else {
+                // Wait to send padding.
                 // This doesn't require a reschedule because this can only happen if
                 // a dequeue happened too early, which can only happen if we have more than
                 // one outstanding scheduled dequeue, in which case there should be
@@ -160,30 +222,8 @@ impl Pacer {
                 None
             }
         } else {
-            // Maybe send padding
-            if let Some(padding_ssrc) = self.config.padding_ssrc {
-                let next_padding_send_time = self.calculate_next_padding_send_time(now);
-                if self.past_send_time(next_padding_send_time, now) {
-                    if let Some(padding) = generate_padding(padding_ssrc) {
-                        self.last_sent = Some((padding.size(), now));
-                        self.reschedule_dequeue(now);
-                        Some(padding)
-                    } else {
-                        // For some reason padding generation failed.
-                        None
-                    }
-                } else {
-                    // Wait to send padding.
-                    // This doesn't require a reschedule because this can only happen if
-                    // a dequeue happened too early, which can only happen if we have more than
-                    // one outstanding scheduled dequeue, in which case there should be
-                    // another one coming up.
-                    None
-                }
-            } else {
-                // Can't send padding because it's not configured.
-                None
-            }
+            // Can't send padding because it's not configured.
+            None
         }
     }
 }
@@ -327,6 +367,8 @@ mod tests {
 
     #[test]
     fn test_pacer() {
+        let pacer = TestPacer::new(Config::default());
+
         let media = {
             let pt = 108;
             let seqnum = 1;
@@ -334,7 +376,15 @@ mod tests {
             let ssrc = 10_000;
             let tcc_seqnum = 1;
             let payload = &[0u8; 1214];
-            rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, Some(tcc_seqnum), payload)
+            rtp::Packet::with_empty_tag(
+                pt,
+                seqnum,
+                timestamp,
+                ssrc,
+                Some(tcc_seqnum),
+                Some(pacer.epoch),
+                payload,
+            )
         };
         let padding_ssrc = 10_001;
         let padding = {
@@ -344,16 +394,22 @@ mod tests {
             let ssrc = padding_ssrc;
             let tcc_seqnum = 2;
             let payload = &[0u8; 1214];
-            rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, Some(tcc_seqnum), payload)
+            rtp::Packet::with_empty_tag(
+                pt,
+                seqnum,
+                timestamp,
+                ssrc,
+                Some(tcc_seqnum),
+                None,
+                payload,
+            )
         };
         // Each packet is 10kbit, which is a convenient number (each packet per 1ms makes 10mbps)
         assert_eq!(media.size().as_bytes(), 1250);
         assert_eq!(padding.size().as_bytes(), 1250);
 
-        let pacer = TestPacer::new(Config::default());
-
         pacer.configure(10_000, 10_000, Some(padding_ssrc), 0);
-        // If we send at or below the target rate, no padding is sent.
+        // If we send at or above the target rate, no padding is sent.
         let (media_sent_times_ms, padding_sent_times_ms) = pacer.send(
             &[
                 (1, 1),
@@ -456,5 +512,27 @@ mod tests {
             pacer.send(&[(25, 60)], &media, &padding);
         assert_eq!(0, media_sent_times_ms.len());
         assert_eq!(0, padding_sent_times_ms.len());
+
+        // Re-enable sending a little before 1 second out
+        pacer.configure(1000, 500, Some(padding_ssrc), 990);
+        let (media_sent_times_ms, padding_sent_times_ms) =
+            pacer.send(&[(26, 990), (27, 990)], &media, &padding);
+
+        assert_eq!(0, padding_sent_times_ms.len());
+        assert_eq!(0, media_sent_times_ms.len());
+
+        let mut media_sent_times_ms = Vec::new();
+        let mut padding_sent_times_ms = Vec::new();
+        pacer.dequeue_until(
+            1021,
+            &padding,
+            &mut media_sent_times_ms,
+            &mut padding_sent_times_ms,
+        );
+
+        // pacer will discard packets over 1 second old, so packet 27 doesn't get sent at 1010
+        // padding will be timed from the last send (1000)
+        assert_eq!(vec![(25, 990), (26, 1000)], media_sent_times_ms);
+        assert_eq!(vec![1020], padding_sent_times_ms);
     }
 }

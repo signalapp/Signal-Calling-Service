@@ -223,6 +223,11 @@ impl<'a> BindingRequest<'a> {
         mac.update(&packet[4..(ranges.hmac.start - ATTR_HEADER_LEN)]);
         mac
     }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.packet.len()
+    }
 }
 
 pub struct VerifiedBindingRequest<'a> {

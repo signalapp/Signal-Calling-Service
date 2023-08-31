@@ -4,12 +4,13 @@
 //
 
 use std::{
+    collections::VecDeque,
     fmt::{self, Display, Formatter},
     iter::Sum,
     ops::{Add, AddAssign, Div, Mul, Sub, SubAssign},
 };
 
-use crate::time::Duration;
+use crate::time::{Duration, Instant};
 
 #[derive(Copy, Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DataSize {
@@ -376,6 +377,59 @@ impl Div<f64> for DataRate {
     }
 }
 
+#[derive(Default)]
+pub struct DataRateTracker {
+    // Oldest is at the back. The newest is at the front. This makes it easier
+    // to do removal using VecDeque::split_off.
+    history: VecDeque<(Instant, DataSize)>,
+    accumulated_size: DataSize,
+    rate: Option<DataRate>,
+}
+
+impl DataRateTracker {
+    const MAX_DURATION: Duration = Duration::from_millis(5000);
+    const MIN_DURATION: Duration = Duration::from_millis(500);
+
+    pub fn rate(&self) -> Option<DataRate> {
+        self.rate
+    }
+
+    /// Old values don't get pushed off unless update() is called periodically.
+    pub fn push(&mut self, size: DataSize, time: Instant) {
+        self.history.push_front((time, size));
+        self.accumulated_size += size;
+    }
+    pub fn push_bytes(&mut self, size: usize, time: Instant) {
+        self.push(DataSize::from_bytes(size as u64), time);
+    }
+
+    pub fn update(&mut self, now: Instant) {
+        let deadline = now - Self::MAX_DURATION;
+        let count_to_remove = self
+            .history
+            .iter()
+            .rev()
+            .take_while(|(old, _)| *old < deadline)
+            .count();
+        let removed = self.history.split_off(self.history.len() - count_to_remove);
+        for (_, removed_size) in removed {
+            self.accumulated_size -= removed_size;
+        }
+
+        let duration = if let Some((oldest, _)) = self.history.back() {
+            now.saturating_duration_since(*oldest)
+        } else {
+            Duration::ZERO
+        };
+        self.rate = if duration >= Self::MIN_DURATION {
+            Some(self.accumulated_size / duration)
+        } else {
+            // Wait for more info
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod data_rate_tests {
     use super::DataRate;
@@ -519,8 +573,8 @@ impl Div<DataRate> for DataSize {
 
 #[cfg(test)]
 mod data_rate_and_data_size_interaction_tests {
-    use super::{DataRate, DataSize};
-    use crate::time::Duration;
+    use super::{DataRate, DataRateTracker, DataSize};
+    use crate::time::{Duration, Instant};
 
     #[test]
     fn per_second() {
@@ -564,5 +618,33 @@ mod data_rate_and_data_size_interaction_tests {
             Duration::from_secs_f64(7.5f64),
             DataSize::from_bits(61_455) / DataRate::from_bps(8_194)
         );
+    }
+
+    #[test]
+    fn test_rate_tracker() {
+        let now = Instant::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut tracker = DataRateTracker::default();
+        assert_eq!(None, tracker.rate());
+
+        tracker.push(DataSize::from_bits(1000), at(0));
+        tracker.update(at(1));
+        // We get ignore values until 500ms have passed
+        assert_eq!(None, tracker.rate());
+
+        tracker.update(at(500));
+        assert_eq!(Some(DataRate::from_bps(2000)), tracker.rate());
+
+        tracker.push(DataSize::from_bits(1000), at(500));
+        tracker.push(DataSize::from_bits(1000), at(1000));
+        tracker.update(at(1000));
+        assert_eq!(Some(DataRate::from_bps(3000)), tracker.rate());
+
+        for i in 2..100 {
+            tracker.push(DataSize::from_bits(1000), at(i * 1000));
+        }
+        tracker.update(at(100000));
+        assert_eq!(Some(DataRate::from_bps(1000)), tracker.rate());
     }
 }

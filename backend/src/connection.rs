@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use calling_common::{DataRate, DataSize, Duration, Instant};
+use calling_common::{DataRate, DataRateTracker, DataSize, Duration, Instant};
 use log::*;
 use std::net::IpAddr::{V4, V6};
 use thiserror::Error;
@@ -77,6 +77,17 @@ pub struct Connection {
     /// See Connection::outgoing_addr().
     outgoing_addr: Option<SocketLocator>,
     outgoing_addr_type: Option<AddressType>,
+
+    video_rate: DataRateTracker,
+    audio_rate: DataRateTracker,
+    rtx_rate: DataRateTracker,
+    padding_rate: DataRateTracker,
+    non_media_rate: DataRateTracker,
+
+    incoming_audio_rate: DataRateTracker,
+    incoming_rtx_rate: DataRateTracker,
+    incoming_non_media_rate: DataRateTracker,
+    incoming_discard_rate: DataRateTracker,
 }
 
 struct Ice {
@@ -164,6 +175,16 @@ impl Connection {
             },
             outgoing_addr: None,
             outgoing_addr_type: None,
+            video_rate: DataRateTracker::default(),
+            audio_rate: DataRateTracker::default(),
+            rtx_rate: DataRateTracker::default(),
+            padding_rate: DataRateTracker::default(),
+            non_media_rate: DataRateTracker::default(),
+
+            incoming_audio_rate: DataRateTracker::default(),
+            incoming_rtx_rate: DataRateTracker::default(),
+            incoming_non_media_rate: DataRateTracker::default(),
+            incoming_discard_rate: DataRateTracker::default(),
         }
     }
 
@@ -196,6 +217,9 @@ impl Connection {
         binding_request: ice::BindingRequest,
         now: Instant,
     ) -> Result<PacketToSend, Error> {
+        self.incoming_non_media_rate
+            .push_bytes(binding_request.len(), now);
+
         let verified_binding_request = binding_request
             .verify_hmac(&self.ice.pwd)
             .map_err(|_| Error::ReceivedIceWithInvalidHmac(binding_request.hmac().to_vec()))?;
@@ -242,10 +266,11 @@ impl Connection {
         }
         self.ice.binding_request_received = Some(now);
 
-        Ok(
-            verified_binding_request
-                .to_binding_response(&self.ice.response_username, &self.ice.pwd),
-        )
+        let response = verified_binding_request
+            .to_binding_response(&self.ice.response_username, &self.ice.pwd);
+        self.non_media_rate.push_bytes(response.len(), now);
+
+        Ok(response)
     }
 
     // This effectively overrides the DHE, which is more convenient for tests.
@@ -269,9 +294,25 @@ impl Connection {
         now: Instant,
     ) -> Result<rtp::Packet<&'packet mut [u8]>, Error> {
         let rtp_endpoint = &mut self.rtp.endpoint;
-        rtp_endpoint
-            .receive_rtp(incoming_packet, now)
-            .ok_or(Error::ReceivedInvalidRtp)
+        let size = incoming_packet.len();
+        match rtp_endpoint.receive_rtp(incoming_packet, now) {
+            Some(packet) => {
+                if packet.is_rtx() {
+                    self.incoming_rtx_rate.push_bytes(size, now);
+                } else if packet.is_audio() {
+                    self.incoming_audio_rate.push_bytes(size, now);
+                } else if !packet.is_video() {
+                    self.incoming_non_media_rate.push_bytes(size, now);
+                }
+                // video packet datarate tracked by layer, in call.rs;
+                // includes data from original and retransmitted packets
+                Ok(packet)
+            }
+            None => {
+                self.incoming_discard_rate.push_bytes(size, now);
+                Err(Error::ReceivedInvalidRtp)
+            }
+        }
     }
 
     /// Decrypts an incoming RTCP packet and processes it.
@@ -286,6 +327,9 @@ impl Connection {
         incoming_packet: &mut [u8],
         now: Instant,
     ) -> Result<HandleRtcpResult, Error> {
+        self.incoming_non_media_rate
+            .push_bytes(incoming_packet.len(), now);
+
         let rtp_endpoint = &mut self.rtp.endpoint;
         let rtcp = rtp_endpoint
             .receive_rtcp(incoming_packet, now)
@@ -307,9 +351,12 @@ impl Connection {
             for rtp::Nack { ssrc, seqnums } in rtcp.nacks {
                 for seqnum in seqnums {
                     if let Some(rtx) = rtp_endpoint.resend_rtp(ssrc, seqnum, now) {
-                        // TODO: Consider sending through the pacer.
-                        rtp_endpoint.remember_sent_for_tcc(&rtx, now);
-                        outgoing_rtx.push((rtx.into_serialized(), outgoing_addr));
+                        if let Some(outgoing_rtp) = self.congestion_control.pacer.enqueue(rtx, now)
+                        {
+                            rtp_endpoint.remember_sent_for_tcc(&outgoing_rtp, now);
+                            self.rtx_rate.push(outgoing_rtp.size(), now);
+                            outgoing_rtx.push((outgoing_rtp.into_serialized(), outgoing_addr));
+                        }
                     } else {
                         debug!("Ignoring NACK for (SSRC, seqnum) that is either too old or invalid: ({}, {})", ssrc, seqnum);
                     }
@@ -362,14 +409,26 @@ impl Connection {
         if let Some(outgoing_addr) = self.outgoing_addr {
             if let Some(outgoing_rtp) = rtp_endpoint.send_rtp(outgoing_rtp, now) {
                 if outgoing_rtp.tcc_seqnum().is_some() {
+                    if !outgoing_rtp.is_video() {
+                        warn!("forwarding non-video congestion controlled packet");
+                    }
                     if let Some(outgoing_rtp) =
                         self.congestion_control.pacer.enqueue(outgoing_rtp, now)
                     {
                         rtp_endpoint.remember_sent_for_tcc(&outgoing_rtp, now);
+                        self.video_rate.push(outgoing_rtp.size(), now);
                         rtp_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
                     }
                 } else {
                     // Skip the pacer for packets that aren't congestion controlled.
+                    if outgoing_rtp.is_audio() {
+                        self.audio_rate.push(outgoing_rtp.size(), now);
+                    } else if outgoing_rtp.is_video() {
+                        warn!("forwarding video packet without congestion control");
+                        self.video_rate.push(outgoing_rtp.size(), now);
+                    } else {
+                        self.non_media_rate.push(outgoing_rtp.size(), now);
+                    }
                     rtp_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
                 }
             }
@@ -387,6 +446,13 @@ impl Connection {
             .dequeue(generate_padding, now)?;
         let outgoing_addr = self.outgoing_addr?;
         rtp_endpoint.remember_sent_for_tcc(&outgoing_rtp, now);
+        if outgoing_rtp.is_padding() {
+            self.padding_rate.push(outgoing_rtp.size(), now);
+        } else if outgoing_rtp.is_rtx() {
+            self.rtx_rate.push(outgoing_rtp.size(), now);
+        } else {
+            self.video_rate.push(outgoing_rtp.size(), now);
+        }
         Some((outgoing_rtp.into_serialized(), outgoing_addr))
     }
 
@@ -397,6 +463,7 @@ impl Connection {
     pub fn send_key_frame_request(
         &mut self,
         key_frame_request: rtp::KeyFrameRequest,
+        now: Instant,
         // It would make more sense to return Option<Packet>, since the outgoing address is fixed,
         // but that actually makes it more difficult for sfu.rs to aggregate the
         // results of calling this across many connections.
@@ -405,6 +472,7 @@ impl Connection {
         let outgoing_addr = self.outgoing_addr?;
         let rtp_endpoint = &mut self.rtp.endpoint;
         let rtcp_packet = rtp_endpoint.send_pli(key_frame_request.ssrc)?;
+        self.non_media_rate.push_bytes(rtcp_packet.len(), now);
         Some((rtcp_packet, outgoing_addr))
     }
 
@@ -428,6 +496,7 @@ impl Connection {
         let rtp_endpoint = &mut self.rtp.endpoint;
         if let Some(outgoing_addr) = self.outgoing_addr {
             for ack_packet in rtp_endpoint.send_acks() {
+                self.non_media_rate.push_bytes(ack_packet.len(), now);
                 packets_to_send.push((ack_packet, outgoing_addr));
             }
 
@@ -454,6 +523,7 @@ impl Connection {
         let rtp_endpoint = &mut self.rtp.endpoint;
         if let Some(outgoing_addr) = self.outgoing_addr {
             for nack_packet in rtp_endpoint.send_nacks(now) {
+                self.non_media_rate.push_bytes(nack_packet.len(), now);
                 packets_to_send.push((nack_packet, outgoing_addr));
             }
 
@@ -475,6 +545,8 @@ impl Connection {
 
         if let Some(outgoing_addr) = self.outgoing_addr {
             if let Some(receiver_report_packet) = self.rtp.endpoint.send_receiver_report() {
+                self.non_media_rate
+                    .push_bytes(receiver_report_packet.len(), now);
                 packets_to_send.push((receiver_report_packet, outgoing_addr));
             }
 
@@ -503,6 +575,35 @@ impl Connection {
     pub fn rtt(&self) -> Duration {
         self.congestion_control.controller.rtt()
     }
+
+    pub fn current_rates(&mut self, now: Instant) -> ConnectionRates {
+        self.video_rate.update(now);
+        self.audio_rate.update(now);
+        self.rtx_rate.update(now);
+        self.padding_rate.update(now);
+        self.non_media_rate.update(now);
+
+        self.incoming_audio_rate.update(now);
+        self.incoming_rtx_rate.update(now);
+        self.incoming_non_media_rate.update(now);
+        self.incoming_discard_rate.update(now);
+
+        ConnectionRates {
+            video_rate: self.video_rate.rate().unwrap_or(DataRate::ZERO),
+            audio_rate: self.audio_rate.rate().unwrap_or(DataRate::ZERO),
+            rtx_rate: self.rtx_rate.rate().unwrap_or(DataRate::ZERO),
+            padding_rate: self.padding_rate.rate().unwrap_or(DataRate::ZERO),
+            non_media_rate: self.non_media_rate.rate().unwrap_or(DataRate::ZERO),
+
+            incoming_audio_rate: self.incoming_audio_rate.rate().unwrap_or(DataRate::ZERO),
+            incoming_rtx_rate: self.incoming_rtx_rate.rate().unwrap_or(DataRate::ZERO),
+            incoming_non_media_rate: self
+                .incoming_non_media_rate
+                .rate()
+                .unwrap_or(DataRate::ZERO),
+            incoming_discard_rate: self.incoming_discard_rate.rate().unwrap_or(DataRate::ZERO),
+        }
+    }
 }
 
 /// Result of Connection::handle_rtcp_packet().
@@ -515,6 +616,20 @@ pub struct HandleRtcpResult {
     // So we use (packet, addr) for convenience.
     pub outgoing_rtx: Vec<(PacketToSend, SocketLocator)>,
     pub new_target_send_rate: Option<DataRate>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ConnectionRates {
+    pub video_rate: DataRate,
+    pub audio_rate: DataRate,
+    pub rtx_rate: DataRate,
+    pub padding_rate: DataRate,
+    pub non_media_rate: DataRate,
+
+    pub incoming_audio_rate: DataRate,
+    pub incoming_rtx_rate: DataRate,
+    pub incoming_non_media_rate: DataRate,
+    pub incoming_discard_rate: DataRate,
 }
 
 #[cfg(test)]
@@ -594,14 +709,22 @@ mod connection_tests {
         seqnum: rtp::FullSequenceNumber,
         tcc_seqnum: Option<tcc::FullSequenceNumber>,
         encrypt: &rtp::KeysAndSalts,
+        now: Instant,
     ) -> rtp::Packet<Vec<u8>> {
         let ssrc = 10000;
         let timestamp = 1000;
         // Note: for this to work with the RTX/NACK tests, this has to be a "NACKable" PT.
         let pt = 108;
         let payload = b"payload";
-        let mut incoming_rtp =
-            rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, tcc_seqnum, payload);
+        let mut incoming_rtp = rtp::Packet::with_empty_tag(
+            pt,
+            seqnum,
+            timestamp,
+            ssrc,
+            tcc_seqnum,
+            Some(now),
+            payload,
+        );
         incoming_rtp
             .encrypt_in_place(&encrypt.rtp.key, &encrypt.rtp.salt)
             .unwrap();
@@ -613,6 +736,7 @@ mod connection_tests {
         seqnum: rtp::FullSequenceNumber,
         tcc_seqnum: Option<tcc::FullSequenceNumber>,
         encrypt: &rtp::KeysAndSalts,
+        now: Instant,
     ) -> rtp::Packet<Vec<u8>> {
         // This gets bumped to 10001 in to_rtx() below.
         let ssrc = 10000;
@@ -621,8 +745,15 @@ mod connection_tests {
         // This gets bumped to 118 in to_rtx() below.
         let pt = 108;
         let payload = b"payload";
-        let incoming_rtp =
-            rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, tcc_seqnum, payload);
+        let incoming_rtp = rtp::Packet::with_empty_tag(
+            pt,
+            seqnum,
+            timestamp,
+            ssrc,
+            tcc_seqnum,
+            Some(now),
+            payload,
+        );
         let mut incoming_rtx_rtp = incoming_rtp.to_rtx(rtx_seqnum);
         incoming_rtx_rtp
             .encrypt_in_place(&encrypt.rtp.key, &encrypt.rtp.salt)
@@ -776,7 +907,7 @@ mod connection_tests {
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt.clone(), encrypt.clone(), now);
 
-        let encrypted_rtp = new_encrypted_rtp(1, None, &decrypt);
+        let encrypted_rtp = new_encrypted_rtp(1, None, &decrypt, now);
         let expected_decrypted_rtp = decrypt_rtp(&encrypted_rtp, &decrypt);
         assert_eq!(
             expected_decrypted_rtp.to_owned(),
@@ -786,13 +917,13 @@ mod connection_tests {
                 .to_owned()
         );
 
-        let encrypted_rtp = new_encrypted_rtp(2, None, &encrypt);
+        let encrypted_rtp = new_encrypted_rtp(2, None, &encrypt, now);
         assert_eq!(
             Err(Error::ReceivedInvalidRtp),
             connection.handle_rtp_packet(&mut encrypted_rtp.into_serialized(), now)
         );
 
-        let encrypted_rtp = new_encrypted_rtx_rtp(5, 2, None, &decrypt);
+        let encrypted_rtp = new_encrypted_rtx_rtp(5, 2, None, &decrypt, now);
         let expected_decrypted_rtp = decrypt_rtp(&encrypted_rtp, &decrypt);
         assert_eq!(
             expected_decrypted_rtp.borrow().to_owned(),
@@ -825,7 +956,7 @@ mod connection_tests {
             );
         };
 
-        let encrypted_rtp = new_encrypted_rtp(2, None, &encrypt);
+        let encrypted_rtp = new_encrypted_rtp(2, None, &encrypt, now);
         let unencrypted_rtp = decrypt_rtp(&encrypted_rtp, &encrypt);
 
         let mut rtp_to_send = vec![];
@@ -932,7 +1063,7 @@ mod connection_tests {
         let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
         handle_ice_binding_request(&mut connection, client_addr, 1, true, now).unwrap();
 
-        let encrypted_rtp = new_encrypted_rtp(1, None, &encrypt);
+        let encrypted_rtp = new_encrypted_rtp(1, None, &encrypt, at(20));
         let unencrypted_rtp = decrypt_rtp(&encrypted_rtp, &encrypt);
         let mut rtp_to_send = vec![];
         connection.send_or_enqueue_rtp(unencrypted_rtp.clone(), &mut rtp_to_send, at(20));
@@ -954,7 +1085,7 @@ mod connection_tests {
             &decrypt.rtcp.salt,
         )
         .unwrap();
-        let result = connection.handle_rtcp_packet(&mut nacks, now).unwrap();
+        let result = connection.handle_rtcp_packet(&mut nacks, at(30)).unwrap();
         let mut expected_rtx = unencrypted_rtp.to_rtx(1);
         expected_rtx
             .encrypt_in_place(&encrypt.rtp.key, &encrypt.rtp.salt)
@@ -964,7 +1095,7 @@ mod connection_tests {
             result.outgoing_rtx
         );
 
-        let encrypted_rtp2 = new_encrypted_rtp(2, None, &encrypt);
+        let encrypted_rtp2 = new_encrypted_rtp(2, None, &encrypt, at(40));
         let unencrypted_rtp2 = decrypt_rtp(&encrypted_rtp2, &encrypt);
         let mut rtp_to_send = vec![];
         connection.send_or_enqueue_rtp(unencrypted_rtp2.clone(), &mut rtp_to_send, at(40));
@@ -987,22 +1118,22 @@ mod connection_tests {
             &decrypt.rtcp.salt,
         )
         .unwrap();
-        let result = connection.handle_rtcp_packet(&mut nacks2, now).unwrap();
+        let result = connection.handle_rtcp_packet(&mut nacks2, at(40)).unwrap();
         let mut expected_rtx = unencrypted_rtp.to_rtx(2);
         expected_rtx
             .encrypt_in_place(&encrypt.rtp.key, &encrypt.rtp.salt)
             .unwrap();
+        assert_eq!(
+            vec![(expected_rtx.into_serialized(), client_addr)],
+            result.outgoing_rtx
+        );
+
         let mut expected_rtx2 = unencrypted_rtp2.to_rtx(3);
         expected_rtx2
             .encrypt_in_place(&encrypt.rtp.key, &encrypt.rtp.salt)
             .unwrap();
-        assert_eq!(
-            vec![
-                (expected_rtx.into_serialized(), client_addr),
-                (expected_rtx2.into_serialized(), client_addr)
-            ],
-            result.outgoing_rtx
-        );
+        let result = connection.dequeue_outgoing_rtp(at(60));
+        assert_eq!(Some((expected_rtx2.into_serialized(), client_addr)), result);
     }
 
     #[test]
@@ -1016,14 +1147,14 @@ mod connection_tests {
 
         connection
             .handle_rtp_packet(
-                &mut new_encrypted_rtp(1, Some(101), &decrypt).into_serialized(),
+                &mut new_encrypted_rtp(1, Some(101), &decrypt, at(1)).into_serialized(),
                 at(1),
             )
             .unwrap();
 
         connection
             .handle_rtp_packet(
-                &mut new_encrypted_rtp(3, Some(103), &decrypt).into_serialized(),
+                &mut new_encrypted_rtp(3, Some(103), &decrypt, at(3)).into_serialized(),
                 at(3),
             )
             .unwrap();
@@ -1074,7 +1205,7 @@ mod connection_tests {
         // But once the NACKed packet is received, we stop NACKing it
         connection
             .handle_rtp_packet(
-                &mut new_encrypted_rtp(2, Some(102), &decrypt).into_serialized(),
+                &mut new_encrypted_rtp(2, Some(102), &decrypt, at(10002)).into_serialized(),
                 at(10002),
             )
             .unwrap();
@@ -1094,7 +1225,7 @@ mod connection_tests {
 
         let ssrc = 10;
         let (mut encrypted_rtcp, outgoing_addr) = connection
-            .send_key_frame_request(rtp::KeyFrameRequest { ssrc })
+            .send_key_frame_request(rtp::KeyFrameRequest { ssrc }, now)
             .unwrap();
         let rtcp = rtp::ControlPacket::parse_and_decrypt_in_place(
             &mut encrypted_rtcp,
@@ -1149,7 +1280,7 @@ mod connection_tests {
             let sent = at(10 * seqnum);
             let received = at(10 * (seqnum + 1));
 
-            let encrypted_rtp = new_encrypted_rtp(seqnum, Some(seqnum), &encrypt);
+            let encrypted_rtp = new_encrypted_rtp(seqnum, Some(seqnum), &encrypt, sent);
             let unencrypted_rtp = decrypt_rtp(&encrypted_rtp, &encrypt);
             connection.send_or_enqueue_rtp(unencrypted_rtp, &mut vec![], sent);
 
