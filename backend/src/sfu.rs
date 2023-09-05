@@ -930,12 +930,6 @@ impl Sfu {
                     let inactive_time = (call_time.empty + call_time.solo).as_secs();
 
                     if active_time == 0 {
-                    } else if active_time < 1 {
-                        event!("calling.sfu.call_complete.active.1sec");
-                    } else if active_time < 10 {
-                        event!("calling.sfu.call_complete.active.10sec");
-                    } else if active_time < 30 {
-                        event!("calling.sfu.call_complete.active.30sec");
                     } else if active_time < 60 {
                         event!("calling.sfu.call_complete.active.1min");
                     } else if active_time < 10 * 60 {
@@ -944,39 +938,17 @@ impl Sfu {
                         event!("calling.sfu.call_complete.active.30mins");
                     } else if active_time < 60 * 60 {
                         event!("calling.sfu.call_complete.active.1hr");
-                    } else if active_time < 4 * 60 * 60 {
-                        event!("calling.sfu.call_complete.active.4hrs");
-                    } else if active_time < 12 * 60 * 60 {
-                        event!("calling.sfu.call_complete.active.12hrs");
-                    } else if active_time < 24 * 60 * 60 {
-                        event!("calling.sfu.call_complete.active.24hrs");
                     } else {
-                        event!("calling.sfu.call_complete.active.days");
+                        event!("calling.sfu.call_complete.active.more");
                     }
 
                     if inactive_time == 0 {
-                    } else if inactive_time < 1 {
-                        event!("calling.sfu.call_complete.inactive.1sec");
-                    } else if inactive_time < 10 {
-                        event!("calling.sfu.call_complete.inactive.10sec");
-                    } else if inactive_time < 30 {
-                        event!("calling.sfu.call_complete.inactive.30sec");
                     } else if inactive_time < 60 {
                         event!("calling.sfu.call_complete.inactive.1min");
                     } else if inactive_time < 10 * 60 {
                         event!("calling.sfu.call_complete.inactive.10mins");
-                    } else if inactive_time < 30 * 60 {
-                        event!("calling.sfu.call_complete.inactive.30mins");
-                    } else if inactive_time < 60 * 60 {
-                        event!("calling.sfu.call_complete.inactive.1hr");
-                    } else if inactive_time < 4 * 60 * 60 {
-                        event!("calling.sfu.call_complete.inactive.4hrs");
-                    } else if inactive_time < 12 * 60 * 60 {
-                        event!("calling.sfu.call_complete.inactive.12hrs");
-                    } else if inactive_time < 24 * 60 * 60 {
-                        event!("calling.sfu.call_complete.inactive.24hrs");
                     } else {
-                        event!("calling.sfu.call_complete.inactive.days");
+                        event!("calling.sfu.call_complete.inactive.more");
                     }
 
                     if active_time > 60 {
