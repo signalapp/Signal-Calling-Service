@@ -1,0 +1,87 @@
+name: Docker builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_tag:
+        required: true
+        type: string
+  push:
+    branches: main
+    tags: v.+
+
+
+jobs:
+  build-frontend:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: 'Authenticate to Google Cloud'
+      uses: 'google-github-actions/auth@v1'
+      with:
+        workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.SERVICE_ACCOUNT }}
+
+    - name: Log in to Docker
+      run: gcloud auth configure-docker ${{ vars.DOCKER_HOSTNAME }}
+
+    - name: build frontend
+      run: docker build . -f frontend/Dockerfile --build-arg rust_flags=-Ctarget-cpu=skylake -t calling-frontend
+
+    - name: add specified tag
+      if: ${{ github.event_name == 'workflow_dispatch' }}
+      run: docker tag calling-frontend ${{ vars.DOCKER_HOSTNAME }}${{ vars.DOCKER_PATH }}/frontend:${{ inputs.docker_tag }}
+
+    - name: add version tag
+      if: ${{ github.event_name != 'workflow_dispatch' && github.ref_type == 'tag' }}
+      env:
+        TAG: ${{ github.ref_name }}
+      run: docker tag calling-frontend ${{ vars.DOCKER_HOSTNAME }}${{ vars.DOCKER_PATH }}/frontend:${TAG:1}
+
+    - name: add latest tag
+      if: ${{ github.event_name != 'workflow_dispatch' && github.ref_type == 'branch' }}
+      run: docker tag calling-frontend ${{ vars.DOCKER_HOSTNAME }}${{ vars.DOCKER_PATH }}/frontend:latest
+
+    - name: push frontend
+      run: docker push --all-tags ${{ vars.DOCKER_HOSTNAME }}${{ vars.DOCKER_PATH }}/frontend
+
+  build-backend:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: 'Authenticate to Google Cloud'
+      uses: 'google-github-actions/auth@v1'
+      with:
+        workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ vars.SERVICE_ACCOUNT }}
+
+    - name: Log in to Docker
+      run: gcloud auth configure-docker ${{ vars.DOCKER_HOSTNAME }}
+
+    - name: build backend
+      run: docker build . -f backend/Dockerfile --build-arg rust_flags=-Ctarget-cpu=skylake -t calling-backend
+
+    - name: add specified tag
+      if: ${{ github.event_name == 'workflow_dispatch' }}
+      run: docker tag calling-backend ${{ vars.DOCKER_HOSTNAME }}${{ vars.DOCKER_PATH }}/backend:${{ inputs.docker_tag }}
+
+    - name: add version tag
+      if: ${{ github.event_name != 'workflow_dispatch' && github.ref_type == 'tag' }}
+      env:
+        TAG: ${{ github.ref_name }}
+      run: docker tag calling-backend ${{ vars.DOCKER_HOSTNAME }}${{ vars.DOCKER_PATH }}/backend:${TAG:1}
+
+    - name: add latest tag
+      if: ${{ github.event_name != 'workflow_dispatch' && github.ref_type == 'branch' }}
+      run: docker tag calling-backend ${{ vars.DOCKER_HOSTNAME }}${{ vars.DOCKER_PATH }}/backend:latest
+
+    - name: push backend
+      run: docker push --all-tags ${{ vars.DOCKER_HOSTNAME }}${{ vars.DOCKER_PATH }}/backend
