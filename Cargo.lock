@@ -721,7 +721,7 @@ dependencies = [
  "hyper",
  "log",
  "mock_instant",
- "nix 0.26.3",
+ "nix 0.26.4",
  "num_cpus",
  "once_cell",
  "parking_lot",
@@ -1838,11 +1838,11 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.26.3"
+version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abbbc55ad7b13aac85f9401c796dcda1b864e07fcad40ad47792eaa8932ea502"
+checksum = "598beaf3cc6fdd9a5dfb1630c2800c7acd31df7aaf0f565796fba2b53ca1af1b"
 dependencies = [
- "bitflags 2.4.0",
+ "bitflags 1.3.2",
  "cfg-if",
  "libc",
  "memoffset 0.7.1",

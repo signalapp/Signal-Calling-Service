@@ -77,7 +77,7 @@ async-stream = "0.3"
 pin-project = "1.0"
 
 # For low-level UDP sockets and tracking TCP sockets
-nix = { version = "0.26.3", optional = true }
+nix = { version = "0.26.4", optional = true }
 unique_id = "0.1"
 
 # For current process memory stats
