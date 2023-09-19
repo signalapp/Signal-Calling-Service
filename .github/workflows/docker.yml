@@ -8,7 +8,7 @@ on:
         type: string
   push:
     branches: main
-    tags: v.+
+    tags: 'v*'
 
 
 jobs:
