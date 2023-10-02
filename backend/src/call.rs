@@ -2399,7 +2399,7 @@ mod call_tests {
         let mut forwarder = SingleSsrcRtpForwarder::default();
         let mut receiver_max = 0;
         let mut used_seqnums = std::collections::HashSet::new();
-        for range in vec![1..half, full..(2 * full)] {
+        for range in [1..half, full..(2 * full)] {
             for seqnum_in in range {
                 let seqnum_out = forwarder.forward_rtp(seqnum_in).unwrap();
                 // Make sure we never reuse a seqnum

@@ -82,8 +82,10 @@ unique_id = "0.1"
 
 # For current process memory stats
 psutil = { version = "3.2.2", default-features = false, features = ["cpu", "process"] }
-accounting-allocator = "0.2.0"
 
+[target.'cfg(target_os="linux")'.dependencies]
+# Only currently needed for metrics (won't build on mac, see https://github.com/rust-lang/rust/issues/115149).
+accounting-allocator = "0.2.0"
 
 [build-dependencies]
 prost-build = "0.11"

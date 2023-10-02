@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
 use accounting_allocator::AccountingAlloc;
 use anyhow::Result;
 use log::*;
@@ -26,6 +27,7 @@ use crate::{
     sfu::Sfu,
 };
 
+#[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: AccountingAlloc = AccountingAlloc::new();
 
@@ -51,6 +53,8 @@ pub async fn start(
         Some(mut datadog) => {
             let tick_handle = tokio::spawn(async move {
                 let mut tick_interval = tokio::time::interval(Duration::from_secs(60));
+
+                #[cfg(target_os = "linux")]
                 let mut last_alloc = 0;
 
                 loop {
@@ -82,21 +86,24 @@ pub async fn start(
                         datadog.count(report.name(), report.event_count() as f64, &None);
                     }
 
-                    let stats = GLOBAL_ALLOCATOR.count();
-                    let alloc = stats.all_time.alloc;
-                    let dealloc = stats.all_time.dealloc;
+                    #[cfg(target_os = "linux")]
+                    {
+                        let stats = GLOBAL_ALLOCATOR.count();
+                        let alloc = stats.all_time.alloc;
+                        let dealloc = stats.all_time.dealloc;
 
-                    datadog.count(
-                        "calling.system.memory.new_alloc_bytes",
-                        (alloc - last_alloc) as f64,
-                        &None,
-                    );
-                    datadog.gauge(
-                        "calling.system.memory.net_alloc_bytes",
-                        (alloc - dealloc) as f64,
-                        &None,
-                    );
-                    last_alloc = alloc;
+                        datadog.count(
+                            "calling.system.memory.new_alloc_bytes",
+                            (alloc - last_alloc) as f64,
+                            &None,
+                        );
+                        datadog.gauge(
+                            "calling.system.memory.net_alloc_bytes",
+                            (alloc - dealloc) as f64,
+                            &None,
+                        );
+                        last_alloc = alloc;
+                    }
                 }
             });
 

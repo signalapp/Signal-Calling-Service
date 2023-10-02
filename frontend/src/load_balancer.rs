@@ -111,7 +111,7 @@ impl LoadBalancerTask {
     }
 
     fn update_weight(&mut self, ip: Ipv4Addr, weight: u8) {
-        if let Some(mut server_health) = self.map.get_mut(&ip) {
+        if let Some(server_health) = self.map.get_mut(&ip) {
             if weight > 0 && self.total_weight == 0 {
                 info!(
                     "{} weight {:?} -> {}, first healthy host",

@@ -99,7 +99,7 @@ impl PacketServerState {
         let all_epoll_fds = (0..num_threads)
             .map(|_| epoll_create1(EpollCreateFlags::empty()))
             .collect::<nix::Result<_>>()?;
-        let tcp_id_generator = SequenceGenerator::default();
+        let tcp_id_generator = SequenceGenerator;
 
         let result = Self {
             local_addr_udp,

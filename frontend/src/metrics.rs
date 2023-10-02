@@ -34,9 +34,7 @@ use tokio::sync::oneshot::Receiver;
 use crate::{
     config::Config,
     frontend::Frontend,
-    metrics::{
-        Client as DatadogClient, Histogram, HistogramReport, PipelineSink, Precision, UdpEventSink,
-    },
+    metrics::{Client as DatadogClient, Histogram},
 };
 
 pub async fn start(frontend: Arc<Frontend>, shutdown_signal_rx: Receiver<()>) -> Result<()> {
