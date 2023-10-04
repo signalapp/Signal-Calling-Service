@@ -218,8 +218,8 @@ impl DynamoDb {
 
         let client = match &config.storage_endpoint {
             Some(endpoint) => {
-                const KEY: &str = "DUMMY_KEY";
-                const PASSWORD: &str = "DUMMY_PASSWORD";
+                const KEY: &str = "DummyAccessKey";
+                const PASSWORD: &str = "DummyPassword";
 
                 info!("Using endpoint for DynamodDB testing: {}", endpoint);
 

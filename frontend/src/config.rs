@@ -124,7 +124,7 @@ pub fn default_test_config() -> Config {
         oauth2_token_url: None,
         backend_ip: None,
         storage_table: "Rooms".to_string(),
-        storage_region: "us-east-1".to_string(),
+        storage_region: "us-west-1".to_string(),
         storage_endpoint: Some("http://localhost:8000".to_string()),
         metrics_datadog_host: None,
     }

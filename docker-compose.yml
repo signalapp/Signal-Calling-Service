@@ -69,8 +69,8 @@ services:
     build: ./docker/bootstrap
     container_name: bootstrap
     environment:
-      AWS_ACCESS_KEY_ID: 'DUMMY_KEY'
-      AWS_SECRET_ACCESS_KEY: 'DUMMY_PASSWORD'
+      AWS_ACCESS_KEY_ID: 'DummyAccessKey'
+      AWS_SECRET_ACCESS_KEY: 'DummyPassword'
 
   calling-frontend:
     depends_on:
