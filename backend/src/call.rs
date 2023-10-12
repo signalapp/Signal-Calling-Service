@@ -55,6 +55,8 @@ const ACTIVE_SPEAKER_CALCULATION_INTERVAL: Duration = Duration::from_millis(300)
 const STATS_MESSAGE_INTERVAL: Duration = Duration::from_secs(1);
 /// This is how often we send update messages to removed clients.
 const REMOVED_CLIENTS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+/// This is how often we send raised hands messages to clients.
+const RAISED_HANDS_MESSAGE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A wrapper around Vec<u8> to identify a Call.
 /// It comes from signaling, but isn't known by the clients.
@@ -274,10 +276,17 @@ pub struct Call {
     /// The last time an active speaker update was sent to the clients
     active_speaker_update_sent: Instant,
 
+    /// A list of clients with the status of their raised hand
+    raised_hands: Option<Vec<RaisedHand>>,
+    /// The latest sequence number of each client in the raised_hands list
+    raised_hands_seqnums: HashMap<DemuxId, u32>,
+
     /// The last time a status update was sent to the clients
     stats_update_sent: Instant,
     /// The last time an update was sent to removed clients
     removed_clients_update_sent: Instant,
+    /// The last time a raised hands update was sent to clients
+    raised_hands_sent: Instant,
 
     /// The last time key frame requests were sent, in general and specifically for certain SSRCs
     key_frame_requests_sent: Instant,
@@ -304,6 +313,11 @@ pub struct SendRateAllocationInfo {
     pub target_send_rate: DataRate,
     pub requested_base_rate: DataRate,
     pub ideal_send_rate: DataRate,
+}
+
+pub struct RaisedHand {
+    pub demux_id: DemuxId,
+    pub raise: bool,
 }
 
 impl Call {
@@ -350,8 +364,12 @@ impl Call {
             active_speaker_calculated: now - ACTIVE_SPEAKER_CALCULATION_INTERVAL, // easier than using None :)
             active_speaker_update_sent: now,
 
+            raised_hands: None,
+            raised_hands_seqnums: HashMap::new(),
+
             stats_update_sent: now, // easier than using None :)
             removed_clients_update_sent: now - REMOVED_CLIENTS_UPDATE_INTERVAL, // easier than using None :)
+            raised_hands_sent: now - RAISED_HANDS_MESSAGE_INTERVAL,
 
             key_frame_requests_sent: now - KEY_FRAME_REQUEST_CALCULATION_INTERVAL, // easier than using None :)
             key_frame_request_sent_by_ssrc: HashMap::new(),
@@ -608,6 +626,7 @@ impl Call {
             );
             self.removed_clients.swap_remove(index);
         }
+        self.lower_raised_hand(demux_id, now);
     }
 
     // Like `drop_client`, but keeps the client around in the `removed_clients` list until they leave.
@@ -634,7 +653,24 @@ impl Call {
                 self.approved_users.remove(&client.user_id);
             }
             self.removed_clients.push(client.into());
+            self.lower_raised_hand(demux_id, now);
         }
+    }
+
+    fn lower_raised_hand(&mut self, demux_id: DemuxId, now: Instant) {
+        if let Some(raised_hands) = &mut self.raised_hands {
+            // Set raise to false
+            if let Some(index) = raised_hands.iter().position(|x| x.demux_id == demux_id) {
+                if raised_hands[index].raise {
+                    raised_hands[index].raise = false;
+                    self.send_raised_hands_on_next_tick(now);
+                }
+            }
+        }
+    }
+
+    fn send_raised_hands_on_next_tick(&mut self, now: Instant) {
+        self.raised_hands_sent = now - RAISED_HANDS_MESSAGE_INTERVAL;
     }
 
     fn block_client(&mut self, demux_id: DemuxId, now: Instant) {
@@ -693,6 +729,53 @@ impl Call {
         }
     }
 
+    fn handle_raise_hand(
+        &mut self,
+        now: Instant,
+        raise_hand: protos::device_to_sfu::RaiseHand,
+        sender_demux_id: DemuxId,
+    ) {
+        if let (Some(raise), Some(seqnum)) = (raise_hand.raise, raise_hand.seqnum) {
+            if self.raised_hands.is_none() {
+                self.raised_hands = Some(Vec::new());
+            }
+            if let Some(raised_hands) = &mut self.raised_hands {
+                let index = raised_hands
+                    .iter()
+                    .position(|x| x.demux_id == sender_demux_id);
+                // Insert raise hand
+                match index {
+                    // Demux id in list
+                    Some(index) => {
+                        if let Some(current_seqnum) =
+                            self.raised_hands_seqnums.get(&sender_demux_id)
+                        {
+                            // Modify raised hand when the seqnum is greater than the value in the list
+                            if seqnum > *current_seqnum {
+                                raised_hands.remove(index);
+                                raised_hands.push(RaisedHand {
+                                    demux_id: sender_demux_id,
+                                    raise,
+                                });
+                                self.raised_hands_seqnums.insert(sender_demux_id, seqnum);
+                                self.send_raised_hands_on_next_tick(now);
+                            }
+                        }
+                    }
+                    // Demux id not in list
+                    None => {
+                        // Add raised hand to end of list
+                        raised_hands.push(RaisedHand {
+                            demux_id: sender_demux_id,
+                            raise,
+                        });
+                        self.raised_hands_seqnums.insert(sender_demux_id, seqnum);
+                        self.send_raised_hands_on_next_tick(now);
+                    }
+                }
+            }
+        }
+    }
     /// For a given packet from the sending client, determine what packets to
     /// send out to the other clients. This may include packets to forward
     /// and packets that update clients about active speaker changes and clients
@@ -829,6 +912,10 @@ impl Call {
                 }
             }
 
+            if let Some(raise_hand) = proto.raise_hand {
+                self.handle_raise_hand(now, raise_hand, sender_demux_id);
+            }
+
             // There's nothing to forward
             return Ok(vec![]);
         }
@@ -942,6 +1029,7 @@ impl Call {
         );
         self.send_update_proto_to_pending_clients(client_was_added_or_removed, &mut rtp_to_send);
         self.send_update_proto_to_removed_clients(&mut rtp_to_send, now);
+        self.send_raised_hands_proto_to_clients(&mut rtp_to_send, now);
 
         // Reallocation can change what key frames to send, so we should do this after reallocating.
         let mut key_frame_requests_to_send = self.send_key_frame_requests_if_its_been_too_long(now);
@@ -1354,6 +1442,54 @@ impl Call {
                     &mut removed_client.next_server_to_client_data_rtp_seqnum,
                 ),
             ))
+        }
+    }
+
+    fn send_raised_hands_proto_to_clients(
+        &mut self,
+        rtp_to_send: &mut Vec<RtpToSend>,
+        now: Instant,
+    ) {
+        if now >= self.raised_hands_sent + RAISED_HANDS_MESSAGE_INTERVAL {
+            if let Some(raised_hands) = &self.raised_hands {
+                // Generate a list of demux ids and seqnums where the raise value is true
+                let (demux_ids, seqnums) = raised_hands
+                    .iter()
+                    .filter(|h| h.raise)
+                    .map(|h| {
+                        (
+                            h.demux_id.as_u32(),
+                            self.raised_hands_seqnums.get(&h.demux_id).unwrap_or(&0),
+                        )
+                    })
+                    .unzip();
+
+                let mut update = protos::SfuToDevice {
+                    raised_hands: Some(protos::sfu_to_device::RaisedHands {
+                        demux_ids,
+                        seqnums,
+                        target_seqnum: Some(0),
+                    }),
+                    ..Default::default()
+                };
+
+                for client in &mut self.clients {
+                    // Set the target_seqnum of the client
+                    let target_seqnum = self
+                        .raised_hands_seqnums
+                        .get(&client.demux_id)
+                        .unwrap_or(&0);
+                    update.raised_hands.as_mut().unwrap().target_seqnum = Some(*target_seqnum);
+
+                    let update_rtp = Self::encode_sfu_to_device_update(
+                        &update,
+                        &mut client.next_server_to_client_data_rtp_seqnum,
+                    );
+                    rtp_to_send.push((client.demux_id, update_rtp))
+                }
+
+                self.raised_hands_sent = now;
+            }
         }
     }
 
@@ -3375,6 +3511,21 @@ mod call_tests {
         )
     }
 
+    fn create_raise_hand_rtp() -> rtp::Packet<Vec<u8>> {
+        create_server_to_client_rtp(
+            1,
+            protos::DeviceToSfu {
+                raise_hand: Some(protos::device_to_sfu::RaiseHand {
+                    raise: Some(true),
+                    seqnum: Some(1),
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .as_slice(),
+        )
+    }
+
     #[test]
     fn forward_heartbeats() {
         let now = Instant::now();
@@ -5175,6 +5326,74 @@ mod call_tests {
                 demux_id2,
                 create_server_to_client_rtp(2, &expected_update_payload)
             )],
+            rtp_to_send
+        );
+    }
+
+    #[test]
+    fn test_raise_hand_message() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+
+        let demux_id1 = add_client(&mut call, "1", 1, at(99));
+        let demux_id2 = add_client(&mut call, "2", 2, at(200));
+        assert_eq!(2, call.clients.len());
+
+        // Clear out updates.
+        let (_rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
+
+        let rtp_to_send = call
+            .handle_rtp(demux_id1, create_raise_hand_rtp().borrow_mut(), at(400))
+            .unwrap();
+        assert!(rtp_to_send.is_empty());
+
+        assert_eq!(2, call.clients.len());
+
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
+
+        // Client1 should have a target_seqnum of 1
+        let expected_update_payload_for_raised_hands_client1 = protos::SfuToDevice {
+            raised_hands: Some(protos::sfu_to_device::RaisedHands {
+                demux_ids: vec![demux_id1.as_u32()],
+                seqnums: vec![1],
+                target_seqnum: Some(1),
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        // Client2 should have a target_seqnum of 0
+        let expected_update_payload_for_raised_hands_client2 = protos::SfuToDevice {
+            raised_hands: Some(protos::sfu_to_device::RaisedHands {
+                demux_ids: vec![demux_id1.as_u32()],
+                seqnums: vec![1],
+                target_seqnum: Some(0),
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        // A raised hands message should be sent to all clients
+        assert_eq!(
+            vec![
+                (
+                    demux_id1,
+                    create_server_to_client_rtp(
+                        2,
+                        &expected_update_payload_for_raised_hands_client1
+                    )
+                ),
+                (
+                    demux_id2,
+                    create_server_to_client_rtp(
+                        2,
+                        &expected_update_payload_for_raised_hands_client2
+                    )
+                )
+            ],
             rtp_to_send
         );
     }
