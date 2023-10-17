@@ -12,6 +12,9 @@ members = [
     "frontend",
 ]
 
+[workspace.package]
+version = "69.0.0"
+
 [profile.release]
 debug = 1
 panic = "abort"
