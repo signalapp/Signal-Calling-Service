@@ -22,7 +22,7 @@ scopeguard = "1.1"
 # For logging and command line operations
 log = "0.4"
 env_logger = "0.10.0"
-clap = { version = "3.0", features = ["derive"] }
+clap = { version = "4.4.6", features = ["derive"] }
 
 # For runtime and threading
 tokio = { version = "1", features = ["full"] }

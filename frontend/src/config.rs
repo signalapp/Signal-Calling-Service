@@ -8,97 +8,97 @@ use std::net::{IpAddr, Ipv4Addr};
 
 /// Configuration options from command line arguments.
 #[derive(clap::Parser, Debug, Clone)]
-#[clap(name = "calling_frontend")]
-#[clap(group(ArgGroup::new("backend").required(true).multiple(true).args(&["calling-server-url", "backend-list-instances-url", "backend-ip"])))]
-#[clap(group(ArgGroup::new("new_backend").required(false).args(&["backend-list-instances-url", "backend-ip"])))]
+#[command(name = "calling_frontend")]
+#[command(group(ArgGroup::new("backend").required(true).multiple(true).args(&["calling_server_url", "backend_list_instances_url", "backend_ip"])))]
+#[command(group(ArgGroup::new("new_backend").required(false).args(&["backend_list_instances_url", "backend_ip"])))]
 pub struct Config {
     /// The IP address to bind to for the server.
-    #[clap(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "0.0.0.0")]
     pub server_ip: IpAddr,
 
     /// The port to use to access the server.
-    #[clap(long, default_value = "8080")]
+    #[arg(long, default_value = "8080")]
     pub server_port: u16,
 
     /// The IP address to bind to for the backend to frontend API.
-    #[clap(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "0.0.0.0")]
     pub internal_api_ip: IpAddr,
 
     /// The port to use for the backend to frontend API. Default is to not run the internal API server.
-    #[clap(long)]
+    #[arg(long)]
     pub internal_api_port: Option<u16>,
 
     /// GCP region of the frontend. Appears as a tag in metrics and logging.
-    #[clap(long)]
+    #[arg(long)]
     pub region: String,
 
     /// The authentication key to use when validating group credentials, hex-encoded.
-    #[clap(long)]
+    #[arg(long)]
     pub authentication_key: String,
 
     /// The authentication key to use when validating zero-knowledge credentials, base64-encoded.
-    #[clap(long)]
+    #[arg(long)]
     pub zkparams: String,
 
     /// Deployment version of the frontend. Appears as a tag in metrics and in logging.
-    #[clap(long)]
+    #[arg(long)]
     pub version: String,
 
     /// Maximum clients per call.
-    #[clap(long)]
+    #[arg(long)]
     pub max_clients_per_call: u32,
 
     /// Interval for removing ended calls from the database.
-    #[clap(long)]
+    #[arg(long)]
     pub cleanup_interval_ms: u64,
 
     /// A URL template string that provides a region-specific address of the server and
     /// used for redirects.
     /// '<region>' will be substituted with the current region.
     /// Example: "https://sfu.<region>.voip.signal.org"
-    #[clap(long)]
+    #[arg(long)]
     pub regional_url_template: String,
 
     /// The URL of the calling server to access for the backend.
-    #[clap(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub calling_server_url: Option<String>,
 
     /// The URL instance group of calling backends.
-    #[clap(long, value_parser = clap::builder::NonEmptyStringValueParser::new(), requires = "oauth2-token-url")]
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new(), requires = "oauth2_token_url")]
     pub backend_list_instances_url: Option<String>,
 
     /// Where to fetch oauth2 tokens from for fetching backend instance list.
-    #[clap(long)]
+    #[arg(long)]
     pub oauth2_token_url: Option<String>,
 
     // Static list of calling backend IPs
-    #[clap(long)]
+    #[arg(long)]
     pub backend_ip: Option<Vec<Ipv4Addr>>,
 
     /// Interval for fetching a new identity token for storage support via DynamodDB.
-    #[clap(long, default_value = "600000")]
+    #[arg(long, default_value = "600000")]
     pub identity_fetcher_interval_ms: u64,
 
     /// Where to fetch identity tokens from for storage support via DynamodDB.
-    #[clap(long)]
+    #[arg(long)]
     pub identity_token_url: Option<String>,
 
     /// The name of the table that tracks information about rooms.
-    #[clap(long)]
+    #[arg(long)]
     pub storage_table: String,
 
     /// The AWS region in which the DynamoDB server resides.
-    #[clap(long)]
+    #[arg(long)]
     pub storage_region: String,
 
     /// The storage endpoint used only for testing. Typically something like "http://dynamodb:8000".
     /// Do not specify anything for production.
-    #[clap(long)]
+    #[arg(long)]
     pub storage_endpoint: Option<String>,
 
     /// IP and port of Datadog StatsD agent. Typically 127.0.0.1:8125. If not
     /// present, metrics will be disabled.
-    #[clap(long)]
+    #[arg(long)]
     pub metrics_datadog_host: Option<String>,
 }
 
