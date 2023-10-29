@@ -38,8 +38,7 @@ const RECEIVER_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub type PacketToSend = Vec<u8>;
 
-#[derive(PartialEq)]
-#[derive(Error, Debug, Eq)]
+#[derive(PartialEq, Error, Debug, Eq)]
 pub enum IceError {
     #[error("received ICE with invalid hmac: {0:?}")]
     ReceivedIceWithInvalidHmac(Vec<u8>),
@@ -76,7 +75,9 @@ pub struct Connection {
 
 #[derive(Error, Debug)]
 pub enum ConnectionError {
-    #[error("ICE binding request timeout: No incoming request received within the specified duration")]
+    #[error(
+        "ICE binding request timeout: No incoming request received within the specified duration"
+    )]
     IceBindingRequestTimeout,
 
     #[error("ICE negotiation error: {0}")]
@@ -93,7 +94,6 @@ pub enum ConnectionError {
 
     #[error("Invalid outgoing address type")]
     InvalidOutgoingAddressType,
-
     // Add more error variants for other scenarios as needed
 }
 
@@ -274,7 +274,7 @@ impl Connection {
         let rtp_endpoint = &mut self.rtp.endpoint;
         rtp_endpoint
             .receive_rtp(incoming_packet, now)
-            .or_else(|e| { Err(IceError::ReceivedInvalidRtp) })
+            .or_else(|e| Err(IceError::ReceivedInvalidRtp))
     }
 
     /// Decrypts an incoming RTCP packet and processes it.
@@ -406,10 +406,13 @@ impl Connection {
         // results of calling this across many connections.
         // So we use (packet, addr) for convenience.
     ) -> Result<(PacketToSend, SocketAddr), ConnectionError> {
-        let outgoing_addr = self.outgoing_addr.ok_or(ConnectionError::InvalidOutgoingAddress)?;
+        let outgoing_addr = self
+            .outgoing_addr
+            .ok_or(ConnectionError::InvalidOutgoingAddress)?;
         let rtp_endpoint = &mut self.rtp.endpoint;
-        let rtcp_packet = rtp_endpoint.send_pli(key_frame_request.ssrc)
-            .or_else(|e| { Err(ConnectionError::RtpError(e.to_string()))})?;
+        let rtcp_packet = rtp_endpoint
+            .send_pli(key_frame_request.ssrc)
+            .or_else(|e| Err(ConnectionError::RtpError(e.to_string())))?;
         Ok((rtcp_packet, outgoing_addr))
     }
 

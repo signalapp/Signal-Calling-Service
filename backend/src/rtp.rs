@@ -417,8 +417,7 @@ pub struct Packet<T> {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum PacketError { 
-
+pub enum PacketError {
     #[error("Invalid payload range in header: {0}")]
     InvalidPayloadRange(usize),
 
@@ -429,7 +428,7 @@ pub enum PacketError {
     InvalidMarker,
 
     #[error("Invalid packet error")]
-    PacketError
+    PacketError,
 }
 
 impl<T> Packet<T> {
@@ -557,7 +556,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
     }
 }
 
-impl<T: BorrowMut<[u8]>> Packet<T> {    
+impl<T: BorrowMut<[u8]>> Packet<T> {
     fn serialized_mut(&mut self) -> &mut [u8] {
         assert!(
             !self.encrypted,
@@ -583,7 +582,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         let payload_range = self.payload_range();
         &mut self.serialized_mut()[payload_range]
     }
- 
+
     // TODO: Return a Result instead
     // pub for tests
     pub fn decrypt_in_place(&mut self, key: &Key, salt: &Salt) -> Result<(), PacketError> {
@@ -593,7 +592,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         let tag = GenericArray::from_slice(tag);
         cipher
             .decrypt_in_place_detached(nonce, aad, ciphertext, tag)
-            .map_err(|e| { PacketError::PacketError })?;
+            .map_err(|e| PacketError::PacketError)?;
         self.encrypted = false;
         Ok(())
     }
@@ -606,7 +605,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         let nonce = GenericArray::from_slice(&nonce);
         let computed_tag = cipher
             .encrypt_in_place_detached(nonce, aad, plaintext)
-            .map_err(|e| { PacketError::PacketError })?;
+            .map_err(|e| PacketError::PacketError)?;
         tag.copy_from_slice(&computed_tag);
         self.encrypted = true;
         Ok(())
@@ -1559,7 +1558,6 @@ pub struct Endpoint {
 
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
 pub enum EndpointError {
-
     #[error("SRTP decryption error: {0}")]
     SrtpDecryptionError(String),
 
@@ -1586,14 +1584,14 @@ pub enum EndpointError {
 
     #[error("RTX sender error: {0}")]
     RtxSenderError(String),
-    
+
     #[error("Undetermined Endpoint error: {0:?}")]
-    UndeterminedError(String)
+    UndeterminedError(String),
 }
 // Add more error variants for other scenarios as needed
 
-// impl<T> std::convert::From<T> for EndpointError 
-// where T: std::string::ToString 
+// impl<T> std::convert::From<T> for EndpointError
+// where T: std::string::ToString
 // {
 //     fn from(error: T) -> Self {
 //         Self::UndeterminedError(error.to_string())
@@ -1663,8 +1661,9 @@ impl Endpoint {
         now: Instant,
     ) -> Result<Packet<&'packet mut [u8]>, EndpointError> {
         // Header::parse will log a warning for every place where it fails to parse.
-        let header = Header::parse(encrypted)
-            .ok_or(EndpointError::UndeterminedError("Header parsing error".to_string()))?;
+        let header = Header::parse(encrypted).ok_or(EndpointError::UndeterminedError(
+            "Header parsing error".to_string(),
+        ))?;
 
         let tcc_seqnum = header
             .tcc_seqnum
@@ -1722,7 +1721,7 @@ impl Endpoint {
                 incoming.payload_type(),
                 incoming.payload_range(),
             );
-            debug!("{}", value); 
+            debug!("{}", value);
             return Err(EndpointError::UndeterminedError(value.to_string()));
         }
 
@@ -1737,7 +1736,9 @@ impl Endpoint {
                     "Invalid RTP: no seqnum in payload of RTX packet; payload len: {}",
                     incoming.payload_range_in_header.len()
                 );
-                return Err(EndpointError::MaxReceivedTccSeqnumError("no seqnum in payload of RTX packet".into()));
+                return Err(EndpointError::MaxReceivedTccSeqnumError(
+                    "no seqnum in payload of RTX packet".into(),
+                ));
             };
             let original_ssrc_state = self.get_incoming_ssrc_state_mut(original_ssrc);
             let original_seqnum =
@@ -1800,7 +1801,8 @@ impl Endpoint {
             encrypted,
             &self.decrypt.rtcp.key,
             &self.decrypt.rtcp.salt,
-        ).ok_or(EndpointError::RtcpSenderSsrcNotSet)?;
+        )
+        .ok_or(EndpointError::RtcpSenderSsrcNotSet)?;
 
         let mut acks = vec![];
         if !incoming.tcc_feedbacks.is_empty() {
@@ -1817,7 +1819,11 @@ impl Endpoint {
 
     // Mutates the seqnum and transport-cc seqnum and encrypts the packet in place.
     // Also remembers the transport-cc seqnum for receiving and processing packets later.
-    pub fn send_rtp(&mut self, incoming: Packet<Vec<u8>>, now: Instant) -> Result<Packet<Vec<u8>>, EndpointError> {
+    pub fn send_rtp(
+        &mut self,
+        incoming: Packet<Vec<u8>>,
+        now: Instant,
+    ) -> Result<Packet<Vec<u8>>, EndpointError> {
         let mut outgoing = incoming;
         if outgoing.is_rtx() {
             outgoing.set_seqnum_in_header(self.rtx_sender.increment_seqnum(outgoing.ssrc_in_header))
@@ -1834,7 +1840,8 @@ impl Endpoint {
     ) -> Option<Packet<Vec<u8>>> {
         let tcc_sender = &mut self.tcc_sender;
         let rtx_sender = &mut self.rtx_sender;
-        let rtx = rtx_sender.resend_as_rtx(ssrc, seqnum, || tcc_sender.increment_seqnum())
+        let rtx = rtx_sender
+            .resend_as_rtx(ssrc, seqnum, || tcc_sender.increment_seqnum())
             .ok_or(EndpointError::UndeterminedError("Packet Error".to_string()))
             .ok()?;
         self.encrypt_and_send_rtp(rtx, now).ok()
@@ -1857,8 +1864,9 @@ impl Endpoint {
         }
         // Don't remember the packet sent for TCC until after we actually send it.
         // (see remember_sent_for_tcc)
-        outgoing.encrypt_in_place(&self.encrypt.rtp.key, &self.encrypt.rtp.salt)
-            .map_err(|e| { EndpointError::UndeterminedError(e.to_string()) })?;
+        outgoing
+            .encrypt_in_place(&self.encrypt.rtp.key, &self.encrypt.rtp.salt)
+            .map_err(|e| EndpointError::UndeterminedError(e.to_string()))?;
         Ok(outgoing)
     }
 
@@ -1888,7 +1896,8 @@ impl Endpoint {
                 next_outgoing_srtcp_index,
                 key,
                 salt,
-            ).ok()
+            )
+            .ok()
         })
     }
 
@@ -1912,15 +1921,16 @@ impl Endpoint {
             .filter_map(move |(ssrc, state)| {
                 let seqnums = state.nack_sender.send_nacks(now)?;
                 let payload = write_nack(*ssrc, seqnums);
-                    Self::send_rtcp_and_increment_index(
-                        RTCP_TYPE_GENERIC_FEEDBACK,
-                        RTCP_FORMAT_NACK,
-                        rtcp_sender_ssrc,
-                        payload,
-                        next_outgoing_srtcp_index,
-                        key,
-                        salt,
-                    ).ok()
+                Self::send_rtcp_and_increment_index(
+                    RTCP_TYPE_GENERIC_FEEDBACK,
+                    RTCP_FORMAT_NACK,
+                    rtcp_sender_ssrc,
+                    payload,
+                    next_outgoing_srtcp_index,
+                    key,
+                    salt,
+                )
+                .ok()
             })
     }
 
@@ -1941,12 +1951,18 @@ impl Endpoint {
             })
             .collect();
         let count = blocks.len() as u8;
-        self.send_rtcp(RTCP_TYPE_RECEIVER_REPORT, count, blocks).ok()
+        self.send_rtcp(RTCP_TYPE_RECEIVER_REPORT, count, blocks)
+            .ok()
     }
 
     // Returns a new, encrypted RTCP packet.
     // TODO: Use Result instead of Option.
-    fn send_rtcp(&mut self, pt: u8, count_or_format: u8, payload: impl Writer) -> Result<Vec<u8>, EndpointError> {
+    fn send_rtcp(
+        &mut self,
+        pt: u8,
+        count_or_format: u8,
+        payload: impl Writer,
+    ) -> Result<Vec<u8>, EndpointError> {
         Self::send_rtcp_and_increment_index(
             pt,
             count_or_format,
@@ -1975,7 +1991,8 @@ impl Endpoint {
             *next_outgoing_srtcp_index,
             key,
             salt,
-        ).ok_or(EndpointError::InvalidOutgoingSrtcpIndex)?;
+        )
+        .ok_or(EndpointError::InvalidOutgoingSrtcpIndex)?;
         *next_outgoing_srtcp_index += 1;
         Ok(serialized)
     }

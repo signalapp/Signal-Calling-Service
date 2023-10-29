@@ -604,15 +604,15 @@ impl Sfu {
 
                     time_scope_us!("calling.sfu.handle_packet.rtcp.in_outgoing_connection_lock");
 
-                    let key_frame_res = outgoing_connection.send_key_frame_request(key_frame_request);
+                    let key_frame_res =
+                        outgoing_connection.send_key_frame_request(key_frame_request);
 
-                    if let Ok(key_frame_request) =
-                        key_frame_res
-                    {
+                    if let Ok(key_frame_request) = key_frame_res {
                         outgoing_packets.push(key_frame_request);
-                    }
-                    else if let Err(e) = key_frame_res {
-                        return Err(SfuError::ConnectionError(connection::IceError::ReceivedInvalidRtp));
+                    } else if let Err(e) = key_frame_res {
+                        return Err(SfuError::ConnectionError(
+                            connection::IceError::ReceivedInvalidRtp,
+                        ));
                     }
                 }
             }
@@ -853,8 +853,8 @@ impl Sfu {
                     self.connection_by_id.get_mut(&outgoing_connection_id)
                 {
                     let mut outgoing_connection = outgoing_connection.lock();
-             
-                    if let Ok(key_frame_request) = 
+
+                    if let Ok(key_frame_request) =
                         outgoing_connection.send_key_frame_request(key_frame_request)
                     {
                         packets_to_send.push(key_frame_request);
