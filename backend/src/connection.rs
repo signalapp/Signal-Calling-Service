@@ -38,8 +38,9 @@ const RECEIVER_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub type PacketToSend = Vec<u8>;
 
-#[derive(Error, Debug, Eq, PartialEq)]
-pub enum Error {
+#[derive(PartialEq)]
+#[derive(Error, Debug, Eq)]
+pub enum IceError {
     #[error("received ICE with invalid hmac: {0:?}")]
     ReceivedIceWithInvalidHmac(Vec<u8>),
     #[error("received ICE with invalid username: {0:?}")]
@@ -71,6 +72,29 @@ pub struct Connection {
     /// See Connection::outgoing_addr().
     outgoing_addr: Option<SocketAddr>,
     outgoing_addr_is_ipv6: Option<bool>,
+}
+
+#[derive(Error, Debug)]
+pub enum ConnectionError {
+    #[error("ICE binding request timeout: No incoming request received within the specified duration")]
+    IceBindingRequestTimeout,
+
+    #[error("ICE negotiation error: {0}")]
+    IceNegotiationError(String),
+
+    #[error("RTP error: {0}")]
+    RtpError(String),
+
+    #[error("Congestion control error: {0}")]
+    CongestionControlError(String),
+
+    #[error("Invalid outgoing address")]
+    InvalidOutgoingAddress,
+
+    #[error("Invalid outgoing address type")]
+    InvalidOutgoingAddressType,
+
+    // Add more error variants for other scenarios as needed
 }
 
 struct Ice {
@@ -189,15 +213,15 @@ impl Connection {
         sender_addr: SocketAddr,
         binding_request: ice::BindingRequest,
         now: Instant,
-    ) -> Result<PacketToSend, Error> {
+    ) -> Result<PacketToSend, IceError> {
         let verified_binding_request = binding_request
             .verify_hmac(&self.ice.pwd)
-            .map_err(|_| Error::ReceivedIceWithInvalidHmac(binding_request.hmac().to_vec()))?;
+            .map_err(|_| IceError::ReceivedIceWithInvalidHmac(binding_request.hmac().to_vec()))?;
 
         // This should never happen because sfu.rs should never call us with an invalid username.
         // But defense in depth is good too.
         if verified_binding_request.username() != self.ice.request_username {
-            return Err(Error::ReceivedIceWithInvalidUsername(
+            return Err(IceError::ReceivedIceWithInvalidUsername(
                 verified_binding_request.username().to_vec(),
             ));
         }
@@ -246,11 +270,11 @@ impl Connection {
         &mut self,
         incoming_packet: &'packet mut [u8],
         now: Instant,
-    ) -> Result<rtp::Packet<&'packet mut [u8]>, Error> {
+    ) -> Result<rtp::Packet<&'packet mut [u8]>, IceError> {
         let rtp_endpoint = &mut self.rtp.endpoint;
         rtp_endpoint
             .receive_rtp(incoming_packet, now)
-            .ok_or(Error::ReceivedInvalidRtp)
+            .or_else(|e| { Err(IceError::ReceivedInvalidRtp) })
     }
 
     /// Decrypts an incoming RTCP packet and processes it.
@@ -264,11 +288,11 @@ impl Connection {
         &mut self,
         incoming_packet: &mut [u8],
         now: Instant,
-    ) -> Result<HandleRtcpResult, Error> {
+    ) -> Result<HandleRtcpResult, IceError> {
         let rtp_endpoint = &mut self.rtp.endpoint;
         let rtcp = rtp_endpoint
             .receive_rtcp(incoming_packet, now)
-            .ok_or(Error::ReceivedInvalidRtcp)?;
+            .or_else(|e| Err(IceError::ReceivedInvalidRtcp))?;
 
         let new_target_send_rate = self
             .congestion_control
@@ -339,7 +363,8 @@ impl Connection {
     ) {
         let rtp_endpoint = &mut self.rtp.endpoint;
         if let Some(outgoing_addr) = self.outgoing_addr {
-            if let Some(outgoing_rtp) = rtp_endpoint.send_rtp(outgoing_rtp, now) {
+            let outgoing_rtp_res = rtp_endpoint.send_rtp(outgoing_rtp, now);
+            if let Ok(outgoing_rtp) = outgoing_rtp_res {
                 if outgoing_rtp.tcc_seqnum().is_some() {
                     if let Some(outgoing_rtp) =
                         self.congestion_control.pacer.enqueue(outgoing_rtp, now)
@@ -372,7 +397,7 @@ impl Connection {
     /// Creates an encrypted key frame request to be sent to
     /// Connection::outgoing_addr().
     /// Will return None if SRTCP encryption fails.
-    // TODO: Use Result instead of Option
+    //TODO: Use Result instead of Option
     pub fn send_key_frame_request(
         &mut self,
         key_frame_request: rtp::KeyFrameRequest,
@@ -380,14 +405,15 @@ impl Connection {
         // but that actually makes it more difficult for sfu.rs to aggregate the
         // results of calling this across many connections.
         // So we use (packet, addr) for convenience.
-    ) -> Option<(PacketToSend, SocketAddr)> {
-        let outgoing_addr = self.outgoing_addr?;
+    ) -> Result<(PacketToSend, SocketAddr), ConnectionError> {
+        let outgoing_addr = self.outgoing_addr.ok_or(ConnectionError::InvalidOutgoingAddress)?;
         let rtp_endpoint = &mut self.rtp.endpoint;
-        let rtcp_packet = rtp_endpoint.send_pli(key_frame_request.ssrc)?;
-        Some((rtcp_packet, outgoing_addr))
+        let rtcp_packet = rtp_endpoint.send_pli(key_frame_request.ssrc)
+            .or_else(|e| { Err(ConnectionError::RtpError(e.to_string()))})?;
+        Ok((rtcp_packet, outgoing_addr))
     }
 
-    // TODO: Use Result instead of Option
+    //TODO: Use Result instead of Option
     // It would make more sense to return a Vec of packets, since the outgoing address is fixed,
     // but that actually makes it more difficult for sfu.rs to aggregate the
     // results of calling this across many connections.
@@ -552,7 +578,7 @@ mod connection_tests {
         transaction_id: u128,
         nominated: bool,
         now: Instant,
-    ) -> Result<PacketToSend, Error> {
+    ) -> Result<PacketToSend, IceError> {
         let transaction_id = transaction_id.to_be_bytes();
         let request_packet = ice::create_binding_request_packet(
             &transaction_id,
@@ -649,7 +675,7 @@ mod connection_tests {
                                   client_addr: SocketAddr,
                                   nominated: bool,
                                   now: Instant|
-         -> Result<(PacketToSend, PacketToSend), Error> {
+         -> Result<(PacketToSend, PacketToSend), IceError> {
             transaction_id += 1;
             let actual_response = handle_ice_binding_request(
                 connection,
@@ -669,7 +695,7 @@ mod connection_tests {
         };
 
         assert_eq!(
-            Err(Error::ReceivedIceWithInvalidUsername(
+            Err(IceError::ReceivedIceWithInvalidUsername(
                 b"invalid username".to_vec()
             )),
             connection.handle_ice_binding_request(
@@ -686,7 +712,7 @@ mod connection_tests {
         );
 
         assert_eq!(
-            Err(Error::ReceivedIceWithInvalidHmac(vec![
+            Err(IceError::ReceivedIceWithInvalidHmac(vec![
                 188, 197, 217, 82, 17, 192, 254, 173, 197, 92, 225, 78, 242, 135, 248, 26, 195,
                 241, 184, 110
             ],)),
@@ -763,7 +789,7 @@ mod connection_tests {
 
         let encrypted_rtp = new_encrypted_rtp(2, None, &encrypt);
         assert_eq!(
-            Err(Error::ReceivedInvalidRtp),
+            Err(IceError::ReceivedInvalidRtp),
             connection.handle_rtp_packet(&mut encrypted_rtp.into_serialized(), now)
         );
 

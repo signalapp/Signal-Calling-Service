@@ -416,6 +416,22 @@ pub struct Packet<T> {
     serialized: T,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum PacketError { 
+
+    #[error("Invalid payload range in header: {0}")]
+    InvalidPayloadRange(usize),
+
+    #[error("Invalid TCC sequence number range: {0}")]
+    InvalidTccSeqNumRange(usize),
+
+    #[error("Invalid marker value")]
+    InvalidMarker,
+
+    #[error("Invalid packet error")]
+    PacketError
+}
+
 impl<T> Packet<T> {
     fn is_rtx(&self) -> bool {
         self.seqnum_in_payload.is_some()
@@ -541,7 +557,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
     }
 }
 
-impl<T: BorrowMut<[u8]>> Packet<T> {
+impl<T: BorrowMut<[u8]>> Packet<T> {    
     fn serialized_mut(&mut self) -> &mut [u8] {
         assert!(
             !self.encrypted,
@@ -567,33 +583,33 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         let payload_range = self.payload_range();
         &mut self.serialized_mut()[payload_range]
     }
-
+ 
     // TODO: Return a Result instead
     // pub for tests
-    pub fn decrypt_in_place(&mut self, key: &Key, salt: &Salt) -> Option<()> {
+    pub fn decrypt_in_place(&mut self, key: &Key, salt: &Salt) -> Result<(), PacketError> {
         assert!(self.encrypted, "Can't decrypt an unencrypted packet");
         let (cipher, nonce, aad, ciphertext, tag) = self.prepare_for_crypto(key, salt);
         let nonce = GenericArray::from_slice(&nonce);
         let tag = GenericArray::from_slice(tag);
         cipher
             .decrypt_in_place_detached(nonce, aad, ciphertext, tag)
-            .ok()?;
+            .map_err(|e| { PacketError::PacketError })?;
         self.encrypted = false;
-        Some(())
+        Ok(())
     }
 
     // TODO: Return a Result instead
     // public for tests
-    pub fn encrypt_in_place(&mut self, key: &Key, salt: &Salt) -> Option<()> {
+    pub fn encrypt_in_place(&mut self, key: &Key, salt: &Salt) -> Result<(), PacketError> {
         assert!(!self.encrypted, "Can't encrypt an already encrypted packet");
         let (cipher, nonce, aad, plaintext, tag) = self.prepare_for_crypto(key, salt);
         let nonce = GenericArray::from_slice(&nonce);
         let computed_tag = cipher
             .encrypt_in_place_detached(nonce, aad, plaintext)
-            .ok()?;
+            .map_err(|e| { PacketError::PacketError })?;
         tag.copy_from_slice(&computed_tag);
         self.encrypted = true;
-        Some(())
+        Ok(())
     }
 
     fn prepare_for_crypto(
@@ -1541,6 +1557,49 @@ pub struct Endpoint {
     rtx_sender: RtxSender,
 }
 
+#[derive(thiserror::Error, Debug, Eq, PartialEq)]
+pub enum EndpointError {
+
+    #[error("SRTP decryption error: {0}")]
+    SrtpDecryptionError(String),
+
+    #[error("SRTP encryption error: {0}")]
+    SrtpEncryptionError(String),
+
+    #[error("RTCP sender SSRC not set")]
+    RtcpSenderSsrcNotSet,
+
+    #[error("Invalid outgoing SRTCP index")]
+    InvalidOutgoingSrtcpIndex,
+
+    #[error("Incoming SSRC state not found for SSRC: {0}")]
+    IncomingSsrcStateNotFound(Ssrc),
+
+    #[error("Transport-CC receiver error: {0}")]
+    TccReceiverError(String),
+
+    #[error("Transport-CC sender error: {0}")]
+    TccSenderError(String),
+
+    #[error("Max received TCC sequence number error: {0}")]
+    MaxReceivedTccSeqnumError(String),
+
+    #[error("RTX sender error: {0}")]
+    RtxSenderError(String),
+    
+    #[error("Undetermined Endpoint error: {0:?}")]
+    UndeterminedError(String)
+}
+// Add more error variants for other scenarios as needed
+
+// impl<T> std::convert::From<T> for EndpointError 
+// where T: std::string::ToString 
+// {
+//     fn from(error: T) -> Self {
+//         Self::UndeterminedError(error.to_string())
+//     }
+// }
+
 struct IncomingSsrcState {
     max_seqnum: FullSequenceNumber,
     seqnum_reuse_detector: SequenceNumberReuseDetector,
@@ -1602,9 +1661,10 @@ impl Endpoint {
         &mut self,
         encrypted: &'packet mut [u8],
         now: Instant,
-    ) -> Option<Packet<&'packet mut [u8]>> {
+    ) -> Result<Packet<&'packet mut [u8]>, EndpointError> {
         // Header::parse will log a warning for every place where it fails to parse.
-        let header = Header::parse(encrypted)?;
+        let header = Header::parse(encrypted)
+            .ok_or(EndpointError::UndeterminedError("Header parsing error".to_string()))?;
 
         let tcc_seqnum = header
             .tcc_seqnum
@@ -1618,7 +1678,7 @@ impl Endpoint {
             SequenceNumberReuse::UsedBefore => {
                 trace!("Dropping SRTP packet because we've already seen this seqnum ({}) from this ssrc ({})", seqnum_in_header, header.ssrc);
                 event!("calling.srtp.seqnum_drop.reused");
-                return None;
+                return Err(EndpointError::IncomingSsrcStateNotFound(1));
             }
             SequenceNumberReuse::TooOldToKnow { delta } => {
                 trace!(
@@ -1628,7 +1688,7 @@ impl Endpoint {
                     delta
                 );
                 sampling_histogram!("calling.srtp.seqnum_drop.old", || delta.try_into().unwrap());
-                return None;
+                return Err(EndpointError::IncomingSsrcStateNotFound(2));
             }
             SequenceNumberReuse::NotUsedBefore => {
                 // Continue decrypting
@@ -1653,16 +1713,17 @@ impl Endpoint {
 
         let decrypt_failed = incoming
             .decrypt_in_place(&self.decrypt.rtp.key, &self.decrypt.rtp.salt)
-            .is_none();
+            .is_err();
         if decrypt_failed {
-            debug!(
+            let value = format!(
                 "Invalid RTP: decryption failed; ssrc: {}, seqnum: {}, pt: {}, payload_range: {:?}",
                 incoming.ssrc(),
                 incoming.seqnum(),
                 incoming.payload_type(),
                 incoming.payload_range(),
             );
-            return None;
+            debug!("{}", value); 
+            return Err(EndpointError::UndeterminedError(value.to_string()));
         }
 
         // We have to do this after decrypting to get the seqnum in the payload.
@@ -1676,7 +1737,7 @@ impl Endpoint {
                     "Invalid RTP: no seqnum in payload of RTX packet; payload len: {}",
                     incoming.payload_range_in_header.len()
                 );
-                return None;
+                return Err(EndpointError::MaxReceivedTccSeqnumError("no seqnum in payload of RTX packet".into()));
             };
             let original_ssrc_state = self.get_incoming_ssrc_state_mut(original_ssrc);
             let original_seqnum =
@@ -1711,7 +1772,7 @@ impl Endpoint {
             self.tcc_receiver.remember_received(tcc_seqnum, now);
         }
 
-        Some(incoming)
+        Ok(incoming)
     }
 
     fn get_incoming_ssrc_state_mut(&mut self, ssrc: Ssrc) -> &mut IncomingSsrcState {
@@ -1730,17 +1791,16 @@ impl Endpoint {
     // Returns parsed and decrypted RTCP, and also processes transport-cc feedback based on
     // previously sent packets (if they had transport-cc seqnums).
     // Also decrypts the packet in place.
-    // TODO: Use Result instead of Option.
     pub fn receive_rtcp(
         &mut self,
         encrypted: &mut [u8],
         now: Instant,
-    ) -> Option<ProcessedControlPacket> {
+    ) -> Result<ProcessedControlPacket, EndpointError> {
         let incoming = ControlPacket::parse_and_decrypt_in_place(
             encrypted,
             &self.decrypt.rtcp.key,
             &self.decrypt.rtcp.salt,
-        )?;
+        ).ok_or(EndpointError::RtcpSenderSsrcNotSet)?;
 
         let mut acks = vec![];
         if !incoming.tcc_feedbacks.is_empty() {
@@ -1748,7 +1808,7 @@ impl Endpoint {
                 .tcc_sender
                 .process_feedback_and_correlate_acks(incoming.tcc_feedbacks.into_iter(), now);
         }
-        Some(ProcessedControlPacket {
+        Ok(ProcessedControlPacket {
             key_frame_requests: incoming.key_frame_requests,
             acks,
             nacks: incoming.nacks,
@@ -1757,8 +1817,7 @@ impl Endpoint {
 
     // Mutates the seqnum and transport-cc seqnum and encrypts the packet in place.
     // Also remembers the transport-cc seqnum for receiving and processing packets later.
-    // TODO: Use Result instead of Option.
-    pub fn send_rtp(&mut self, incoming: Packet<Vec<u8>>, now: Instant) -> Option<Packet<Vec<u8>>> {
+    pub fn send_rtp(&mut self, incoming: Packet<Vec<u8>>, now: Instant) -> Result<Packet<Vec<u8>>, EndpointError> {
         let mut outgoing = incoming;
         if outgoing.is_rtx() {
             outgoing.set_seqnum_in_header(self.rtx_sender.increment_seqnum(outgoing.ssrc_in_header))
@@ -1775,29 +1834,32 @@ impl Endpoint {
     ) -> Option<Packet<Vec<u8>>> {
         let tcc_sender = &mut self.tcc_sender;
         let rtx_sender = &mut self.rtx_sender;
-        let rtx = rtx_sender.resend_as_rtx(ssrc, seqnum, || tcc_sender.increment_seqnum())?;
-        self.encrypt_and_send_rtp(rtx, now)
+        let rtx = rtx_sender.resend_as_rtx(ssrc, seqnum, || tcc_sender.increment_seqnum())
+            .ok_or(EndpointError::UndeterminedError("Packet Error".to_string()))
+            .ok()?;
+        self.encrypt_and_send_rtp(rtx, now).ok()
     }
 
     pub fn send_padding(&mut self, rtx_ssrc: Ssrc, now: Instant) -> Option<Packet<Vec<u8>>> {
         let tcc_seqnum = self.tcc_sender.increment_seqnum();
         let padding = self.rtx_sender.send_padding(rtx_ssrc, tcc_seqnum);
-        self.encrypt_and_send_rtp(padding, now)
+        self.encrypt_and_send_rtp(padding, now).ok()
     }
 
     fn encrypt_and_send_rtp(
         &mut self,
         mut outgoing: Packet<Vec<u8>>,
         now: Instant,
-    ) -> Option<Packet<Vec<u8>>> {
+    ) -> Result<Packet<Vec<u8>>, EndpointError> {
         // Remember the packet sent for RTX before we encrypt it.
         if is_rtxable_payload_type(outgoing.payload_type()) {
             self.rtx_sender.remember_sent(outgoing.to_owned(), now);
         }
         // Don't remember the packet sent for TCC until after we actually send it.
         // (see remember_sent_for_tcc)
-        outgoing.encrypt_in_place(&self.encrypt.rtp.key, &self.encrypt.rtp.salt)?;
-        Some(outgoing)
+        outgoing.encrypt_in_place(&self.encrypt.rtp.key, &self.encrypt.rtp.salt)
+            .map_err(|e| { EndpointError::UndeterminedError(e.to_string()) })?;
+        Ok(outgoing)
     }
 
     pub fn remember_sent_for_tcc(&mut self, outgoing: &Packet<Vec<u8>>, now: Instant) {
@@ -1826,7 +1888,7 @@ impl Endpoint {
                 next_outgoing_srtcp_index,
                 key,
                 salt,
-            )
+            ).ok()
         })
     }
 
@@ -1850,21 +1912,21 @@ impl Endpoint {
             .filter_map(move |(ssrc, state)| {
                 let seqnums = state.nack_sender.send_nacks(now)?;
                 let payload = write_nack(*ssrc, seqnums);
-                Self::send_rtcp_and_increment_index(
-                    RTCP_TYPE_GENERIC_FEEDBACK,
-                    RTCP_FORMAT_NACK,
-                    rtcp_sender_ssrc,
-                    payload,
-                    next_outgoing_srtcp_index,
-                    key,
-                    salt,
-                )
+                    Self::send_rtcp_and_increment_index(
+                        RTCP_TYPE_GENERIC_FEEDBACK,
+                        RTCP_FORMAT_NACK,
+                        rtcp_sender_ssrc,
+                        payload,
+                        next_outgoing_srtcp_index,
+                        key,
+                        salt,
+                    ).ok()
             })
     }
 
     // Returns a new, encrypted RTCP packet for a PLI (keyframe request).
     // TODO: Use Result instead of Option.
-    pub fn send_pli(&mut self, pli_ssrc: Ssrc) -> Option<Vec<u8>> {
+    pub fn send_pli(&mut self, pli_ssrc: Ssrc) -> Result<Vec<u8>, EndpointError> {
         self.send_rtcp(RTCP_TYPE_SPECIFIC_FEEDBACK, RTCP_FORMAT_PLI, pli_ssrc)
     }
 
@@ -1879,12 +1941,12 @@ impl Endpoint {
             })
             .collect();
         let count = blocks.len() as u8;
-        self.send_rtcp(RTCP_TYPE_RECEIVER_REPORT, count, blocks)
+        self.send_rtcp(RTCP_TYPE_RECEIVER_REPORT, count, blocks).ok()
     }
 
     // Returns a new, encrypted RTCP packet.
     // TODO: Use Result instead of Option.
-    fn send_rtcp(&mut self, pt: u8, count_or_format: u8, payload: impl Writer) -> Option<Vec<u8>> {
+    fn send_rtcp(&mut self, pt: u8, count_or_format: u8, payload: impl Writer) -> Result<Vec<u8>, EndpointError> {
         Self::send_rtcp_and_increment_index(
             pt,
             count_or_format,
@@ -1904,7 +1966,7 @@ impl Endpoint {
         next_outgoing_srtcp_index: &mut u32,
         key: &Key,
         salt: &Salt,
-    ) -> Option<Vec<u8>> {
+    ) -> Result<Vec<u8>, EndpointError> {
         let serialized = ControlPacket::serialize_and_encrypt(
             pt,
             count_or_format,
@@ -1913,9 +1975,9 @@ impl Endpoint {
             *next_outgoing_srtcp_index,
             key,
             salt,
-        )?;
+        ).ok_or(EndpointError::InvalidOutgoingSrtcpIndex)?;
         *next_outgoing_srtcp_index += 1;
-        Some(serialized)
+        Ok(serialized)
     }
 
     pub fn stats(&self) -> EndpointStats {
@@ -2591,7 +2653,7 @@ mod test {
         let mut nacks: Vec<Vec<u8>> = receiver.send_nacks(at(40)).collect();
         assert_eq!(1, nacks.len());
         assert_eq!(
-            Some(ProcessedControlPacket {
+            Ok(ProcessedControlPacket {
                 key_frame_requests: vec![],
                 acks: vec![],
                 nacks: vec![Nack {
@@ -2779,14 +2841,14 @@ mod test {
         let received1c = receiver.receive_rtp(sent1c.serialized.borrow_mut(), at(10));
         let received2c = receiver.receive_rtp(sent2c.serialized.borrow_mut(), at(10));
 
-        assert!(received1a.is_some());
-        assert!(received1b.is_none());
-        assert!(received2a.is_some());
-        assert!(received2b.is_none());
-        assert!(received200a.is_some());
-        assert!(received200b.is_none());
-        assert!(received1c.is_none());
-        assert!(received2c.is_none());
+        assert!(received1a.is_ok());
+        assert!(received1b.is_err());
+        assert!(received2a.is_ok());
+        assert!(received2b.is_err());
+        assert!(received200a.is_ok());
+        assert!(received200b.is_err());
+        assert!(received1c.is_err());
+        assert!(received2c.is_err());
     }
 
     #[test]

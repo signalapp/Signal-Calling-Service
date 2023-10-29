@@ -58,7 +58,7 @@ pub enum SfuError {
     #[error("ICE binding request with unknown username: {0:?}")]
     IceBindingRequestUnknownUsername(Vec<u8>),
     #[error("connection error: {0}")]
-    ConnectionError(connection::Error),
+    ConnectionError(connection::IceError),
     #[error("call error: {0}")]
     CallError(call::Error),
 }
@@ -502,7 +502,7 @@ impl Sfu {
                 time_scope_us!("calling.sfu.handle_packet.rtp.in_incoming_connection_lock");
                 let incoming_rtp = incoming_connection
                     .handle_rtp_packet(incoming_packet, Instant::now())
-                    .map_err(SfuError::ConnectionError)?;
+                    .map_err(|e| SfuError::ConnectionError(e))?;
                 (incoming_connection_id, incoming_rtp)
             };
 
@@ -566,7 +566,7 @@ impl Sfu {
                 time_scope_us!("calling.sfu.handle_packet.rtcp.in_incomin_connection_lock");
                 let result = incoming_connection
                     .handle_rtcp_packet(incoming_packet, Instant::now())
-                    .map_err(SfuError::ConnectionError)?;
+                    .map_err(|e| SfuError::ConnectionError(e.into()))?;
                 (incoming_connection_id, result)
             };
 
@@ -604,11 +604,16 @@ impl Sfu {
 
                     time_scope_us!("calling.sfu.handle_packet.rtcp.in_outgoing_connection_lock");
 
-                    if let Some(key_frame_request) =
-                        outgoing_connection.send_key_frame_request(key_frame_request)
+                    let key_frame_res = outgoing_connection.send_key_frame_request(key_frame_request);
+
+                    if let Ok(key_frame_request) =
+                        key_frame_res
                     {
                         outgoing_packets.push(key_frame_request);
-                    };
+                    }
+                    else if let Err(e) = key_frame_res {
+                        return Err(SfuError::ConnectionError(connection::IceError::ReceivedInvalidRtp));
+                    }
                 }
             }
 
@@ -848,11 +853,12 @@ impl Sfu {
                     self.connection_by_id.get_mut(&outgoing_connection_id)
                 {
                     let mut outgoing_connection = outgoing_connection.lock();
-                    if let Some(key_frame_request) =
+             
+                    if let Ok(key_frame_request) = 
                         outgoing_connection.send_key_frame_request(key_frame_request)
                     {
                         packets_to_send.push(key_frame_request);
-                    };
+                    }
                 }
             }
 
