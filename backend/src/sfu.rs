@@ -502,7 +502,7 @@ impl Sfu {
                 time_scope_us!("calling.sfu.handle_packet.rtp.in_incoming_connection_lock");
                 let incoming_rtp = incoming_connection
                     .handle_rtp_packet(incoming_packet, Instant::now())
-                    .map_err(|e| SfuError::ConnectionError(e))?;
+                    .map_err(SfuError::ConnectionError)?;
                 (incoming_connection_id, incoming_rtp)
             };
 
@@ -566,7 +566,7 @@ impl Sfu {
                 time_scope_us!("calling.sfu.handle_packet.rtcp.in_incomin_connection_lock");
                 let result = incoming_connection
                     .handle_rtcp_packet(incoming_packet, Instant::now())
-                    .map_err(|e| SfuError::ConnectionError(e.into()))?;
+                    .map_err( SfuError::ConnectionError)?;
                 (incoming_connection_id, result)
             };
 
@@ -609,7 +609,7 @@ impl Sfu {
 
                     if let Ok(key_frame_request) = key_frame_res {
                         outgoing_packets.push(key_frame_request);
-                    } else if let Err(e) = key_frame_res {
+                    } else if let Err(_e) = key_frame_res {
                         return Err(SfuError::ConnectionError(
                             connection::IceError::ReceivedInvalidRtp,
                         ));

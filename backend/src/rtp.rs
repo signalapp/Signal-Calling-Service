@@ -583,7 +583,6 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         &mut self.serialized_mut()[payload_range]
     }
 
-    // TODO: Return a Result instead
     // pub for tests
     pub fn decrypt_in_place(&mut self, key: &Key, salt: &Salt) -> Result<(), PacketError> {
         assert!(self.encrypted, "Can't decrypt an unencrypted packet");
@@ -592,12 +591,11 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         let tag = GenericArray::from_slice(tag);
         cipher
             .decrypt_in_place_detached(nonce, aad, ciphertext, tag)
-            .map_err(|e| PacketError::PacketError)?;
+            .map_err(|_e| PacketError::PacketError)?;
         self.encrypted = false;
         Ok(())
     }
 
-    // TODO: Return a Result instead
     // public for tests
     pub fn encrypt_in_place(&mut self, key: &Key, salt: &Salt) -> Result<(), PacketError> {
         assert!(!self.encrypted, "Can't encrypt an already encrypted packet");
@@ -605,7 +603,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         let nonce = GenericArray::from_slice(&nonce);
         let computed_tag = cipher
             .encrypt_in_place_detached(nonce, aad, plaintext)
-            .map_err(|e| PacketError::PacketError)?;
+            .map_err(|_e| PacketError::PacketError)?;
         tag.copy_from_slice(&computed_tag);
         self.encrypted = true;
         Ok(())
@@ -1653,7 +1651,6 @@ impl Endpoint {
 
     // Returns a Packet and an optional transport-cc feedback RTCP packet that should be sent.
     // The packet's payload is also decrypted in place.
-    // TODO: Use Result instead of Option.
     #[allow(clippy::type_complexity)]
     pub fn receive_rtp<'packet>(
         &mut self,
@@ -1661,7 +1658,7 @@ impl Endpoint {
         now: Instant,
     ) -> Result<Packet<&'packet mut [u8]>, EndpointError> {
         // Header::parse will log a warning for every place where it fails to parse.
-        let header = Header::parse(encrypted).ok_or(EndpointError::UndeterminedError(
+        let header = Header::parse(encrypted).ok_or_else(|| EndpointError::UndeterminedError(
             "Header parsing error".to_string(),
         ))?;
 
@@ -1722,7 +1719,7 @@ impl Endpoint {
                 incoming.payload_range(),
             );
             debug!("{}", value);
-            return Err(EndpointError::UndeterminedError(value.to_string()));
+            return Err(EndpointError::UndeterminedError(value));
         }
 
         // We have to do this after decrypting to get the seqnum in the payload.
@@ -1842,7 +1839,7 @@ impl Endpoint {
         let rtx_sender = &mut self.rtx_sender;
         let rtx = rtx_sender
             .resend_as_rtx(ssrc, seqnum, || tcc_sender.increment_seqnum())
-            .ok_or(EndpointError::UndeterminedError("Packet Error".to_string()))
+            .ok_or_else(|| EndpointError::UndeterminedError("Packet Error".to_string()))
             .ok()?;
         self.encrypt_and_send_rtp(rtx, now).ok()
     }
@@ -1935,7 +1932,6 @@ impl Endpoint {
     }
 
     // Returns a new, encrypted RTCP packet for a PLI (keyframe request).
-    // TODO: Use Result instead of Option.
     pub fn send_pli(&mut self, pli_ssrc: Ssrc) -> Result<Vec<u8>, EndpointError> {
         self.send_rtcp(RTCP_TYPE_SPECIFIC_FEEDBACK, RTCP_FORMAT_PLI, pli_ssrc)
     }
@@ -1956,7 +1952,6 @@ impl Endpoint {
     }
 
     // Returns a new, encrypted RTCP packet.
-    // TODO: Use Result instead of Option.
     fn send_rtcp(
         &mut self,
         pt: u8,

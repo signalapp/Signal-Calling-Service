@@ -274,7 +274,7 @@ impl Connection {
         let rtp_endpoint = &mut self.rtp.endpoint;
         rtp_endpoint
             .receive_rtp(incoming_packet, now)
-            .or_else(|e| Err(IceError::ReceivedInvalidRtp))
+            .map_err(|_e| IceError::ReceivedInvalidRtp)
     }
 
     /// Decrypts an incoming RTCP packet and processes it.
@@ -292,7 +292,7 @@ impl Connection {
         let rtp_endpoint = &mut self.rtp.endpoint;
         let rtcp = rtp_endpoint
             .receive_rtcp(incoming_packet, now)
-            .or_else(|e| Err(IceError::ReceivedInvalidRtcp))?;
+            .map_err(|_e| IceError::ReceivedInvalidRtcp)?;
 
         let new_target_send_rate = self
             .congestion_control
@@ -397,7 +397,6 @@ impl Connection {
     /// Creates an encrypted key frame request to be sent to
     /// Connection::outgoing_addr().
     /// Will return None if SRTCP encryption fails.
-    //TODO: Use Result instead of Option
     pub fn send_key_frame_request(
         &mut self,
         key_frame_request: rtp::KeyFrameRequest,
@@ -412,11 +411,10 @@ impl Connection {
         let rtp_endpoint = &mut self.rtp.endpoint;
         let rtcp_packet = rtp_endpoint
             .send_pli(key_frame_request.ssrc)
-            .or_else(|e| Err(ConnectionError::RtpError(e.to_string())))?;
+            .map_err(|e| ConnectionError::RtpError(e.to_string()))?;
         Ok((rtcp_packet, outgoing_addr))
     }
 
-    //TODO: Use Result instead of Option
     // It would make more sense to return a Vec of packets, since the outgoing address is fixed,
     // but that actually makes it more difficult for sfu.rs to aggregate the
     // results of calling this across many connections.
