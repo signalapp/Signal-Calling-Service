@@ -1586,8 +1586,8 @@ pub enum EndpointError {
     #[error("Undetermined Endpoint error: {0:?}")]
     UndeterminedError(String),
 }
-// Add more error variants for other scenarios as needed
 
+//TODO: Develop some way for performing cross error conversions
 // impl<T> std::convert::From<T> for EndpointError
 // where T: std::string::ToString
 // {

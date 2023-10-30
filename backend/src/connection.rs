@@ -94,7 +94,6 @@ pub enum ConnectionError {
 
     #[error("Invalid outgoing address type")]
     InvalidOutgoingAddressType,
-    // Add more error variants for other scenarios as needed
 }
 
 struct Ice {
