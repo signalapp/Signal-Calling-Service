@@ -1658,9 +1658,8 @@ impl Endpoint {
         now: Instant,
     ) -> Result<Packet<&'packet mut [u8]>, EndpointError> {
         // Header::parse will log a warning for every place where it fails to parse.
-        let header = Header::parse(encrypted).ok_or_else(|| EndpointError::UndeterminedError(
-            "Header parsing error".to_string(),
-        ))?;
+        let header = Header::parse(encrypted)
+            .ok_or_else(|| EndpointError::UndeterminedError("Header parsing error".to_string()))?;
 
         let tcc_seqnum = header
             .tcc_seqnum
@@ -2645,7 +2644,7 @@ mod test {
             )
             .unwrap();
         // Simulate never received
-        sent2.decrypt_in_place(&sender_key.rtp.key, &sender_key.rtp.salt);
+        let _ = sent2.decrypt_in_place(&sender_key.rtp.key, &sender_key.rtp.salt);
         assert_eq!(&[5, 6, 7], sent2.payload());
         assert_eq!(Some(2), sent2.tcc_seqnum);
 
