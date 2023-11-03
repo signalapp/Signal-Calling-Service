@@ -418,16 +418,13 @@ pub struct Packet<T> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PacketError {
-    #[error("Invalid payload range in header: {0}")]
-    InvalidPayloadRange(usize),
+    #[error("Packet Decryption Failure")]
+    DecryptFailure,
 
-    #[error("Invalid TCC sequence number range: {0}")]
-    InvalidTccSeqNumRange(usize),
+    #[error("Packet Encryption failure")]
+    EncryptFailure,
 
-    #[error("Invalid marker value")]
-    InvalidMarker,
-
-    #[error("Invalid packet error")]
+    #[error("Unknown packet error")]
     PacketError,
 }
 
@@ -591,7 +588,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         let tag = GenericArray::from_slice(tag);
         cipher
             .decrypt_in_place_detached(nonce, aad, ciphertext, tag)
-            .map_err(|_e| PacketError::PacketError)?;
+            .map_err(|_e| PacketError::DecryptFailure)?;
         self.encrypted = false;
         Ok(())
     }
@@ -603,7 +600,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         let nonce = GenericArray::from_slice(&nonce);
         let computed_tag = cipher
             .encrypt_in_place_detached(nonce, aad, plaintext)
-            .map_err(|_e| PacketError::PacketError)?;
+            .map_err(|_e| PacketError::EncryptFailure)?;
         tag.copy_from_slice(&computed_tag);
         self.encrypted = true;
         Ok(())
@@ -1555,46 +1552,46 @@ pub struct Endpoint {
 }
 
 #[derive(thiserror::Error, Debug, Eq, PartialEq)]
-pub enum EndpointError {
-    #[error("SRTP decryption error: {0}")]
-    SrtpDecryptionError(String),
+pub enum SsrcError { 
+    UsedBefore, 
+    TooOldToKnow
+}
 
-    #[error("SRTP encryption error: {0}")]
-    SrtpEncryptionError(String),
+#[derive(thiserror::Error, Debug, Eq, PartialEq)]
+pub enum EndpointError {
 
     #[error("RTCP sender SSRC not set")]
     RtcpSenderSsrcNotSet,
 
     #[error("Invalid outgoing SRTCP index")]
-    InvalidOutgoingSrtcpIndex,
+    InvalidOutgoingSrtcp,
+
+    #[error("Srtp decryption error")]
+    SrtpDecryptionError, 
+
+    #[error("Srtp encryption error")]
+    SrtpEncryptionError, 
 
     #[error("Incoming SSRC state not found for SSRC: {0}")]
     IncomingSsrcStateNotFound(Ssrc),
 
-    #[error("Transport-CC receiver error: {0}")]
-    TccReceiverError(String),
+    #[error("Missing RTC sequence number")]
+    MissingRTXSeqNum,
 
-    #[error("Transport-CC sender error: {0}")]
-    TccSenderError(String),
+    #[error("RTXError: {0:?}")]
+    RTXError {
 
-    #[error("Max received TCC sequence number error: {0}")]
-    MaxReceivedTccSeqnumError(String),
+    },
 
-    #[error("RTX sender error: {0}")]
-    RtxSenderError(String),
+    #[error("Ssrc Error: {0:?}")]
+    SsrcError(SsrcError), 
 
-    #[error("Undetermined Endpoint error: {0:?}")]
+    #[error("Header parsing error")]
+    HeaderParseError, 
+
+    #[error("Undetermined Endpoint error: {0}")]
     UndeterminedError(String),
 }
-
-//TODO: Develop some way for performing cross error conversions
-// impl<T> std::convert::From<T> for EndpointError
-// where T: std::string::ToString
-// {
-//     fn from(error: T) -> Self {
-//         Self::UndeterminedError(error.to_string())
-//     }
-// }
 
 struct IncomingSsrcState {
     max_seqnum: FullSequenceNumber,
@@ -1659,7 +1656,7 @@ impl Endpoint {
     ) -> Result<Packet<&'packet mut [u8]>, EndpointError> {
         // Header::parse will log a warning for every place where it fails to parse.
         let header = Header::parse(encrypted)
-            .ok_or_else(|| EndpointError::UndeterminedError("Header parsing error".to_string()))?;
+            .ok_or_else(|| EndpointError::HeaderParseError)?;
 
         let tcc_seqnum = header
             .tcc_seqnum
@@ -1673,7 +1670,7 @@ impl Endpoint {
             SequenceNumberReuse::UsedBefore => {
                 trace!("Dropping SRTP packet because we've already seen this seqnum ({}) from this ssrc ({})", seqnum_in_header, header.ssrc);
                 event!("calling.srtp.seqnum_drop.reused");
-                return Err(EndpointError::IncomingSsrcStateNotFound(1));
+                return Err(EndpointError::SsrcError::UsedBefore);
             }
             SequenceNumberReuse::TooOldToKnow { delta } => {
                 trace!(
@@ -1683,7 +1680,7 @@ impl Endpoint {
                     delta
                 );
                 sampling_histogram!("calling.srtp.seqnum_drop.old", || delta.try_into().unwrap());
-                return Err(EndpointError::IncomingSsrcStateNotFound(2));
+                return Err(EndpointError::SsrcError(SsrcError::TooOldToKnow));
             }
             SequenceNumberReuse::NotUsedBefore => {
                 // Continue decrypting
@@ -1718,7 +1715,7 @@ impl Endpoint {
                 incoming.payload_range(),
             );
             debug!("{}", value);
-            return Err(EndpointError::UndeterminedError(value));
+            return Err(EndpointError::SrtpDecryptionError);
         }
 
         // We have to do this after decrypting to get the seqnum in the payload.
@@ -1838,7 +1835,7 @@ impl Endpoint {
         let rtx_sender = &mut self.rtx_sender;
         let rtx = rtx_sender
             .resend_as_rtx(ssrc, seqnum, || tcc_sender.increment_seqnum())
-            .ok_or_else(|| EndpointError::UndeterminedError("Packet Error".to_string()))
+            .ok_or_else(|| EndpointError::ResendAsRtxError)
             .ok()?;
         self.encrypt_and_send_rtp(rtx, now).ok()
     }
@@ -1862,7 +1859,7 @@ impl Endpoint {
         // (see remember_sent_for_tcc)
         outgoing
             .encrypt_in_place(&self.encrypt.rtp.key, &self.encrypt.rtp.salt)
-            .map_err(|e| EndpointError::UndeterminedError(e.to_string()))?;
+            .map_err(|e| EndpointError::SrtpEncryptionError)?;
         Ok(outgoing)
     }
 
@@ -1986,7 +1983,7 @@ impl Endpoint {
             key,
             salt,
         )
-        .ok_or(EndpointError::InvalidOutgoingSrtcpIndex)?;
+        .ok_or(EndpointError::InvalidOutgoingSrtcp)?;
         *next_outgoing_srtcp_index += 1;
         Ok(serialized)
     }

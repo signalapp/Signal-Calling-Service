@@ -38,7 +38,7 @@ const RECEIVER_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub type PacketToSend = Vec<u8>;
 
-#[derive(PartialEq, Error, Debug, Eq)]
+#[derive(Error, Debug, Eq, PartialEq)]
 pub enum IceError {
     #[error("received ICE with invalid hmac: {0:?}")]
     ReceivedIceWithInvalidHmac(Vec<u8>),
@@ -83,8 +83,8 @@ pub enum ConnectionError {
     #[error("ICE negotiation error: {0}")]
     IceNegotiationError(String),
 
-    #[error("RTP error: {0}")]
-    RtpError(String),
+    #[error("RTP error ")]
+    RtpError,
 
     #[error("Congestion control error: {0}")]
     CongestionControlError(String),
@@ -362,8 +362,7 @@ impl Connection {
     ) {
         let rtp_endpoint = &mut self.rtp.endpoint;
         if let Some(outgoing_addr) = self.outgoing_addr {
-            let outgoing_rtp_res = rtp_endpoint.send_rtp(outgoing_rtp, now);
-            if let Ok(outgoing_rtp) = outgoing_rtp_res {
+            if let Ok(outgoing_rtp) = rtp_endpoint.send_rtp(outgoing_rtp, now) {
                 if outgoing_rtp.tcc_seqnum().is_some() {
                     if let Some(outgoing_rtp) =
                         self.congestion_control.pacer.enqueue(outgoing_rtp, now)
@@ -410,7 +409,7 @@ impl Connection {
         let rtp_endpoint = &mut self.rtp.endpoint;
         let rtcp_packet = rtp_endpoint
             .send_pli(key_frame_request.ssrc)
-            .map_err(|e| ConnectionError::RtpError(e.to_string()))?;
+            .map_err(|_| ConnectionError::RtpError)?;
         Ok((rtcp_packet, outgoing_addr))
     }
 
