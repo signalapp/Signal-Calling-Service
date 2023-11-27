@@ -828,6 +828,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-rustls",
+ "lazy_static",
  "log",
  "mime",
  "mock_instant",

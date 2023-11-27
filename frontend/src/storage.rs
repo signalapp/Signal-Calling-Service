@@ -780,15 +780,7 @@ impl IdentityFetcher {
 
 #[cfg(test)]
 mod tests {
-    use aws_sdk_dynamodb::types::{DeleteRequest, PutRequest, WriteRequest};
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
-    use futures::FutureExt;
     use once_cell::sync::Lazy;
-
-    use std::future::Future;
-
-    use crate::config::default_test_config;
 
     use super::*;
 
@@ -841,564 +833,6 @@ mod tests {
             .map(|(k, v)| (k, v.into()))
             .collect()
         );
-    }
-
-    fn timestamp_to_string(timestamp: SystemTime) -> String {
-        timestamp
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string()
-    }
-
-    static TESTING_EXPIRATION: Lazy<SystemTime> =
-        Lazy::new(|| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2524608000)); // 2050-01-01
-
-    fn default_call_link_state_json(room_id: &str) -> serde_json::Value {
-        serde_json::json!({
-            ROOM_ID_KEY: {"S": room_id},
-            RECORD_TYPE_KEY: {"S": CallLinkState::RECORD_TYPE},
-            "adminPasskey": {"B": STANDARD.encode([1, 2, 3])},
-            "zkparams": {"B": ""},
-            "restrictions": {"S": "adminApproval"},
-            "encryptedName": {"B": STANDARD.encode(b"abc")},
-            "revoked": {"BOOL": false},
-            "expiration": {"N": timestamp_to_string(*TESTING_EXPIRATION)},
-        })
-    }
-
-    fn default_call_link_state_json_with(
-        room_id: &str,
-        mut extra_keys: serde_json::Value,
-    ) -> serde_json::Value {
-        let mut state = default_call_link_state_json(room_id);
-        state
-            .as_object_mut()
-            .unwrap()
-            .append(extra_keys.as_object_mut().unwrap());
-        state
-    }
-
-    fn with_approved_users_sorted(
-        full_info: &mut (Option<CallLinkState>, Option<CallRecord>),
-    ) -> &(Option<CallLinkState>, Option<CallRecord>) {
-        if let Some(CallLinkState { approved_users, .. }) = &mut full_info.0 {
-            approved_users.sort()
-        }
-        full_info
-    }
-
-    async fn with_db_items<R>(
-        storage: &DynamoDb,
-        items: impl IntoIterator<Item = serde_json::Value>,
-        pending_deletes: impl IntoIterator<Item = (&str, &str)>,
-        test: impl Future<Output = R>,
-    ) -> R {
-        let (mut deletes, puts): (Vec<_>, Vec<_>) = items
-            .into_iter()
-            .map(|item| {
-                (
-                    WriteRequest::builder()
-                        .delete_request(
-                            DeleteRequest::builder()
-                                .key(
-                                    ROOM_ID_KEY,
-                                    serde_json::from_value::<serde_dynamo::AttributeValue>(
-                                        item.as_object().unwrap().get(ROOM_ID_KEY).unwrap().clone(),
-                                    )
-                                    .unwrap()
-                                    .into(),
-                                )
-                                .key(
-                                    RECORD_TYPE_KEY,
-                                    serde_json::from_value::<serde_dynamo::AttributeValue>(
-                                        item.as_object()
-                                            .unwrap()
-                                            .get(RECORD_TYPE_KEY)
-                                            .unwrap()
-                                            .clone(),
-                                    )
-                                    .unwrap()
-                                    .into(),
-                                )
-                                .build(),
-                        )
-                        .build(),
-                    WriteRequest::builder()
-                        .put_request(
-                            PutRequest::builder()
-                                .set_item(Some(
-                                    serde_json::from_value::<Item>(item).unwrap().into(),
-                                ))
-                                .build(),
-                        )
-                        .build(),
-                )
-            })
-            .unzip();
-
-        deletes.extend(
-            pending_deletes
-                .into_iter()
-                .map(|(partition_key, sort_key)| {
-                    WriteRequest::builder()
-                        .delete_request(
-                            DeleteRequest::builder()
-                                .key(ROOM_ID_KEY, AttributeValue::S(partition_key.to_string()))
-                                .key(RECORD_TYPE_KEY, AttributeValue::S(sort_key.to_string()))
-                                .build(),
-                        )
-                        .build()
-                }),
-        );
-
-        storage
-            .client
-            .batch_write_item()
-            .request_items(&storage.table_name, puts)
-            .send()
-            .await
-            .expect("can initialize table");
-
-        // Why is this safe?
-        // Well, the only thing we do after panicking is run the cleanup code.
-        // But if the panic comes from the DynamoDB client, this might not actually be safe.
-        // There's not really anything we can do about that (short of reinitializing the client).
-        let result = std::panic::AssertUnwindSafe(test).catch_unwind().await;
-
-        storage
-            .client
-            .batch_write_item()
-            .request_items(&storage.table_name, deletes)
-            .send()
-            .await
-            .expect("can clean up table");
-
-        result.unwrap()
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_absent_call_link() -> Result<()> {
-        let storage = DynamoDb::new(&default_test_config()).await?;
-        assert_eq!(
-            storage
-                .get_call_link(&RoomId::from("testing-nonexistent".to_string()))
-                .await?,
-            None
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_present_call_link() -> Result<()> {
-        let storage = DynamoDb::new(&default_test_config()).await?;
-        let room_id = format!("testing-room-{}", line!());
-        with_db_items(
-            &storage,
-            [default_call_link_state_json(&room_id)],
-            [],
-            async {
-                assert_eq!(
-                    storage.get_call_link(&RoomId::from(room_id)).await?,
-                    Some(CallLinkState {
-                        admin_passkey: vec![1, 2, 3],
-                        zkparams: vec![],
-                        restrictions: CallLinkRestrictions::AdminApproval,
-                        encrypted_name: b"abc".to_vec(),
-                        revoked: false,
-                        expiration: *TESTING_EXPIRATION,
-                        approved_users: vec![],
-                    })
-                );
-                Ok(())
-            },
-        )
-        .await
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_get_call_link_skips_approved_users() -> Result<()> {
-        let storage = DynamoDb::new(&default_test_config()).await?;
-        let room_id = format!("testing-room-{}", line!());
-        with_db_items(
-            &storage,
-            [default_call_link_state_json_with(
-                &room_id,
-                serde_json::json!({
-                    "approvedUsers": {"SS": ["Moxie", "Brian", "Meredith"]},
-                }),
-            )],
-            [],
-            async {
-                assert_eq!(
-                    storage.get_call_link(&RoomId::from(room_id)).await?,
-                    Some(CallLinkState {
-                        admin_passkey: vec![1, 2, 3],
-                        zkparams: vec![],
-                        restrictions: CallLinkRestrictions::AdminApproval,
-                        encrypted_name: b"abc".to_vec(),
-                        revoked: false,
-                        expiration: *TESTING_EXPIRATION,
-                        approved_users: vec![],
-                    })
-                );
-                Ok(())
-            },
-        )
-        .await
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_get_call_link_and_record_absent() -> Result<()> {
-        let storage = DynamoDb::new(&default_test_config()).await?;
-        assert_eq!(
-            storage
-                .get_call_link_and_record(&RoomId::from("testing-nonexistent".to_string()), false)
-                .await?,
-            (None, None)
-        );
-        assert_eq!(
-            storage
-                .get_call_link_and_record(&RoomId::from("testing-nonexistent".to_string()), true)
-                .await?,
-            (None, None)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_get_call_link_and_record_with_no_call() -> Result<()> {
-        let storage = DynamoDb::new(&default_test_config()).await?;
-        let room_id = format!("testing-room-{}", line!());
-        with_db_items(
-            &storage,
-            [default_call_link_state_json(&room_id)],
-            [],
-            async {
-                let expected = (
-                    Some(CallLinkState {
-                        admin_passkey: vec![1, 2, 3],
-                        zkparams: vec![],
-                        restrictions: CallLinkRestrictions::AdminApproval,
-                        encrypted_name: b"abc".to_vec(),
-                        revoked: false,
-                        expiration: *TESTING_EXPIRATION,
-                        approved_users: vec![],
-                    }),
-                    None,
-                );
-                assert_eq!(
-                    &storage
-                        .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
-                        .await?,
-                    &expected
-                );
-                assert_eq!(
-                    &storage
-                        .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
-                        .await?,
-                    &expected
-                );
-                Ok(())
-            },
-        )
-        .await
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_get_call_link_and_record_with_no_call_and_approved_users() -> Result<()> {
-        let storage = DynamoDb::new(&default_test_config()).await?;
-        let room_id = format!("testing-room-{}", line!());
-        with_db_items(
-            &storage,
-            [default_call_link_state_json_with(
-                &room_id,
-                serde_json::json!({
-                    "approvedUsers": {"SS": ["Moxie", "Brian", "Meredith"]},
-                }),
-            )],
-            [],
-            async {
-                let mut expected = (
-                    Some(CallLinkState {
-                        admin_passkey: vec![1, 2, 3],
-                        zkparams: vec![],
-                        restrictions: CallLinkRestrictions::AdminApproval,
-                        encrypted_name: b"abc".to_vec(),
-                        revoked: false,
-                        expiration: *TESTING_EXPIRATION,
-                        approved_users: vec![
-                            "Brian".to_string(),
-                            "Meredith".to_string(),
-                            "Moxie".to_string(),
-                        ],
-                    }),
-                    None,
-                );
-                assert_eq!(
-                    with_approved_users_sorted(
-                        &mut storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
-                            .await?
-                    ),
-                    &expected
-                );
-                expected.0.as_mut().unwrap().approved_users = vec![];
-                assert_eq!(
-                    with_approved_users_sorted(
-                        &mut storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
-                            .await?
-                    ),
-                    &expected
-                );
-                Ok(())
-            },
-        )
-        .await
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_get_call_link_and_record_with_call() -> Result<()> {
-        let storage = DynamoDb::new(&default_test_config()).await?;
-        let room_id = format!("testing-room-{}", line!());
-        with_db_items(
-            &storage,
-            [
-                default_call_link_state_json(&room_id),
-                serde_json::json!({
-                    ROOM_ID_KEY: {"S": room_id},
-                    RECORD_TYPE_KEY: {"S": CallRecord::RECORD_TYPE},
-                    "eraId": {"S": "mesozoic"},
-                    "backendIp": {"S": "127.0.0.1"},
-                    "region": {"S": "pangaea"},
-                    "creator": {"S": "Peter"},
-                }),
-            ],
-            [],
-            async {
-                let expected = (
-                    Some(CallLinkState {
-                        admin_passkey: vec![1, 2, 3],
-                        zkparams: vec![],
-                        restrictions: CallLinkRestrictions::AdminApproval,
-                        encrypted_name: b"abc".to_vec(),
-                        revoked: false,
-                        expiration: *TESTING_EXPIRATION,
-                        approved_users: vec![],
-                    }),
-                    Some(CallRecord {
-                        room_id: RoomId::from(room_id.clone()),
-                        era_id: "mesozoic".to_string(),
-                        backend_ip: "127.0.0.1".to_string(),
-                        backend_region: "pangaea".to_string(),
-                        creator: "Peter".to_string(),
-                    }),
-                );
-                assert_eq!(
-                    &storage
-                        .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
-                        .await?,
-                    &expected
-                );
-                assert_eq!(
-                    &storage
-                        .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
-                        .await?,
-                    &expected
-                );
-                Ok(())
-            },
-        )
-        .await
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_get_call_link_and_record_with_call_and_approved_users() -> Result<()> {
-        let storage = DynamoDb::new(&default_test_config()).await?;
-        let room_id = format!("testing-room-{}", line!());
-        with_db_items(
-            &storage,
-            [
-                default_call_link_state_json_with(
-                    &room_id,
-                    serde_json::json!({
-                        "approvedUsers": {"SS": ["Moxie", "Brian", "Meredith"]},
-                    }),
-                ),
-                serde_json::json!({
-                    ROOM_ID_KEY: {"S": room_id},
-                    RECORD_TYPE_KEY: {"S": CallRecord::RECORD_TYPE},
-                    "eraId": {"S": "mesozoic"},
-                    "backendIp": {"S": "127.0.0.1"},
-                    "region": {"S": "pangaea"},
-                    "creator": {"S": "Peter"},
-                }),
-            ],
-            [],
-            async {
-                let mut expected = (
-                    Some(CallLinkState {
-                        admin_passkey: vec![1, 2, 3],
-                        zkparams: vec![],
-                        restrictions: CallLinkRestrictions::AdminApproval,
-                        encrypted_name: b"abc".to_vec(),
-                        revoked: false,
-                        expiration: *TESTING_EXPIRATION,
-                        approved_users: vec![
-                            "Brian".to_string(),
-                            "Meredith".to_string(),
-                            "Moxie".to_string(),
-                        ],
-                    }),
-                    Some(CallRecord {
-                        room_id: RoomId::from(room_id.clone()),
-                        era_id: "mesozoic".to_string(),
-                        backend_ip: "127.0.0.1".to_string(),
-                        backend_region: "pangaea".to_string(),
-                        creator: "Peter".to_string(),
-                    }),
-                );
-                assert_eq!(
-                    with_approved_users_sorted(
-                        &mut storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
-                            .await?
-                    ),
-                    &expected
-                );
-                expected.0.as_mut().unwrap().approved_users = vec![];
-                assert_eq!(
-                    with_approved_users_sorted(
-                        &mut storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
-                            .await?
-                    ),
-                    &expected
-                );
-                Ok(())
-            },
-        )
-        .await
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_get_call_link_and_record_non_call_link_call() -> Result<()> {
-        let storage = DynamoDb::new(&default_test_config()).await?;
-        let room_id = format!("testing-room-{}", line!());
-        with_db_items(
-            &storage,
-            [
-                // This indicates a group call that coincidentally matches the call link we looked up.
-                // But there's no call link state, so this API should ignore it.
-                // (This is fantastically unlikely in practice.)
-                serde_json::json!({
-                    ROOM_ID_KEY: {"S": room_id},
-                    RECORD_TYPE_KEY: {"S": CallRecord::RECORD_TYPE},
-                    "eraId": {"S": "mesozoic"},
-                    "backendIp": {"S": "127.0.0.1"},
-                    "region": {"S": "pangaea"},
-                    "creator": {"S": "Peter"},
-                }),
-            ],
-            [],
-            async {
-                let expected = (
-                    None,
-                    Some(CallRecord {
-                        room_id: RoomId::from(room_id.clone()),
-                        era_id: "mesozoic".to_string(),
-                        backend_ip: "127.0.0.1".to_string(),
-                        backend_region: "pangaea".to_string(),
-                        creator: "Peter".to_string(),
-                    }),
-                );
-                assert_eq!(
-                    &storage
-                        .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
-                        .await?,
-                    &expected
-                );
-                assert_eq!(
-                    &storage
-                        .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
-                        .await?,
-                    &expected
-                );
-                Ok(())
-            },
-        )
-        .await
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_update_call_link_approved_users() -> Result<()> {
-        let storage = DynamoDb::new(&default_test_config()).await?;
-        let room_id = format!("testing-room-{}", line!());
-        with_db_items(
-            &storage,
-            [default_call_link_state_json(&room_id)],
-            [],
-            async {
-                storage
-                    .update_call_link_approved_users(
-                        &RoomId::from(room_id.clone()),
-                        vec!["me".to_string()],
-                    )
-                    .await?;
-
-                let mut expected = (
-                    Some(CallLinkState {
-                        admin_passkey: vec![1, 2, 3],
-                        zkparams: vec![],
-                        restrictions: CallLinkRestrictions::AdminApproval,
-                        encrypted_name: b"abc".to_vec(),
-                        revoked: false,
-                        expiration: *TESTING_EXPIRATION,
-                        approved_users: vec!["me".to_string()],
-                    }),
-                    None,
-                );
-                assert_eq!(
-                    with_approved_users_sorted(
-                        &mut storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
-                            .await?
-                    ),
-                    &expected
-                );
-
-                storage
-                    .update_call_link_approved_users(
-                        &RoomId::from(room_id.clone()),
-                        vec!["me".to_string(), "you".to_string()],
-                    )
-                    .await?;
-                expected.0.as_mut().unwrap().approved_users =
-                    vec!["me".to_string(), "you".to_string()];
-                assert_eq!(
-                    with_approved_users_sorted(
-                        &mut storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
-                            .await?
-                    ),
-                    &expected
-                );
-
-                Ok(())
-            },
-        )
-        .await
     }
 
     #[test]
@@ -1455,5 +889,625 @@ mod tests {
         let mut known_keys: Vec<&str> = CallLinkState::PEEK_ATTRIBUTES.split(',').collect();
         known_keys.sort();
         assert_eq!(serialized_keys, known_keys);
+    }
+
+    static TESTING_EXPIRATION: Lazy<SystemTime> =
+        Lazy::new(|| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2524608000)); // 2050-01-01
+
+    #[cfg(feature = "storage-tests")]
+    mod test_operations {
+        use super::*;
+        use crate::config::default_test_config;
+        use aws_sdk_dynamodb::error::SdkError;
+        use aws_sdk_dynamodb::types::{DeleteRequest, PutRequest, WriteRequest};
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        use futures::FutureExt;
+        use lazy_static::lazy_static;
+        use std::future::Future;
+        use std::process::Command;
+
+        lazy_static! {
+            static ref DYNAMODB_STATUS: std::process::ExitStatus = start_dynamodb();
+        }
+
+        fn default_call_link_state_json(room_id: &str) -> serde_json::Value {
+            serde_json::json!({
+            ROOM_ID_KEY: {"S": room_id},
+            RECORD_TYPE_KEY: {"S": CallLinkState::RECORD_TYPE},
+            "adminPasskey": {"B": STANDARD.encode([1, 2, 3])},
+            "zkparams": {"B": ""},
+            "restrictions": {"S": "adminApproval"},
+            "encryptedName": {"B": STANDARD.encode(b"abc")},
+            "revoked": {"BOOL": false},
+            "expiration": {"N": timestamp_to_string(*TESTING_EXPIRATION)},
+            })
+        }
+
+        fn default_call_link_state_json_with(
+            room_id: &str,
+            mut extra_keys: serde_json::Value,
+        ) -> serde_json::Value {
+            let mut state = default_call_link_state_json(room_id);
+            state
+                .as_object_mut()
+                .unwrap()
+                .append(extra_keys.as_object_mut().unwrap());
+            state
+        }
+
+        fn with_approved_users_sorted(
+            full_info: &mut (Option<CallLinkState>, Option<CallRecord>),
+        ) -> &(Option<CallLinkState>, Option<CallRecord>) {
+            if let Some(CallLinkState { approved_users, .. }) = &mut full_info.0 {
+                approved_users.sort()
+            }
+            full_info
+        }
+
+        fn timestamp_to_string(timestamp: SystemTime) -> String {
+            timestamp
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .to_string()
+        }
+
+        #[derive(thiserror::Error, Debug)]
+        enum BootstrapError {
+            #[error(transparent)]
+            UnexpectedError(#[from] anyhow::Error),
+
+            #[error("failed to run `docker compose run bootstrap from workspace root`")]
+            StartupError,
+        }
+
+        // Create a local DynamoDb client. Attempt to contact local DynamoDb, if fail - bring up
+        // local DynamoDb using Docker Compose and retry.
+        async fn bootstrap_storage() -> Result<DynamoDb, BootstrapError> {
+            let client = DynamoDb::new(&default_test_config()).await.unwrap();
+            println!("Checking local DynamoDB connection...");
+            match client.client.list_tables().send().await {
+                Ok(_) => {
+                    println!("Reusing existing local DynamoDB instance.");
+                    Ok(client)
+                }
+                Err(err) => {
+                    if let SdkError::DispatchFailure { .. } = err {
+                        println!("Local DynamoDB not running, starting...");
+                        // Ensure we only start the container once by referencing static variable
+                        if DYNAMODB_STATUS.success() {
+                            Ok(client)
+                        } else {
+                            Err(BootstrapError::StartupError)
+                        }
+                    } else {
+                        Err(BootstrapError::UnexpectedError(err.into()))
+                    }
+                }
+            }
+        }
+
+        fn start_dynamodb() -> std::process::ExitStatus {
+            // Note: --build flag checks for container existence, not freshness.
+            // use `docker compose build bootstrap` when bootstrap image is stale
+            Command::new("docker")
+                .args(["compose", "run", "bootstrap", "--build"])
+                .status()
+                .expect("failed to run docker compose - check executing directory and whether docker is installed")
+        }
+
+        async fn with_db_items<R>(
+            storage: &DynamoDb,
+            items: impl IntoIterator<Item = serde_json::Value>,
+            pending_deletes: impl IntoIterator<Item = (&str, &str)>,
+            test: impl Future<Output = R>,
+        ) -> R {
+            let (mut deletes, puts): (Vec<_>, Vec<_>) = items
+                .into_iter()
+                .map(|item| {
+                    (
+                        WriteRequest::builder()
+                            .delete_request(
+                                DeleteRequest::builder()
+                                    .key(
+                                        ROOM_ID_KEY,
+                                        serde_json::from_value::<serde_dynamo::AttributeValue>(
+                                            item.as_object()
+                                                .unwrap()
+                                                .get(ROOM_ID_KEY)
+                                                .unwrap()
+                                                .clone(),
+                                        )
+                                        .unwrap()
+                                        .into(),
+                                    )
+                                    .key(
+                                        RECORD_TYPE_KEY,
+                                        serde_json::from_value::<serde_dynamo::AttributeValue>(
+                                            item.as_object()
+                                                .unwrap()
+                                                .get(RECORD_TYPE_KEY)
+                                                .unwrap()
+                                                .clone(),
+                                        )
+                                        .unwrap()
+                                        .into(),
+                                    )
+                                    .build(),
+                            )
+                            .build(),
+                        WriteRequest::builder()
+                            .put_request(
+                                PutRequest::builder()
+                                    .set_item(Some(
+                                        serde_json::from_value::<Item>(item).unwrap().into(),
+                                    ))
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                })
+                .unzip();
+
+            deletes.extend(
+                pending_deletes
+                    .into_iter()
+                    .map(|(partition_key, sort_key)| {
+                        WriteRequest::builder()
+                            .delete_request(
+                                DeleteRequest::builder()
+                                    .key(ROOM_ID_KEY, AttributeValue::S(partition_key.to_string()))
+                                    .key(RECORD_TYPE_KEY, AttributeValue::S(sort_key.to_string()))
+                                    .build(),
+                            )
+                            .build()
+                    }),
+            );
+
+            storage
+                .client
+                .batch_write_item()
+                .request_items(&storage.table_name, puts)
+                .send()
+                .await
+                .expect("can initialize table");
+
+            // Why is this safe?
+            // Well, the only thing we do after panicking is run the cleanup code.
+            // But if the panic comes from the DynamoDB client, this might not actually be safe.
+            // There's not really anything we can do about that (short of reinitializing the client).
+            let result = std::panic::AssertUnwindSafe(test).catch_unwind().await;
+
+            storage
+                .client
+                .batch_write_item()
+                .request_items(&storage.table_name, deletes)
+                .send()
+                .await
+                .expect("can clean up table");
+
+            result.unwrap()
+        }
+
+        #[tokio::test]
+        async fn test_absent_call_link() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            assert_eq!(
+                storage
+                    .get_call_link(&RoomId::from("testing-nonexistent".to_string()))
+                    .await?,
+                None
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_present_call_link() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            with_db_items(
+                &storage,
+                [default_call_link_state_json(&room_id)],
+                [],
+                async {
+                    assert_eq!(
+                        storage.get_call_link(&RoomId::from(room_id)).await?,
+                        Some(CallLinkState {
+                            admin_passkey: vec![1, 2, 3],
+                            zkparams: vec![],
+                            restrictions: CallLinkRestrictions::AdminApproval,
+                            encrypted_name: b"abc".to_vec(),
+                            revoked: false,
+                            expiration: *TESTING_EXPIRATION,
+                            approved_users: vec![],
+                        })
+                    );
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_skips_approved_users() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            with_db_items(
+                &storage,
+                [default_call_link_state_json_with(
+                    &room_id,
+                    serde_json::json!({
+                    "approvedUsers": {"SS": ["Moxie", "Brian", "Meredith"]},
+                    }),
+                )],
+                [],
+                async {
+                    assert_eq!(
+                        storage.get_call_link(&RoomId::from(room_id)).await?,
+                        Some(CallLinkState {
+                            admin_passkey: vec![1, 2, 3],
+                            zkparams: vec![],
+                            restrictions: CallLinkRestrictions::AdminApproval,
+                            encrypted_name: b"abc".to_vec(),
+                            revoked: false,
+                            expiration: *TESTING_EXPIRATION,
+                            approved_users: vec![],
+                        })
+                    );
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_and_record_absent() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            assert_eq!(
+                storage
+                    .get_call_link_and_record(
+                        &RoomId::from("testing-nonexistent".to_string()),
+                        false
+                    )
+                    .await?,
+                (None, None)
+            );
+            assert_eq!(
+                storage
+                    .get_call_link_and_record(
+                        &RoomId::from("testing-nonexistent".to_string()),
+                        true
+                    )
+                    .await?,
+                (None, None)
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_and_record_with_no_call() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            with_db_items(
+                &storage,
+                [default_call_link_state_json(&room_id)],
+                [],
+                async {
+                    let expected = (
+                        Some(CallLinkState {
+                            admin_passkey: vec![1, 2, 3],
+                            zkparams: vec![],
+                            restrictions: CallLinkRestrictions::AdminApproval,
+                            encrypted_name: b"abc".to_vec(),
+                            revoked: false,
+                            expiration: *TESTING_EXPIRATION,
+                            approved_users: vec![],
+                        }),
+                        None,
+                    );
+                    assert_eq!(
+                        &storage
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                            .await?,
+                        &expected
+                    );
+                    assert_eq!(
+                        &storage
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
+                            .await?,
+                        &expected
+                    );
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_and_record_with_no_call_and_approved_users() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            with_db_items(
+                &storage,
+                [default_call_link_state_json_with(
+                    &room_id,
+                    serde_json::json!({
+                    "approvedUsers": {"SS": ["Moxie", "Brian", "Meredith"]},
+                    }),
+                )],
+                [],
+                async {
+                    let mut expected = (
+                        Some(CallLinkState {
+                            admin_passkey: vec![1, 2, 3],
+                            zkparams: vec![],
+                            restrictions: CallLinkRestrictions::AdminApproval,
+                            encrypted_name: b"abc".to_vec(),
+                            revoked: false,
+                            expiration: *TESTING_EXPIRATION,
+                            approved_users: vec![
+                                "Brian".to_string(),
+                                "Meredith".to_string(),
+                                "Moxie".to_string(),
+                            ],
+                        }),
+                        None,
+                    );
+                    assert_eq!(
+                        with_approved_users_sorted(
+                            &mut storage
+                                .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                                .await?
+                        ),
+                        &expected
+                    );
+                    expected.0.as_mut().unwrap().approved_users = vec![];
+                    assert_eq!(
+                        with_approved_users_sorted(
+                            &mut storage
+                                .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
+                                .await?
+                        ),
+                        &expected
+                    );
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_and_record_with_call() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            with_db_items(
+                &storage,
+                [
+                    default_call_link_state_json(&room_id),
+                    serde_json::json!({
+                    ROOM_ID_KEY: {"S": room_id},
+                    RECORD_TYPE_KEY: {"S": CallRecord::RECORD_TYPE},
+                    "eraId": {"S": "mesozoic"},
+                    "backendIp": {"S": "127.0.0.1"},
+                    "region": {"S": "pangaea"},
+                    "creator": {"S": "Peter"},
+                    }),
+                ],
+                [],
+                async {
+                    let expected = (
+                        Some(CallLinkState {
+                            admin_passkey: vec![1, 2, 3],
+                            zkparams: vec![],
+                            restrictions: CallLinkRestrictions::AdminApproval,
+                            encrypted_name: b"abc".to_vec(),
+                            revoked: false,
+                            expiration: *TESTING_EXPIRATION,
+                            approved_users: vec![],
+                        }),
+                        Some(CallRecord {
+                            room_id: RoomId::from(room_id.clone()),
+                            era_id: "mesozoic".to_string(),
+                            backend_ip: "127.0.0.1".to_string(),
+                            backend_region: "pangaea".to_string(),
+                            creator: "Peter".to_string(),
+                        }),
+                    );
+                    assert_eq!(
+                        &storage
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                            .await?,
+                        &expected
+                    );
+                    assert_eq!(
+                        &storage
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
+                            .await?,
+                        &expected
+                    );
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_and_record_with_call_and_approved_users() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            with_db_items(
+                &storage,
+                [
+                    default_call_link_state_json_with(
+                        &room_id,
+                        serde_json::json!({
+                        "approvedUsers": {"SS": ["Moxie", "Brian", "Meredith"]},
+                        }),
+                    ),
+                    serde_json::json!({
+                    ROOM_ID_KEY: {"S": room_id},
+                    RECORD_TYPE_KEY: {"S": CallRecord::RECORD_TYPE},
+                    "eraId": {"S": "mesozoic"},
+                    "backendIp": {"S": "127.0.0.1"},
+                    "region": {"S": "pangaea"},
+                    "creator": {"S": "Peter"},
+                    }),
+                ],
+                [],
+                async {
+                    let mut expected = (
+                        Some(CallLinkState {
+                            admin_passkey: vec![1, 2, 3],
+                            zkparams: vec![],
+                            restrictions: CallLinkRestrictions::AdminApproval,
+                            encrypted_name: b"abc".to_vec(),
+                            revoked: false,
+                            expiration: *TESTING_EXPIRATION,
+                            approved_users: vec![
+                                "Brian".to_string(),
+                                "Meredith".to_string(),
+                                "Moxie".to_string(),
+                            ],
+                        }),
+                        Some(CallRecord {
+                            room_id: RoomId::from(room_id.clone()),
+                            era_id: "mesozoic".to_string(),
+                            backend_ip: "127.0.0.1".to_string(),
+                            backend_region: "pangaea".to_string(),
+                            creator: "Peter".to_string(),
+                        }),
+                    );
+                    assert_eq!(
+                        with_approved_users_sorted(
+                            &mut storage
+                                .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                                .await?
+                        ),
+                        &expected
+                    );
+                    expected.0.as_mut().unwrap().approved_users = vec![];
+                    assert_eq!(
+                        with_approved_users_sorted(
+                            &mut storage
+                                .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
+                                .await?
+                        ),
+                        &expected
+                    );
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_and_record_non_call_link_call() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            with_db_items(
+                &storage,
+                [
+                    // This indicates a group call that coincidentally matches the call link we looked up.
+                    // But there's no call link state, so this API should ignore it.
+                    // (This is fantastically unlikely in practice.)
+                    serde_json::json!({
+                    ROOM_ID_KEY: {"S": room_id},
+                    RECORD_TYPE_KEY: {"S": CallRecord::RECORD_TYPE},
+                    "eraId": {"S": "mesozoic"},
+                    "backendIp": {"S": "127.0.0.1"},
+                    "region": {"S": "pangaea"},
+                    "creator": {"S": "Peter"},
+                    }),
+                ],
+                [],
+                async {
+                    let expected = (
+                        None,
+                        Some(CallRecord {
+                            room_id: RoomId::from(room_id.clone()),
+                            era_id: "mesozoic".to_string(),
+                            backend_ip: "127.0.0.1".to_string(),
+                            backend_region: "pangaea".to_string(),
+                            creator: "Peter".to_string(),
+                        }),
+                    );
+                    assert_eq!(
+                        &storage
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                            .await?,
+                        &expected
+                    );
+                    assert_eq!(
+                        &storage
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
+                            .await?,
+                        &expected
+                    );
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_update_call_link_approved_users() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            with_db_items(
+                &storage,
+                [default_call_link_state_json(&room_id)],
+                [],
+                async {
+                    storage
+                        .update_call_link_approved_users(
+                            &RoomId::from(room_id.clone()),
+                            vec!["me".to_string()],
+                        )
+                        .await?;
+
+                    let mut expected = (
+                        Some(CallLinkState {
+                            admin_passkey: vec![1, 2, 3],
+                            zkparams: vec![],
+                            restrictions: CallLinkRestrictions::AdminApproval,
+                            encrypted_name: b"abc".to_vec(),
+                            revoked: false,
+                            expiration: *TESTING_EXPIRATION,
+                            approved_users: vec!["me".to_string()],
+                        }),
+                        None,
+                    );
+                    assert_eq!(
+                        with_approved_users_sorted(
+                            &mut storage
+                                .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                                .await?
+                        ),
+                        &expected
+                    );
+
+                    storage
+                        .update_call_link_approved_users(
+                            &RoomId::from(room_id.clone()),
+                            vec!["me".to_string(), "you".to_string()],
+                        )
+                        .await?;
+                    expected.0.as_mut().unwrap().approved_users =
+                        vec!["me".to_string(), "you".to_string()];
+                    assert_eq!(
+                        with_approved_users_sorted(
+                            &mut storage
+                                .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                                .await?
+                        ),
+                        &expected
+                    );
+
+                    Ok(())
+                },
+            )
+            .await
+        }
     }
 }

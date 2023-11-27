@@ -48,6 +48,25 @@ async fn main() -> Result<(), Error> {
 
     let client = Client::new(&sdk_config);
 
+    // Poll for DynamoDb to be ready, fail after 10 seconds.
+    const MAX_ATTEMPTS: u32 = 20;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match client.list_tables().send().await {
+            Err(..) if attempt == MAX_ATTEMPTS => {
+                eprintln!("Poll {}: DynamoDB is not ready, failing...", attempt);
+                std::process::exit(1);
+            }
+            Err(err) => {
+                println!("Poll {}: DynamoDB is not ready: {}", attempt, err);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Ok(_) => {
+                println!("Poll {}: DynamoDB is ready!", attempt);
+                break;
+            }
+        }
+    }
+
     build_table(&client, "Rooms", |table| {
         let provisional_throughput = ProvisionedThroughput::builder()
             .read_capacity_units(5)
