@@ -9,7 +9,7 @@
 //!   GET /v2/conference/participants
 //!   PUT /v2/conference/participants
 
-use std::{convert::TryInto, net::SocketAddr, str, sync::Arc, time::UNIX_EPOCH};
+use std::{net::SocketAddr, str, sync::Arc, time::UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -23,8 +23,8 @@ use axum::{
 use hex::{FromHex, ToHex};
 use log::*;
 use parking_lot::Mutex;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
 
@@ -34,6 +34,8 @@ use crate::{
     region::Region,
     sfu::{self, Sfu},
 };
+
+use calling_common::DemuxId;
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -111,28 +113,9 @@ mod metrics {
     }
 }
 
-/// Obtain a demux_id from the given user_id.
-///
-/// The demux_id is the first 112 bits of the SHA-256 hash of the user_id string byte
-/// representation.
-///
-/// ```
-/// use calling_backend::http_server::demux_id_from_user_id;
-/// use std::convert::TryInto;
-///
-/// assert_eq!(demux_id_from_user_id("abcdef-0"), 3487943312.try_into().unwrap());
-/// assert_eq!(demux_id_from_user_id("abcdef-12345"), 2175944000.try_into().unwrap());
-/// assert_eq!(demux_id_from_user_id(""), 3820012608.try_into().unwrap());
-/// ```
-pub fn demux_id_from_user_id(user_id: &str) -> calling_common::DemuxId {
-    let mut hasher = Sha256::new();
-    hasher.update(user_id.as_bytes());
-
-    // Get the 32-bit hash but mask out 4 bits since DemuxIDs must leave
-    // these unset for "SSRC space".
-    (u32::from_be_bytes(hasher.finalize()[0..4].try_into().unwrap()) & 0xfffffff0)
-        .try_into()
-        .unwrap()
+pub fn random_demux_id() -> DemuxId {
+    let unmasked_id = rand::thread_rng().gen::<u32>();
+    DemuxId::try_from(unmasked_id & !0b1111).expect("valid")
 }
 
 /// Synthesizes a conference ID from the call start timestamp.
@@ -344,7 +327,7 @@ async fn join_conference(
     };
 
     // Generate ids for the client.
-    let demux_id = demux_id_from_user_id(user_id.as_str());
+    let demux_id = random_demux_id();
     let server_ice_ufrag = ice::random_ufrag();
     let server_ice_pwd = ice::random_pwd();
 
