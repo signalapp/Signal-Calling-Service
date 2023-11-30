@@ -7,9 +7,8 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::{
-    operation::delete_item::DeleteItemError,
-    operation::update_item::UpdateItemError,
-    types::{AttributeValue, ReturnValue, Select},
+    operation::{delete_item::DeleteItemError, update_item::UpdateItemError},
+    types::{AttributeValue, Delete, ReturnValue, Select, TransactWriteItem},
     Client, Config,
 };
 use aws_smithy_async::rt::sleep::default_async_sleep;
@@ -62,6 +61,13 @@ impl CallRecord {
     // 'region' is a DynamoDB reserved word, so anyone using this list has to provide an alias with
     // '#region'.
     const ATTRIBUTES: &str = "roomId,eraId,backendIp,#region,creator";
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CallRecordKey {
+    pub room_id: RoomId,
+    pub era_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -146,6 +152,9 @@ pub struct CallLinkUpdate {
 pub enum StorageError {
     #[error(transparent)]
     UnexpectedError(#[from] anyhow::Error),
+
+    #[error("too many items in batch, provided {provided}, limit is {limit}")]
+    BatchLimitExceeded { provided: usize, limit: usize },
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -169,6 +178,12 @@ pub trait Storage: Sync + Send {
     /// Removes the given call from the table as long as the era_id of the record that
     /// exists in the table is the same.
     async fn remove_call_record(&self, room_id: &RoomId, era_id: &str) -> Result<(), StorageError>;
+    /// Removes a batch of call records from the table, applying the same checks as remove_call_record.
+    /// The batch delete is all or nothing. Caller should issue serial deletes in case of error.
+    async fn remove_batch_call_records(
+        &self,
+        call_keys: Vec<CallRecordKey>,
+    ) -> Result<(), StorageError>;
     /// Returns a list of all calls in the table that are in the given region.
     async fn get_call_records_for_region(
         &self,
@@ -212,6 +227,8 @@ pub struct DynamoDb {
 }
 
 impl DynamoDb {
+    const TRANSACT_WRITE_ITEMS_LIMIT: usize = 100;
+
     pub async fn new(config: &config::Config) -> Result<Self> {
         let sleep_impl =
             default_async_sleep().ok_or_else(|| anyhow!("failed to create sleep_impl"))?;
@@ -429,6 +446,57 @@ impl Storage for DynamoDb {
                 DeleteItemError::ConditionalCheckFailedException(_) => Ok(()),
                 err => Err(StorageError::UnexpectedError(err.into())),
             },
+        }
+    }
+
+    async fn remove_batch_call_records(
+        &self,
+        call_keys: Vec<CallRecordKey>,
+    ) -> Result<(), StorageError> {
+        if call_keys.len() > DynamoDb::TRANSACT_WRITE_ITEMS_LIMIT {
+            error!("Error during remove_batch_call_records: BatchLimitExceeded");
+            return Err(StorageError::BatchLimitExceeded {
+                provided: call_keys.len(),
+                limit: DynamoDb::TRANSACT_WRITE_ITEMS_LIMIT,
+            });
+        }
+
+        let delete_requests = call_keys
+            .into_iter()
+            .map(|k| {
+                Delete::builder()
+                    .table_name(&self.table_name)
+                    .key(ROOM_ID_KEY, AttributeValue::S(k.room_id.into()))
+                    .key(
+                        RECORD_TYPE_KEY,
+                        AttributeValue::S(CallRecord::RECORD_TYPE.to_string()),
+                    )
+                    .condition_expression("eraId = :value")
+                    .expression_attribute_values(":value", AttributeValue::S(k.era_id))
+                    .build()
+            })
+            .map(|delete| {
+                TransactWriteItem::builder()
+                    .set_delete(Some(delete))
+                    .build()
+            })
+            .collect();
+
+        let response = self
+            .client
+            .transact_write_items()
+            .set_transact_items(Some(delete_requests))
+            .send()
+            .await;
+
+        match response {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                error!("Error during remove_batch_call_records: {:?}", err);
+                Err(StorageError::UnexpectedError(
+                    err.into_service_error().into(),
+                ))
+            }
         }
     }
 
@@ -904,11 +972,25 @@ mod tests {
         use base64::Engine;
         use futures::FutureExt;
         use lazy_static::lazy_static;
+        use std::collections::HashSet;
         use std::future::Future;
         use std::process::Command;
 
         lazy_static! {
             static ref DYNAMODB_STATUS: std::process::ExitStatus = start_dynamodb();
+        }
+
+        const ERA_ID_KEY: &str = "eraId";
+
+        fn default_call_record_state(room_id: &str, era_id: &str) -> serde_json::Value {
+            serde_json::json!({
+            ROOM_ID_KEY: {"S": room_id},
+            RECORD_TYPE_KEY: {"S": CallRecord::RECORD_TYPE},
+            ERA_ID_KEY: {"S": era_id},
+            "backendIp": {"S": "127.0.0.1"},
+            "region": {"S": "pangaea"},
+            "creator": {"S": "Peter"},
+            })
         }
 
         fn default_call_link_state_json(room_id: &str) -> serde_json::Value {
@@ -1104,7 +1186,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_present_call_link() -> Result<()> {
-            let storage = bootstrap_storage().await?;
+            let storage = DynamoDb::new(&default_test_config()).await?;
             let room_id = format!("testing-room-{}", line!());
             with_db_items(
                 &storage,
@@ -1508,6 +1590,55 @@ mod tests {
                 },
             )
             .await
+        }
+
+        #[tokio::test]
+        async fn test_remove_batch_call_records_success() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let call_keys = (0..10)
+                .map(|i| CallRecordKey {
+                    room_id: RoomId::from(format!("testing-room-{}-{}", line!(), i)),
+                    era_id: format!("testing-era-id-{}-{}", line!(), i),
+                })
+                .collect::<Vec<_>>();
+            let items = call_keys
+                .iter()
+                .map(|k| default_call_record_state(k.room_id.as_ref(), &k.era_id));
+
+            let (delete, save) = call_keys.split_at(5);
+            let save: HashSet<&RoomId> = save.iter().map(|k| &k.room_id).collect();
+
+            with_db_items(&storage, items, [], async {
+                storage.remove_batch_call_records(delete.to_vec()).await?;
+                let remaining = storage.get_call_records_for_region("pangaea").await?;
+                assert_eq!(remaining.len(), save.len());
+                assert!(remaining.iter().all(|item| save.contains(&item.room_id)));
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_remove_batch_call_records_limit_exceeded() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let call_keys = (0..DynamoDb::TRANSACT_WRITE_ITEMS_LIMIT + 1)
+                .map(|i| CallRecordKey {
+                    room_id: RoomId::from(format!("testing-room-{}-{}", line!(), i)),
+                    era_id: format!("testing-era-id-{}-{}", line!(), i),
+                })
+                .collect::<Vec<_>>();
+            match storage
+                .remove_batch_call_records(call_keys)
+                .await
+                .unwrap_err()
+            {
+                StorageError::BatchLimitExceeded { provided, limit } => {
+                    assert_eq!(limit, DynamoDb::TRANSACT_WRITE_ITEMS_LIMIT);
+                    assert_eq!(provided, DynamoDb::TRANSACT_WRITE_ITEMS_LIMIT + 1);
+                }
+                _ => panic!("unexpected error"),
+            }
+            Ok(())
         }
     }
 }

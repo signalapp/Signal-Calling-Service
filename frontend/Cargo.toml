@@ -53,7 +53,9 @@ http = "0.2"
 
 # For storage access to DynamoDB
 aws-types = "0.56"
-aws-credential-types = { version = "0.56", features = ["hardcoded-credentials"] }
+aws-credential-types = { version = "0.56", features = [
+  "hardcoded-credentials",
+] }
 aws-smithy-types = "0.56"
 aws-smithy-async = "0.56"
 aws-config = "0.56"
@@ -67,7 +69,6 @@ psutil = { version = "3.2.2", default-features = false, features = ["process"] }
 # For the call link credentials
 bincode = "1.2.1"
 zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.23.1" }
-lazy_static = "1.4.0"
 
 [dev-dependencies]
 mockall = "0.11.0"

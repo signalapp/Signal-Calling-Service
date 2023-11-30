@@ -47,7 +47,7 @@ impl From<DemuxId> for u32 {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Deserialize, Hash, Serialize, Eq, PartialEq)]
 pub struct RoomId(String);
 
 impl From<String> for RoomId {
