@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::{
     operation::{delete_item::DeleteItemError, update_item::UpdateItemError},
@@ -150,11 +151,10 @@ pub struct CallLinkUpdate {
 
 #[derive(thiserror::Error, Debug)]
 pub enum StorageError {
-    #[error(transparent)]
-    UnexpectedError(#[from] anyhow::Error),
-
     #[error("too many items in batch, provided {provided}, limit is {limit}")]
     BatchLimitExceeded { provided: usize, limit: usize },
+    #[error(transparent)]
+    UnexpectedError(#[from] anyhow::Error),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -241,6 +241,7 @@ impl DynamoDb {
                 info!("Using endpoint for DynamodDB testing: {}", endpoint);
 
                 let aws_config = Config::builder()
+                    .behavior_version(BehaviorVersion::v2023_11_09())
                     .credentials_provider(Credentials::from_keys(KEY, PASSWORD, None))
                     .endpoint_url(endpoint)
                     .sleep_impl(sleep_impl)
@@ -266,7 +267,7 @@ impl DynamoDb {
                     .connect_timeout(core::time::Duration::from_millis(3100))
                     .build();
 
-                let aws_config = aws_config::from_env()
+                let aws_config = aws_config::defaults(BehaviorVersion::v2023_11_09())
                     .sleep_impl(sleep_impl)
                     .retry_config(retry_config)
                     .timeout_config(timeout_config)
@@ -474,13 +475,19 @@ impl Storage for DynamoDb {
                     .condition_expression("eraId = :value")
                     .expression_attribute_values(":value", AttributeValue::S(k.era_id))
                     .build()
+                    .map(|delete| {
+                        TransactWriteItem::builder()
+                            .set_delete(Some(delete))
+                            .build()
+                    })
             })
-            .map(|delete| {
-                TransactWriteItem::builder()
-                    .set_delete(Some(delete))
-                    .build()
-            })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| {
+                error!("Failed to build a Delete item: {:?}", err);
+                StorageError::UnexpectedError(
+                    anyhow::Error::from(err).context("failed to build a Delete item"),
+                )
+            })?;
 
         let response = self
             .client
@@ -488,11 +495,10 @@ impl Storage for DynamoDb {
             .set_transact_items(Some(delete_requests))
             .send()
             .await;
-
         match response {
             Ok(_) => Ok(()),
             Err(err) => {
-                error!("Error during remove_batch_call_records: {:?}", err);
+                error!("Failed to send batch delete transaction: {:?}", err);
                 Err(StorageError::UnexpectedError(
                     err.into_service_error().into(),
                 ))
@@ -1116,7 +1122,8 @@ mod tests {
                                         .unwrap()
                                         .into(),
                                     )
-                                    .build(),
+                                    .build()
+                                    .unwrap(),
                             )
                             .build(),
                         WriteRequest::builder()
@@ -1125,7 +1132,8 @@ mod tests {
                                     .set_item(Some(
                                         serde_json::from_value::<Item>(item).unwrap().into(),
                                     ))
-                                    .build(),
+                                    .build()
+                                    .unwrap(),
                             )
                             .build(),
                     )
@@ -1141,7 +1149,8 @@ mod tests {
                                 DeleteRequest::builder()
                                     .key(ROOM_ID_KEY, AttributeValue::S(partition_key.to_string()))
                                     .key(RECORD_TYPE_KEY, AttributeValue::S(sort_key.to_string()))
-                                    .build(),
+                                    .build()
+                                    .unwrap(),
                             )
                             .build()
                     }),

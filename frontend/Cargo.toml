@@ -52,15 +52,15 @@ mime = "0.3"
 http = "0.2"
 
 # For storage access to DynamoDB
-aws-types = "0.56"
-aws-credential-types = { version = "0.56", features = [
+aws-types = "1.0.3"
+aws-credential-types = { version = "1.0.3", features = [
   "hardcoded-credentials",
 ] }
-aws-smithy-types = "0.56"
-aws-smithy-async = "0.56"
-aws-config = "0.56"
-aws-sdk-dynamodb = "0.30"
-serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+0_30"] }
+aws-smithy-types = "1.0.3"
+aws-smithy-async = "1.0.3"
+aws-config = "1.0.3"
+aws-sdk-dynamodb = "1.4.0"
+serde_dynamo = { version = "4.2.13", features = ["aws-sdk-dynamodb+1"] }
 
 # For metrics
 parking_lot = "0.12"
