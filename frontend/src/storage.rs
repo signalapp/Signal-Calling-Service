@@ -57,10 +57,10 @@ pub struct CallRecord {
 }
 
 impl CallRecord {
-    const RECORD_TYPE: &str = "ActiveCall";
+    const RECORD_TYPE: &'static str = "ActiveCall";
     // 'region' is a DynamoDB reserved word, so anyone using this list has to provide an alias with
     // '#region'.
-    const ATTRIBUTES: &str = "roomId,eraId,backendIp,#region,creator";
+    const ATTRIBUTES: &'static str = "roomId,eraId,backendIp,#region,creator";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -110,8 +110,8 @@ pub struct CallLinkState {
 }
 
 impl CallLinkState {
-    const RECORD_TYPE: &str = "CallLinkState";
-    const PEEK_ATTRIBUTES: &str =
+    const RECORD_TYPE: &'static str = "CallLinkState";
+    const PEEK_ATTRIBUTES: &'static str =
         "adminPasskey,zkparams,restrictions,encryptedName,revoked,expiration";
 
     const EXPIRATION_TIMER: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24 * 90);
