@@ -24,4 +24,4 @@ thiserror = "1.0"
 
 [dev-dependencies]
 hex = { version = "0.4", features = ["serde"] }
-hex-literal = "0.3.2"
+hex-literal = "0.4.1"

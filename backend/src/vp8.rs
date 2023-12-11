@@ -433,16 +433,14 @@ mod read_header_tests {
     #[test]
     fn read_header() {
         let data = &hex!(
-            "
-           /* byte0 */ 90
-           /* xbyte */ c0
-      /* picture_id */ 9267  // (with leading bit)
-     /* tl0_pic_idx */ dc
-        /* payload0 */ 00
-         /* skipped */ 0000000000
- /* width and scale */ 8002
-/* height and scale */ 6801
-            "
+                   /* byte0 */ "90"
+                   /* xbyte */ "c0"
+              /* picture_id */ "9267"  // (with leading bit)
+             /* tl0_pic_idx */ "dc"
+                /* payload0 */ "00"
+                 /* skipped */ "0000000000"
+         /* width and scale */ "8002"
+        /* height and scale */ "6801"
         );
         assert_eq!(
             ParsedHeader::read(data).unwrap(),
@@ -461,16 +459,14 @@ mod read_header_tests {
     #[test]
     fn read_header_alternative_values() {
         let data = &hex!(
-            "
-           /* byte0 */ 90
-           /* xbyte */ c0
-      /* picture_id */ 81d4  // (with leading bit)
-     /* tl0_pic_idx */ d4
-        /* payload0 */ 00
-         /* skipped */ 0000000000
- /* width and scale */ 8007
-/* height and scale */ 38C4
-            "
+                   /* byte0 */ "90"
+                   /* xbyte */ "c0"
+              /* picture_id */ "81d4"  // (with leading bit)
+             /* tl0_pic_idx */ "d4"
+                /* payload0 */ "00"
+                 /* skipped */ "0000000000"
+         /* width and scale */ "8007"
+        /* height and scale */ "38C4"
         );
         assert_eq!(
             ParsedHeader::read(data).unwrap(),
@@ -489,13 +485,11 @@ mod read_header_tests {
     #[test]
     fn no_extensions() {
         let data = &hex!(
-            "
-          /* byte0 */ 10
-       /* payload0 */ 00
-        /* skipped */ 0000000000
- /* width and scale */ 8002
-/* height and scale */ 6801
-        "
+                   /* byte0 */ "10"
+                /* payload0 */ "00"
+                 /* skipped */ "0000000000"
+         /* width and scale */ "8002"
+        /* height and scale */ "6801"
         );
         assert_eq!(
             ParsedHeader::read(data).unwrap(),
@@ -514,16 +508,14 @@ mod read_header_tests {
     #[test]
     fn seven_bit_picture_id() {
         let data = &hex!(
-            "
-           /* byte0 */ 90
-           /* xbyte */ c0
-      /* picture_id */ 12 // seven bits due to no leading bit set
-     /* tl0_pic_idx */ dc
-        /* payload0 */ 00
-         /* skipped */ 0000000000
- /* width and scale */ 8002
-/* height and scale */ 6801
-            "
+                   /* byte0 */ "90"
+                   /* xbyte */ "c0"
+              /* picture_id */ "12" // seven bits due to no leading bit set
+             /* tl0_pic_idx */ "dc"
+                /* payload0 */ "00"
+                 /* skipped */ "0000000000"
+         /* width and scale */ "8002"
+        /* height and scale */ "6801"
         );
         assert_eq!(
             ParsedHeader::read(data)

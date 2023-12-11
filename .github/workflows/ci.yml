@@ -12,7 +12,7 @@ jobs:
     steps:
     - name: Install protoc
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - run: rustup toolchain install $(cat rust-toolchain) --profile minimal --component rustfmt,clippy
     - run: shellcheck **/*.sh
     - name: Environment

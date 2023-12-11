@@ -695,29 +695,25 @@ mod test {
 
         assert_eq!(
             &hex!(
-                "
-                      /* ssrc */ 01020304
-              /* first_seqnum */ 0001
-                     /* count */ 0003
-                      /* time */ 000000
-                    /* seqnum */ 05
-                    /* status */ 2003
-                    /* deltas */ 00 5C 04
-            "
+                      /* ssrc */ "01020304"
+              /* first_seqnum */ "0001"
+                     /* count */ "0003"
+                      /* time */ "000000"
+                    /* seqnum */ "05"
+                    /* status */ "2003"
+                    /* deltas */ "00 5C 04"
             )[..],
             &feedback[0][..],
         );
         assert_eq!(
             &hex!(
-                "
-                      /* ssrc */ 01020304
-              /* first_seqnum */ 0002
-                     /* count */ 0001
-                      /* time */ 000000
-                    /* seqnum */ 06
-                    /* status */ 2001
-                    /* deltas */ B0
-            "
+                      /* ssrc */ "01020304"
+              /* first_seqnum */ "0002"
+                     /* count */ "0001"
+                      /* time */ "000000"
+                    /* seqnum */ "06"
+                    /* status */ "2001"
+                    /* deltas */ "B0"
             )[..],
             &feedback[1][..],
         );
@@ -739,29 +735,25 @@ mod test {
 
         assert_eq!(
             &hex!(
-                "
-                      /* ssrc */ 01020304
-              /* first_seqnum */ 0001
-                     /* count */ 0003
-                      /* time */ 000000
-                    /* seqnum */ 05
-                    /* status */ D600
-                    /* deltas */ 00 5C 0368
-            "
+                      /* ssrc */ "01020304"
+              /* first_seqnum */ "0001"
+                     /* count */ "0003"
+                      /* time */ "000000"
+                    /* seqnum */ "05"
+                    /* status */ "D600"
+                    /* deltas */ "00 5C 0368"
             )[..],
             &feedback[0][..],
         );
         assert_eq!(
             &hex!(
-                "
-                      /* ssrc */ 01020304
-              /* first_seqnum */ 0004
-                     /* count */ 0001
-                      /* time */ 0007FF
-                    /* seqnum */ 06
-                    /* status */ 2001
-                    /* deltas */ C4
-            "
+                      /* ssrc */ "01020304"
+              /* first_seqnum */ "0004"
+                     /* count */ "0001"
+                      /* time */ "0007FF"
+                    /* seqnum */ "06"
+                    /* status */ "2001"
+                    /* deltas */ "C4"
             )[..],
             &feedback[1][..],
         );

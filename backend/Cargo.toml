@@ -43,7 +43,7 @@ hex = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = { version = "3.3.0", features = ["base64"] }
-prost = "0.11"
+prost = "0.12.3"
 strum = "0.25.0"
 strum_macros = "0.25.2"
 
@@ -88,10 +88,10 @@ psutil = { version = "3.2.2", default-features = false, features = ["cpu", "proc
 accounting-allocator = "0.2.0"
 
 [build-dependencies]
-prost-build = "0.11"
+prost-build = "0.12.3"
 
 [dev-dependencies]
-hex-literal = "0.3.2"
+hex-literal = "0.4.1"
 unzip3 = "1.0"
 
 # For simulating passage of time in timing tests

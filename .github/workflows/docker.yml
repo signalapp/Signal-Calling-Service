@@ -19,10 +19,10 @@ jobs:
       id-token: write
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: 'Authenticate to Google Cloud'
-      uses: 'google-github-actions/auth@v1'
+      uses: 'google-github-actions/auth@v2'
       with:
         workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
         service_account: ${{ vars.SERVICE_ACCOUNT }}
@@ -57,10 +57,10 @@ jobs:
       id-token: write
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: 'Authenticate to Google Cloud'
-      uses: 'google-github-actions/auth@v1'
+      uses: 'google-github-actions/auth@v2'
       with:
         workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
         service_account: ${{ vars.SERVICE_ACCOUNT }}
