@@ -23,7 +23,7 @@
 #   3) Repeat for the other APIs
 #
 # Option 2:
-#   1) Go to this URL to find the ngrok http address that points to your frontend: http://localhost:4551
+#   1) Go to this URL to find the ngrok http address that points to your frontend: http://localhost:4040
 #   2) Modify Desktop code to ignore TLS certificate errors. Add this line in calling.ts, CallingClass.initialize:
 #      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 #
@@ -162,19 +162,19 @@ services:
       - --approved-users-persistence-url
       - "http://calling-frontend:8100/v1/call-link-approvals"
 
-
-  # Go here on the host to find out the ngrok tunnel URL: http://localhost:4551
+  # Go here on the host to find out the ngrok tunnel URL: http://localhost:4040
   ngrok-frontend:
     depends_on:
       - calling-frontend
-    image: shkoliar/ngrok:latest
+    image: ngrok/ngrok:latest
     ports:
-      - 4551:4551
-    links:
-      - calling-frontend
-    environment:
-      - DOMAIN=calling-frontend
-      - PORT=8080
+      - 4040:4040
+    # Optional: Set your ngrok auth token here to avoid timeouts and rate limits.
+    #environment:
+    #  - NGROK_AUTHTOKEN=
+    command:
+      - "http"
+      - "calling-frontend:8080"
 
 networks:
   default:
