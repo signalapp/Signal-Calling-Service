@@ -103,6 +103,11 @@ pub struct CallLinkState {
     /// the name of an expired link.
     #[serde_as(as = "serde_with::TimestampSeconds<i64>")]
     pub expiration: SystemTime,
+    /// When the link record is deleted.
+    ///
+    /// Deletes the dynamodb record at the given time.
+    #[serde_as(as = "serde_with::TimestampSeconds<i64>")]
+    pub delete_at: SystemTime,
     /// List of approved users.
     ///
     /// Only fetched by certain APIs, will be empty otherwise.
@@ -113,9 +118,12 @@ pub struct CallLinkState {
 impl CallLinkState {
     const RECORD_TYPE: &'static str = "CallLinkState";
     const PEEK_ATTRIBUTES: &'static str =
-        "adminPasskey,zkparams,restrictions,encryptedName,revoked,expiration";
+        "adminPasskey,zkparams,restrictions,encryptedName,revoked,expiration,deleteAt";
 
-    const EXPIRATION_TIMER: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24 * 90);
+    pub const EXPIRATION_TIMER: std::time::Duration =
+        std::time::Duration::from_secs(60 * 60 * 24 * 90);
+    pub const DELETION_TIMER: std::time::Duration =
+        std::time::Duration::from_secs(60 * 60 * 24 * 90);
 
     pub fn new(admin_passkey: Vec<u8>, zkparams: Vec<u8>, now: SystemTime) -> Self {
         Self {
@@ -125,6 +133,7 @@ impl CallLinkState {
             encrypted_name: vec![],
             revoked: false,
             expiration: now + Self::EXPIRATION_TIMER,
+            delete_at: now + Self::EXPIRATION_TIMER + Self::DELETION_TIMER,
             approved_users: vec![],
         }
     }
@@ -643,12 +652,16 @@ impl Storage for DynamoDb {
         now: SystemTime,
     ) -> Result<(), CallLinkUpdateError> {
         let expiration = now + CallLinkState::EXPIRATION_TIMER;
+        let delete_at = expiration + CallLinkState::DELETION_TIMER;
         // Must match the serialization used by CallLinkState's expiration property.
-        let attribute_value: AttributeValue =
-            serde_dynamo::to_attribute_value(
-                SerializeAsWrap::<_, serde_with::TimestampSeconds<i64>>::new(&expiration),
-            )
-            .expect("failed to convert timestamp to attribute");
+        let expiration_attribute_value: AttributeValue = serde_dynamo::to_attribute_value(
+            SerializeAsWrap::<_, serde_with::TimestampSeconds<i64>>::new(&expiration),
+        )
+        .expect("failed to convert timestamp to attribute");
+        let delete_at_attribute_value: AttributeValue = serde_dynamo::to_attribute_value(
+            SerializeAsWrap::<_, serde_with::TimestampSeconds<i64>>::new(&delete_at),
+        )
+        .expect("failed to convert timestamp to attribute");
 
         let response = self
             .client
@@ -659,9 +672,10 @@ impl Storage for DynamoDb {
                 RECORD_TYPE_KEY,
                 AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
             )
-            .update_expression("SET expiration = :newExpiration")
+            .update_expression("SET expiration = :newExpiration, deleteAt = :newDeleteAt")
             .condition_expression("attribute_exists(recordType)")
-            .expression_attribute_values(":newExpiration", attribute_value)
+            .expression_attribute_values(":newExpiration", expiration_attribute_value)
+            .expression_attribute_values(":newDeleteAt", delete_at_attribute_value)
             .send()
             .await;
 
@@ -948,6 +962,7 @@ mod tests {
             encrypted_name: b"abc".to_vec(),
             revoked: true,
             expiration: *TESTING_EXPIRATION,
+            delete_at: *TESTING_DELETE_AT,
             // Deliberately empty to be left out of this serialization.
             approved_users: vec![],
         });
@@ -967,6 +982,11 @@ mod tests {
 
     static TESTING_EXPIRATION: Lazy<SystemTime> =
         Lazy::new(|| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2524608000)); // 2050-01-01
+    static TESTING_DELETE_AT: Lazy<SystemTime> = Lazy::new(|| {
+        SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(2524608000)
+            + CallLinkState::DELETION_TIMER
+    }); // 2050-04-01
 
     #[cfg(feature = "storage-tests")]
     mod test_operations {
@@ -1009,6 +1029,7 @@ mod tests {
             "encryptedName": {"B": STANDARD.encode(b"abc")},
             "revoked": {"BOOL": false},
             "expiration": {"N": timestamp_to_string(*TESTING_EXPIRATION)},
+            "deleteAt": {"N": timestamp_to_string(*TESTING_DELETE_AT)},
             })
         }
 
@@ -1211,6 +1232,7 @@ mod tests {
                             encrypted_name: b"abc".to_vec(),
                             revoked: false,
                             expiration: *TESTING_EXPIRATION,
+                            delete_at: *TESTING_DELETE_AT,
                             approved_users: vec![],
                         })
                     );
@@ -1243,6 +1265,7 @@ mod tests {
                             encrypted_name: b"abc".to_vec(),
                             revoked: false,
                             expiration: *TESTING_EXPIRATION,
+                            delete_at: *TESTING_DELETE_AT,
                             approved_users: vec![],
                         })
                     );
@@ -1293,6 +1316,7 @@ mod tests {
                             encrypted_name: b"abc".to_vec(),
                             revoked: false,
                             expiration: *TESTING_EXPIRATION,
+                            delete_at: *TESTING_DELETE_AT,
                             approved_users: vec![],
                         }),
                         None,
@@ -1337,6 +1361,7 @@ mod tests {
                             encrypted_name: b"abc".to_vec(),
                             revoked: false,
                             expiration: *TESTING_EXPIRATION,
+                            delete_at: *TESTING_DELETE_AT,
                             approved_users: vec![
                                 "Brian".to_string(),
                                 "Meredith".to_string(),
@@ -1395,6 +1420,7 @@ mod tests {
                             encrypted_name: b"abc".to_vec(),
                             revoked: false,
                             expiration: *TESTING_EXPIRATION,
+                            delete_at: *TESTING_DELETE_AT,
                             approved_users: vec![],
                         }),
                         Some(CallRecord {
@@ -1455,6 +1481,7 @@ mod tests {
                             encrypted_name: b"abc".to_vec(),
                             revoked: false,
                             expiration: *TESTING_EXPIRATION,
+                            delete_at: *TESTING_DELETE_AT,
                             approved_users: vec![
                                 "Brian".to_string(),
                                 "Meredith".to_string(),
@@ -1565,6 +1592,7 @@ mod tests {
                             encrypted_name: b"abc".to_vec(),
                             revoked: false,
                             expiration: *TESTING_EXPIRATION,
+                            delete_at: *TESTING_DELETE_AT,
                             approved_users: vec!["me".to_string()],
                         }),
                         None,

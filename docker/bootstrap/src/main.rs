@@ -87,6 +87,11 @@ async fn main() -> Result<(), Error> {
         .attribute_type(ScalarAttributeType::S)
         .build()?;
 
+    let attribute_definition_delete_at = AttributeDefinition::builder()
+        .attribute_name("deleteAt")
+        .attribute_type(ScalarAttributeType::S)
+        .build()?;
+
     let partition_key = KeySchemaElement::builder()
         .attribute_name("roomId")
         .key_type(KeyType::Hash)
@@ -130,6 +135,7 @@ async fn main() -> Result<(), Error> {
             .attribute_definitions(attribute_definition_id)
             .attribute_definitions(attribute_definition_record_type)
             .attribute_definitions(attribute_definition_region)
+            .attribute_definitions(attribute_definition_delete_at)
             .key_schema(partition_key)
             .key_schema(sort_key)
             .global_secondary_indexes(global_secondary_index)

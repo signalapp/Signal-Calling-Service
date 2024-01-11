@@ -36,6 +36,8 @@ struct CallLinkState {
     revoked: bool,
     #[serde_as(as = "serde_with::TimestampSeconds<i64>")]
     expiration: SystemTime,
+    #[serde_as(as = "serde_with::TimestampSeconds<i64>")]
+    delete_at: SystemTime,
 }
 
 /// A light wrapper around [`calling_common::RoomId`] that limits the maximum size when
@@ -180,6 +182,7 @@ pub async fn read_call_link(
         name: state.encrypted_name,
         revoked: state.revoked,
         expiration: state.expiration,
+        delete_at: state.delete_at,
     })
     .into_response())
 }
@@ -294,6 +297,7 @@ pub async fn update_call_link(
             name: state.encrypted_name,
             revoked: state.revoked,
             expiration: state.expiration,
+            delete_at: state.delete_at,
         })
         .into_response()),
         Err(CallLinkUpdateError::AdminPasskeyDidNotMatch) => {
@@ -439,9 +443,17 @@ pub mod tests {
     pub const X_ROOM_ID: &str = "X-Room-Id";
 
     const DISTANT_FUTURE_IN_EPOCH_SECONDS: u64 = 4133980800; // 2101-01-01
+    const DISTANT_FUTURE_DELETE_AT_IN_EPOCH_SECONDS: u64 =
+        4133980800 + storage::CallLinkState::DELETION_TIMER.as_secs();
 
     static DISTANT_FUTURE: Lazy<SystemTime> = Lazy::new(|| {
         SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(DISTANT_FUTURE_IN_EPOCH_SECONDS)
+    });
+
+    static DISTANT_FUTURE_DELETE_AT: Lazy<SystemTime> = Lazy::new(|| {
+        SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(DISTANT_FUTURE_IN_EPOCH_SECONDS)
+            + storage::CallLinkState::DELETION_TIMER
     });
 
     static CONFIG: Lazy<config::Config> = Lazy::new(|| {
@@ -548,6 +560,7 @@ pub mod tests {
             encrypted_name: vec![],
             revoked: false,
             expiration: *DISTANT_FUTURE,
+            delete_at: *DISTANT_FUTURE_DELETE_AT,
             approved_users: vec![],
         }
     }
@@ -719,6 +732,7 @@ pub mod tests {
                 "name": "",
                 "revoked": false,
                 "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+                "delete_at": DISTANT_FUTURE_DELETE_AT_IN_EPOCH_SECONDS,
             })
         );
     }
@@ -770,6 +784,7 @@ pub mod tests {
                 "name": STANDARD.encode(b"abc"),
                 "revoked": true,
                 "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+                "delete_at": DISTANT_FUTURE_DELETE_AT_IN_EPOCH_SECONDS,
             })
         );
     }
@@ -940,6 +955,7 @@ pub mod tests {
                 "name": "",
                 "revoked": false,
                 "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+                "delete_at": DISTANT_FUTURE_DELETE_AT_IN_EPOCH_SECONDS,
             })
         );
     }
@@ -1013,6 +1029,7 @@ pub mod tests {
                 "name": STANDARD.encode(b"abc"),
                 "revoked": false,
                 "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+                "delete_at": DISTANT_FUTURE_DELETE_AT_IN_EPOCH_SECONDS,
             })
         );
     }
@@ -1347,6 +1364,7 @@ pub mod tests {
                 "name": STANDARD.encode(b"abc"),
                 "revoked": false,
                 "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+                "delete_at": DISTANT_FUTURE_DELETE_AT_IN_EPOCH_SECONDS,
             })
         );
     }
@@ -1424,6 +1442,7 @@ pub mod tests {
                 "name": STANDARD.encode(b"abc"),
                 "revoked": false,
                 "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+                "delete_at": DISTANT_FUTURE_DELETE_AT_IN_EPOCH_SECONDS,
             })
         );
     }
@@ -1502,6 +1521,7 @@ pub mod tests {
                 "name": "",
                 "revoked": true,
                 "expiration": DISTANT_FUTURE_IN_EPOCH_SECONDS,
+                "delete_at": DISTANT_FUTURE_DELETE_AT_IN_EPOCH_SECONDS,
             })
         );
     }
