@@ -1630,6 +1630,48 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_update_call_link() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            let actual = storage
+                .update_call_link(
+                    &RoomId::from(room_id.clone()),
+                    CallLinkUpdate {
+                        admin_passkey: vec![1, 2, 3],
+                        restrictions: Some(CallLinkRestrictions::AdminApproval),
+                        encrypted_name: Some(b"abc".to_vec()),
+                        revoked: Some(false),
+                    },
+                    Some(vec![]),
+                )
+                .await?;
+
+            let expected = (
+                Some(CallLinkState {
+                    admin_passkey: vec![1, 2, 3],
+                    zkparams: vec![],
+                    restrictions: CallLinkRestrictions::AdminApproval,
+                    encrypted_name: b"abc".to_vec(),
+                    revoked: false,
+                    expiration: actual.expiration,
+                    delete_at: actual.delete_at,
+                    approved_users: vec![],
+                }),
+                None,
+            );
+            assert_eq!(
+                with_approved_users_sorted(
+                    &mut storage
+                        .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                        .await?
+                ),
+                &expected
+            );
+
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn test_remove_batch_call_records_success() -> Result<()> {
             let storage = bootstrap_storage().await?;
             let call_keys = (0..10)
