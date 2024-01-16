@@ -113,6 +113,15 @@ pub struct Config {
     #[arg(long)]
     pub approved_users_persistence_url: Option<hyper::Uri>,
 
+    /// The base URL to DELETE individual and batch of call records.
+    /// An empty URL disables backend initiated call record removal.
+    #[arg(long)]
+    pub remove_call_records_base_url: Option<hyper::Uri>,
+
+    /// Amount of time to wait before failing a call to the calling frontend.
+    #[arg(long, default_value = "5000")]
+    pub frontend_operation_timeout_ms: u64,
+
     /// Whether to save any users who join to the approved users list.
     ///
     /// ...as opposed to only those who are explicitly approved. Only used for testing.
@@ -202,7 +211,9 @@ pub(crate) fn default_test_config() -> Config {
         inactivity_timeout_secs: 30,
         new_clients_require_approval: false,
         approved_users_persistence_url: Default::default(),
+        remove_call_records_base_url: Default::default(),
         persist_approval_for_all_users_who_join: false,
         metrics: Default::default(),
+        frontend_operation_timeout_ms: 1000,
     }
 }

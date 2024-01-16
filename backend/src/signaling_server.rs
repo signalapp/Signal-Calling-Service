@@ -178,6 +178,15 @@ pub fn validate_user_id(user_id_str: &str) -> Result<sfu::UserId> {
     Ok(user_id_str.to_string().into())
 }
 
+/// Validates a room_id.
+///
+/// Currently any non-empty string is considered a valid room_id
+pub fn validate_room_id(room_id: &Option<RoomId>) -> Result<()> {
+    if room_id.as_ref().map_or(false, |id| id.as_ref().is_empty()) {
+        return Err(anyhow!("missing room_id"));
+    }
+    Ok(())
+}
 /// Return a health response after accessing the SFU and obtaining basic information.
 async fn get_health(
     State(sfu): State<Arc<Mutex<Sfu>>>,
@@ -282,6 +291,10 @@ async fn join(
     Json(request): Json<JoinRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     trace!("join(): {} {}", call_id, demux_id);
+
+    if let Err(err) = validate_room_id(&request.room_id) {
+        return Err((StatusCode::BAD_REQUEST, err.to_string()));
+    }
 
     let call_id =
         call_id_from_hex(&call_id).map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;

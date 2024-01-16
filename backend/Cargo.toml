@@ -30,6 +30,7 @@ parking_lot = "0.12"
 once_cell = "1.16.0"
 futures = "0.3"
 num_cpus = "1.13"
+async-trait = "0.1.74"
 
 # For http
 axum = { version = "0.6", features = ["headers"] }

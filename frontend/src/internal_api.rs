@@ -7,10 +7,10 @@ use std::{collections::HashMap, net::SocketAddr, str, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use axum::{
-    extract::{MatchedPath, State},
+    extract::{MatchedPath, Path, State},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{get, put},
+    routing::{delete, get, put},
     Json, Router, TypedHeader,
 };
 use http::{Request, StatusCode};
@@ -20,8 +20,10 @@ use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
 
 use crate::{
-    api::call_links::RoomId, frontend::Frontend, metrics::histogram::Histogram,
-    storage::CallLinkUpdateError,
+    api::call_links::RoomId,
+    frontend::Frontend,
+    metrics::histogram::Histogram,
+    storage::{CallLinkUpdateError, CallRecordKey},
 };
 
 #[derive(Default)]
@@ -54,6 +56,10 @@ async fn metrics<B>(
 
     let tag = if path.starts_with("/v1/call-link-approvals") {
         "call_link_approvals"
+    } else if path == "/v2/conference" {
+        "conference_batch"
+    } else if path.starts_with("/v2/conference/") {
+        "conference"
     } else {
         "unknown"
     };
@@ -112,11 +118,23 @@ fn app(frontend: Arc<Frontend>) -> Router {
         .layer(
             ServiceBuilder::new().layer(middleware::from_fn_with_state(frontend.clone(), metrics)),
         )
+        .with_state(frontend.clone());
+
+    let remove_calls_route = Router::new()
+        .route(
+            "/v2/conference/:room_id/:era_id",
+            delete(remove_call_record),
+        )
+        .route("/v2/conference", delete(remove_batch_call_records))
+        .layer(
+            ServiceBuilder::new().layer(middleware::from_fn_with_state(frontend.clone(), metrics)),
+        )
         .with_state(frontend);
 
     Router::new()
         .merge(health_route)
         .merge(approval_route)
+        .merge(remove_calls_route)
         .fallback(unknown_request_handler)
 }
 
@@ -171,6 +189,53 @@ pub async fn update_approval(
         }
         Err(err) => {
             error!("update_approval: {}", err);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveBatchCallRecordsRequest {
+    pub call_keys: Vec<CallRecordKey>,
+}
+
+/// Removes a call record in the database. If the record does not exist, returns success.
+pub async fn remove_call_record(
+    State(frontend): State<Arc<Frontend>>,
+    Path((room_id, era_id)): Path<(calling_common::RoomId, String)>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if room_id.as_ref().is_empty() || era_id.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    match frontend.storage.remove_call_record(&room_id, &era_id).await {
+        Ok(_) => Ok(Json("ok")),
+        Err(err) => {
+            error!("remove_call_record: {}", err);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Attempts to remove a batch of call records in the database. All or nothing operation.
+/// Caller should issue serial deletes if the batch fails.
+pub async fn remove_batch_call_records(
+    State(frontend): State<Arc<Frontend>>,
+    Json(request): Json<RemoveBatchCallRecordsRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if request.call_keys.is_empty() {
+        return Ok(Json("ok"));
+    }
+
+    match frontend
+        .storage
+        .remove_batch_call_records(request.call_keys)
+        .await
+    {
+        Ok(_) => Ok(Json("ok")),
+        Err(err) => {
+            error!("remove_batch_call_records: {}", err);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

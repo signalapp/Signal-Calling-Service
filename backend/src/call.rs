@@ -66,6 +66,12 @@ const RAISED_HANDS_MESSAGE_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct CallId(Arc<[u8]>);
 
+impl Serialize for CallId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_slice().encode_hex::<String>().as_str())
+    }
+}
+
 impl From<Vec<u8>> for CallId {
     fn from(call_id: Vec<u8>) -> Self {
         Self(call_id.into())
@@ -237,6 +243,7 @@ type KeyFrameRequestToSend = (DemuxId, rtp::KeyFrameRequest);
 /// different video spatial layers.
 pub struct Call {
     // Immutable
+    room_id: Option<RoomId>,
     loggable_call_id: LoggableCallId,
     creator_id: UserId, // AKA the first user to join
     new_clients_require_approval: bool,
@@ -338,6 +345,7 @@ impl Call {
     ) -> Self {
         info!("call: {} creating", loggable_call_id);
         Self {
+            room_id: room_id.clone(),
             loggable_call_id,
             creator_id,
             new_clients_require_approval,
@@ -375,6 +383,10 @@ impl Call {
             key_frame_request_sent_by_ssrc: HashMap::new(),
             call_time: CallTimeStats::default(),
         }
+    }
+
+    pub fn room_id(&self) -> Option<&RoomId> {
+        self.room_id.as_ref()
     }
 
     pub fn loggable_call_id(&self) -> &LoggableCallId {

@@ -115,12 +115,16 @@ impl std::fmt::Debug for ConnectionId {
 }
 
 pub type ConnectionHandler = dyn Fn(Arc<Mutex<Connection>>) + Send + 'static;
+pub type CallEndHandler = dyn Fn(&CallId, &Call) -> Result<()> + Send + 'static;
 pub struct Sfu {
     /// Configuration structure originally from the command line or environment.
     pub config: &'static config::Config,
 
     // If set, called each time a connection is added
     new_connection_handler: Option<Box<ConnectionHandler>>,
+
+    // If set, called each time a call is ended by inactivty or hangups
+    call_end_handler: Option<Box<CallEndHandler>>,
 
     /// Mapping of Calls by their unique CallId. Set by configuration/signaling.
     call_by_call_id: HashMap<CallId, Arc<Mutex<Call>>>,
@@ -161,6 +165,8 @@ impl Sfu {
             config,
             // To enable, call set_new_connection_handler
             new_connection_handler: None,
+            // To enable, call set_call_ended_handler
+            call_end_handler: None,
             call_by_call_id: HashMap::new(),
             connection_by_id: HashMap::new(),
             connection_id_by_ice_request_username: HashMap::new(),
@@ -177,6 +183,10 @@ impl Sfu {
 
     pub fn set_new_connection_handler(&mut self, new_connection_handler: Box<ConnectionHandler>) {
         self.new_connection_handler = Some(new_connection_handler);
+    }
+
+    pub fn set_call_ended_handler(&mut self, new_call_end_handler: Box<CallEndHandler>) {
+        self.call_end_handler = Some(new_call_end_handler);
     }
 
     /// Return a snapshot of all calls tracked by the Sfu.
@@ -967,6 +977,9 @@ impl Sfu {
                         event!("calling.sfu.all_call_seconds.many", seconds);
                     }
 
+                    if let Some(call_ended_handler) = self.call_end_handler.as_ref() {
+                        let _ = call_ended_handler(call_id, &call);
+                    }
                     false
                 } else {
                     // Keep the call around for a while longer.

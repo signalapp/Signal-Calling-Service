@@ -8,8 +8,10 @@ pub mod metrics;
 
 pub mod audio;
 pub mod call;
+pub mod call_lifecycle;
 pub mod config;
 pub mod connection;
+pub mod frontend;
 pub mod googcc;
 pub mod http_server;
 pub mod ice;

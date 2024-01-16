@@ -10,7 +10,7 @@ use std::sync::{atomic::AtomicBool, Arc};
 
 use anyhow::Result;
 use calling_backend::{
-    config, http_server, metrics_server, packet_server, sfu::Sfu, signaling_server,
+    call_lifecycle, config, http_server, metrics_server, packet_server, sfu::Sfu, signaling_server,
 };
 use calling_common::{DataRate, Duration, Instant};
 use clap::Parser;
@@ -120,13 +120,16 @@ fn main() -> Result<()> {
     let (signaling_ender_tx, signaling_ender_rx) = oneshot::channel();
     let (udp_ender_tx, udp_ender_rx) = oneshot::channel();
     let (metrics_ender_tx, metrics_ender_rx) = oneshot::channel();
+    let (call_lifecycle_ender_tx, call_lifecycle_ender_rx) = oneshot::channel();
     let (signal_canceller_tx, signal_canceller_rx) = mpsc::channel(1);
     let is_healthy = Arc::new(AtomicBool::new(true));
 
     let sfu_clone_for_udp = sfu.clone();
     let sfu_clone_for_metrics = sfu.clone();
+    let sfu_clone_for_call_lifecycle = sfu.clone();
     let signal_canceller_tx_clone_for_udp = signal_canceller_tx.clone();
     let signal_canceller_tx_clone_for_metrics = signal_canceller_tx.clone();
+    let signal_canceller_tx_clone_for_call_lifecycle = signal_canceller_tx.clone();
     let is_healthy_clone_for_udp = is_healthy.clone();
 
     threaded_rt.block_on(async {
@@ -166,6 +169,17 @@ fn main() -> Result<()> {
             let _ = signal_canceller_tx_clone_for_metrics.send(()).await;
         });
 
+        // Start the call lifecycle task that manages call hangups off of sfu tick execution.
+        let call_lifecycle_handle = tokio::spawn(async move {
+            let _ = call_lifecycle::start(
+                config,
+                sfu_clone_for_call_lifecycle,
+                call_lifecycle_ender_rx,
+            )
+            .await;
+            let _ = signal_canceller_tx_clone_for_call_lifecycle.send(()).await;
+        });
+
         // Wait for any signals to be detected, or cancel due to one of the
         // servers not being able to be started (the channel is buffered).
         wait_for_signal(signal_canceller_rx).await;
@@ -174,12 +188,14 @@ fn main() -> Result<()> {
         let _ = signaling_ender_tx.send(());
         let _ = udp_ender_tx.send(());
         let _ = metrics_ender_tx.send(());
+        let _ = call_lifecycle_ender_tx.send(());
 
         // Wait for the servers to exit.
         let _ = tokio::join!(
             signaling_server_handle,
             packet_server_handle,
             metrics_server_handle,
+            call_lifecycle_handle,
         );
     });
 
