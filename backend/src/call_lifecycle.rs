@@ -46,6 +46,7 @@ pub async fn start(
             if let Err(err) = call_removal_queue_tx.try_send(key) {
                 error!("Failed to send call removal to queue: {}", err);
             }
+            info!("call: {} queued for delete", LoggableCallId::from(call_id));
             Ok(())
         }));
 
@@ -55,6 +56,7 @@ pub async fn start(
     let tick_handle = tokio::spawn(async move {
         let mut pacing = tokio::time::interval(tokio::time::Duration::from_millis(10));
         let mut delete_buffer: Vec<CallKey> = Vec::with_capacity(CALL_REMOVAL_QUEUE_CAPACITY);
+        info!("call_lifecycle started, delete buffer with capacity {}", delete_buffer.capacity());
 
         loop {
             if let Some(key) = call_removal_queue_rx.recv().await {
@@ -72,6 +74,7 @@ pub async fn start(
             }
 
             for chunk in delete_buffer.chunks(FrontendHttpClient::MAX_BATCH_SIZE) {
+                info!("attempting to batch delete {} calls", chunk.len());
                 if let Err(err) = frontend_client.remove_batch_call_records(chunk).await {
                     warn!("failed to batch remove calls: {:?}", err);
                     for key in chunk {
