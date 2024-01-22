@@ -56,7 +56,10 @@ pub async fn start(
     let tick_handle = tokio::spawn(async move {
         let mut pacing = tokio::time::interval(tokio::time::Duration::from_millis(10));
         let mut delete_buffer: Vec<CallKey> = Vec::with_capacity(CALL_REMOVAL_QUEUE_CAPACITY);
-        info!("call_lifecycle started, delete buffer with capacity {}", delete_buffer.capacity());
+        info!(
+            "call_lifecycle started, delete buffer with capacity {}",
+            delete_buffer.capacity()
+        );
 
         loop {
             if let Some(key) = call_removal_queue_rx.recv().await {
