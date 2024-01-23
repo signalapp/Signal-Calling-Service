@@ -22,6 +22,7 @@ use std::time::Duration;
 pub struct CallKey {
     pub room_id: RoomId,
     /// CallId is referred to as EraId in the frontend
+    #[serde(rename = "eraId")]
     pub call_id: CallId,
 }
 
@@ -99,8 +100,22 @@ impl Frontend for FrontendHttpClient {
         );
 
         match future.await {
-            Ok(response) => match response {
-                Ok(_) => Ok(()),
+            Ok(result) => match result {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        Ok(())
+                    } else {
+                        let status = response.status();
+                        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                        let res_body = String::from_utf8(bytes.into_iter().collect())
+                            .expect("Could not parse body as UTF-8");
+                        Err(FrontendError::UnexpectedError(anyhow::anyhow!(
+                            "Received non-success response. status={:?}, body={:?}",
+                            status,
+                            res_body
+                        )))
+                    }
+                }
                 Err(err) => Err(FrontendError::UnexpectedError(err)),
             },
             _ => Err(FrontendError::Timeout),
@@ -115,7 +130,7 @@ impl Frontend for FrontendHttpClient {
         let body = serde_json::to_vec(&RemoveBatchCallRecordsRequest { call_keys }).unwrap();
         let request = Request::builder()
             .method(Method::DELETE)
-            .uri(url)
+            .uri(url.clone())
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .unwrap();
@@ -128,8 +143,22 @@ impl Frontend for FrontendHttpClient {
         );
 
         match future.await {
-            Ok(response) => match response {
-                Ok(_) => Ok(()),
+            Ok(result) => match result {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        Ok(())
+                    } else {
+                        let status = response.status();
+                        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                        let res_body = String::from_utf8(bytes.into_iter().collect())
+                            .expect("Could not parse body as UTF-8");
+                        Err(FrontendError::UnexpectedError(anyhow::anyhow!(
+                            "Received non-success response. status={:?}, body={:?}",
+                            status,
+                            res_body
+                        )))
+                    }
+                }
                 Err(err) => Err(FrontendError::UnexpectedError(err)),
             },
             _ => Err(FrontendError::Timeout),

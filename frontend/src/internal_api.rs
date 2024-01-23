@@ -121,11 +121,11 @@ fn app(frontend: Arc<Frontend>) -> Router {
         .with_state(frontend.clone());
 
     let remove_calls_route = Router::new()
+        .route("/v2/conference", delete(remove_batch_call_records))
         .route(
             "/v2/conference/:room_id/:era_id",
             delete(remove_call_record),
         )
-        .route("/v2/conference", delete(remove_batch_call_records))
         .layer(
             ServiceBuilder::new().layer(middleware::from_fn_with_state(frontend.clone(), metrics)),
         )
