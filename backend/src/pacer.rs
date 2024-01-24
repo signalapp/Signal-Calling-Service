@@ -54,7 +54,12 @@ impl Pacer {
     }
 
     pub fn set_config(&mut self, config: Config, now: Instant) {
+        let was_scheduled = self.calculate_next_send_time(now).is_some();
         self.config = config;
+        if !was_scheduled {
+            // reset last sent time so next dequeue doesn't appear to be late
+            self.last_sent = Some((DataSize::ZERO, now));
+        }
         self.reschedule_dequeue(now);
     }
 
@@ -182,6 +187,14 @@ impl Pacer {
             // Maybe send media
             let next_media_send_time = self.calculate_next_media_send_time(now);
             if Self::past_send_time(next_media_send_time, now) {
+                if let Some(next_send) = next_media_send_time {
+                    let dequeue_delay = now.saturating_duration_since(next_send).as_micros();
+                    if let Ok(dequeue_delay) = dequeue_delay.try_into() {
+                        sampling_histogram!("calling.pacer.dequeue_delay_us.with_data", || {
+                            dequeue_delay
+                        });
+                    }
+                }
                 if let Some(media) = self.pop_rtx(now).or_else(|| self.pop_video(now)) {
                     self.last_sent = Some((media.size(), now));
                     self.reschedule_dequeue(now);
@@ -201,6 +214,16 @@ impl Pacer {
         if let Some(padding_ssrc) = self.config.padding_ssrc {
             let next_padding_send_time = self.calculate_next_padding_send_time(now);
             if Self::past_send_time(next_padding_send_time, now) {
+                if was_empty {
+                    if let Some(next_send) = next_padding_send_time {
+                        let dequeue_delay = now.saturating_duration_since(next_send).as_micros();
+                        if let Ok(dequeue_delay) = dequeue_delay.try_into() {
+                            sampling_histogram!("calling.pacer.dequeue_delay_us.padding", || {
+                                dequeue_delay
+                            });
+                        }
+                    }
+                }
                 if let Some(padding) = generate_padding(padding_ssrc) {
                     self.last_sent = Some((padding.size(), now));
                     self.reschedule_dequeue(now);
