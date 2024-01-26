@@ -235,7 +235,7 @@ pub async fn remove_batch_call_records(
     {
         Ok(_) => Ok(Json("ok")),
         Err(err) => {
-            error!("remove_batch_call_records: {}", err);
+            error!("failed remove_batch_call_records: {}", err);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

@@ -24,6 +24,8 @@ use serde_dynamo::{from_item, to_item, Item};
 use serde_with::{ser::SerializeAsWrap, serde_as, Bytes};
 use tokio::{io::AsyncWriteExt, sync::oneshot::Receiver};
 
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+use aws_sdk_dynamodb::types::BatchStatementErrorCodeEnum;
 use std::{collections::HashMap, path::PathBuf, time::SystemTime};
 
 #[cfg(test)]
@@ -507,10 +509,20 @@ impl Storage for DynamoDb {
         match response {
             Ok(_) => Ok(()),
             Err(err) => {
-                error!("Failed to send batch delete transaction: {:?}", err);
-                Err(StorageError::UnexpectedError(
-                    err.into_service_error().into(),
-                ))
+                // A ConditionalCheckFailed occurs when a record does not exist. If all deletes failed due to this
+                // reason, then we can assume that the batch was previously deleted.
+                let err = err.into_service_error();
+                if let TransactWriteItemsError::TransactionCanceledException(ref cancellation) = err
+                {
+                    if cancellation.cancellation_reasons().iter().all(|reason| {
+                        reason.code()
+                            == Some(BatchStatementErrorCodeEnum::ConditionalCheckFailed.as_str())
+                    }) {
+                        return Ok(());
+                    }
+                }
+
+                Err(StorageError::UnexpectedError(err.into()))
             }
         }
     }
@@ -1692,6 +1704,71 @@ mod tests {
                 let remaining = storage.get_call_records_for_region("pangaea").await?;
                 assert_eq!(remaining.len(), save.len());
                 assert!(remaining.iter().all(|item| save.contains(&item.room_id)));
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_remove_nonexistent_call_records_success() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let call_keys = (0..10)
+                .map(|i| CallRecordKey {
+                    room_id: RoomId::from(format!("testing-room-{}-{}", line!(), i)),
+                    era_id: format!("testing-era-id-{}-{}", line!(), i),
+                })
+                .collect::<Vec<_>>();
+            let items = call_keys
+                .iter()
+                .map(|k| default_call_record_state(k.room_id.as_ref(), &k.era_id));
+
+            let (delete, save) = call_keys.split_at(5);
+            let save: HashSet<&RoomId> = save.iter().map(|k| &k.room_id).collect();
+
+            with_db_items(&storage, items, [], async {
+                storage.remove_batch_call_records(delete.to_vec()).await?;
+                // call a second time to ensure removing nonexistent records doesn't fail
+                storage.remove_batch_call_records(delete.to_vec()).await?;
+                let remaining = storage.get_call_records_for_region("pangaea").await?;
+                assert_eq!(remaining.len(), save.len());
+                assert!(remaining.iter().all(|item| save.contains(&item.room_id)));
+                Ok(())
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_remove_partial_nonexistent_call_records_fails() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let call_keys = (0..10)
+                .map(|i| CallRecordKey {
+                    room_id: RoomId::from(format!("testing-room-{}-{}", line!(), i)),
+                    era_id: format!("testing-era-id-{}-{}", line!(), i),
+                })
+                .collect::<Vec<_>>();
+            let items = call_keys
+                .iter()
+                .map(|k| default_call_record_state(k.room_id.as_ref(), &k.era_id));
+
+            let (delete, save) = call_keys.split_at(5);
+            let save: HashSet<&RoomId> = save.iter().map(|k| &k.room_id).collect();
+
+            with_db_items(&storage, items, [], async {
+                storage.remove_batch_call_records(delete.to_vec()).await?;
+
+                match storage
+                    .remove_batch_call_records(call_keys.clone())
+                    .await
+                    .unwrap_err()
+                {
+                    StorageError::UnexpectedError(_) => {
+                        let remaining = storage.get_call_records_for_region("pangaea").await?;
+                        assert_eq!(remaining.len(), save.len());
+                        assert!(remaining.iter().all(|item| save.contains(&item.room_id)));
+                    }
+                    _ => panic!("should have been unexpected error"),
+                }
+
                 Ok(())
             })
             .await
