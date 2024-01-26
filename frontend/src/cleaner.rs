@@ -114,12 +114,25 @@ pub async fn start(config: &'static config::Config, ender_rx: Receiver<()>) -> R
                     }
 
                     for chunk in calls_to_remove.chunks(100) {
-                        debug!("Batch removing {} calls.", chunk.len());
+                        info!("attempting to batch delete {} calls", chunk.len());
 
                         // Remove the calls from the database since they don't exist anymore
                         // on a Calling Backend (or there was an *error* accessing it).
                         if let Err(err) = storage.remove_batch_call_records(chunk.to_vec()).await {
-                            error!("{:?}", err);
+                            error!("failed remove_batch_call_records: {}", err);
+
+                            // There was a problem with the batch removal, try to remove each separately.
+                            for call_record_key in chunk {
+                                if let Err(err) = storage
+                                    .remove_call_record(
+                                        &call_record_key.room_id,
+                                        &call_record_key.era_id,
+                                    )
+                                    .await
+                                {
+                                    error!("{:?}", err);
+                                }
+                            }
                         }
                     }
                 }
