@@ -325,10 +325,11 @@ impl Frontend {
 
     #[track_caller]
     fn log_error(context: &str, err: Error) {
-        // Custom format the error using up to the first two errors in the chain. This is
-        // enough to get single line description of the error.
+        // Custom format the error using up to the first three errors in the chain. This is
+        // enough to get single line description of the error. We do a third error in case
+        // a library wraps their errors
         let mut error_string = err.to_string();
-        err.chain().skip(1).take(1).for_each(|cause| {
+        err.chain().skip(1).take(2).for_each(|cause| {
             let _ = write!(error_string, ": {}", cause);
         });
         let location = std::panic::Location::caller();
