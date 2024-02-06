@@ -465,6 +465,14 @@ impl Storage for DynamoDb {
         &self,
         call_keys: Vec<CallRecordKey>,
     ) -> Result<(), StorageError> {
+        if call_keys.is_empty() {
+            return Ok(());
+        }
+        if call_keys.len() == 1 {
+            return self
+                .remove_call_record(&call_keys[0].room_id, &call_keys[0].era_id)
+                .await;
+        }
         if call_keys.len() > DynamoDb::TRANSACT_WRITE_ITEMS_LIMIT {
             error!("Error during remove_batch_call_records: BatchLimitExceeded");
             return Err(StorageError::BatchLimitExceeded {
