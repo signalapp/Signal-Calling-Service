@@ -17,13 +17,17 @@ use std::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
         Arc,
     },
+    thread,
 };
 
 use anyhow::Result;
 use byteorder::{BigEndian, ByteOrder};
 use calling_common::{try_scoped, Duration, Instant};
 use log::*;
-use nix::{errno::Errno, sys::epoll::*};
+use nix::{
+    errno::Errno,
+    sys::{epoll::*, timerfd::*},
+};
 use parking_lot::{Mutex, RwLock};
 use scopeguard::ScopeGuard;
 use unique_id::sequence::SequenceGenerator;
@@ -31,8 +35,8 @@ use unique_id::Generator;
 
 use crate::{
     metrics::TimingOptions,
-    packet_server::SocketLocator,
-    sfu::{self, SfuStats},
+    packet_server::{self, SocketLocator, TimerHeap, TimerHeapNextResult},
+    sfu::{self, HandleOutput, Sfu, SfuStats},
 };
 
 /// Controls number of sockets a particular thread will handle without going back to epoll.
@@ -60,6 +64,12 @@ const MAX_RTP_LENGTH: usize = 1500;
 /// Tcp socket sendbuffer size, enough for 10 Mbps with a 1 second round trip time.
 const TCP_SEND_BUFFER_BYTES: usize = 10_000_000 / 8;
 
+/// epoll_wait timeout in ms.
+///
+/// Timers set from tick() don't have a wakeup mechanism; a lower value
+/// limits the maximum delay for those timers. A larger value reduces CPU load.
+const EPOLL_WAIT_TIMEOUT_MS: isize = 25;
+
 /// The shared state for an epoll-based packet server.
 ///
 /// This server is implemented with a "new client" socket that receives new connections, plus a map
@@ -82,6 +92,7 @@ pub struct PacketServerState {
     tick_interval: Duration,
     tick_number: AtomicU64, // u64 will never rollover
     tcp_id_generator: SequenceGenerator,
+    timer_heap: Mutex<TimerHeap<SocketLocator>>,
 }
 
 impl PacketServerState {
@@ -110,6 +121,7 @@ impl PacketServerState {
             tick_interval,
             tick_number: 0.into(),
             tcp_id_generator,
+            timer_heap: Mutex::new(TimerHeap::new()),
         };
         result.add_socket_to_poll_for_reads(&result.new_client_socket)?;
         result.add_socket_to_poll_for_reads(&result.new_tcp_socket)?;
@@ -221,45 +233,72 @@ impl PacketServerState {
     /// Launches the configured number of threads for the server using Tokio's blocking thread pool
     /// ([`tokio::task::spawn_blocking`]).
     ///
-    /// `handle_packet` should take a single incoming packet's source address and data and produce a
-    /// (possibly empty) set of outgoing packets.
-    ///
     /// This should only be called once.
-    pub fn start_threads(
-        self: Arc<Self>,
-        handle_packet: impl FnMut(SocketLocator, &mut [u8]) -> Vec<(Vec<u8>, SocketLocator)>
-            + Clone
-            + Send
-            + 'static,
-    ) -> impl Future {
-        let all_handles = self.all_epoll_fds.iter().map(|&epoll_fd| {
-            let self_for_thread = self.clone();
-            let handle_packet_for_thread = handle_packet.clone();
-            tokio::task::spawn_blocking(move || {
-                self_for_thread.run(epoll_fd, handle_packet_for_thread)
-            })
-        });
+    pub fn start_threads(self: Arc<Self>, sfu: &Arc<Mutex<Sfu>>) -> impl Future {
+        let all_handles = self
+            .all_epoll_fds
+            .iter()
+            .enumerate()
+            .map(|(thread_num, &epoll_fd)| {
+                let self_for_thread = self.clone();
+                let sfu_for_thread = sfu.clone();
+                tokio::task::spawn_blocking(move || {
+                    let builder = thread::Builder::new().name(format!("epoll {}", thread_num));
+                    builder
+                        .spawn(move || self_for_thread.run(epoll_fd, &sfu_for_thread))
+                        .unwrap()
+                        .join()
+                })
+            });
         futures::future::select_all(all_handles)
     }
 
     /// Runs a single listener on the current thread, polling `epoll_fd`.
     ///
     /// See [`PacketServerState::start_threads`].
-    fn run(
-        self: Arc<Self>,
-        epoll_fd: RawFd,
-        mut handle_packet: impl FnMut(SocketLocator, &mut [u8]) -> Vec<(Vec<u8>, SocketLocator)>,
-    ) {
+    fn run(self: Arc<Self>, epoll_fd: RawFd, sfu: &Arc<Mutex<Sfu>>) {
         let new_client_socket_fd = self.new_client_socket.as_raw_fd();
         let new_tcp_socket_fd = self.new_tcp_socket.as_raw_fd();
         let mut buf = [0u8; MAX_RTP_LENGTH];
+        let mut poll_timeout_ms = EPOLL_WAIT_TIMEOUT_MS;
+
+        let (timer, timer_fd) = match TimerFd::new(ClockId::CLOCK_MONOTONIC, TimerFlags::empty()) {
+            Ok(timer) => {
+                let timer_fd = timer.as_raw_fd();
+                let mut event_read_only = EpollEvent::new(
+                    EpollFlags::EPOLLIN | EpollFlags::EPOLLEXCLUSIVE,
+                    timer_fd as u64,
+                );
+
+                match epoll_ctl(
+                    epoll_fd,
+                    EpollOp::EpollCtlAdd,
+                    timer_fd,
+                    &mut event_read_only,
+                ) {
+                    Ok(()) => (Some(timer), timer_fd),
+                    Err(e) => {
+                        error!("timerfd couldn't be added to epoll, {}, coercing timer waits to milliseconds", e);
+                        (None, -1)
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    "timerfd creation failed, {}, coercing timer waits to milliseconds",
+                    e
+                );
+                (None, -1)
+            }
+        };
 
         loop {
             let mut current_events = [EpollEvent::empty(); MAX_EPOLL_EVENTS];
-            let num_events = epoll_wait(epoll_fd, &mut current_events, -1).unwrap_or_else(|err| {
-                warn!("epoll_wait() failed: {}", err);
-                0
-            });
+            let num_events = epoll_wait(epoll_fd, &mut current_events, poll_timeout_ms)
+                .unwrap_or_else(|err| {
+                    warn!("epoll_wait() failed: {}", err);
+                    0
+                });
             for event in &current_events[..num_events] {
                 let socket_fd = event.data() as i32;
                 let connections_lock = self.all_connections.read();
@@ -301,6 +340,12 @@ impl PacketServerState {
                             }
                         },
                     }
+                    continue;
+                } else if socket_fd == timer_fd {
+                    let _ = timer
+                        .as_ref()
+                        .expect("timer must exist if it epolled")
+                        .wait();
                     continue;
                 } else {
                     match connections_lock.get_by_fd(socket_fd) {
@@ -417,10 +462,54 @@ impl PacketServerState {
                 };
                 drop(connections_lock);
 
-                let packets_to_send = handle_packet(sender_addr, &mut buf[..size]);
+                let HandleOutput {
+                    packets_to_send,
+                    dequeues_to_schedule,
+                } = packet_server::handle_packet(sfu, sender_addr, &mut buf[..size]);
+
                 for (buf, addr) in packets_to_send {
                     self.send_packet(&buf, addr)
                 }
+
+                if !dequeues_to_schedule.is_empty() {
+                    let mut timer_heap = self.timer_heap.lock();
+                    for (time, addr) in dequeues_to_schedule {
+                        timer_heap.schedule(time, addr);
+                    }
+                }
+            }
+
+            let mut dequeues_left = MAX_EPOLL_EVENTS;
+            while dequeues_left > 0 {
+                let now = Instant::now();
+                let mut timer_heap = self.timer_heap.lock();
+                match timer_heap.next(now) {
+                    TimerHeapNextResult::Value(addr) => {
+                        if let Some((addr, buf, time)) = Sfu::handle_dequeue(sfu, addr, now) {
+                            if let Some(buf) = buf {
+                                dequeues_left -= 1;
+                                self.send_packet(&buf, addr);
+                            }
+                            if let Some(time) = time {
+                                timer_heap.schedule(time, addr);
+                            }
+                        }
+                    }
+                    TimerHeapNextResult::Wait(_timeout) => {
+                        if let Some(timer) = &timer {
+                            timer_heap.set_timer(timer, now);
+                        }
+                        break;
+                    }
+                    TimerHeapNextResult::WaitForever => {
+                        break;
+                    }
+                }
+            }
+            if dequeues_left == 0 {
+                poll_timeout_ms = 0; // busy loop
+            } else {
+                poll_timeout_ms = EPOLL_WAIT_TIMEOUT_MS;
             }
         }
     }
@@ -620,6 +709,16 @@ impl PacketServerState {
                     ConnectionState::NotYetConnected => {
                         trace!("dropping packet (not yet connected)")
                     }
+                }
+            }
+        }
+
+        {
+            time_scope_us!("calling.packet_server.tick.dequeue_scheduling");
+            if !tick_update.dequeues_to_schedule.is_empty() {
+                let mut timer_heap = self.timer_heap.lock();
+                for (time, addr) in tick_update.dequeues_to_schedule {
+                    timer_heap.schedule(time, addr);
                 }
             }
         }

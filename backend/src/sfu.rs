@@ -114,14 +114,10 @@ impl std::fmt::Debug for ConnectionId {
     }
 }
 
-pub type ConnectionHandler = dyn Fn(Arc<Mutex<Connection>>) + Send + 'static;
 pub type CallEndHandler = dyn Fn(&CallId, &Call) -> Result<()> + Send + 'static;
 pub struct Sfu {
     /// Configuration structure originally from the command line or environment.
     pub config: &'static config::Config,
-
-    // If set, called each time a connection is added
-    new_connection_handler: Option<Box<ConnectionHandler>>,
 
     // If set, called each time a call is ended by inactivty or hangups
     call_end_handler: Option<Box<CallEndHandler>>,
@@ -151,7 +147,14 @@ pub struct Sfu {
 /// See [Sfu::tick].
 pub struct TickOutput {
     pub packets_to_send: Vec<(PacketToSend, SocketLocator)>,
+    pub dequeues_to_schedule: Vec<(Instant, SocketLocator)>,
     pub expired_client_addrs: Vec<SocketLocator>,
+}
+
+#[derive(Debug, PartialEq, Eq, Default)]
+pub struct HandleOutput {
+    pub packets_to_send: Vec<(PacketToSend, SocketLocator)>,
+    pub dequeues_to_schedule: Vec<(Instant, SocketLocator)>,
 }
 
 pub struct SfuStats {
@@ -163,8 +166,6 @@ impl Sfu {
     pub fn new(now: Instant, config: &'static config::Config) -> Result<Self> {
         Ok(Self {
             config,
-            // To enable, call set_new_connection_handler
-            new_connection_handler: None,
             // To enable, call set_call_ended_handler
             call_end_handler: None,
             call_by_call_id: HashMap::new(),
@@ -179,10 +180,6 @@ impl Sfu {
             packet_server: None,
             region: Region::from_str(&config.metrics.region).unwrap_or(Region::Unknown),
         })
-    }
-
-    pub fn set_new_connection_handler(&mut self, new_connection_handler: Box<ConnectionHandler>) {
-        self.new_connection_handler = Some(new_connection_handler);
     }
 
     pub fn set_call_ended_handler(&mut self, new_call_end_handler: Box<CallEndHandler>) {
@@ -485,9 +482,6 @@ impl Sfu {
         )));
         self.connection_by_id
             .insert(connection_id.clone(), connection.clone());
-        if let Some(new_connection_handler) = self.new_connection_handler.as_ref() {
-            new_connection_handler(connection);
-        };
         self.connection_id_by_ice_request_username
             .insert(ice_request_username, connection_id);
         // Entries are inserted into self.connection_id_by_address as we received ICE binding
@@ -518,12 +512,8 @@ impl Sfu {
         if let Some(connection) = self.connection_by_id.remove(&connection_id) {
             event!("calling.sfu.close_connection.remove_client_from_call");
 
-            let mut connection = connection.lock();
-            // This prevents an Arc cycle where connection -> scheduler -> connection.
-            connection.set_dequeue_scheduler(None);
-
             self.connection_id_by_ice_request_username
-                .remove(connection.ice_request_username());
+                .remove(connection.lock().ice_request_username());
 
             // Entries are removed from self.connection_id_by_address over time in tick().
         }
@@ -535,12 +525,8 @@ impl Sfu {
         if let Some(connection) = self.connection_by_id.remove(&connection_id) {
             event!("calling.sfu.close_connection.rtp");
 
-            let mut connection = connection.lock();
-            // This prevents an Arc cycle where connection -> scheduler -> connection.
-            connection.set_dequeue_scheduler(None);
-
             self.connection_id_by_ice_request_username
-                .remove(connection.ice_request_username());
+                .remove(connection.lock().ice_request_username());
 
             // Entries are removed from self.connection_id_by_address over time in tick().
         }
@@ -596,7 +582,7 @@ impl Sfu {
         sfu: &Mutex<Self>,
         sender_addr: SocketLocator,
         incoming_packet: &mut [u8],
-    ) -> Result<Vec<(PacketToSend, SocketLocator)>, SfuError> {
+    ) -> Result<HandleOutput, SfuError> {
         trace!("handle_packet():");
 
         // RTP should go first because it's by far the most common.
@@ -639,13 +625,14 @@ impl Sfu {
                             incoming_connection_id.call_id,
                             incoming_connection_id.demux_id,
                         );
-                        return Ok(vec![]);
+                        return Ok(Default::default());
                     }
                     Err(e) => return Err(SfuError::CallError(e)),
                 }
             };
 
             let mut packets_to_send = vec![];
+            let mut dequeues_to_schedule = vec![];
             // We use one mutable outgoing ConnectionId to avoid cloning the CallId many times.
             let mut outgoing_connection_id = incoming_connection_id;
             for (demux_id, outgoing_rtp) in outgoing_rtp {
@@ -658,12 +645,16 @@ impl Sfu {
                     outgoing_connection.send_or_enqueue_rtp(
                         outgoing_rtp,
                         &mut packets_to_send,
+                        &mut dequeues_to_schedule,
                         Instant::now(),
                     );
                 }
             }
 
-            return Ok(packets_to_send);
+            return Ok(HandleOutput {
+                packets_to_send,
+                dequeues_to_schedule,
+            });
         }
 
         if rtp::looks_like_rtcp(incoming_packet) {
@@ -674,7 +665,8 @@ impl Sfu {
                 incoming_connection_id,
                 HandleRtcpResult {
                     incoming_key_frame_requests,
-                    outgoing_rtx,
+                    mut packets_to_send,
+                    dequeues_to_schedule,
                     new_target_send_rate,
                 },
             ) = {
@@ -710,7 +702,6 @@ impl Sfu {
                 )
             };
 
-            let mut outgoing_packets = outgoing_rtx;
             // We use one mutable outgoing ConnectionId to avoid cloning the CallId many times.
             let mut outgoing_connection_id = incoming_connection_id;
 
@@ -726,12 +717,15 @@ impl Sfu {
                     if let Some(key_frame_request) = outgoing_connection
                         .send_key_frame_request(key_frame_request, Instant::now())
                     {
-                        outgoing_packets.push(key_frame_request);
+                        packets_to_send.push(key_frame_request);
                     };
                 }
             }
 
-            return Ok(outgoing_packets);
+            return Ok(HandleOutput {
+                packets_to_send,
+                dequeues_to_schedule,
+            });
         }
 
         // When we get a valid ICE check, send back a check response and update the
@@ -760,10 +754,29 @@ impl Sfu {
                 .connection_id_by_address
                 .insert_without_removing_old(sender_addr, incoming_connection_id);
 
-            return Ok(vec![(outgoing_response, sender_addr)]);
+            return Ok(HandleOutput {
+                packets_to_send: vec![(outgoing_response, sender_addr)],
+                dequeues_to_schedule: vec![],
+            });
         }
 
         Err(SfuError::UnknownPacketType(sender_addr))
+    }
+
+    pub fn handle_dequeue(
+        sfu: &Mutex<Self>,
+        addr: SocketLocator,
+        now: Instant,
+    ) -> Option<(SocketLocator, Option<PacketToSend>, Option<Instant>)> {
+        trace!("handle_dequeue():");
+
+        time_scope_us!("calling.sfu.handle_dequeue");
+
+        let (_connection_id, connection) = sfu.lock().get_connection_from_address(&addr).ok()?;
+        let mut connection = connection.lock();
+        time_scope_us!("calling.sfu.handle_dequeue.connection_lock");
+
+        connection.dequeue_outgoing_rtp(now)
     }
 
     /// Handle the periodic tick, which could be fired every 100ms in production.
@@ -773,7 +786,8 @@ impl Sfu {
     pub fn tick(&mut self, now: Instant) -> TickOutput {
         time_scope_us!("calling.sfu.tick");
         let config = self.config;
-        let mut packets_to_send: Vec<(PacketToSend, SocketLocator)> = vec![];
+        let mut packets_to_send = vec![];
+        let mut dequeues_to_schedule = vec![];
 
         // Post diagnostics to the log if needed.
         if let Some(diagnostics_interval_secs) = config.diagnostics_interval_secs {
@@ -879,8 +893,6 @@ impl Sfu {
                     event!("calling.sfu.close_connection.inactive");
                 }
 
-                // This prevents an Arc cycle where connection -> scheduler -> connection.
-                connection.set_dequeue_scheduler(None);
                 false
             } else {
                 // Don't remove the connection; it's still active!
@@ -1037,6 +1049,7 @@ impl Sfu {
                 if let Some(connection) = self.connection_by_id.get_mut(&outgoing_connection_id) {
                     let mut connection = connection.lock();
                     connection.configure_congestion_control(
+                        &mut dequeues_to_schedule,
                         googcc::Request {
                             base: send_rate_allocation_info.requested_base_rate,
                             ideal: send_rate_allocation_info.ideal_send_rate,
@@ -1079,6 +1092,7 @@ impl Sfu {
                     outgoing_connection.send_or_enqueue_rtp(
                         outgoing_rtp,
                         &mut packets_to_send,
+                        &mut dequeues_to_schedule,
                         now,
                     );
                 }
@@ -1092,6 +1106,7 @@ impl Sfu {
 
         TickOutput {
             packets_to_send,
+            dequeues_to_schedule,
             expired_client_addrs,
         }
     }

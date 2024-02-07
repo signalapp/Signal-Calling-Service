@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 
 use calling_common::{DataRate, DataSize, Instant};
+use log::error;
 
 use crate::rtp;
 
@@ -19,8 +20,6 @@ pub struct Config {
     pub padding_ssrc: Option<rtp::Ssrc>,
 }
 
-pub type Scheduler = dyn Fn(Instant) + Send;
-
 type Queue = VecDeque<rtp::Packet<Vec<u8>>>;
 
 /// A Pacer smooths out the sending of packets such that we send packets at a regular interval
@@ -29,9 +28,6 @@ type Queue = VecDeque<rtp::Packet<Vec<u8>>>;
 /// media send rate to allow for cases where we want only want to pad up to some rate
 /// (such as the ideal send rate) but can use the full target send rate when draining the queue.
 pub struct Pacer {
-    // If not set, then you must call dequeue_outgoing_rtp regularly.
-    pub dequeue_scheduler: Option<Box<Scheduler>>,
-
     config: Config,
 
     video_queue: Queue,
@@ -41,10 +37,8 @@ pub struct Pacer {
 }
 
 impl Pacer {
-    // If dequeue_scheduler not set, then you must call dequeue_outgoing_rtp regularly.
     pub fn new(config: Config) -> Self {
         Self {
-            dequeue_scheduler: None,
             config,
             video_queue: Default::default(),
             rtx_queue: Default::default(),
@@ -53,26 +47,14 @@ impl Pacer {
         }
     }
 
-    pub fn set_config(&mut self, config: Config, now: Instant) {
+    pub fn set_config(&mut self, config: Config, now: Instant) -> Option<Instant> {
         let was_scheduled = self.calculate_next_send_time(now).is_some();
         self.config = config;
         if !was_scheduled {
             // reset last sent time so next dequeue doesn't appear to be late
             self.last_sent = Some((DataSize::ZERO, now));
         }
-        self.reschedule_dequeue(now);
-    }
-
-    fn reschedule_dequeue(&mut self, now: Instant) {
-        if let Some(dequeue_scheduler) = self.dequeue_scheduler.as_ref() {
-            if let Some(next_send_time) = self.calculate_next_send_time(now) {
-                if next_send_time < now {
-                    dequeue_scheduler(now);
-                } else {
-                    dequeue_scheduler(next_send_time);
-                }
-            }
-        }
+        self.calculate_next_send_time(now)
     }
 
     fn calculate_next_send_time(&self, now: Instant) -> Option<Instant> {
@@ -122,14 +104,13 @@ impl Pacer {
         &mut self,
         media: rtp::Packet<Vec<u8>>,
         now: Instant,
-    ) -> Option<rtp::Packet<Vec<u8>>> {
+    ) -> (Option<rtp::Packet<Vec<u8>>>, Option<Instant>) {
         let next_media_send_time = self.calculate_next_media_send_time(now);
         let was_empty = self.queue_is_empty();
         if was_empty && Self::past_send_time(next_media_send_time, now) {
             // Skip the queue
             self.last_sent = Some((media.size(), now));
-            self.reschedule_dequeue(now);
-            Some(media)
+            (Some(media), self.calculate_next_send_time(now))
         } else {
             self.queued_size += media.size();
             match media.is_rtx() {
@@ -137,12 +118,12 @@ impl Pacer {
                 true => self.rtx_queue.push_back(media),
             }
             if was_empty {
-                self.reschedule_dequeue(now);
+                (None, self.calculate_next_send_time(now))
             } else {
                 // The next dequeue time shouldn't change because this isn't at the front of the queue.
                 // So don't waste cycles scheduling it.
+                (None, None)
             }
-            None
         }
     }
 
@@ -181,7 +162,7 @@ impl Pacer {
         &mut self,
         generate_padding: impl FnOnce(rtp::Ssrc) -> Option<rtp::Packet<Vec<u8>>>,
         now: Instant,
-    ) -> Option<rtp::Packet<Vec<u8>>> {
+    ) -> (Option<rtp::Packet<Vec<u8>>>, Option<Instant>) {
         let was_empty = self.queue_is_empty();
         if !was_empty {
             // Maybe send media
@@ -197,8 +178,7 @@ impl Pacer {
                 }
                 if let Some(media) = self.pop_rtx(now).or_else(|| self.pop_video(now)) {
                     self.last_sent = Some((media.size(), now));
-                    self.reschedule_dequeue(now);
-                    return Some(media);
+                    return (Some(media), self.calculate_next_send_time(now));
                 }
             } else {
                 // Wait to send the front of the queue.
@@ -206,7 +186,8 @@ impl Pacer {
                 // a dequeue happened too early, which can only happen if we have more than
                 // one outstanding scheduled dequeue, in which case there should be
                 // another one coming up.
-                return None;
+                event!("calling.pacer.dequeue.data.early");
+                return (None, None);
             }
         }
 
@@ -226,27 +207,28 @@ impl Pacer {
                 }
                 if let Some(padding) = generate_padding(padding_ssrc) {
                     self.last_sent = Some((padding.size(), now));
-                    self.reschedule_dequeue(now);
-                    Some(padding)
+                    (Some(padding), self.calculate_next_send_time(now))
                 } else {
                     // For some reason padding generation failed.
-                    None
+                    error!("padding generation failed");
+                    (None, None)
                 }
             } else if !was_empty {
                 // Reschedule, we're too early for padding, because we thought we had media, but it expired
-                self.reschedule_dequeue(now);
-                None
+                event!("calling.pacer.dequeue.padding.expired_data");
+                (None, self.calculate_next_send_time(now))
             } else {
                 // Wait to send padding.
                 // This doesn't require a reschedule because this can only happen if
                 // a dequeue happened too early, which can only happen if we have more than
                 // one outstanding scheduled dequeue, in which case there should be
                 // another one coming up.
-                None
+                event!("calling.pacer.dequeue.padding.early");
+                (None, None)
             }
         } else {
             // Can't send padding because it's not configured.
-            None
+            (None, None)
         }
     }
 }
@@ -255,36 +237,25 @@ impl Pacer {
 mod tests {
     use super::*;
 
-    use std::{
-        cmp::Reverse,
-        collections::BinaryHeap,
-        sync::{Arc, Mutex},
-    };
+    use std::{cmp::Reverse, collections::BinaryHeap};
 
     use calling_common::Duration;
 
-    // We have to wrap the Pacer in an Arc<Mutex> to make it easy to "drive" the dequeueing.
-    // And we can make some things easier to use for tests.
-    #[derive(Clone)]
+    // Wrap the Pacer to make it easier to use for testing.
     struct TestPacer {
         epoch: Instant,
-        pacer: Arc<Mutex<Pacer>>,
-        scheduled_dequeue_times: Arc<Mutex<BinaryHeap<Reverse<Instant>>>>,
+        pacer: Pacer,
+        scheduled_dequeue_times: BinaryHeap<Reverse<Instant>>,
     }
 
     impl TestPacer {
         fn new(config: Config) -> Self {
-            let pacer = Arc::new(Mutex::new(Pacer::new(config)));
-            let test_pacer = Self {
+            let pacer = Pacer::new(config);
+            Self {
                 epoch: Instant::now(),
                 pacer,
-                scheduled_dequeue_times: Arc::new(Mutex::new(BinaryHeap::new())),
-            };
-            let test_pacer_for_dequeue_scheduler = test_pacer.clone();
-            test_pacer.set_dequeue_scheduler(Box::new(move |scheduled_dequeue_time| {
-                test_pacer_for_dequeue_scheduler.push_scheduled_dequeue_time(scheduled_dequeue_time)
-            }));
-            test_pacer
+                scheduled_dequeue_times: BinaryHeap::new(),
+            }
         }
 
         fn time_from_ms(&self, ms: u64) -> Instant {
@@ -295,51 +266,45 @@ mod tests {
             time.saturating_duration_since(self.epoch).as_millis() as u64
         }
 
-        fn set_dequeue_scheduler(&self, dequeue_scheduler: Box<Scheduler>) {
-            let mut pacer = self.pacer.lock().unwrap();
-            pacer.dequeue_scheduler = Some(dequeue_scheduler);
+        fn push_scheduled_dequeue_time(&mut self, scheduled_dequeue_time: Instant) {
+            self.scheduled_dequeue_times
+                .push(Reverse(scheduled_dequeue_time));
         }
 
-        fn push_scheduled_dequeue_time(&self, scheduled_dequeue_time: Instant) {
-            let mut scheduled_dequeue_times = self.scheduled_dequeue_times.lock().unwrap();
-            scheduled_dequeue_times.push(Reverse(scheduled_dequeue_time));
-        }
-
-        fn pop_scheduled_dequeue_time_if_before(&self, deadline: Instant) -> Option<Instant> {
-            let mut scheduled_dequeue_times = self.scheduled_dequeue_times.lock().unwrap();
-            let next_scheduled_dequeue_time = scheduled_dequeue_times.peek()?.0;
+        fn pop_scheduled_dequeue_time_if_before(&mut self, deadline: Instant) -> Option<Instant> {
+            let next_scheduled_dequeue_time = self.scheduled_dequeue_times.peek()?.0;
             if next_scheduled_dequeue_time < deadline {
-                Some(scheduled_dequeue_times.pop()?.0)
+                Some(self.scheduled_dequeue_times.pop()?.0)
             } else {
                 None
             }
         }
 
         fn configure(
-            &self,
+            &mut self,
             media_send_rate_kbps: u64,
             padding_send_rate_kbps: u64,
             padding_ssrc: Option<u32>,
             now_ms: u64,
         ) {
-            let mut pacer = self.pacer.lock().unwrap();
-            pacer.set_config(
+            if let Some(schedule) = self.pacer.set_config(
                 Config {
                     media_send_rate: DataRate::from_kbps(media_send_rate_kbps),
                     padding_send_rate: DataRate::from_kbps(padding_send_rate_kbps),
                     padding_ssrc,
                 },
                 self.time_from_ms(now_ms),
-            );
+            ) {
+                self.push_scheduled_dequeue_time(schedule);
+            }
         }
 
         fn queued_size(&self) -> DataSize {
-            let pacer = self.pacer.lock().unwrap();
-            pacer.queued_size()
+            self.pacer.queued_size()
         }
 
         fn dequeue_until(
-            &self,
+            &mut self,
             deadline_ms: u64,
             padding: &rtp::Packet<Vec<u8>>,
             media_sent_times_ms: &mut Vec<(rtp::FullSequenceNumber, u64)>,
@@ -347,21 +312,25 @@ mod tests {
         ) {
             let deadline = self.time_from_ms(deadline_ms);
             while let Some(dequeue_time) = self.pop_scheduled_dequeue_time_if_before(deadline) {
-                let mut pacer = self.pacer.lock().unwrap();
                 let generate_padding = Box::new(|_| Some(padding.clone()));
-                if let Some(sent) = pacer.dequeue(generate_padding, dequeue_time) {
+                let (sent, schedule) = self.pacer.dequeue(generate_padding, dequeue_time);
+
+                if let Some(sent) = sent {
                     let dequeue_time_ms = self.time_as_ms(dequeue_time);
-                    if Some(sent.ssrc()) == pacer.config.padding_ssrc {
+                    if Some(sent.ssrc()) == self.pacer.config.padding_ssrc {
                         padding_sent_times_ms.push(dequeue_time_ms);
                     } else {
                         media_sent_times_ms.push((sent.seqnum(), dequeue_time_ms));
                     }
                 }
+                if let Some(schedule) = schedule {
+                    self.push_scheduled_dequeue_time(schedule);
+                }
             }
         }
 
         fn send(
-            &self,
+            &mut self,
             send_times_ms: &[(rtp::FullSequenceNumber, u64)],
             media: &rtp::Packet<Vec<u8>>,
             padding: &rtp::Packet<Vec<u8>>,
@@ -376,12 +345,15 @@ mod tests {
                     &mut padding_sent_times_ms,
                 );
 
-                let mut pacer = self.pacer.lock().unwrap();
                 let send_time = self.time_from_ms(*send_time_ms);
                 let mut media = media.clone();
                 media.set_seqnum_in_header(*seqnum);
-                if let Some(_sent) = pacer.enqueue(media.clone(), send_time) {
+                let (sent, schedule) = self.pacer.enqueue(media.clone(), send_time);
+                if let Some(_sent) = sent {
                     media_sent_times_ms.push((*seqnum, *send_time_ms));
+                }
+                if let Some(schedule) = schedule {
+                    self.push_scheduled_dequeue_time(schedule);
                 }
             }
             (media_sent_times_ms, padding_sent_times_ms)
@@ -390,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_pacer() {
-        let pacer = TestPacer::new(Config::default());
+        let mut pacer = TestPacer::new(Config::default());
 
         let media = {
             let pt = 108;
