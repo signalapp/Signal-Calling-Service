@@ -127,9 +127,6 @@ impl LoadBalancerTask {
             } else if server_health.reported_weight == 0 || weight == 0 {
                 info!("{} weight {:?} -> {}", ip, server_health.weight, weight);
                 server_health.reported_weight = weight;
-            } else if server_health.reported_weight.abs_diff(weight) > 10 {
-                info!("{} weight {:?} -> {}", ip, server_health.weight, weight);
-                server_health.reported_weight = weight;
             }
 
             if weight == 0 {
