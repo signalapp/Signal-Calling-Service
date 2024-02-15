@@ -48,13 +48,45 @@ impl Pacer {
     }
 
     pub fn set_config(&mut self, config: Config, now: Instant) -> Option<Instant> {
-        let was_scheduled = self.calculate_next_send_time(now).is_some();
+        let old_schedule = self.calculate_next_send_time(now);
         self.config = config;
-        if !was_scheduled {
-            // reset last sent time so next dequeue doesn't appear to be late
-            self.last_sent = Some((DataSize::ZERO, now));
+
+        // Setting the last sent to zero bytes and a specific time below cleans up the
+        // dequeue_delay metrics tracked in dequeue(). If the last sent size is zero bytes,
+        // the next send time is the same as whatever time is set.
+
+        if let Some(new_schedule) = self.calculate_next_send_time(now) {
+            match old_schedule {
+                None => {
+                    if new_schedule < now {
+                        // Old last sent could have been a long time ago.
+                        self.last_sent = Some((DataSize::ZERO, now));
+                        Some(now)
+                    } else {
+                        // Leave last sent, it is recent enough that sending
+                        // now would be above the configured rate.
+                        Some(new_schedule)
+                    }
+                }
+                Some(old_schedule) => {
+                    if new_schedule <= now {
+                        if old_schedule > now {
+                            // The old timer wasn't late, this shouldn't be considered late either.
+                            self.last_sent = Some((DataSize::ZERO, now));
+                        } else {
+                            // Reset to previous scheduled time, so that the delay
+                            // is tracked from when the previous timer was set.
+                            self.last_sent = Some((DataSize::ZERO, old_schedule));
+                        }
+                        Some(now)
+                    } else {
+                        Some(new_schedule)
+                    }
+                }
+            }
+        } else {
+            None
         }
-        self.calculate_next_send_time(now)
     }
 
     fn calculate_next_send_time(&self, now: Instant) -> Option<Instant> {
