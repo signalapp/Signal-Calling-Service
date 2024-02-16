@@ -75,6 +75,7 @@ pub struct JoinResponse {
     pub ice_pwd: String,
     pub dhe_public_key: String,
     pub conference_id: String,
+    pub client_status: String,
 }
 
 mod metrics {
@@ -349,7 +350,7 @@ async fn join_conference(
         is_admin,
         None,
     ) {
-        Ok(server_dhe_public_key) => {
+        Ok((server_dhe_public_key, client_status)) => {
             let media_server = config::ServerMediaAddress::from(config);
 
             let signaling = sfu
@@ -370,6 +371,7 @@ async fn join_conference(
                 ice_pwd: server_ice_pwd,
                 dhe_public_key: server_dhe_public_key.encode_hex(),
                 conference_id: conference_id_from_signaling_info(&signaling),
+                client_status: client_status.to_string(),
             };
 
             Ok(Json(response).into_response())

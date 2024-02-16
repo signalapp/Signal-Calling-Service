@@ -13,8 +13,8 @@ use std::{
 
 use anyhow::Result;
 use calling_common::{
-    DataRate, DataSize, DemuxId, Duration, Instant, RoomId, TwoGenerationCacheWithManualRemoveOld,
-    DUMMY_DEMUX_ID,
+    ClientStatus, DataRate, DataSize, DemuxId, Duration, Instant, RoomId,
+    TwoGenerationCacheWithManualRemoveOld, DUMMY_DEMUX_ID,
 };
 use hkdf::Hkdf;
 use log::*;
@@ -354,7 +354,7 @@ impl Sfu {
         new_clients_require_approval: bool,
         is_admin: bool,
         approved_users: Option<Vec<UserId>>,
-    ) -> Result<DhePublicKey, SfuError> {
+    ) -> Result<(DhePublicKey, ClientStatus), SfuError> {
         let loggable_call_id = LoggableCallId::from(&call_id);
         trace!("get_or_create_call_and_add_client():");
 
@@ -412,7 +412,7 @@ impl Sfu {
                 self.config.approved_users_persistence_url.as_ref(),
             )))
         });
-        {
+        let client_status = {
             let mut call = call.lock();
             if call.has_client(demux_id) {
                 return Err(SfuError::DuplicateDemuxIdDetected);
@@ -442,8 +442,8 @@ impl Sfu {
                 user_id.clone(),
                 is_admin,
                 Instant::now(), // Now after taking the lock
-            );
-        }
+            )
+        };
 
         // ACKs can be sent from any SSRC that the client is configured to send with, which includes the
         // video base layer, so use that.
@@ -486,7 +486,7 @@ impl Sfu {
             .insert(ice_request_username, connection_id);
         // Entries are inserted into self.connection_id_by_address as we received ICE binding
 
-        Ok(server_dhe_public_key)
+        Ok((server_dhe_public_key, client_status))
     }
 
     /// Remove a client from a call.

@@ -13,7 +13,8 @@ use std::{
 };
 
 use calling_common::{
-    DataRate, DataRateTracker, DemuxId, Duration, Instant, PixelSize, RoomId, VideoHeight,
+    ClientStatus, DataRate, DataRateTracker, DemuxId, Duration, Instant, PixelSize, RoomId,
+    VideoHeight,
 };
 use hex::ToHex;
 use hyper::Uri;
@@ -444,7 +445,13 @@ impl Call {
             .any(|client| client.is_admin && &client.user_id == user_id)
     }
 
-    pub fn add_client(&mut self, demux_id: DemuxId, user_id: UserId, is_admin: bool, now: Instant) {
+    pub fn add_client(
+        &mut self,
+        demux_id: DemuxId,
+        user_id: UserId,
+        is_admin: bool,
+        now: Instant,
+    ) -> ClientStatus {
         let pending_client = NonParticipantClient {
             demux_id,
             user_id,
@@ -458,6 +465,7 @@ impl Call {
                 demux_id.as_u32()
             );
             self.removed_clients.push(pending_client);
+            ClientStatus::Blocked
         } else if is_admin
             || !self.new_clients_require_approval
             || self.approved_users.contains(&pending_client.user_id)
@@ -471,6 +479,7 @@ impl Call {
                 self.approved_users.insert(pending_client.user_id.clone());
             }
             self.promote_client(pending_client, now);
+            ClientStatus::Active
         } else {
             debug!(
                 "call: {} client {} requesting to join",
@@ -480,6 +489,7 @@ impl Call {
             // We use the same event to inform clients about changes in the pending list.
             self.will_add_or_remove_client(now);
             self.pending_clients.push(pending_client);
+            ClientStatus::Pending
         }
     }
 

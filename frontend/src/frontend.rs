@@ -65,6 +65,7 @@ pub struct JoinResponseWrapper {
     pub ice_ufrag: String,
     pub ice_pwd: String,
     pub dhe_public_key: String,
+    pub client_status: Option<String>,
 }
 
 pub struct ClientInfo {
@@ -306,6 +307,7 @@ impl Frontend {
             ice_ufrag: backend_join_response.ice_ufrag,
             ice_pwd: backend_join_response.ice_pwd,
             dhe_public_key: backend_dhe_public_key,
+            client_status: backend_join_response.client_status,
         })
     }
 

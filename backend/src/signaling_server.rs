@@ -112,6 +112,7 @@ pub struct JoinResponse {
     pub server_ice_ufrag: String,
     pub server_ice_pwd: String,
     pub server_dhe_public_key: String,
+    pub client_status: String,
 }
 
 impl Header for sfu::UserId {
@@ -339,7 +340,7 @@ async fn join(
         request.is_admin,
         request.approved_users,
     ) {
-        Ok(server_dhe_public_key) => {
+        Ok((server_dhe_public_key, client_status)) => {
             let media_server = config::ServerMediaAddress::from(config);
             let server_dhe_public_key = server_dhe_public_key.encode_hex();
 
@@ -355,6 +356,7 @@ async fn join(
                 server_ice_ufrag,
                 server_ice_pwd,
                 server_dhe_public_key,
+                client_status: client_status.to_string(),
             };
 
             Ok(Json(response))
@@ -475,7 +477,7 @@ fn start_monitor(mut ender_rx: Receiver<()>, cpu_idle_pct: Arc<AtomicU8>) {
 mod signaling_server_tests {
     use axum::body::Body;
     use axum::http::{self, Request};
-    use calling_common::{DemuxId, Instant};
+    use calling_common::{ClientStatus, DemuxId, Instant};
     use once_cell::sync::Lazy;
     use tokio::sync::oneshot;
     use tower::ServiceExt;
@@ -1154,6 +1156,7 @@ mod signaling_server_tests {
         assert_eq!(response.server_ip, "127.0.0.1");
         assert_eq!(response.server_port, 10000);
         assert_eq!(64, response.server_dhe_public_key.len());
+        assert_eq!(ClientStatus::Active.to_string(), response.client_status);
 
         assert!(
             check_call_exists_in_sfu(sfu.clone(), CALL_ID),

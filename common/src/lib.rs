@@ -7,6 +7,7 @@
 
 mod bits;
 mod call_ids;
+mod client_status;
 mod collections;
 mod counters;
 mod data_rate;
@@ -22,6 +23,7 @@ use std::{cmp::PartialEq, convert::TryInto, io::Write};
 
 pub use bits::*;
 pub use call_ids::*;
+pub use client_status::*;
 pub use collections::*;
 pub use counters::*;
 pub use data_rate::*;

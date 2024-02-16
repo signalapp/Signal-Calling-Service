@@ -116,6 +116,8 @@ pub struct JoinResponse {
     pub ice_pwd: String,
     #[serde(rename = "serverDhePublicKey")]
     pub dhe_public_key: Option<String>,
+    #[serde(rename = "clientStatus")]
+    pub client_status: Option<String>,
 }
 
 #[derive(thiserror::Error, Debug)]

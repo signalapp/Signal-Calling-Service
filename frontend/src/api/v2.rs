@@ -73,6 +73,7 @@ pub struct JoinResponse {
     pub call_creator: String,
     #[serde(rename = "conferenceId")]
     pub era_id: String,
+    pub client_status: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -338,6 +339,7 @@ pub async fn join(
         dhe_public_key: response.dhe_public_key,
         call_creator: call.creator,
         era_id: call.era_id,
+        client_status: response.client_status,
     })
     .into_response())
 }
@@ -378,6 +380,9 @@ pub mod api_server_v2_tests {
 
     const AUTH_KEY: &str = "f00f0014fe091de31827e8d686969fad65013238aadd25ef8629eb8a9e5ef69b";
     const ZKPARAMS: &str = "AMJqvmQRYwEGlm0MSy6QFPIAvgOVsqRASNX1meQyCOYHJFqxO8lITPkow5kmhPrsNbu9JhVfKFwesVSKhdZaqQko3IZlJZMqP7DDw0DgTWpdnYzSt0XBWT50DM1cw1nCUXXBZUiijdaFs+JRlTKdh54M7sf43pFxyMHlS3URH50LOeR8jVQKaUHi1bDP2GR9ZXp3Ot9Fsp0pM4D/vjL5PwoOUuzNNdpIqUSFhKVrtazwuHNn9ecHMsFsN0QPzByiDA8nhKcGpdzyWUvGjEDBvpKkBtqjo8QuXWjyS3jSl2oJ/Z4Fh3o2N1YfD2aWV/K88o+TN2/j2/k+KbaIZgmiWwppLU+SYGwthxdDfZgnbaaGT/vMYX9P5JlUWSuP3xIxDzPzxBEFho67BP0Pvux+0a5nEOEVEpfRSs61MMvwNXEKZtzkO0QFbOrFYrPntyb7ToqNi66OQNyTfl/J7kqFZg2MTm3CKjHTAIvVMFAGCIamsrT9sWXOtuNeMS94xazxDA==";
+
+    pub static ACTIVE_CLIENT_STATUS: Lazy<Option<String>> =
+        Lazy::new(|| Some("active".to_string()));
 
     pub const USER_ID_1: &str = "1111111111111111";
     const USER_ID_2: &str = "2222222222222222";
@@ -867,6 +872,7 @@ pub mod api_server_v2_tests {
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    client_status: ACTIVE_CLIENT_STATUS.clone(),
                 })
             });
 
@@ -971,6 +977,7 @@ pub mod api_server_v2_tests {
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    client_status: ACTIVE_CLIENT_STATUS.clone(),
                 })
             });
 
@@ -1075,6 +1082,7 @@ pub mod api_server_v2_tests {
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    client_status: ACTIVE_CLIENT_STATUS.clone(),
                 })
             });
 
@@ -2234,6 +2242,7 @@ pub mod api_server_v2_tests {
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    client_status: ACTIVE_CLIENT_STATUS.clone(),
                 })
             });
 
@@ -2363,6 +2372,7 @@ pub mod api_server_v2_tests {
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    client_status: ACTIVE_CLIENT_STATUS.clone(),
                 })
             });
 
@@ -2493,6 +2503,7 @@ pub mod api_server_v2_tests {
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    client_status: ACTIVE_CLIENT_STATUS.clone(),
                 })
             });
 
@@ -2596,6 +2607,7 @@ pub mod api_server_v2_tests {
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    client_status: ACTIVE_CLIENT_STATUS.clone(),
                 })
             });
 
@@ -2700,6 +2712,7 @@ pub mod api_server_v2_tests {
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    client_status: ACTIVE_CLIENT_STATUS.clone(),
                 })
             });
 
@@ -2904,6 +2917,7 @@ pub mod api_server_v2_tests {
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    client_status: ACTIVE_CLIENT_STATUS.clone(),
                 })
             });
 
@@ -3009,6 +3023,7 @@ pub mod api_server_v2_tests {
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
                     dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    client_status: ACTIVE_CLIENT_STATUS.clone(),
                 })
             });
 
