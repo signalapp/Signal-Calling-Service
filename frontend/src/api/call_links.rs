@@ -23,9 +23,11 @@ use zkgroup::call_links::{
 
 use crate::{
     frontend::Frontend,
-    storage::{self, CallLinkRestrictions, CallLinkUpdateError},
+    storage::{self, CallLinkDeleteError, CallLinkRestrictions, CallLinkUpdateError},
 };
 static X_ROOM_ID: HeaderName = HeaderName::from_static("x-room-id");
+const ADMIN_PASSKEY_LIMIT: usize = 32;
+const CALL_LINK_NAME_LIMIT: usize = 256;
 
 #[serde_as]
 #[derive(Serialize, Debug)]
@@ -117,6 +119,14 @@ pub struct CallLinkUpdate {
     revoked: Option<bool>,
 }
 
+#[serde_as]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallLinkDelete {
+    #[serde_as(as = "serde_with::base64::Base64")]
+    admin_passkey: Vec<u8>,
+}
+
 impl From<CallLinkUpdate> for storage::CallLinkUpdate {
     fn from(value: CallLinkUpdate) -> Self {
         Self {
@@ -204,12 +214,12 @@ pub async fn update_call_link(
     })?;
 
     // Validate the updates.
-    if update.admin_passkey.len() > 256 {
+    if update.admin_passkey.len() > ADMIN_PASSKEY_LIMIT {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
     if let Some(new_name) = update.name.as_ref() {
         const AES_TAG_AND_SALT_OVERHEAD: usize = 32;
-        if new_name.len() > 256 + AES_TAG_AND_SALT_OVERHEAD {
+        if new_name.len() > CALL_LINK_NAME_LIMIT + AES_TAG_AND_SALT_OVERHEAD {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
     }
@@ -317,6 +327,72 @@ pub async fn update_call_link(
         }
         Err(CallLinkUpdateError::UnexpectedError(err)) => {
             error!("update_call_link: {err}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Handler for the DELETE /call-link route.
+/// Idempotent, succeeds if call link is not found
+pub async fn delete_call_link(
+    State(frontend): State<Arc<Frontend>>,
+    auth_credential: Option<Extension<Arc<CallLinkAuthCredentialPresentation>>>,
+    TypedHeader(room_id): TypedHeader<RoomId>,
+    Json(request): Json<CallLinkDelete>,
+) -> Result<impl IntoResponse, StatusCode> {
+    trace!("delete_call_link:");
+
+    let _ = hex::decode(room_id.as_ref()).map_err(|_| {
+        event!("calling.frontend.api.delete_call_link.bad_room_id");
+        StatusCode::BAD_REQUEST
+    })?;
+    if request.admin_passkey.len() > ADMIN_PASSKEY_LIMIT {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // Check preconditions:
+    // - Credentials must be valid.
+    // - There must not be an active call.
+    if let Some(Extension(auth_credential)) = auth_credential {
+        let (maybe_existing_call_link, maybe_current_call_record) = frontend
+            .storage
+            .get_call_link_and_record(&room_id.clone().into(), true)
+            .await
+            .map_err(|err| {
+                error!("delete_call_link: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        if let Some(existing_call_link) = maybe_existing_call_link {
+            verify_auth_credential_against_zkparams(
+                &auth_credential,
+                &existing_call_link,
+                &frontend,
+            )?;
+        } else {
+            event!("calling.frontend.api.delete_call_link.nonexistent_room");
+            return Ok(());
+        }
+
+        if maybe_current_call_record.is_some() {
+            return Err(StatusCode::CONFLICT);
+        }
+    } else {
+        error!("no auth creds provided");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    match frontend
+        .storage
+        .delete_call_link(&room_id.into(), &request.admin_passkey)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(CallLinkDeleteError::AdminPasskeyDidNotMatch) => Err(StatusCode::FORBIDDEN),
+        Err(CallLinkDeleteError::RoomDoesNotExist) => Ok(()),
+        Err(CallLinkDeleteError::CallRecordConflict) => Err(StatusCode::CONFLICT),
+        Err(CallLinkDeleteError::UnexpectedError(err)) => {
+            error!("delete_call_link: {err}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1568,5 +1644,289 @@ pub mod tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_link_during_active_call_fails() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
+            .once()
+            .return_once(|_, _| {
+                Ok((
+                    Some(default_call_link_state()),
+                    Some(create_call_record(ROOM_ID, "pangaea")),
+                ))
+            });
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::DELETE)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_link_succeeds() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
+            .once()
+            .return_once(|_, _| Ok((Some(default_call_link_state()), None)));
+        storage
+            .expect_delete_call_link()
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(ADMIN_PASSKEY))
+            .once()
+            .return_once(|_, _| Ok(()));
+
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::DELETE)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_delete_link_absent_succeeds() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
+            .once()
+            .return_once(|_, _| Ok((None, None)));
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::DELETE)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_delete_link_no_auth_fails() {
+        // Create mocked dependencies with expectations.
+        let storage = Box::new(MockStorage::new());
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::DELETE)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_delete_link_storage_call_conflict_fails() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
+            .once()
+            .return_once(|_, _| Ok((Some(default_call_link_state()), None)));
+        storage
+            .expect_delete_call_link()
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(ADMIN_PASSKEY))
+            .once()
+            .return_once(|_, _| Err(CallLinkDeleteError::CallRecordConflict));
+
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::DELETE)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Call Record Conflict case
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_link_storage_room_not_found_succeeds() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
+            .once()
+            .return_once(|_, _| Ok((Some(default_call_link_state()), None)));
+        storage
+            .expect_delete_call_link()
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(ADMIN_PASSKEY))
+            .once()
+            .return_once(|_, _| Err(CallLinkDeleteError::RoomDoesNotExist));
+
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::DELETE)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_delete_link_storage_adminkey_mismatch_fails() {
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(true))
+            .once()
+            .return_once(|_, _| Ok((Some(default_call_link_state()), None)));
+        storage
+            .expect_delete_call_link()
+            .with(eq(calling_common::RoomId::from(ROOM_ID)), eq(ADMIN_PASSKEY))
+            .once()
+            .return_once(|_, _| Err(CallLinkDeleteError::AdminPasskeyDidNotMatch));
+
+        let frontend = create_frontend(storage);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::DELETE)
+            .uri("/v1/call-link".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_authorization_header_for_user(&frontend, USER_ID_1),
+            )
+            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "adminPasskey": STANDARD.encode(ADMIN_PASSKEY),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

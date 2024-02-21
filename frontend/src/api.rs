@@ -363,7 +363,9 @@ fn app(frontend: Arc<Frontend>) -> Router {
 
     let call_link_routes = Router::new().route(
         "/v1/call-link",
-        get(call_links::read_call_link).put(call_links::update_call_link),
+        get(call_links::read_call_link)
+            .put(call_links::update_call_link)
+            .delete(call_links::delete_call_link),
     );
     #[cfg(any(debug_assertions, feature = "testing"))]
     let call_link_routes = call_link_routes

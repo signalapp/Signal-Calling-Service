@@ -9,11 +9,11 @@ use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::{
     operation::{delete_item::DeleteItemError, update_item::UpdateItemError},
-    types::{AttributeValue, Delete, ReturnValue, Select, TransactWriteItem},
+    types::{AttributeValue, ConditionCheck, Delete, ReturnValue, Select, TransactWriteItem},
     Client, Config,
 };
 use aws_smithy_async::rt::sleep::default_async_sleep;
-use aws_smithy_types::{retry::RetryConfigBuilder, timeout::TimeoutConfig};
+use aws_smithy_types::{retry::RetryConfigBuilder, timeout::TimeoutConfig, Blob};
 use aws_types::region::Region;
 use calling_common::{Duration, RoomId};
 use hyper::client::HttpConnector;
@@ -178,6 +178,18 @@ pub enum CallLinkUpdateError {
     UnexpectedError(#[from] anyhow::Error),
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum CallLinkDeleteError {
+    #[error("room does not exist")]
+    RoomDoesNotExist,
+    #[error("admin passkey does not match")]
+    AdminPasskeyDidNotMatch,
+    #[error("call record for this call link was found")]
+    CallRecordConflict,
+    #[error(transparent)]
+    UnexpectedError(#[from] anyhow::Error),
+}
+
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Storage: Sync + Send {
@@ -216,6 +228,13 @@ pub trait Storage: Sync + Send {
         room_id: &RoomId,
         now: SystemTime,
     ) -> Result<(), CallLinkUpdateError>;
+    /// Deletes a call link, ensuring that a matching call record does not exist
+    /// at the same time
+    async fn delete_call_link(
+        &self,
+        room_id: &RoomId,
+        admin_passkey: &[u8],
+    ) -> Result<(), CallLinkDeleteError>;
     /// Fetches both the current state for a call link and the call record.
     ///
     /// Includes the list of approved users in the CallLinkState unless `peek_info_only` is set to
@@ -662,6 +681,94 @@ impl Storage for DynamoDb {
                     anyhow::Error::from(err)
                         .context("failed to update_item in storage for update_call_link"),
                 )),
+            },
+        }
+    }
+
+    /// Deletes a call link
+    async fn delete_call_link(
+        &self,
+        room_id: &RoomId,
+        admin_passkey: &[u8],
+    ) -> Result<(), CallLinkDeleteError> {
+        let delete_link = Delete::builder()
+            .table_name(&self.table_name)
+            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(
+                RECORD_TYPE_KEY,
+                AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
+            )
+            .condition_expression("adminPasskey = :adminPassKey")
+            .set_expression_attribute_values(Some(HashMap::from([(
+                ":adminPassKey".to_string(),
+                AttributeValue::B(Blob::new(admin_passkey)),
+            )])))
+            .build()
+            .map(|d| TransactWriteItem::builder().delete(d).build())
+            .map_err(|err| {
+                error!("Failed to build a Delete item: {:?}", err);
+                CallLinkDeleteError::UnexpectedError(
+                    anyhow::Error::from(err).context("failed to build a Delete item"),
+                )
+            })?;
+
+        let active_call_check = ConditionCheck::builder()
+            .table_name(&self.table_name)
+            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(
+                RECORD_TYPE_KEY,
+                AttributeValue::S(CallRecord::RECORD_TYPE.to_string()),
+            )
+            .condition_expression(format!("attribute_not_exists({})", ROOM_ID_KEY))
+            .build()
+            .map(|c| TransactWriteItem::builder().condition_check(c).build())
+            .map_err(|err| {
+                error!("Failed to build a ConditionCheck item: {:?}", err);
+                CallLinkDeleteError::UnexpectedError(
+                    anyhow::Error::from(err).context("failed to build a ConditionCheck item"),
+                )
+            })?;
+
+        let response = self
+            .client
+            .transact_write_items()
+            .transact_items(delete_link)
+            .transact_items(active_call_check)
+            .send()
+            .await;
+
+        match response {
+            Ok(_) => Ok(()),
+            Err(err) => match err.into_service_error() {
+                TransactWriteItemsError::TransactionCanceledException(ref cancellation) => {
+                    let reasons = cancellation.cancellation_reasons();
+
+                    if let Some(code) = reasons[0].code() {
+                        if code == BatchStatementErrorCodeEnum::ConditionalCheckFailed.as_str() {
+                            // disambiguate check error
+                            return match self.get_call_link(room_id).await {
+                                Ok(Some(_)) => Err(CallLinkDeleteError::AdminPasskeyDidNotMatch),
+                                Ok(None) => Err(CallLinkDeleteError::RoomDoesNotExist),
+                                Err(inner_err) => Err(CallLinkDeleteError::UnexpectedError(
+                                    anyhow::Error::from(inner_err)
+                                        .context("failed to check for existing room after failing to transact_write_items in storage for delete_call_link"),
+                                ))
+                            };
+                        }
+                    }
+                    if let Some(code) = reasons[1].code() {
+                        if code == BatchStatementErrorCodeEnum::ConditionalCheckFailed.as_str() {
+                            return Err(CallLinkDeleteError::CallRecordConflict);
+                        }
+                    }
+                    Err(CallLinkDeleteError::UnexpectedError(anyhow::Error::from(
+                        cancellation.clone(),
+                    )))
+                }
+
+                inner_err => Err(CallLinkDeleteError::UnexpectedError(anyhow::Error::from(
+                    inner_err,
+                ))),
             },
         }
     }
@@ -1689,6 +1796,95 @@ mod tests {
             );
 
             Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_delete_call_link_present_succeeds() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id_raw = format!("testing-room-{}", line!());
+            let room_id = RoomId::from(room_id_raw.clone());
+            let admin_passkey = vec![1, 2, 3];
+            with_db_items(
+                &storage,
+                [default_call_link_state_json(&room_id_raw)],
+                [],
+                async {
+                    if let Err(err) = storage.delete_call_link(&room_id, &admin_passkey).await {
+                        panic!("{:?}", err)
+                    }
+
+                    match storage.get_call_link(&room_id).await? {
+                        None => Ok(()),
+                        _ => panic!("expected call link to be deleted"),
+                    }
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_delete_call_link_absent_fails() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            let admin_passkey = vec![1, 2, 3];
+            match storage
+                .delete_call_link(&RoomId::from(room_id), &admin_passkey)
+                .await
+            {
+                Err(CallLinkDeleteError::RoomDoesNotExist) => Ok(()),
+                Err(err) => panic!("{:?}", err),
+                _ => panic!("expected RoomDoesNotExist error"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_delete_call_link_mismatched_admin_key_fails() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            let admin_passkey = vec![1, 2, 4];
+            with_db_items(
+                &storage,
+                [default_call_link_state_json(&room_id)],
+                [],
+                async {
+                    match storage
+                        .delete_call_link(&RoomId::from(room_id), &admin_passkey)
+                        .await
+                    {
+                        Err(CallLinkDeleteError::AdminPasskeyDidNotMatch) => Ok(()),
+                        Err(err) => panic!("{:?}", err),
+                        _ => panic!("Expected AdminPasskeyDidNotMatch error"),
+                    }
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_delete_call_link_active_call_fails() -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            let era_id = format!("{:x}", line!());
+            let admin_passkey = vec![1, 2, 3];
+            with_db_items(
+                &storage,
+                [
+                    default_call_link_state_json(&room_id),
+                    default_call_record_state(&room_id, &era_id),
+                ],
+                [],
+                async {
+                    match storage
+                        .delete_call_link(&RoomId::from(room_id), &admin_passkey)
+                        .await
+                    {
+                        Err(CallLinkDeleteError::CallRecordConflict) => Ok(()),
+                        Err(err) => panic!("{:?}", err),
+                        _ => panic!("Expected CallRecordConflict error"),
+                    }
+                },
+            )
+            .await
         }
 
         #[tokio::test]
