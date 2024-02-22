@@ -540,10 +540,10 @@ mod tests {
         assert_eq!(0, media_sent_times_ms.len());
         assert_eq!(0, padding_sent_times_ms.len());
 
-        // Re-enable sending a little before 1 second out
-        pacer.configure(1000, 500, Some(padding_ssrc), 990);
+        // Re-enable sending a little before 3 seconds out
+        pacer.configure(1000, 500, Some(padding_ssrc), 2990);
         let (media_sent_times_ms, padding_sent_times_ms) =
-            pacer.send(&[(26, 990), (27, 990)], &media, &padding);
+            pacer.send(&[(26, 2990), (27, 2990)], &media, &padding);
 
         assert_eq!(0, padding_sent_times_ms.len());
         assert_eq!(0, media_sent_times_ms.len());
@@ -551,15 +551,15 @@ mod tests {
         let mut media_sent_times_ms = Vec::new();
         let mut padding_sent_times_ms = Vec::new();
         pacer.dequeue_until(
-            1021,
+            3021,
             &padding,
             &mut media_sent_times_ms,
             &mut padding_sent_times_ms,
         );
 
-        // pacer will discard packets over 1 second old, so packet 27 doesn't get sent at 1010
-        // padding will be timed from the last send (1000)
-        assert_eq!(vec![(25, 990), (26, 1000)], media_sent_times_ms);
-        assert_eq!(vec![1020], padding_sent_times_ms);
+        // pacer will discard packets over 3 seconds old, so packet 27 doesn't get sent at 3010
+        // padding will be timed from the last send (3000)
+        assert_eq!(vec![(25, 2990), (26, 3000)], media_sent_times_ms);
+        assert_eq!(vec![3020], padding_sent_times_ms);
     }
 }

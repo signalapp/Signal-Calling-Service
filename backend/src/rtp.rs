@@ -67,8 +67,8 @@ const RTX_PAYLOAD_TYPE_OFFSET: PayloadType = 10;
 const RTX_SSRC_OFFSET: Ssrc = 1;
 
 // Discard outgoing packets after this time.
-// 1 second lifteime matches WebRTC's RTX history
-const PACKET_LIFETIME: Duration = Duration::from_secs(1);
+// 3 second lifetime matches WebRTC's RTX history
+const PACKET_LIFETIME: Duration = Duration::from_secs(3);
 
 pub type Key = Zeroizing<[u8; SRTP_KEY_LEN]>;
 pub type Salt = [u8; SRTP_SALT_LEN];
