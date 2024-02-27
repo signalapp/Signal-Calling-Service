@@ -18,10 +18,13 @@ use aes::{
     Aes128,
 };
 use aes_gcm::{AeadInPlace, Aes128Gcm};
+use anyhow::Result;
+use anyhow::{anyhow, bail};
 use byteorder::{ReadBytesExt, BE};
 use calling_common::{
     expand_truncated_counter, parse_u16, parse_u32, read_u16, round_up_to_multiple_of, Bits,
-    CheckedSplitAt, DataSize, Duration, Instant, KeySortedCache, TwoGenerationCache, Writer, U24,
+    CheckedSplitAt, DataSize, Duration, Instant, KeySortedCache, PixelSize, TwoGenerationCache,
+    Writer, U24,
 };
 use log::*;
 use zeroize::Zeroizing;
@@ -36,9 +39,11 @@ const RTP_TIMESTAMP_RANGE: Range<usize> = 4..8;
 const RTP_SSRC_RANGE: Range<usize> = 8..12;
 const RTP_EXTENSIONS_HEADER_LEN: usize = 4;
 const RTP_ONE_BYTE_EXTENSIONS_PROFILE: u16 = 0xBEDE;
+const RTP_TWO_BYTE_EXTENSIONS_PROFILE: u16 = 0x1000;
 const RTP_EXT_ID_TCC_SEQNUM: u8 = 1; // Really u4
 const RTP_EXT_ID_VIDEO_ORIENTATION: u8 = 4; // Really u4
 const RTP_EXT_ID_AUDIO_LEVEL: u8 = 5; // Really u4
+const RTP_EXT_ID_DEPENDENCY_DESCRIPTOR: u8 = 6;
 const RTCP_PAYLOAD_TYPES: RangeInclusive<u8> = 64..=95;
 const RTCP_HEADER_LEN: usize = 8;
 const RTCP_PAYLOAD_TYPE_OFFSET: usize = 1;
@@ -200,6 +205,422 @@ impl From<u8> for VideoRotation {
     }
 }
 
+/// https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DependencyDescriptor {
+    pub is_key_frame: bool,
+    pub resolution: Option<PixelSize>,
+}
+
+/// Parser for DependencyDescriptor
+#[derive(Debug)]
+struct DependencyDescriptorReader<'a> {
+    bytes: &'a [u8],
+    /// The index into `bytes` of the next byte to read.
+    byte_index: usize,
+    /// The offset into `bytes[byte_index]` of the next bit to read. In the range 0..=7.
+    bit_offset: u8,
+}
+
+impl<'a> DependencyDescriptorReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            byte_index: 0,
+            bit_offset: 0,
+        }
+    }
+
+    /// An implementation of the pseudocode from the following section of the spec:
+    /// https://aomediacodec.github.io/av1-rtp-spec/#a82-syntax
+    ///
+    /// The meaning of each parsed field is here:
+    /// https://aomediacodec.github.io/av1-rtp-spec/#a83-semantics
+    fn read(mut self) -> Result<DependencyDescriptor> {
+        if self.bytes.len() <= 3 {
+            return Ok(DependencyDescriptor {
+                is_key_frame: false,
+                resolution: None,
+            });
+        }
+
+        // Ignore start_of_frame, end_of_frame, frame_dependency_template_id, and frame_number.
+        self.byte_index = 3;
+
+        let template_dependency_structure_present_flag = self.read_u8(1)? == 1;
+        let _active_decode_targets_present_flag = self.read_u8(1)?;
+        let _custom_dtis_flag = self.read_u8(1)?;
+        let _custom_fdiffs_flag = self.read_u8(1)?;
+        let _custom_chains_flag = self.read_u8(1)?;
+
+        if !template_dependency_structure_present_flag {
+            return Ok(DependencyDescriptor {
+                is_key_frame: false,
+                resolution: None,
+            });
+        }
+
+        let _template_id_offset = self.read_u8(6)?;
+        let dt_cnt = self.read_u8(5)? + 1;
+
+        // template_layers
+        let mut template_cnt = 1;
+        while self.read_u8(2)? != 3 {
+            template_cnt += 1;
+        }
+
+        // template_dtis
+        for _ in 0..template_cnt {
+            for _ in 0..dt_cnt {
+                let _template_dti = self.read_u8(2)?;
+            }
+        }
+
+        // template_fdiffs
+        for _ in 0..template_cnt {
+            while self.read_u8(1)? == 1 {
+                let _fdiff_minus_one = self.read_u8(4)?;
+            }
+        }
+
+        // Skip over template_chains since we don't use SVC, so num_chains is 0.
+        self.skip_non_symmetric(dt_cnt + 1)?;
+
+        let mut resolution = None;
+        let resolutions_present_flag = self.read_u8(1)?;
+        if resolutions_present_flag == 1 {
+            let width = self.read_u16()?.saturating_add(1);
+            let height = self.read_u16()?.saturating_add(1);
+            resolution = Some(PixelSize { width, height });
+        }
+
+        Ok(DependencyDescriptor {
+            is_key_frame: true,
+            resolution,
+        })
+    }
+
+    /// An implementation of the `f(n)` function in the spec, where 0 < n <= 8:
+    /// https://aomediacodec.github.io/av1-rtp-spec/#a82-syntax
+    fn read_u8(&mut self, bits: u8) -> Result<u8> {
+        assert!(bits > 0 && bits <= 8);
+
+        let last_byte = self.bytes.len() - 1;
+        if self.byte_index > last_byte
+            || (self.byte_index == last_byte && self.bit_offset + bits > 8)
+        {
+            bail!(
+                "out of bounds access: byte_index={}, bit_offset={}, bits={bits}, bytes_len={}",
+                self.byte_index,
+                self.bit_offset,
+                self.bytes.len(),
+            );
+        }
+
+        let mut byte: u8;
+        if self.bit_offset + bits >= 8 {
+            // Need to read the remainder of the current byte, and potentially some of the
+            // following byte.
+            byte = self.bytes[self.byte_index];
+
+            let num_bits_in_current_byte = 8 - self.bit_offset;
+            if num_bits_in_current_byte < 8 {
+                byte &= (1 << num_bits_in_current_byte) - 1;
+            }
+            let num_bits_in_next_byte = bits - num_bits_in_current_byte;
+            byte <<= num_bits_in_next_byte;
+
+            if num_bits_in_next_byte > 0 {
+                let next_byte = self.bytes[self.byte_index + 1];
+                let mask = ((1 << num_bits_in_next_byte) - 1) << (8 - num_bits_in_next_byte);
+                byte |= (next_byte & mask) >> (8 - num_bits_in_next_byte);
+            }
+
+            self.byte_index += 1;
+            self.bit_offset = (self.bit_offset + bits) % 8;
+        } else {
+            // Only need to look at the current byte.
+            byte = self.bytes[self.byte_index];
+            byte &= ((1 << bits) - 1) << (8 - self.bit_offset - bits);
+            byte >>= 8 - self.bit_offset - bits;
+
+            self.bit_offset += bits;
+        }
+
+        Ok(byte)
+    }
+
+    /// A special case of the `f(n)` function where n = 16:
+    /// https://aomediacodec.github.io/av1-rtp-spec/#a82-syntax
+    fn read_u16(&mut self) -> Result<u16> {
+        match (self.read_u8(8), self.read_u8(8)) {
+            (Ok(upper), Ok(lower)) => Ok(u16::from_be_bytes([upper, lower])),
+            (Err(err), _) => Err(err),
+            (_, Err(err)) => Err(err),
+        }
+    }
+
+    /// A variant of the `ns(n)` function in the spec which doesn't return the result:
+    /// https://aomediacodec.github.io/av1-rtp-spec/#a82-syntax
+    fn skip_non_symmetric(&mut self, n: u8) -> Result<()> {
+        let mut w = 0;
+        let mut x = n;
+        while x != 0 {
+            x >>= 1;
+            w += 1;
+        }
+
+        let m = (1 << w) - n;
+        let v = self.read_u8(w - 1)?;
+        if v < m {
+            return Ok(());
+        }
+
+        let _extra_bit = self.read_u8(1)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dependency_descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn read_u8() -> Result<()> {
+        let bytes = [0b0000_0010, 0b1010_0000];
+        let mut rdr = DependencyDescriptorReader::new(&bytes);
+
+        assert_eq!(rdr.read_u8(1)?, 0);
+
+        rdr.bit_offset = 1;
+        assert_eq!(rdr.read_u8(1)?, 0);
+
+        rdr.bit_offset = 6;
+        assert_eq!(rdr.read_u8(1)?, 1);
+
+        rdr.bit_offset = 3;
+        assert_eq!(rdr.read_u8(5)?, 0b10);
+
+        rdr.byte_index = 0;
+        rdr.bit_offset = 6;
+        assert_eq!(rdr.read_u8(3)?, 0b101);
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_u8_two_bytes() -> Result<()> {
+        let bytes = [0b0000_0010, 0b1010_0011];
+        let mut rdr = DependencyDescriptorReader::new(&bytes);
+
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert_eq!(rdr.read_u8(5)?, 0b1);
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert_eq!(rdr.read_u8(4)?, 0b1010);
+        assert_eq!(rdr.read_u8(2)?, 0b0);
+        assert_eq!(rdr.read_u8(1)?, 0b1);
+        assert_eq!(rdr.read_u8(1)?, 0b1);
+
+        assert!(rdr.read_u8(1).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_u8_one_byte() -> Result<()> {
+        let bytes = [0b0001_1011];
+        let mut rdr = DependencyDescriptorReader::new(&bytes);
+
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert_eq!(rdr.read_u8(1)?, 1);
+        assert_eq!(rdr.read_u8(1)?, 1);
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert_eq!(rdr.read_u8(1)?, 1);
+        assert_eq!(rdr.read_u8(1)?, 1);
+
+        rdr.byte_index = 0;
+        rdr.bit_offset = 0;
+        assert_eq!(rdr.read_u8(2)?, 0b0);
+        assert_eq!(rdr.read_u8(2)?, 0b1);
+        assert_eq!(rdr.read_u8(2)?, 0b10);
+        assert_eq!(rdr.read_u8(2)?, 0b11);
+
+        rdr.byte_index = 0;
+        rdr.bit_offset = 0;
+        assert_eq!(rdr.read_u8(4)?, 0b1);
+        assert_eq!(rdr.read_u8(4)?, 0b1011);
+
+        rdr.byte_index = 0;
+        rdr.bit_offset = 0;
+        assert_eq!(rdr.read_u8(5)?, 0b11);
+        assert_eq!(rdr.read_u8(3)?, 0b11);
+
+        rdr.byte_index = 0;
+        rdr.bit_offset = 0;
+        assert_eq!(rdr.read_u8(8)?, 0b0001_1011);
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_camera_layer_0() -> Result<()> {
+        let bytes = [
+            0b11000000,
+            0b00000000,
+            0b00000001,
+            0b10000000, // The first bit in this byte indicates that this is for a key frame.
+            0b00000010,
+            0b00000100,
+            0b01001110,
+            0b10101010,
+            0b10101111,
+            0b00101000,
+            0b01100000,
+            0b01000001,
+            0b01001101,
+            0b00110100,
+            0b01010011,
+            0b10001010,
+            0b00001001,
+            0b01000000,
+            // The resolution is 160x120, but the value on the wire is one pixel smaller than the
+            // real resolution. 159x119 in binary is 0b1001_1111 x 0b0111_0111 and each value is
+            // stored as 2 bytes.
+            //
+            // The second bit in the following byte indicates that a resolution is included.
+            // The third bit is where the width starts.
+            0b01_000000,
+            0b00_100111,
+            // The third bit in the following byte is where the height starts.
+            0b11_000000,
+            0b00_011101,
+            0b11_000000,
+        ];
+        let rdr = DependencyDescriptorReader::new(&bytes);
+
+        let descriptor = rdr.read()?;
+
+        assert!(descriptor.is_key_frame);
+        assert_eq!(
+            descriptor.resolution,
+            Some(PixelSize {
+                width: 160,
+                height: 120
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_screenshare() -> Result<()> {
+        let bytes = [
+            0b10000000,
+            0b00001011,
+            0b00001011,
+            0b10000000, // The first bit in this byte indicates that this is for a key frame.
+            0b00000001,
+            0b00000100,
+            0b11101010,
+            0b10101100,
+            0b10000101,
+            0b00010100,
+            0b01010000,
+            0b01000110,
+            0b0000_0100, // width - 1 is 2879 / 0b0000_1011_0011_1111 (starting on the 7th bit)
+            0b0010_1100,
+            0b1111_1100, // height - 1 is 1619 / 0b0000_0110_0101_0011 (from the 7th bit)
+            0b0001_1001,
+            0b0100_1100,
+        ];
+        let rdr = DependencyDescriptorReader::new(&bytes);
+
+        let descriptor = rdr.read()?;
+
+        assert!(descriptor.is_key_frame);
+        assert_eq!(
+            descriptor.resolution,
+            Some(PixelSize {
+                width: 2880,
+                height: 1620
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_no_dependency_structure() -> Result<()> {
+        let bytes = [0b10000011, 0b00000001, 0b01100101];
+        let rdr = DependencyDescriptorReader::new(&bytes);
+
+        let descriptor = rdr.read()?;
+
+        assert!(!descriptor.is_key_frame);
+        assert_eq!(descriptor.resolution, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_ignore_custom_fdiffs() -> Result<()> {
+        let bytes = [
+            0b10000010,
+            0b00001011,
+            0b00101100,
+            // The first bit in the following byte indicates that this isn't a keyframe. The fourth
+            // bit indicates that there are custom fdiffs.
+            0b0001_0010,
+            0b01000000,
+        ];
+        let rdr = DependencyDescriptorReader::new(&bytes);
+
+        let descriptor = rdr.read()?;
+
+        assert!(!descriptor.is_key_frame);
+        assert_eq!(descriptor.resolution, None);
+
+        Ok(())
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum HeaderExtensionsProfile {
+    /// https://www.rfc-editor.org/rfc/rfc8285#section-4.2
+    OneByte,
+    /// https://www.rfc-editor.org/rfc/rfc8285#section-4.3
+    TwoByte,
+}
+
+impl TryFrom<u16> for HeaderExtensionsProfile {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        if value == RTP_ONE_BYTE_EXTENSIONS_PROFILE {
+            Ok(Self::OneByte)
+        } else if value & 0xFFF0 == RTP_TWO_BYTE_EXTENSIONS_PROFILE {
+            Ok(Self::TwoByte)
+        } else {
+            Err(anyhow!(
+                "not using 1-byte or 2-byte extensions; profile = 0x{:x}",
+                value
+            ))
+        }
+    }
+}
+
+impl HeaderExtensionsProfile {
+    fn len(&self) -> usize {
+        match self {
+            HeaderExtensionsProfile::OneByte => 1,
+            HeaderExtensionsProfile::TwoByte => 2,
+        }
+    }
+}
+
 // pub for tests
 #[derive(Debug, Eq, PartialEq)]
 pub struct Header {
@@ -217,6 +638,7 @@ pub struct Header {
     // The payload end isn't technically part of the "Header",
     // but it's convenient to parse at the same time.
     pub payload_range: Range<usize>,
+    dependency_descriptor: Option<DependencyDescriptor>,
 }
 
 impl Header {
@@ -241,6 +663,7 @@ impl Header {
         let mut tcc_seqnum_range = None;
         let mut video_rotation = None;
         let mut audio_level = None;
+        let mut dependency_descriptor = None;
 
         let extensions_start = RTP_MIN_HEADER_LEN + csrcs_len;
         let mut payload_start = extensions_start;
@@ -250,17 +673,15 @@ impl Header {
             let extensions_profile = parse_u16(&extensions_header[0..2]);
             let extensions_len = (parse_u16(&extensions_header[2..4]) as usize) * 4;
 
-            if extensions_profile != RTP_ONE_BYTE_EXTENSIONS_PROFILE {
-                // 2-byte header extension is only needed for extensions of size = 0
-                // size > 16, and we don't use any such extensions.
-                event!("calling.rtp.invalid.not_one_byte_extensions_profile");
-                debug!(
-                    "Invalid RTP: not using 1-byte extensions; profile = 0x{:x}",
-                    extensions_profile
-                );
-                debug!("{}", hex::encode(&packet[..packet.len().min(100)]));
-                return None;
-            }
+            let extensions_profile = match HeaderExtensionsProfile::try_from(extensions_profile) {
+                Ok(extensions_profile) => extensions_profile,
+                Err(err) => {
+                    event!("calling.rtp.invalid.extensions_profile");
+                    debug!("Invalid RTP: {err}");
+                    debug!("{}", hex::encode(&packet[..packet.len().min(100)]));
+                    return None;
+                }
+            };
 
             let (extensions, _payload_tag) =
                 extension_payload_tag.checked_split_at(extensions_len)?;
@@ -269,13 +690,19 @@ impl Header {
             let mut extension_start = 0;
             while extensions.len() > extension_start {
                 let (extension_header, extension_val) =
-                    extensions[extension_start..].checked_split_at(1)?;
-                let extension_id = extension_header[0] >> 4;
+                    extensions[extension_start..].checked_split_at(extensions_profile.len())?;
+                let extension_id = match extensions_profile {
+                    HeaderExtensionsProfile::OneByte => extension_header[0] >> 4,
+                    HeaderExtensionsProfile::TwoByte => extension_header[0],
+                };
                 if extension_id == 0 {
                     // Tail padding
                     break;
                 }
-                let extension_len = ((extension_header[0] & 0x0F) as usize) + 1;
+                let extension_len = match extensions_profile {
+                    HeaderExtensionsProfile::OneByte => ((extension_header[0] & 0x0F) as usize) + 1,
+                    HeaderExtensionsProfile::TwoByte => extension_header[1] as usize,
+                };
                 if extension_val.len() < extension_len {
                     event!("calling.rtp.invalid.extension_too_short");
                     debug!(
@@ -288,9 +715,10 @@ impl Header {
                     return None;
                 }
                 let extension_val = &extension_val[..extension_len];
-                // TODO: Dedup this with the above code.
-                let extension_val_start =
-                    extensions_start + RTP_EXTENSIONS_HEADER_LEN + extension_start + 1;
+                let extension_val_start = extensions_start
+                    + RTP_EXTENSIONS_HEADER_LEN
+                    + extension_start
+                    + extensions_profile.len();
                 let extension_val_end = extension_val_start + extension_len;
                 let extension_val_range = extension_val_start..extension_val_end;
 
@@ -308,9 +736,18 @@ impl Header {
                             // by a factor of 10, so this ends up being 120 as the lowest value (muted).
                             Some(120u8.saturating_sub(negative_audio_level_with_voice_activity & 0b0111_1111));
                     }
+                    (RTP_EXT_ID_DEPENDENCY_DESCRIPTOR, val) => {
+                        dependency_descriptor = DependencyDescriptorReader::new(val)
+                            .read()
+                            .ok()
+                            .or(Some(DependencyDescriptor {
+                                is_key_frame: false,
+                                resolution: None,
+                            }));
+                    }
                     _ => {}
                 }
-                extension_start += 1 + extension_len;
+                extension_start += extensions_profile.len() + extension_len;
             }
             payload_start = extensions_start + RTP_EXTENSIONS_HEADER_LEN + extensions_len;
         };
@@ -339,6 +776,7 @@ impl Header {
             tcc_seqnum,
             tcc_seqnum_range,
             payload_range,
+            dependency_descriptor,
         })
     }
 }
@@ -419,6 +857,7 @@ pub struct Packet<T> {
     pub timestamp: TruncatedTimestamp,
     pub video_rotation: Option<VideoRotation>,
     pub audio_level: Option<audio::Level>,
+    pub dependency_descriptor: Option<DependencyDescriptor>,
     tcc_seqnum: Option<tcc::FullSequenceNumber>,
 
     // These are relative to self.serialized.
@@ -527,6 +966,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             timestamp: self.timestamp,
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
+            dependency_descriptor: self.dependency_descriptor,
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
@@ -547,6 +987,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             timestamp: self.timestamp,
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
+            dependency_descriptor: self.dependency_descriptor,
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
@@ -720,6 +1161,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
             timestamp: self.timestamp,
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
+            dependency_descriptor: self.dependency_descriptor,
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
@@ -751,6 +1193,7 @@ impl Packet<Vec<u8>> {
     ///
     /// Returns `(serialized, payload_range_in_serialized)`.
     /// The returned Vec includes an empty (zeroed) SRTP authentication tag at the end.
+    #[allow(clippy::too_many_arguments)]
     fn write_serialized(
         marker: bool,
         pt: PayloadType,
@@ -758,6 +1201,7 @@ impl Packet<Vec<u8>> {
         timestamp: TruncatedTimestamp,
         ssrc: Ssrc,
         extensions: impl Writer,
+        extensions_profile: HeaderExtensionsProfile,
         payload: &[u8],
     ) -> (Vec<u8>, Range<usize>) {
         let has_padding = 0u8;
@@ -775,11 +1219,15 @@ impl Packet<Vec<u8>> {
             ssrc,
         );
         let extensions = if has_extensions {
+            let profile = match extensions_profile {
+                HeaderExtensionsProfile::OneByte => RTP_ONE_BYTE_EXTENSIONS_PROFILE,
+                HeaderExtensionsProfile::TwoByte => RTP_TWO_BYTE_EXTENSIONS_PROFILE,
+            };
             let padded_len = round_up_to_multiple_of::<4>(extensions_len);
             let padding_len = padded_len - extensions_len;
             let extension_padding = &[0u8, 0, 0][..padding_len];
             Some((
-                RTP_ONE_BYTE_EXTENSIONS_PROFILE,
+                profile,
                 u16::try_from(padded_len / 4).expect("too many extensions"),
                 extensions,
                 extension_padding,
@@ -813,8 +1261,16 @@ impl Packet<Vec<u8>> {
             let tcc_seqnum = tcc_seqnum as tcc::TruncatedSequenceNumber;
             write_extension(RTP_EXT_ID_TCC_SEQNUM, tcc_seqnum)
         });
-        let (serialized, payload_range) =
-            Self::write_serialized(marker, pt, seqnum, timestamp, ssrc, extensions, payload);
+        let (serialized, payload_range) = Self::write_serialized(
+            marker,
+            pt,
+            seqnum,
+            timestamp,
+            ssrc,
+            extensions,
+            HeaderExtensionsProfile::OneByte,
+            payload,
+        );
         Self {
             marker,
             payload_type_in_header: pt,
@@ -824,6 +1280,7 @@ impl Packet<Vec<u8>> {
             timestamp,
             video_rotation: None,
             audio_level: None,
+            dependency_descriptor: None,
             tcc_seqnum,
             // This only matters for tests.
             tcc_seqnum_range: if tcc_seqnum.is_some() {
@@ -892,6 +1349,7 @@ pub fn parse_and_forward_rtp_for_fuzzing(data: Vec<u8>) -> Option<Vec<u8>> {
         timestamp: header.timestamp,
         video_rotation: header.video_rotation,
         audio_level: header.audio_level,
+        dependency_descriptor: header.dependency_descriptor,
         tcc_seqnum: Default::default(),
         tcc_seqnum_range: header.tcc_seqnum_range,
         payload_range_in_header: header.payload_range,
@@ -1704,6 +2162,7 @@ impl Endpoint {
             timestamp: header.timestamp,
             video_rotation: header.video_rotation,
             audio_level: header.audio_level,
+            dependency_descriptor: header.dependency_descriptor,
             tcc_seqnum,
             tcc_seqnum_range: header.tcc_seqnum_range,
             payload_range_in_header: header.payload_range,
@@ -2136,6 +2595,7 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: None,
+                dependency_descriptor: None,
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range: RTP_MIN_HEADER_LEN..RTP_MIN_HEADER_LEN,
@@ -2170,6 +2630,7 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: None,
+                dependency_descriptor: None,
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(17..19),
                 payload_range: expected_payload_start..expected_payload_start,
@@ -2194,7 +2655,16 @@ mod test {
     fn test_parse_rtp_header_with_audio() {
         fn parse_audio_level_from_packet(raw_level: u8) -> u8 {
             let extensions = write_extension(RTP_EXT_ID_AUDIO_LEVEL, [raw_level]);
-            let (packet, _) = Packet::write_serialized(false, 1, 2, 3, 4, extensions, &[]);
+            let (packet, _) = Packet::write_serialized(
+                false,
+                1,
+                2,
+                3,
+                4,
+                extensions,
+                HeaderExtensionsProfile::OneByte,
+                &[],
+            );
             let parsed = Header::parse(&packet).unwrap();
             parsed.audio_level.unwrap()
         }
@@ -2220,7 +2690,16 @@ mod test {
             write_extension(RTP_EXT_ID_TCC_SEQNUM, 0x5678u16),
             write_extension(RTP_EXT_ID_AUDIO_LEVEL, [0x21u8]),
         );
-        let (packet, payload_range) = Packet::write_serialized(false, 1, 2, 3, 4, extensions, &[]);
+        let (packet, payload_range) = Packet::write_serialized(
+            false,
+            1,
+            2,
+            3,
+            4,
+            extensions,
+            HeaderExtensionsProfile::OneByte,
+            &[],
+        );
         assert_eq!(
             Some(Header {
                 marker: false,
@@ -2230,6 +2709,7 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: Some(87),
+                dependency_descriptor: None,
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(17..19),
                 payload_range,
@@ -2241,7 +2721,16 @@ mod test {
             write_extension(RTP_EXT_ID_AUDIO_LEVEL, [0x21u8]),
             write_extension(RTP_EXT_ID_TCC_SEQNUM, 0x5678u16),
         );
-        let (packet, payload_range) = Packet::write_serialized(false, 1, 2, 3, 4, extensions, &[]);
+        let (packet, payload_range) = Packet::write_serialized(
+            false,
+            1,
+            2,
+            3,
+            4,
+            extensions,
+            HeaderExtensionsProfile::OneByte,
+            &[],
+        );
         assert_eq!(
             Some(Header {
                 marker: false,
@@ -2251,6 +2740,7 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: Some(87),
+                dependency_descriptor: None,
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(19..21),
                 payload_range,
@@ -2264,7 +2754,16 @@ mod test {
             write_extension(RTP_EXT_ID_TCC_SEQNUM, 0x5678u16),
             [0u8, 0u8, 0u8, 0u8],
         );
-        let (packet, payload_range) = Packet::write_serialized(false, 1, 2, 3, 4, extensions, &[]);
+        let (packet, payload_range) = Packet::write_serialized(
+            false,
+            1,
+            2,
+            3,
+            4,
+            extensions,
+            HeaderExtensionsProfile::OneByte,
+            &[],
+        );
         assert_eq!(
             Some(Header {
                 marker: false,
@@ -2274,6 +2773,7 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: Some(87),
+                dependency_descriptor: None,
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(19..21),
                 payload_range,
@@ -2285,7 +2785,16 @@ mod test {
     #[test]
     fn test_parse_rtp_header_with_orientation() {
         let extensions = write_extension(RTP_EXT_ID_VIDEO_ORIENTATION, [0x1u8]);
-        let (packet, payload_range) = Packet::write_serialized(false, 1, 2, 3, 4, extensions, &[]);
+        let (packet, payload_range) = Packet::write_serialized(
+            false,
+            1,
+            2,
+            3,
+            4,
+            extensions,
+            HeaderExtensionsProfile::OneByte,
+            &[],
+        );
         assert_eq!(
             Some(Header {
                 marker: false,
@@ -2295,6 +2804,7 @@ mod test {
                 ssrc: 4,
                 video_rotation: Some(VideoRotation::Clockwise90),
                 audio_level: None,
+                dependency_descriptor: None,
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,
@@ -2303,7 +2813,16 @@ mod test {
         );
 
         let extensions = write_extension(RTP_EXT_ID_VIDEO_ORIENTATION, [0x2u8]);
-        let (packet, payload_range) = Packet::write_serialized(false, 1, 2, 3, 4, extensions, &[]);
+        let (packet, payload_range) = Packet::write_serialized(
+            false,
+            1,
+            2,
+            3,
+            4,
+            extensions,
+            HeaderExtensionsProfile::OneByte,
+            &[],
+        );
         assert_eq!(
             Some(Header {
                 marker: false,
@@ -2313,6 +2832,7 @@ mod test {
                 ssrc: 4,
                 video_rotation: Some(VideoRotation::Clockwise180),
                 audio_level: None,
+                dependency_descriptor: None,
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,
@@ -2325,7 +2845,16 @@ mod test {
             write_extension(RTP_EXT_ID_VIDEO_ORIENTATION, [0x3u8]),
             [0u8, 0u8, 0u8, 0u8],
         );
-        let (packet, payload_range) = Packet::write_serialized(false, 1, 2, 3, 4, extensions, &[]);
+        let (packet, payload_range) = Packet::write_serialized(
+            false,
+            1,
+            2,
+            3,
+            4,
+            extensions,
+            HeaderExtensionsProfile::OneByte,
+            &[],
+        );
         assert_eq!(
             Some(Header {
                 marker: false,
@@ -2335,6 +2864,119 @@ mod test {
                 ssrc: 4,
                 video_rotation: Some(VideoRotation::Clockwise270),
                 audio_level: None,
+                dependency_descriptor: None,
+                tcc_seqnum: None,
+                tcc_seqnum_range: None,
+                payload_range,
+            }),
+            Header::parse(&packet)
+        );
+    }
+
+    #[test]
+    fn test_parse_rtp_header_with_dependency_descriptor() {
+        let extensions = write_extension(
+            RTP_EXT_ID_DEPENDENCY_DESCRIPTOR,
+            [0b10000011u8, 0b00000001, 0b01100101],
+        );
+        let (packet, payload_range) = Packet::write_serialized(
+            false,
+            1,
+            2,
+            3,
+            4,
+            extensions,
+            HeaderExtensionsProfile::OneByte,
+            &[],
+        );
+        assert_eq!(
+            Some(Header {
+                marker: false,
+                payload_type: 1,
+                seqnum: 2,
+                timestamp: 3,
+                ssrc: 4,
+                video_rotation: None,
+                audio_level: None,
+                dependency_descriptor: Some(DependencyDescriptor {
+                    is_key_frame: false,
+                    resolution: None,
+                }),
+                tcc_seqnum: None,
+                tcc_seqnum_range: None,
+                payload_range,
+            }),
+            Header::parse(&packet)
+        );
+    }
+
+    #[test]
+    fn test_parse_rtp_header_two_byte_extensions() {
+        fn write_two_byte_extension(id: u8, value: impl Writer) -> impl Writer {
+            assert_ne!(id, 0, "id must not be 0");
+            let length = value.written_len();
+            let header = [id, length.try_into().expect("length must fit in 8 bits")];
+            (header, value)
+        }
+
+        let extensions = (
+            write_two_byte_extension(RTP_EXT_ID_VIDEO_ORIENTATION, [0x3u8]),
+            write_two_byte_extension(
+                RTP_EXT_ID_DEPENDENCY_DESCRIPTOR,
+                [
+                    0b10000000u8,
+                    0b00001000,
+                    0b01010111,
+                    0b10000000, // The first bit in this byte indicates that this is for a key frame.
+                    0b00000010,
+                    0b00000100,
+                    0b01001110,
+                    0b10101010,
+                    0b10101111,
+                    0b00101000,
+                    0b01100000,
+                    0b01000001,
+                    0b01001101,
+                    0b00110100,
+                    0b01010011,
+                    0b10001010,
+                    0b00001001,
+                    0b01000000,
+                    0b0100_0000, // width - 1 is 639 / 0b0000_0010_0111_1111 (starting on the 3rd bit)
+                    0b1001_1111,
+                    0b1100_0000, // height - 1 is 479 / 0b0000_0001_1101_1111 (from the 3rd bit)
+                    0b0111_0111,
+                    0b1100_0000,
+                ],
+            ),
+        );
+
+        let (packet, payload_range) = Packet::write_serialized(
+            false,
+            1,
+            2,
+            3,
+            4,
+            extensions,
+            HeaderExtensionsProfile::TwoByte,
+            &[],
+        );
+        assert_eq!(
+            Some(Header {
+                marker: false,
+                payload_type: 1,
+                seqnum: 2,
+                timestamp: 3,
+                ssrc: 4,
+                video_rotation: Some(VideoRotation::Clockwise270),
+                audio_level: None,
+                dependency_descriptor: Some(DependencyDescriptor {
+                    is_key_frame: true,
+                    resolution: Some(PixelSize {
+                        width: 640,
+                        height: 480,
+                    }),
+                }),
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,

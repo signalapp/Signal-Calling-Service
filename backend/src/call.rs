@@ -1781,7 +1781,11 @@ impl Client {
         incoming_rtp: &rtp::Packet<&[u8]>,
         now: Instant,
     ) -> Option<vp8::ParsedHeader> {
-        let incoming_vp8 = vp8::ParsedHeader::read(incoming_rtp.payload()).ok()?;
+        let incoming_vp8 = if let Some(descriptor) = incoming_rtp.dependency_descriptor {
+            vp8::ParsedHeader::from(descriptor)
+        } else {
+            vp8::ParsedHeader::read(incoming_rtp.payload()).ok()?
+        };
         let incoming_layer_id = LayerId::from_ssrc(incoming_rtp.ssrc());
         let incoming_video = match incoming_layer_id {
             Some(LayerId::Video0) => &mut self.incoming_video0,
@@ -1865,11 +1869,13 @@ impl Client {
             outgoing.seqnum,
             outgoing.timestamp as rtp::TruncatedTimestamp,
         );
-        vp8::modify_header(
-            outgoing_rtp.payload_mut(),
-            outgoing.picture_id as vp8::TruncatedPictureId,
-            outgoing.tl0_pic_idx as vp8::TruncatedTl0PicIdx,
-        );
+        if let (Some(picture_id), Some(tl0_pic_idx)) = (outgoing.picture_id, outgoing.tl0_pic_idx) {
+            vp8::modify_header(
+                outgoing_rtp.payload_mut(),
+                picture_id as vp8::TruncatedPictureId,
+                tl0_pic_idx as vp8::TruncatedTl0PicIdx,
+            );
+        }
         Some(outgoing_rtp)
     }
 
@@ -2219,23 +2225,35 @@ enum Vp8SimulcastRtpForwardingState {
     },
 }
 
-// These are the IDs that we rewrite when forwarding VP8.
-// These is a convenience for keep track of all 4 together,
-// which is a common thing in Vp8SimulcastRtpForwarder.
-#[derive(Default, Debug, Clone, Eq, PartialEq)]
+/// The IDs that we rewrite when forwarding VP8.
+///
+/// This is a convenience for keep track of all 4 together, which is a common
+/// thing in Vp8SimulcastRtpForwarder.
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct Vp8RewrittenIds {
     seqnum: rtp::FullSequenceNumber,
     timestamp: rtp::FullTimestamp,
-    picture_id: vp8::FullPictureId,
-    tl0_pic_idx: vp8::FullTl0PicIdx,
+    picture_id: Option<vp8::FullPictureId>,
+    tl0_pic_idx: Option<vp8::FullTl0PicIdx>,
+}
+
+impl Default for Vp8RewrittenIds {
+    fn default() -> Self {
+        Self {
+            seqnum: 0,
+            timestamp: 0,
+            picture_id: Some(0),
+            tl0_pic_idx: Some(0),
+        }
+    }
 }
 
 impl Vp8RewrittenIds {
     fn new(
         seqnum: rtp::FullSequenceNumber,
         timestamp: rtp::FullTimestamp,
-        picture_id: vp8::FullPictureId,
-        tl0_pic_idx: vp8::FullTl0PicIdx,
+        picture_id: Option<vp8::FullPictureId>,
+        tl0_pic_idx: Option<vp8::FullTl0PicIdx>,
     ) -> Self {
         Self {
             seqnum,
@@ -2246,20 +2264,40 @@ impl Vp8RewrittenIds {
     }
 
     fn checked_sub(&self, other: &Self) -> Option<Self> {
+        let picture_id = if let (Some(lhs), Some(rhs)) = (self.picture_id, other.picture_id) {
+            Some(lhs.checked_sub(rhs)?)
+        } else {
+            None
+        };
+        let tl0_pic_idx = if let (Some(lhs), Some(rhs)) = (self.tl0_pic_idx, other.tl0_pic_idx) {
+            Some(lhs.checked_sub(rhs)?)
+        } else {
+            None
+        };
         Some(Self::new(
             self.seqnum.checked_sub(other.seqnum)?,
             self.timestamp.checked_sub(other.timestamp)?,
-            self.picture_id.checked_sub(other.picture_id)?,
-            self.tl0_pic_idx.checked_sub(other.tl0_pic_idx)?,
+            picture_id,
+            tl0_pic_idx,
         ))
     }
 
     fn checked_add(&self, other: &Self) -> Option<Self> {
+        let picture_id = if let (Some(lhs), Some(rhs)) = (self.picture_id, other.picture_id) {
+            Some(lhs.checked_add(rhs)?)
+        } else {
+            None
+        };
+        let tl0_pic_idx = if let (Some(lhs), Some(rhs)) = (self.tl0_pic_idx, other.tl0_pic_idx) {
+            Some(lhs.checked_add(rhs)?)
+        } else {
+            None
+        };
         Some(Self::new(
             self.seqnum.checked_add(other.seqnum)?,
             self.timestamp.checked_add(other.timestamp)?,
-            self.picture_id.checked_add(other.picture_id)?,
-            self.tl0_pic_idx.checked_add(other.tl0_pic_idx)?,
+            picture_id,
+            tl0_pic_idx,
         ))
     }
 
@@ -2364,8 +2402,10 @@ impl Vp8SimulcastRtpForwarder {
         incoming_rtp: &rtp::Packet<&[u8]>,
         incoming_vp8: &vp8::ParsedHeader,
     ) -> Option<(rtp::Ssrc, Vp8RewrittenIds)> {
-        let incoming_picture_id = incoming_vp8.picture_id?;
-        let incoming_tl0_pic_idx = incoming_vp8.tl0_pic_idx?;
+        // Both IDs are None when a dependency descriptor is used, otherwise they're both Some.
+        if incoming_vp8.picture_id.is_some() != incoming_vp8.tl0_pic_idx.is_some() {
+            return None;
+        }
 
         if self.switching_ssrc() == Some(incoming_rtp.ssrc()) && incoming_vp8.is_key_frame {
             trace!(
@@ -2381,8 +2421,10 @@ impl Vp8SimulcastRtpForwarder {
                 // In other words, we are only tracking the ROC since the switching point,
                 // and that is now, so the ROC is 0.
                 incoming_rtp.timestamp as rtp::FullTimestamp,
-                incoming_picture_id as vp8::FullPictureId,
-                incoming_tl0_pic_idx as vp8::FullTl0PicIdx,
+                incoming_vp8.picture_id.map(|id| id as vp8::FullPictureId),
+                incoming_vp8
+                    .tl0_pic_idx
+                    .map(|idx| idx as vp8::FullTl0PicIdx),
             );
             // We make two simplifying assumptions here:
             // 1. The first packet we received is the first packet of the key frame.
@@ -2395,9 +2437,9 @@ impl Vp8SimulcastRtpForwarder {
             // and the first seqnum/picture_id after the switch and doesn't require any fancy logic or queuing.
             // Ok, there is a gap of 1 seqnum to signify to the encoder that the
             // previous frame was (probably) incomplete.  That's why there's a 2 for the seqnum.
-            let first_outgoing = self
-                .max_outgoing
-                .checked_add(&Vp8RewrittenIds::new(2, 1, 1, 1))?;
+            let first_outgoing =
+                self.max_outgoing
+                    .checked_add(&Vp8RewrittenIds::new(2, 1, Some(1), Some(1)))?;
 
             self.forwarding = Vp8SimulcastRtpForwardingState::Forwarding {
                 incoming_ssrc: incoming_rtp.ssrc(),
@@ -2420,11 +2462,26 @@ impl Vp8SimulcastRtpForwarder {
         } = &mut self.forwarding
         {
             if *incoming_ssrc == incoming_rtp.ssrc() {
+                let expanded_picture_id = if let (Some(incoming), Some(mut max_incoming)) =
+                    (incoming_vp8.picture_id, max_incoming.picture_id)
+                {
+                    Some(vp8::expand_picture_id(incoming, &mut max_incoming))
+                } else {
+                    None
+                };
+                let expanded_tl0_pic_idx = if let (Some(incoming), Some(mut max_incoming)) =
+                    (incoming_vp8.tl0_pic_idx, max_incoming.tl0_pic_idx)
+                {
+                    Some(vp8::expand_tl0_pic_idx(incoming, &mut max_incoming))
+                } else {
+                    None
+                };
+
                 let incoming = Vp8RewrittenIds::new(
                     incoming_rtp.seqnum(),
                     rtp::expand_timestamp(incoming_rtp.timestamp, &mut max_incoming.timestamp),
-                    vp8::expand_picture_id(incoming_picture_id, &mut max_incoming.picture_id),
-                    vp8::expand_tl0_pic_idx(incoming_tl0_pic_idx, &mut max_incoming.tl0_pic_idx),
+                    expanded_picture_id,
+                    expanded_tl0_pic_idx,
                 );
                 // If the sub fails, it's because the incoming packet predates the switch (before the key frame)
                 let outgoing =
@@ -2677,8 +2734,8 @@ mod call_tests {
                 Vp8RewrittenIds {
                     seqnum,
                     timestamp,
-                    picture_id,
-                    tl0_pic_idx,
+                    picture_id: Some(picture_id),
+                    tl0_pic_idx: Some(tl0_pic_idx),
                 },
             ))
         };

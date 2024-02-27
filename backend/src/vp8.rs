@@ -8,6 +8,8 @@ use byteorder::{ReadBytesExt, BE, LE};
 use calling_common::{expand_truncated_counter, Bits, PixelSize, ReadSliceExt};
 use thiserror::Error;
 
+use crate::rtp;
+
 pub type TruncatedPictureId = u16;
 pub type FullPictureId = u64;
 pub type TruncatedTl0PicIdx = u8;
@@ -120,6 +122,17 @@ impl PayloadHeader {
 pub enum Vp8Error {
     #[error("Got a 7-bit VP8 picture ID. Expecting only 15-bit picture IDs.")]
     SevenBitPictureId,
+}
+
+impl From<rtp::DependencyDescriptor> for ParsedHeader {
+    fn from(value: rtp::DependencyDescriptor) -> Self {
+        Self {
+            picture_id: None,
+            tl0_pic_idx: None,
+            is_key_frame: value.is_key_frame,
+            resolution: value.resolution,
+        }
+    }
 }
 
 impl ParsedHeader {
