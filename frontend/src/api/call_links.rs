@@ -29,6 +29,11 @@ static X_ROOM_ID: HeaderName = HeaderName::from_static("x-room-id");
 const ADMIN_PASSKEY_LIMIT: usize = 32;
 const CALL_LINK_NAME_LIMIT: usize = 256;
 
+#[inline(always)]
+fn empty_json_object() -> serde_json::Value {
+    serde_json::json!({})
+}
+
 #[serde_as]
 #[derive(Serialize, Debug)]
 struct CallLinkState {
@@ -371,7 +376,7 @@ pub async fn delete_call_link(
             )?;
         } else {
             event!("calling.frontend.api.delete_call_link.nonexistent_room");
-            return Ok(());
+            return Ok(Json(empty_json_object()));
         }
 
         if maybe_current_call_record.is_some() {
@@ -387,9 +392,9 @@ pub async fn delete_call_link(
         .delete_call_link(&room_id.into(), &request.admin_passkey)
         .await
     {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(Json(empty_json_object())),
         Err(CallLinkDeleteError::AdminPasskeyDidNotMatch) => Err(StatusCode::FORBIDDEN),
-        Err(CallLinkDeleteError::RoomDoesNotExist) => Ok(()),
+        Err(CallLinkDeleteError::RoomDoesNotExist) => Ok(Json(empty_json_object())),
         Err(CallLinkDeleteError::CallRecordConflict) => Err(StatusCode::CONFLICT),
         Err(CallLinkDeleteError::UnexpectedError(err)) => {
             error!("delete_call_link: {err}");
@@ -1731,6 +1736,9 @@ pub mod tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).expect("valid utf-8");
+        assert_eq!(body, "{}");
     }
 
     #[tokio::test]
