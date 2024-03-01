@@ -2403,8 +2403,15 @@ impl Vp8SimulcastRtpForwarder {
         incoming_vp8: &vp8::ParsedHeader,
     ) -> Option<(rtp::Ssrc, Vp8RewrittenIds)> {
         // Both IDs are None when a dependency descriptor is used, otherwise they're both Some.
-        if incoming_vp8.picture_id.is_some() != incoming_vp8.tl0_pic_idx.is_some() {
-            return None;
+        match (
+            incoming_vp8.from_dependency_descriptor,
+            incoming_vp8.picture_id,
+            incoming_vp8.tl0_pic_idx,
+        ) {
+            (false, None, _) | (false, _, None) | (true, Some(_), _) | (true, _, Some(_)) => {
+                return None;
+            }
+            _ => {}
         }
 
         if self.switching_ssrc() == Some(incoming_rtp.ssrc()) && incoming_vp8.is_key_frame {
@@ -2462,17 +2469,17 @@ impl Vp8SimulcastRtpForwarder {
         } = &mut self.forwarding
         {
             if *incoming_ssrc == incoming_rtp.ssrc() {
-                let expanded_picture_id = if let (Some(incoming), Some(mut max_incoming)) =
-                    (incoming_vp8.picture_id, max_incoming.picture_id)
+                let expanded_picture_id = if let (Some(incoming), Some(max_incoming)) =
+                    (incoming_vp8.picture_id, max_incoming.picture_id.as_mut())
                 {
-                    Some(vp8::expand_picture_id(incoming, &mut max_incoming))
+                    Some(vp8::expand_picture_id(incoming, max_incoming))
                 } else {
                     None
                 };
-                let expanded_tl0_pic_idx = if let (Some(incoming), Some(mut max_incoming)) =
-                    (incoming_vp8.tl0_pic_idx, max_incoming.tl0_pic_idx)
+                let expanded_tl0_pic_idx = if let (Some(incoming), Some(max_incoming)) =
+                    (incoming_vp8.tl0_pic_idx, max_incoming.tl0_pic_idx.as_mut())
                 {
-                    Some(vp8::expand_tl0_pic_idx(incoming, &mut max_incoming))
+                    Some(vp8::expand_tl0_pic_idx(incoming, max_incoming))
                 } else {
                     None
                 };
@@ -2688,6 +2695,7 @@ mod call_tests {
                         tl0_pic_idx: Some(((100 * ssrc) + index) as u8),
                         is_key_frame,
                         resolution,
+                        from_dependency_descriptor: false,
                     },
                 }
             }

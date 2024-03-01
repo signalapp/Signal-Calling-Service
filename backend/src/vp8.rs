@@ -56,6 +56,8 @@ pub struct ParsedHeader {
     /// Subsequent frames must have the same resolution.
     /// Really u14s.
     pub resolution: Option<PixelSize>,
+
+    pub from_dependency_descriptor: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -131,6 +133,7 @@ impl From<rtp::DependencyDescriptor> for ParsedHeader {
             tl0_pic_idx: None,
             is_key_frame: value.is_key_frame,
             resolution: value.resolution,
+            from_dependency_descriptor: true,
         }
     }
 }
@@ -438,7 +441,7 @@ mod payload_header_tests {
 }
 
 #[cfg(test)]
-mod read_header_tests {
+mod parsed_header_tests {
     use hex_literal::hex;
 
     use super::*;
@@ -464,7 +467,8 @@ mod read_header_tests {
                 resolution: Some(PixelSize {
                     width: 640,
                     height: 360
-                })
+                }),
+                from_dependency_descriptor: false,
             }
         );
     }
@@ -490,7 +494,8 @@ mod read_header_tests {
                 resolution: Some(PixelSize {
                     width: 1920,
                     height: 1080
-                })
+                }),
+                from_dependency_descriptor: false,
             }
         );
     }
@@ -513,7 +518,8 @@ mod read_header_tests {
                 resolution: Some(PixelSize {
                     width: 640,
                     height: 360
-                })
+                }),
+                from_dependency_descriptor: false,
             }
         );
     }
@@ -536,6 +542,29 @@ mod read_header_tests {
                 .downcast::<Vp8Error>()
                 .unwrap(),
             Vp8Error::SevenBitPictureId
+        );
+    }
+
+    #[test]
+    fn from_dependency_descriptor() {
+        assert_eq!(
+            ParsedHeader::from(rtp::DependencyDescriptor {
+                is_key_frame: true,
+                resolution: Some(PixelSize {
+                    width: 640,
+                    height: 360
+                })
+            }),
+            ParsedHeader {
+                picture_id: None,
+                tl0_pic_idx: None,
+                is_key_frame: true,
+                resolution: Some(PixelSize {
+                    width: 640,
+                    height: 360
+                }),
+                from_dependency_descriptor: true,
+            }
         );
     }
 }
