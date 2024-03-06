@@ -12,7 +12,7 @@ use crate::{
     googcc, ice,
     pacer::{self, Pacer},
     packet_server::SocketLocator,
-    rtp,
+    rtp::{self, TruncatedSequenceNumber},
 };
 
 // This is a value sent in each RTCP message that isn't used anywhere, but
@@ -354,6 +354,7 @@ impl Connection {
                             rtp_endpoint.remember_sent_for_tcc(&outgoing_rtp, now);
                             self.rtx_rate.push(outgoing_rtp.size(), now);
                             packets_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
+                            rtp_endpoint.mark_as_sent(ssrc, seqnum);
                         }
                         // if more than one packet requests a scheduled dequeue, only the most recent time requested is scheduled
                         if let Some(dequeue_time) = dequeue_time {
@@ -460,6 +461,10 @@ impl Connection {
             if outgoing_rtp.is_padding() {
                 self.padding_rate.push(outgoing_rtp.size(), now);
             } else if outgoing_rtp.is_rtx() {
+                rtp_endpoint.mark_as_sent(
+                    outgoing_rtp.ssrc(),
+                    outgoing_rtp.seqnum() as TruncatedSequenceNumber,
+                );
                 self.rtx_rate.push(outgoing_rtp.size(), now);
             } else {
                 self.video_rate.push(outgoing_rtp.size(), now);

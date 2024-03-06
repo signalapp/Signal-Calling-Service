@@ -854,6 +854,8 @@ pub struct Packet<T> {
     seqnum_in_header: FullSequenceNumber,
     // Set if and only if the Packet is RTX.
     seqnum_in_payload: Option<FullSequenceNumber>,
+    // True when this packet is RTX and is in the pacer queue.
+    pending_retransmission: bool,
     pub timestamp: TruncatedTimestamp,
     pub video_rotation: Option<VideoRotation>,
     pub audio_level: Option<audio::Level>,
@@ -963,6 +965,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             ssrc_in_header: self.ssrc_in_header,
             seqnum_in_header: self.seqnum_in_header,
             seqnum_in_payload: self.seqnum_in_payload,
+            pending_retransmission: self.pending_retransmission,
             timestamp: self.timestamp,
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
@@ -984,6 +987,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             ssrc_in_header: self.ssrc_in_header,
             seqnum_in_header: self.seqnum_in_header,
             seqnum_in_payload: self.seqnum_in_payload,
+            pending_retransmission: self.pending_retransmission,
             timestamp: self.timestamp,
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
@@ -1158,6 +1162,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
             ssrc_in_header: self.ssrc_in_header,
             seqnum_in_header: self.seqnum_in_header,
             seqnum_in_payload: self.seqnum_in_payload,
+            pending_retransmission: self.pending_retransmission,
             timestamp: self.timestamp,
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
@@ -1277,6 +1282,7 @@ impl Packet<Vec<u8>> {
             ssrc_in_header: ssrc,
             seqnum_in_header: seqnum,
             seqnum_in_payload: None,
+            pending_retransmission: false,
             timestamp,
             video_rotation: None,
             audio_level: None,
@@ -1346,6 +1352,7 @@ pub fn parse_and_forward_rtp_for_fuzzing(data: Vec<u8>) -> Option<Vec<u8>> {
         ssrc_in_header: header.ssrc,
         seqnum_in_header: Default::default(),
         seqnum_in_payload: None,
+        pending_retransmission: false,
         timestamp: header.timestamp,
         video_rotation: header.video_rotation,
         audio_level: header.audio_level,
@@ -1813,11 +1820,20 @@ impl RtxSender {
         let rtx_ssrc = to_rtx_ssrc(ssrc);
         let rtx_seqnum = *self.get_next_seqnum_mut(rtx_ssrc);
 
-        let previously_sent = self.previously_sent_by_seqnum.get(&(ssrc, seqnum))?;
+        let previously_sent = self.previously_sent_by_seqnum.get_mut(&(ssrc, seqnum))?;
+        if previously_sent.is_past_deadline(now) && previously_sent.pending_retransmission {
+            event!("calling.rtp.rtx_expired_duplicate_skip");
+            return None;
+        }
+        if previously_sent.pending_retransmission {
+            event!("calling.rtp.rtx_duplicate_skip");
+            return None;
+        }
         if previously_sent.is_past_deadline(now) {
             event!("calling.rtp.rtx_resend_skip");
             return None;
         }
+        previously_sent.pending_retransmission = true;
         let mut rtx = previously_sent.to_rtx(rtx_seqnum);
         // This has to go after the use of previously_sent.to_rtx because previously_sent
         // has a ref to self.previously_sent_by_seqnum until then, and so we can't
@@ -1864,6 +1880,12 @@ impl RtxSender {
                 sum_of_packets += packet.serialized().len()
             });
         (count, sum_of_packets)
+    }
+
+    fn mark_as_sent(&mut self, ssrc: Ssrc, seqnum: TruncatedSequenceNumber) {
+        if let Some(packet) = self.previously_sent_by_seqnum.get_mut(&(ssrc, seqnum)) {
+            packet.pending_retransmission = false;
+        }
     }
 }
 
@@ -2159,6 +2181,7 @@ impl Endpoint {
             ssrc_in_header: header.ssrc,
             seqnum_in_header,
             seqnum_in_payload: None,
+            pending_retransmission: false,
             timestamp: header.timestamp,
             video_rotation: header.video_rotation,
             audio_level: header.audio_level,
@@ -2298,6 +2321,10 @@ impl Endpoint {
         let rtx_sender = &mut self.rtx_sender;
         let rtx = rtx_sender.resend_as_rtx(ssrc, seqnum, now, || tcc_sender.increment_seqnum())?;
         self.encrypt_and_send_rtp(rtx, now)
+    }
+
+    pub fn mark_as_sent(&mut self, ssrc: Ssrc, seqnum: TruncatedSequenceNumber) {
+        self.rtx_sender.mark_as_sent(ssrc, seqnum);
     }
 
     pub fn send_padding(&mut self, rtx_ssrc: Ssrc, now: Instant) -> Option<Packet<Vec<u8>>> {
@@ -3145,6 +3172,7 @@ mod test {
             rtx_seqnum: FullSequenceNumber,
             tcc_seqnum: tcc::FullSequenceNumber,
             now: Instant,
+            pending_retransmission: bool,
         ) -> Packet<Vec<u8>> {
             let timestamp = seqnum as TruncatedTimestamp;
             let payload = &(seqnum as u16).to_be_bytes();
@@ -3158,6 +3186,7 @@ mod test {
                 payload,
             );
             rtx.seqnum_in_payload = Some(seqnum);
+            rtx.pending_retransmission = pending_retransmission;
             rtx
         }
 
@@ -3183,12 +3212,15 @@ mod test {
         rtx_sender.remember_sent(sent_packet(2, 11, now), now);
         rtx_sender.remember_sent(sent_packet(4, 21, now), now + Duration::from_millis(2000));
         assert_eq!(
-            Some(rtx_packet(2, 11, 1, 101, now)),
+            Some(rtx_packet(2, 11, 1, 101, now, true)),
             rtx_sender.resend_as_rtx(2, 11, now, || 101)
         );
-        // Make sure we can send more than once.
+        // The same packet can't be sent again while the previous send is pending.
+        assert_eq!(None, rtx_sender.resend_as_rtx(2, 11, now, || 102));
+        // Once the packet has been sent, another retransmission can be made.
+        rtx_sender.mark_as_sent(2, 11);
         assert_eq!(
-            Some(rtx_packet(2, 11, 2, 102, now)),
+            Some(rtx_packet(2, 11, 2, 102, now, true)),
             rtx_sender.resend_as_rtx(2, 11, now, || 102)
         );
         // Make sure wrong SSRC or seqnum is ignored.
@@ -3229,7 +3261,8 @@ mod test {
                 12,
                 3,
                 103,
-                now + Duration::from_millis(14000)
+                now + Duration::from_millis(14000),
+                true,
             )),
             rtx_sender.resend_as_rtx(2, 12, now, || 103)
         );
@@ -3239,7 +3272,8 @@ mod test {
                 22,
                 1,
                 104,
-                now + Duration::from_millis(16000)
+                now + Duration::from_millis(16000),
+                true,
             )),
             rtx_sender.resend_as_rtx(4, 22, now, || 104)
         );
@@ -3249,7 +3283,8 @@ mod test {
                 24,
                 2,
                 105,
-                now + Duration::from_millis(24000)
+                now + Duration::from_millis(24000),
+                true,
             )),
             rtx_sender.resend_as_rtx(4, 24, now, || 105)
         );
@@ -3258,7 +3293,7 @@ mod test {
         let mut sent = sent_packet(2, 15, now + Duration::from_millis(16000));
         sent.marker = true;
         sent.serialized_mut()[1] = (1 << 7) | VP8_PAYLOAD_TYPE;
-        let mut rtx = rtx_packet(2, 15, 4, 106, now + Duration::from_millis(16000));
+        let mut rtx = rtx_packet(2, 15, 4, 106, now + Duration::from_millis(16000), true);
         rtx.marker = true;
         rtx.serialized_mut()[1] = (1 << 7) | VP8_RTX_PAYLOAD_TYPE;
         rtx_sender.remember_sent(sent, now + Duration::from_millis(16000));
@@ -3273,17 +3308,16 @@ mod test {
         assert_eq!(padding_packet(7, 1, 109), rtx_sender.send_padding(7, 109));
 
         // Try resending an RTX packet.
-        rtx_sender.remember_sent(
-            rtx_packet(2, 16, 37, 40, now + Duration::from_millis(17_000)),
-            now + Duration::from_millis(17_000),
-        );
+        let packet = rtx_packet(2, 16, 37, 40, now + Duration::from_millis(17_000), false);
+        rtx_sender.remember_sent(packet, now + Duration::from_millis(17_000));
         assert_eq!(
             Some(rtx_packet(
                 2,
                 16,
                 6,
                 107,
-                now + Duration::from_millis(17_000)
+                now + Duration::from_millis(17_000),
+                true,
             )),
             rtx_sender.resend_as_rtx(2, 16, now + Duration::from_millis(17_000), || 107)
         );
@@ -3386,6 +3420,7 @@ mod test {
         resent2.encrypted = false; // Got decrypted by the above
         let mut received2 = received2.to_owned();
         received2.deadline = resent2.deadline; // tweak deadline to match
+        received2.pending_retransmission = true; // tweak to match
         assert_eq!(resent2, received2);
         assert_eq!(sent2.payload_type(), resent2.payload_type());
         assert_eq!(VP8_RTX_PAYLOAD_TYPE, resent2.payload_type_in_header);

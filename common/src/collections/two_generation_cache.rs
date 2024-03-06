@@ -43,6 +43,14 @@ where
         self.0.get(key)
     }
 
+    pub fn get_mut<Q: ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        self.0.get_mut(key)
+    }
+
     pub fn remove<Q: ?Sized>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
@@ -123,6 +131,16 @@ where
         self.generation0
             .get(key)
             .or_else(|| self.generation1.get(key))
+    }
+
+    pub fn get_mut<Q: ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        self.generation0
+            .get_mut(key)
+            .or_else(|| self.generation1.get_mut(key))
     }
 
     pub fn remove<Q: ?Sized>(&mut self, key: &Q) -> Option<V>
