@@ -2071,7 +2071,9 @@ fn allocate_send_rate(
     for layer_index in 0..=2 {
         trace!("Allocating layer {}", layer_index);
         for video in &videos {
-            let layer = &video.layers[layer_index];
+            let mut candidate_layer_index = layer_index;
+            let mut layer = &video.layers[candidate_layer_index];
+
             trace!(
                 "Allocating {:?}.{} = ({}, {:?})",
                 video.sender_demux_id,
@@ -2084,12 +2086,27 @@ fn allocate_send_rate(
                 continue;
             }
 
-            let ideal_layer_index = ideal_video_layer_index(video);
-            if ideal_layer_index.is_none() || ideal_layer_index.unwrap() < layer_index {
-                trace!(
-                    "Skipped layer that's not requested (ideal layer index: {:?}).",
-                    ideal_layer_index
-                );
+            if let Some(ideal_layer_index) = ideal_video_layer_index(video) {
+                if ideal_layer_index < layer_index {
+                    trace!(
+                        "Skipped layer that's not requested (ideal layer index: {:?}).",
+                        ideal_layer_index
+                    );
+                    continue;
+                }
+
+                for possible_layer_index in layer_index + 1..=ideal_layer_index {
+                    let possible_layer = &video.layers[possible_layer_index];
+                    if possible_layer.incoming_height != VideoHeight::from(0)
+                        && possible_layer.incoming_rate.as_bps() != 0
+                        && possible_layer.incoming_rate < layer.incoming_rate
+                    {
+                        candidate_layer_index = possible_layer_index;
+                        layer = possible_layer;
+                    }
+                }
+            } else {
+                trace!("Skipped layer that's not requested (ideal layer index: None).");
                 continue;
             }
 
@@ -2116,7 +2133,7 @@ fn allocate_send_rate(
                 video.sender_demux_id,
                 AllocatedVideo {
                     sender_demux_id: video.sender_demux_id,
-                    layer_index,
+                    layer_index: candidate_layer_index,
                     rate: layer.incoming_rate,
                     height: layer.incoming_height,
                 },
@@ -3347,6 +3364,172 @@ mod call_tests {
                 2000,
                 0,
                 &[&request(VideoHeight::from(1), &screenshare),],
+                no_max
+            )
+        );
+
+        // Test with layer 1 using less bandwidth than layer 0
+        let small_layer1 = layer(100, VideoHeight::from(360));
+        let video_with_small_layer1 =
+            video(DemuxId::from_const(0x50), [&layer0, &small_layer1, &layer2]);
+
+        // Not enough bandwidth to allocate anything
+        assert_eq!(
+            (2000, vec![]),
+            allocate(
+                99,
+                0,
+                &[&request(VideoHeight::from(720), &video_with_small_layer1),],
+                no_max
+            )
+        );
+
+        // Enough for layer 1, even though not enough for layer 0!
+        assert_eq!(
+            (2000, vec![(0x50, 1, 100)]),
+            allocate(
+                100,
+                0,
+                &[&request(VideoHeight::from(720), &video_with_small_layer1),],
+                no_max
+            )
+        );
+
+        // Enough for layer 2
+        assert_eq!(
+            (2000, vec![(0x50, 2, 2000)]),
+            allocate(
+                2000,
+                0,
+                &[&request(VideoHeight::from(720), &video_with_small_layer1),],
+                no_max
+            )
+        );
+
+        // Don't use layer 1, because it's too tall, not enough bandwidth for layer 0
+        assert_eq!(
+            (200, vec![]),
+            allocate(
+                100,
+                0,
+                &[&request(VideoHeight::from(180), &video_with_small_layer1),],
+                no_max
+            )
+        );
+
+        // Test with layer 2 using less bandwidth than layer 1
+        let small_layer2 = layer(100, VideoHeight::from(720));
+        let video_with_small_layer2 =
+            video(DemuxId::from_const(0x50), [&layer0, &layer1, &small_layer2]);
+        let video6 = video(DemuxId::from_const(0x60), [&layer0, &layer1, &layer2]);
+
+        // Enough for layer 2, even though not enough for other layers
+        assert_eq!(
+            (100, vec![(0x50, 2, 100)]),
+            allocate(
+                100,
+                0,
+                &[&request(VideoHeight::from(720), &video_with_small_layer2),],
+                no_max
+            )
+        );
+
+        // Only enough for the small layer 2
+        assert_eq!(
+            (2100, vec![(0x50, 2, 100)]),
+            allocate(
+                100,
+                0,
+                &[
+                    &request(VideoHeight::from(720), &video_with_small_layer2),
+                    &request(VideoHeight::from(720), &video6),
+                ],
+                no_max
+            )
+        );
+
+        // Enough for everything
+        assert_eq!(
+            (2100, vec![(0x50, 2, 100), (0x60, 2, 2000)]),
+            allocate(
+                2100,
+                0,
+                &[
+                    &request(VideoHeight::from(720), &video_with_small_layer2),
+                    &request(VideoHeight::from(720), &video6),
+                ],
+                no_max
+            )
+        );
+
+        // Only enough for small layer 2 and other layer 0
+        assert_eq!(
+            (2100, vec![(0x50, 2, 100), (0x60, 0, 200)]),
+            allocate(
+                899,
+                0,
+                &[
+                    &request(VideoHeight::from(720), &video_with_small_layer2),
+                    &request(VideoHeight::from(720), &video6),
+                ],
+                no_max
+            )
+        );
+
+        // Only enough for small layer 2 and other layer 1
+        assert_eq!(
+            (2100, vec![(0x50, 2, 100), (0x60, 1, 800)]),
+            allocate(
+                2099,
+                0,
+                &[
+                    &request(VideoHeight::from(720), &video_with_small_layer2),
+                    &request(VideoHeight::from(720), &video6),
+                ],
+                no_max
+            )
+        );
+
+        // Only enough for one; biggest wins
+        assert_eq!(
+            (2100, vec![(0x50, 2, 100)]),
+            allocate(
+                200,
+                0,
+                &[
+                    &request(VideoHeight::from(721), &video_with_small_layer2),
+                    &request(VideoHeight::from(720), &video6),
+                ],
+                no_max
+            )
+        );
+
+        // Only enough for one; biggest wins
+        assert_eq!(
+            (2100, vec![(0x60, 0, 200)]),
+            allocate(
+                200,
+                0,
+                &[
+                    &request(VideoHeight::from(720), &video_with_small_layer2),
+                    &request(VideoHeight::from(721), &video6),
+                ],
+                no_max
+            )
+        );
+
+        // Not enough; small layer 2 and regular layer 1 selected; because
+        // both layer 0's would be selected, but 0x50's layer 2 is smallest
+        // that fits the requested resolution
+        assert_eq!(
+            (2100, vec![(0x50, 2, 100), (0x60, 0, 200)]),
+            allocate(
+                899,
+                0,
+                &[
+                    &request(VideoHeight::from(720), &video_with_small_layer2),
+                    &request(VideoHeight::from(721), &video6),
+                ],
                 no_max
             )
         );
