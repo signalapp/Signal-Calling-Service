@@ -184,7 +184,7 @@ impl ServerMediaAddress {
 
     pub fn ip(&self) -> &IpAddr {
         self.addresses
-            .get(0)
+            .first()
             .expect("addresses should be non-empty")
     }
 }

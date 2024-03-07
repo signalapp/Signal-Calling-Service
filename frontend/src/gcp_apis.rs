@@ -282,7 +282,7 @@ impl InstanceLister {
                     .context("failed to get body for instance")?;
                 let instance_response: Instance = serde_json::from_reader(body.reader())
                     .context("failed to convert body to instance response")?;
-                if let Some(interface) = instance_response.network_interfaces.get(0) {
+                if let Some(interface) = instance_response.network_interfaces.first() {
                     Ok(Ipv4Addr::from_str(&interface.network_ip)?)
                 } else {
                     Err(anyhow!("instance {} has no interfaces", instance_url))

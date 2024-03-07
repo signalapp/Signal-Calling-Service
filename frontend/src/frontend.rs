@@ -143,7 +143,7 @@ impl Frontend {
             FrontendError::InternalError
         })?;
 
-        match self
+        let result = self
             .backend
             .get_clients(&backend_address, &call.era_id, Some(user_id))
             .await
@@ -178,8 +178,9 @@ impl Frontend {
                     active_clients,
                     pending_clients,
                 })
-            }) {
-            Ok(result) => Ok(result),
+            });
+        match result {
+            Ok(client_response) => Ok(client_response),
             Err(BackendError::CallNotFound) => {
                 if let Err(err) = self
                     .storage

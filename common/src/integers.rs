@@ -128,16 +128,18 @@ mod u48_tests {
 
     #[test]
     fn zero() {
-        assert_eq!(Ok(U48(0)), 0u16.try_into());
         assert_eq!(U48(0), 0u16.into());
         assert_eq!(U48::ZERO, 0u16.into());
         assert_eq!(U48::MIN, 0u16.into());
+        assert_eq!(U48(0), 0u32.into());
+        assert_eq!(Ok(U48(0)), 0u64.try_into());
     }
 
     #[test]
     fn one() {
-        assert_eq!(Ok(U48(1)), 1u16.try_into());
         assert_eq!(U48(1), 1u16.into());
+        assert_eq!(U48(1), 1u32.into());
+        assert_eq!(Ok(U48(1)), 1u64.try_into());
     }
 
     #[test]
@@ -266,16 +268,16 @@ mod u24_tests {
 
     #[test]
     fn zero() {
-        assert_eq!(Ok(U24(0)), 0u16.try_into());
         assert_eq!(U24(0), 0.into());
         assert_eq!(U24::ZERO, 0.into());
         assert_eq!(U24::MIN, 0.into());
+        assert_eq!(Ok(U24(0)), 0u32.try_into());
     }
 
     #[test]
     fn one() {
-        assert_eq!(Ok(U24(1)), 1u16.try_into());
         assert_eq!(U24(1), 1.into());
+        assert_eq!(Ok(U24(1)), 1u32.try_into());
     }
 
     #[test]

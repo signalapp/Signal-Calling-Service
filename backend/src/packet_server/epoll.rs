@@ -645,24 +645,30 @@ impl PacketServerState {
                     ConnectionState::NotYetConnected => {
                         trace!("connecting to {:?}", addr);
                         match addr {
-                            SocketLocator::Udp(udp_addr) => match try_scoped(|| {
-                                let client_socket =
-                                    Self::open_socket_with_reusable_port(&self.local_addr_udp)?;
-                                client_socket.connect(udp_addr)?;
-                                self.add_socket_to_poll_for_reads(&client_socket)?;
-                                let client_socket = Socket::Udp(client_socket);
-                                let client_socket =
-                                    write_lock.get_or_insert_connected(client_socket, addr, None);
-                                if !Self::send_and_keep(client_socket, buf) {
-                                    write_lock.mark_closed(&addr, Instant::now());
+                            SocketLocator::Udp(udp_addr) => {
+                                let result = try_scoped(|| {
+                                    let client_socket =
+                                        Self::open_socket_with_reusable_port(&self.local_addr_udp)?;
+                                    client_socket.connect(udp_addr)?;
+                                    self.add_socket_to_poll_for_reads(&client_socket)?;
+                                    let client_socket = Socket::Udp(client_socket);
+                                    let client_socket = write_lock.get_or_insert_connected(
+                                        client_socket,
+                                        addr,
+                                        None,
+                                    );
+                                    if !Self::send_and_keep(client_socket, buf) {
+                                        write_lock.mark_closed(&addr, Instant::now());
+                                    }
+                                    Ok(())
+                                });
+                                match result {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        error!("failed to connect to peer: {}", e);
+                                    }
                                 }
-                                Ok(())
-                            }) {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    error!("failed to connect to peer: {}", e);
-                                }
-                            },
+                            }
                             SocketLocator::Tcp { .. } => {
                                 event!("calling.udp.epoll.tcp_use_after_close");
                             }

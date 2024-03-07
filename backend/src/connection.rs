@@ -5,7 +5,6 @@
 
 use calling_common::{DataRate, DataRateTracker, DataSize, Duration, Instant};
 use log::*;
-use std::net::IpAddr::{V4, V6};
 use thiserror::Error;
 
 use crate::{
@@ -239,18 +238,13 @@ impl Connection {
             event!("calling.sfu.ice.outgoing_addr_switch");
             self.outgoing_addr = Some(sender_addr);
             self.outgoing_addr_type = Some(match sender_addr {
-                // addr.ip().to_canonical().is_ipv6());
-                // can't use this because it's not yet stable, do a little bit of the work ourselves
-                SocketLocator::Udp(addr) => match addr.ip() {
-                    V4(_) => AddressType::UdpV4,
-                    V6(addr) => {
-                        if addr.to_ipv4_mapped().is_none() {
-                            AddressType::UdpV6
-                        } else {
-                            AddressType::UdpV4
-                        }
+                SocketLocator::Udp(addr) => {
+                    if addr.ip().to_canonical().is_ipv6() {
+                        AddressType::UdpV6
+                    } else {
+                        AddressType::UdpV4
                     }
-                },
+                }
                 SocketLocator::Tcp { is_ipv6, .. } => {
                     if is_ipv6 {
                         AddressType::TcpV6

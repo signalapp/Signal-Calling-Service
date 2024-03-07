@@ -483,7 +483,7 @@ mod http_server_tests {
         let end = Instant::now();
 
         assert_eq!(count, ids_bytes.len());
-        assert_eq!(32, ids_bytes.get(0).unwrap().len());
+        assert_eq!(32, ids_bytes.first().unwrap().len());
 
         println!(
             "hex_decode() for {} ids took {}ns",
@@ -508,7 +508,7 @@ mod http_server_tests {
         let end = Instant::now();
 
         assert_eq!(count, ids_strings.len());
-        assert_eq!(64, ids_strings.get(0).unwrap().len());
+        assert_eq!(64, ids_strings.first().unwrap().len());
 
         println!(
             "hex_encode() for {} ids took {}ns",
