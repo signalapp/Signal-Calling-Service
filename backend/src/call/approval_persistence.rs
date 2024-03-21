@@ -74,7 +74,7 @@ impl ApprovedUsers {
     }
     pub fn insert(&mut self, value: UserId) -> bool {
         if self.set.insert(value) {
-            self.modified();
+            self.modified = true;
             true
         } else {
             false
@@ -82,29 +82,21 @@ impl ApprovedUsers {
     }
     pub fn remove(&mut self, value: &UserId) -> bool {
         if self.set.remove(value) {
-            self.modified();
+            self.modified = true;
             true
         } else {
             false
         }
     }
-    fn modified(&mut self) {
-        match &self.future {
-            Some(future) if !future.is_finished() => {
-                self.modified = true;
-            }
-            _ => {
-                self.retry_count = 0;
-                self.spawn(None);
-            }
-        }
-    }
+
     fn spawn(&mut self, wait: Option<Duration>) {
         if matches!(self.persistence_mode, PersistenceMode::Off) {
+            self.modified = false;
             return;
         }
         if Handle::try_current().is_err() {
             warn!("called outside of tokio runtime; can't persist updates");
+            self.modified = false;
             return;
         }
         debug!(
@@ -165,7 +157,7 @@ impl ApprovedUsers {
         }));
     }
     pub fn is_busy(&self) -> bool {
-        self.future.is_some()
+        self.modified || self.future.is_some()
     }
 
     #[cfg(test)]
@@ -204,11 +196,7 @@ impl ApprovedUsers {
                     }
                 };
 
-                if self.modified {
-                    self.modified = false;
-                    self.retry_count = 0;
-                    self.spawn(None);
-                } else if needs_retry {
+                if needs_retry && !self.modified {
                     self.retry_count += 1;
                     if self.retry_count > 3 {
                         event!("calling.call.persist_approved_users.too_many_retries");
@@ -221,6 +209,12 @@ impl ApprovedUsers {
             } else {
                 self.future = Some(future);
             }
+        }
+
+        if self.modified && self.future.is_none() {
+            self.modified = false;
+            self.retry_count = 0;
+            self.spawn(None);
         }
     }
 }
@@ -256,6 +250,7 @@ mod tests {
 
         users.insert("user".to_string().into());
         assert!(users.is_busy());
+        users.tick();
 
         // yield_now is not *guaranteed* to run the spawned persistence task,
         // but in practice it will for the single-threaded tokio runtime.
@@ -286,6 +281,7 @@ mod tests {
 
         users.insert("user".to_string().into());
         assert!(users.is_busy());
+        users.tick();
 
         // yield_now is not *guaranteed* to run the spawned persistence task,
         // but in practice it will for the single-threaded tokio runtime.
@@ -376,6 +372,7 @@ mod tests {
 
         users.insert("user".to_string().into());
         assert!(users.is_busy());
+        users.tick();
 
         // yield_now is not *guaranteed* to run the spawned persistence task,
         // but in practice it will for the single-threaded tokio runtime.
@@ -430,6 +427,7 @@ mod tests {
 
         users.insert("C".to_string().into());
         assert!(users.is_busy());
+        users.tick();
         tokio::task::yield_now().await;
         // Make sure the callback was invoked so our assertions get checked.
         assert_eq!(CALLBACK_COUNT.load(SeqCst), 1);
@@ -468,6 +466,7 @@ mod tests {
 
         users.remove(&"B".to_string().into());
         assert!(users.is_busy());
+        users.tick();
         tokio::task::yield_now().await;
         // Make sure the callback was invoked so our assertions get checked.
         assert_eq!(CALLBACK_COUNT.load(SeqCst), 1);
@@ -502,6 +501,7 @@ mod tests {
 
         users.insert("C".to_string().into());
         assert!(users.is_busy());
+        users.tick();
         tokio::task::yield_now().await;
         // Make sure the callback was invoked so our assertions get checked.
         assert_eq!(CALLBACK_COUNT.load(SeqCst), 1);
@@ -554,6 +554,7 @@ mod tests {
 
         users.insert("C".to_string().into());
         assert!(users.is_busy());
+        users.tick();
         tokio::task::yield_now().await;
         // Make sure the callback was invoked so our assertions get checked.
         assert_eq!(CALLBACK_COUNT.load(SeqCst), 1);
@@ -606,6 +607,7 @@ mod tests {
 
         users.insert("C".to_string().into());
         assert!(users.is_busy());
+        users.tick();
         tokio::task::yield_now().await;
         // Make sure the callback was invoked so our assertions get checked.
         assert_eq!(CALLBACK_COUNT.load(SeqCst), 1);
