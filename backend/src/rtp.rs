@@ -625,6 +625,7 @@ impl HeaderExtensionsProfile {
 #[derive(Debug, Eq, PartialEq)]
 pub struct Header {
     marker: bool,
+    has_padding: bool,
     pub payload_type: PayloadType,
     seqnum: TruncatedSequenceNumber,
     timestamp: TruncatedTimestamp,
@@ -647,6 +648,7 @@ impl Header {
         let (main_header, csrcs_extensions_payload_tag) =
             packet.checked_split_at(RTP_MIN_HEADER_LEN)?;
 
+        let has_padding = (main_header[0] & 0b0010_0000) > 0;
         let has_extensions = ((main_header[0] & 0b0001_0000) >> 4) > 0;
         let csrc_count = main_header[0] & 0b0000_1111;
         let payload_type = main_header[RTP_PAYLOAD_TYPE_OFFSET] & 0b01111111;
@@ -767,6 +769,7 @@ impl Header {
 
         Some(Self {
             marker,
+            has_padding,
             payload_type,
             seqnum,
             timestamp,
@@ -877,6 +880,8 @@ pub struct Packet<T> {
     // If the packet isn't sent by the deadline, discard it
     deadline: Option<Instant>,
 
+    pub padding_byte_count: u8,
+
     serialized: T,
 }
 
@@ -975,6 +980,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             payload_range_in_header: self.payload_range_in_header.clone(),
             encrypted: self.encrypted,
             deadline: self.deadline,
+            padding_byte_count: self.padding_byte_count,
 
             serialized: self.serialized.borrow(),
         }
@@ -997,6 +1003,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             payload_range_in_header: self.payload_range_in_header.clone(),
             encrypted: self.encrypted,
             deadline: self.deadline,
+            padding_byte_count: self.padding_byte_count,
 
             serialized: self.serialized.borrow().to_vec(),
         }
@@ -1172,6 +1179,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
             payload_range_in_header: self.payload_range_in_header.clone(),
             encrypted: self.encrypted,
             deadline: self.deadline,
+            padding_byte_count: self.padding_byte_count,
 
             serialized: self.serialized.borrow_mut(),
         }
@@ -1297,6 +1305,7 @@ impl Packet<Vec<u8>> {
             payload_range_in_header: payload_range,
             encrypted: false,
             deadline: deadline_start.map(|deadline_start| deadline_start + PACKET_LIFETIME),
+            padding_byte_count: 0,
             serialized,
         }
     }
@@ -1362,8 +1371,13 @@ pub fn parse_and_forward_rtp_for_fuzzing(data: Vec<u8>) -> Option<Vec<u8>> {
         payload_range_in_header: header.payload_range,
         encrypted: true,
         deadline: None,
+        padding_byte_count: 0,
         serialized: data,
     };
+
+    if header.has_padding {
+        incoming.padding_byte_count = incoming.payload()[incoming.payload().len() - 1];
+    }
 
     let _ = incoming.decrypt_in_place(&fuzzing_key(), &Default::default());
     incoming.encrypted = false;
@@ -2191,6 +2205,7 @@ impl Endpoint {
             payload_range_in_header: header.payload_range,
             encrypted: true,
             deadline: Some(now + PACKET_LIFETIME),
+            padding_byte_count: 0,
             serialized: encrypted,
         };
 
@@ -2253,6 +2268,10 @@ impl Endpoint {
 
         if let Some(tcc_seqnum) = incoming.tcc_seqnum {
             self.tcc_receiver.remember_received(tcc_seqnum, now);
+        }
+
+        if header.has_padding {
+            incoming.padding_byte_count = incoming.payload()[incoming.payload().len() - 1];
         }
 
         Some(incoming)
@@ -2616,6 +2635,7 @@ mod test {
         assert_eq!(
             Some(Header {
                 marker: false,
+                has_padding: false,
                 payload_type: 1,
                 seqnum: 2,
                 timestamp: 3,
@@ -2651,6 +2671,7 @@ mod test {
         assert_eq!(
             Some(Header {
                 marker: false,
+                has_padding: false,
                 payload_type: 1,
                 seqnum: 2,
                 timestamp: 3,
@@ -2730,6 +2751,7 @@ mod test {
         assert_eq!(
             Some(Header {
                 marker: false,
+                has_padding: false,
                 payload_type: 1,
                 seqnum: 2,
                 timestamp: 3,
@@ -2761,6 +2783,7 @@ mod test {
         assert_eq!(
             Some(Header {
                 marker: false,
+                has_padding: false,
                 payload_type: 1,
                 seqnum: 2,
                 timestamp: 3,
@@ -2794,6 +2817,7 @@ mod test {
         assert_eq!(
             Some(Header {
                 marker: false,
+                has_padding: false,
                 payload_type: 1,
                 seqnum: 2,
                 timestamp: 3,
@@ -2825,6 +2849,7 @@ mod test {
         assert_eq!(
             Some(Header {
                 marker: false,
+                has_padding: false,
                 payload_type: 1,
                 seqnum: 2,
                 timestamp: 3,
@@ -2853,6 +2878,7 @@ mod test {
         assert_eq!(
             Some(Header {
                 marker: false,
+                has_padding: false,
                 payload_type: 1,
                 seqnum: 2,
                 timestamp: 3,
@@ -2885,6 +2911,7 @@ mod test {
         assert_eq!(
             Some(Header {
                 marker: false,
+                has_padding: false,
                 payload_type: 1,
                 seqnum: 2,
                 timestamp: 3,
@@ -2919,6 +2946,7 @@ mod test {
         assert_eq!(
             Some(Header {
                 marker: false,
+                has_padding: false,
                 payload_type: 1,
                 seqnum: 2,
                 timestamp: 3,
@@ -2991,6 +3019,7 @@ mod test {
         assert_eq!(
             Some(Header {
                 marker: false,
+                has_padding: false,
                 payload_type: 1,
                 seqnum: 2,
                 timestamp: 3,

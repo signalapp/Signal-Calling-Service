@@ -1016,6 +1016,7 @@ impl Call {
             sender.incoming_video0.rate_tracker.update(now);
             sender.incoming_video1.rate_tracker.update(now);
             sender.incoming_video2.rate_tracker.update(now);
+            sender.incoming_padding_rate.update(now);
         }
 
         let mut new_active_speaker: Option<DemuxId> = None;
@@ -1685,6 +1686,7 @@ struct Client {
     incoming_video1: IncomingVideoState,
     incoming_video2: IncomingVideoState,
     video_rotation: VideoRotation,
+    incoming_padding_rate: DataRateTracker,
 
     // Updated by incoming audio packets
     incoming_audio_levels: audio::LevelsTracker,
@@ -1745,6 +1747,7 @@ impl Client {
             incoming_video0: IncomingVideoState::default(),
             incoming_video1: IncomingVideoState::default(),
             incoming_video2: IncomingVideoState::default(),
+            incoming_padding_rate: DataRateTracker::default(),
             video_rotation: VideoRotation::None,
 
             incoming_audio_levels: audio::LevelsTracker::default(),
@@ -1787,16 +1790,34 @@ impl Client {
             vp8::ParsedHeader::read(incoming_rtp.payload()).ok()?
         };
         let incoming_layer_id = LayerId::from_ssrc(incoming_rtp.ssrc());
+        let size = incoming_rtp.size().as_bytes() as usize;
+        if incoming_rtp.padding_byte_count as usize >= incoming_rtp.payload().len() {
+            event!("calling.bandwidth.incoming.padding_bytes", size);
+            self.incoming_padding_rate.push_bytes(size, now);
+            // Don't forward the packet if it only contains padding.
+            return None;
+        }
+
         let incoming_video = match incoming_layer_id {
-            Some(LayerId::Video0) => &mut self.incoming_video0,
-            Some(LayerId::Video1) => &mut self.incoming_video1,
-            Some(LayerId::Video2) => &mut self.incoming_video2,
+            Some(LayerId::Video0) => {
+                event!("calling.bandwidth.incoming.video0_bytes", size);
+                &mut self.incoming_video0
+            }
+            Some(LayerId::Video1) => {
+                event!("calling.bandwidth.incoming.video1_bytes", size);
+                &mut self.incoming_video1
+            }
+            Some(LayerId::Video2) => {
+                event!("calling.bandwidth.incoming.video2_bytes", size);
+                &mut self.incoming_video2
+            }
             _ => {
+                event!("calling.bandwidth.incoming.video_unknown_layer_bytes", size);
                 return None;
             }
         };
 
-        incoming_video.rate_tracker.push(incoming_rtp.size(), now);
+        incoming_video.rate_tracker.push_bytes(size, now);
 
         let old_resolution = incoming_video.original_resolution;
         if let Some(resolution) = incoming_vp8.resolution {
@@ -1902,6 +1923,7 @@ impl Client {
             video0_incoming_rate: self.incoming_video0.rate(),
             video1_incoming_rate: self.incoming_video1.rate(),
             video2_incoming_rate: self.incoming_video2.rate(),
+            padding_incoming_rate: self.incoming_padding_rate.rate(),
             video0_incoming_height: self.incoming_video0.height,
             video1_incoming_height: self.incoming_video1.height,
             video2_incoming_height: self.incoming_video2.height,
@@ -2545,6 +2567,7 @@ pub struct ClientStats {
     pub video0_incoming_rate: Option<DataRate>,
     pub video1_incoming_rate: Option<DataRate>,
     pub video2_incoming_rate: Option<DataRate>,
+    pub padding_incoming_rate: Option<DataRate>,
     pub video0_incoming_height: Option<VideoHeight>,
     pub video1_incoming_height: Option<VideoHeight>,
     pub video2_incoming_height: Option<VideoHeight>,

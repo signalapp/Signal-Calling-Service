@@ -212,8 +212,7 @@ impl Connection {
         binding_request: ice::BindingRequest,
         now: Instant,
     ) -> Result<PacketToSend, Error> {
-        self.incoming_non_media_rate
-            .push_bytes(binding_request.len(), now);
+        self.push_incoming_non_media_bytes(binding_request.len(), now);
 
         let verified_binding_request = binding_request
             .verify_hmac(&self.ice.pwd)
@@ -258,7 +257,7 @@ impl Connection {
 
         let response = verified_binding_request
             .to_binding_response(&self.ice.response_username, &self.ice.pwd);
-        self.non_media_rate.push_bytes(response.len(), now);
+        self.push_outgoing_non_media_bytes(response.len(), now);
 
         Ok(response)
     }
@@ -288,17 +287,20 @@ impl Connection {
         match rtp_endpoint.receive_rtp(incoming_packet, now) {
             Some(packet) => {
                 if packet.is_rtx() {
+                    event!("calling.bandwidth.incoming.rtx_bytes", size);
                     self.incoming_rtx_rate.push_bytes(size, now);
                 } else if packet.is_audio() {
+                    event!("calling.bandwidth.incoming.audio_bytes", size);
                     self.incoming_audio_rate.push_bytes(size, now);
                 } else if !packet.is_video() {
-                    self.incoming_non_media_rate.push_bytes(size, now);
+                    self.push_incoming_non_media_bytes(size, now);
                 }
                 // video packet datarate tracked by layer, in call.rs;
                 // includes data from original and retransmitted packets
                 Ok(packet)
             }
             None => {
+                event!("calling.bandwidth.incoming.discard_bytes", size);
                 self.incoming_discard_rate.push_bytes(size, now);
                 Err(Error::ReceivedInvalidRtp)
             }
@@ -317,8 +319,7 @@ impl Connection {
         incoming_packet: &mut [u8],
         now: Instant,
     ) -> Result<HandleRtcpResult, Error> {
-        self.incoming_non_media_rate
-            .push_bytes(incoming_packet.len(), now);
+        self.push_incoming_non_media_bytes(incoming_packet.len(), now);
 
         let rtp_endpoint = &mut self.rtp.endpoint;
         let rtcp = rtp_endpoint
@@ -346,7 +347,9 @@ impl Connection {
                             self.congestion_control.pacer.enqueue(rtx, now);
                         if let Some(outgoing_rtp) = outgoing_rtp {
                             rtp_endpoint.remember_sent_for_tcc(&outgoing_rtp, now);
-                            self.rtx_rate.push(outgoing_rtp.size(), now);
+                            let size = outgoing_rtp.size();
+                            self.rtx_rate.push(size, now);
+                            Self::count_outgoing_rtx(size);
                             packets_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
                             rtp_endpoint.mark_as_sent(ssrc, seqnum);
                         }
@@ -415,7 +418,7 @@ impl Connection {
                         self.congestion_control.pacer.enqueue(outgoing_rtp, now);
                     if let Some(outgoing_rtp) = outgoing_rtp {
                         rtp_endpoint.remember_sent_for_tcc(&outgoing_rtp, now);
-                        self.video_rate.push(outgoing_rtp.size(), now);
+                        self.push_outgoing_video(outgoing_rtp.size(), now);
                         rtp_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
                     }
                     if let Some(dequeue_time) = dequeue_time {
@@ -424,12 +427,20 @@ impl Connection {
                 } else {
                     // Skip the pacer for packets that aren't congestion controlled.
                     if outgoing_rtp.is_audio() {
-                        self.audio_rate.push(outgoing_rtp.size(), now);
+                        let size = outgoing_rtp.size();
+                        event!(
+                            "calling.bandwidth.outgoing.audio_bytes",
+                            size.as_bytes() as usize
+                        );
+                        self.audio_rate.push(size, now);
                     } else if outgoing_rtp.is_video() {
                         warn!("forwarding video packet without congestion control");
-                        self.video_rate.push(outgoing_rtp.size(), now);
+                        self.push_outgoing_video(outgoing_rtp.size(), now);
                     } else {
-                        self.non_media_rate.push(outgoing_rtp.size(), now);
+                        self.push_outgoing_non_media_bytes(
+                            outgoing_rtp.size().as_bytes() as usize,
+                            now,
+                        );
                     }
                     rtp_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
                 }
@@ -452,16 +463,25 @@ impl Connection {
 
         if let Some(outgoing_rtp) = outgoing_rtp {
             rtp_endpoint.remember_sent_for_tcc(&outgoing_rtp, now);
+            let size = outgoing_rtp.size();
             if outgoing_rtp.is_padding() {
-                self.padding_rate.push(outgoing_rtp.size(), now);
+                event!(
+                    "calling.bandwidth.outgoing.padding_bytes",
+                    size.as_bytes() as usize
+                );
+                self.padding_rate.push(size, now);
             } else if outgoing_rtp.is_rtx() {
                 rtp_endpoint.mark_as_sent(
                     outgoing_rtp.ssrc(),
                     outgoing_rtp.seqnum() as TruncatedSequenceNumber,
                 );
-                self.rtx_rate.push(outgoing_rtp.size(), now);
+                self.rtx_rate.push(size, now);
+                Self::count_outgoing_rtx(size);
             } else {
-                self.video_rate.push(outgoing_rtp.size(), now);
+                if !outgoing_rtp.is_video() {
+                    warn!("dequeued non-video packet");
+                }
+                self.push_outgoing_video(size, now);
             }
             Some((
                 outgoing_addr,
@@ -491,7 +511,7 @@ impl Connection {
         let outgoing_addr = self.outgoing_addr?;
         let rtp_endpoint = &mut self.rtp.endpoint;
         let rtcp_packet = rtp_endpoint.send_pli(key_frame_request.ssrc)?;
-        self.non_media_rate.push_bytes(rtcp_packet.len(), now);
+        self.push_outgoing_non_media_bytes(rtcp_packet.len(), now);
         Some((rtcp_packet, outgoing_addr))
     }
 
@@ -514,11 +534,12 @@ impl Connection {
 
         let rtp_endpoint = &mut self.rtp.endpoint;
         if let Some(outgoing_addr) = self.outgoing_addr {
+            let mut bytes = 0;
             for ack_packet in rtp_endpoint.send_acks() {
-                self.non_media_rate.push_bytes(ack_packet.len(), now);
+                bytes += ack_packet.len();
                 packets_to_send.push((ack_packet, outgoing_addr));
             }
-
+            self.push_outgoing_non_media_bytes(bytes, now);
             self.rtp.acks_sent = Some(now);
         }
     }
@@ -541,11 +562,13 @@ impl Connection {
 
         let rtp_endpoint = &mut self.rtp.endpoint;
         if let Some(outgoing_addr) = self.outgoing_addr {
+            let mut bytes = 0;
             for nack_packet in rtp_endpoint.send_nacks(now) {
-                self.non_media_rate.push_bytes(nack_packet.len(), now);
+                bytes += nack_packet.len();
                 packets_to_send.push((nack_packet, outgoing_addr));
             }
 
+            self.push_outgoing_non_media_bytes(bytes, now);
             self.rtp.nacks_sent = Some(now);
         }
     }
@@ -564,8 +587,7 @@ impl Connection {
 
         if let Some(outgoing_addr) = self.outgoing_addr {
             if let Some(receiver_report_packet) = self.rtp.endpoint.send_receiver_report() {
-                self.non_media_rate
-                    .push_bytes(receiver_report_packet.len(), now);
+                self.push_outgoing_non_media_bytes(receiver_report_packet.len(), now);
                 packets_to_send.push((receiver_report_packet, outgoing_addr));
             }
 
@@ -627,6 +649,31 @@ impl Connection {
                 .unwrap_or(DataRate::ZERO),
             incoming_discard_rate: self.incoming_discard_rate.rate().unwrap_or(DataRate::ZERO),
         }
+    }
+
+    fn push_incoming_non_media_bytes(&mut self, size: usize, now: Instant) {
+        event!("calling.bandwidth.incoming.non_media_bytes", size);
+        self.incoming_non_media_rate.push_bytes(size, now);
+    }
+
+    fn push_outgoing_non_media_bytes(&mut self, size: usize, now: Instant) {
+        event!("calling.bandwidth.outgoing.non_media_bytes", size);
+        self.non_media_rate.push_bytes(size, now);
+    }
+
+    fn push_outgoing_video(&mut self, size: DataSize, now: Instant) {
+        event!(
+            "calling.bandwidth.outgoing.video_bytes",
+            size.as_bytes() as usize
+        );
+        self.video_rate.push(size, now);
+    }
+
+    fn count_outgoing_rtx(size: DataSize) {
+        event!(
+            "calling.bandwidth.outgoing.rtx_bytes",
+            size.as_bytes() as usize
+        );
     }
 }
 

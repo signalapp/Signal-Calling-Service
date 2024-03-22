@@ -815,7 +815,7 @@ impl Sfu {
                                 0
                             };
 
-                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), incoming_audio: {}, incoming_rtx: {}, incoming_non_media: {}, incoming_discard: {}, target: {}, requested_base: {}, ideal: {}, allocated: {}, queue_drain: {}, max_requested_height: {}, rtt_ms: {}, video_rate: {}, audio_rate: {}, rtx_rate: {}, padding_rate: {}, non_media_rate: {} }}",
+                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), incoming_padding: {}, incoming_audio: {}, incoming_rtx: {}, incoming_non_media: {}, incoming_discard: {}, target: {}, requested_base: {}, ideal: {}, allocated: {}, queue_drain: {}, max_requested_height: {}, rtt_ms: {}, video_rate: {}, audio_rate: {}, rtx_rate: {}, padding_rate: {}, non_media_rate: {} }}",
                                   client.demux_id.as_u32(),
                                   client.video0_incoming_height.unwrap_or_default().as_u16(),
                                   client.video1_incoming_height.unwrap_or_default().as_u16(),
@@ -823,6 +823,7 @@ impl Sfu {
                                   client.video0_incoming_rate.unwrap_or_default().as_kbps(),
                                   client.video1_incoming_rate.unwrap_or_default().as_kbps(),
                                   client.video2_incoming_rate.unwrap_or_default().as_kbps(),
+                                  client.padding_incoming_rate.unwrap_or_default().as_kbps(),
                                   client.connection_rates.incoming_audio_rate.as_kbps(),
                                   client.connection_rates.incoming_rtx_rate.as_kbps(),
                                   client.connection_rates.incoming_non_media_rate.as_kbps(),
