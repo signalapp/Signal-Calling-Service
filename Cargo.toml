@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "80.0.0"
+version = "81.0.0"
 
 [profile.release]
 debug = 1
