@@ -3,9 +3,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::collections::VecDeque;
+use std::{
+    cmp::{max, min},
+    collections::VecDeque,
+};
 
-use calling_common::{DataRate, DataSize, Instant};
+use calling_common::{DataRate, DataSize, Duration, Instant};
 use log::error;
 
 use crate::rtp;
@@ -22,6 +25,10 @@ pub struct Config {
 
 type Queue = VecDeque<rtp::Packet<Vec<u8>>>;
 
+/// The maximum debt level, in terms of time, capped when sending packets.
+/// Use same value as WebRTC.
+const MAX_DEBT_IN_TIME: Duration = Duration::from_millis(500);
+
 /// A Pacer smooths out the sending of packets such that we send packets at a regular interval
 /// instead of in bursts.  It does so by queuing packets and then leaking them out.  If there
 /// is nothing to leak out, it generates padding.  The padding send rate can be lower than the
@@ -33,7 +40,9 @@ pub struct Pacer {
     video_queue: Queue,
     rtx_queue: Queue,
     queued_size: DataSize,
-    last_sent: Option<(DataSize, Instant)>,
+    last_sent: Option<Instant>,
+    media_debt: DataSize,
+    padding_debt: DataSize,
 }
 
 impl Pacer {
@@ -44,23 +53,27 @@ impl Pacer {
             rtx_queue: Default::default(),
             queued_size: Default::default(),
             last_sent: None,
+            media_debt: Default::default(),
+            padding_debt: Default::default(),
         }
     }
 
     pub fn set_config(&mut self, config: Config, now: Instant) -> Option<Instant> {
         let old_schedule = self.calculate_next_send_time(now);
         self.config = config;
+        // Record a zero byte send which limits the maximum media and padding debt
+        // so that the maximum wait time is MAX_DEBT_IN_TIME
+        self.update_budget_with_sent_data(DataSize::ZERO);
 
-        // Setting the last sent to zero bytes and a specific time below cleans up the
-        // dequeue_delay metrics tracked in dequeue(). If the last sent size is zero bytes,
-        // the next send time is the same as whatever time is set.
+        // Setting the last sent to a specific time below cleans up the
+        // dequeue_delay metrics tracked in dequeue().
 
         if let Some(new_schedule) = self.calculate_next_send_time(now) {
             match old_schedule {
                 None => {
                     if new_schedule < now {
                         // Old last sent could have been a long time ago.
-                        self.last_sent = Some((DataSize::ZERO, now));
+                        self.update_budget_with_time(now);
                         Some(now)
                     } else {
                         // Leave last sent, it is recent enough that sending
@@ -72,11 +85,11 @@ impl Pacer {
                     if new_schedule <= now {
                         if old_schedule > now {
                             // The old timer wasn't late, this shouldn't be considered late either.
-                            self.last_sent = Some((DataSize::ZERO, now));
+                            self.update_budget_with_time(now);
                         } else {
                             // Reset to previous scheduled time, so that the delay
                             // is tracked from when the previous timer was set.
-                            self.last_sent = Some((DataSize::ZERO, old_schedule));
+                            self.update_budget_with_time(old_schedule);
                         }
                         Some(now)
                     } else {
@@ -98,28 +111,74 @@ impl Pacer {
     }
 
     fn calculate_next_media_send_time(&self, now: Instant) -> Option<Instant> {
-        self.calculate_next_send_time_by_rate(self.config.media_send_rate, now)
+        if self.config.media_send_rate > DataRate::ZERO {
+            if let Some(last_sent_time) = self.last_sent {
+                let drain_time = self.media_debt / self.config.media_send_rate;
+                Some(last_sent_time + drain_time)
+            } else {
+                // We haven't sent anything, so go ahead and send now.
+                Some(now)
+            }
+        } else {
+            None
+        }
     }
 
     fn calculate_next_padding_send_time(&self, now: Instant) -> Option<Instant> {
-        self.calculate_next_send_time_by_rate(self.config.padding_send_rate, now)
-    }
-
-    // None means "never"
-    fn calculate_next_send_time_by_rate(
-        &self,
-        send_rate: DataRate,
-        now: Instant,
-    ) -> Option<Instant> {
-        if let Some((last_sent_size, last_sent_time)) = self.last_sent {
-            if send_rate > DataRate::ZERO {
-                Some(last_sent_time + (last_sent_size / send_rate))
+        if self.config.padding_send_rate > DataRate::ZERO
+            && self.config.media_send_rate > DataRate::ZERO
+        {
+            if let Some(last_sent_time) = self.last_sent {
+                let media_drain_time = self.media_debt / self.config.media_send_rate;
+                let padding_drain_time = self.padding_debt / self.config.padding_send_rate;
+                let drain_time = max(media_drain_time, padding_drain_time);
+                Some(last_sent_time + drain_time)
             } else {
-                None
+                // We haven't sent anything, so go ahead and send now.
+                Some(now)
             }
         } else {
-            // We haven't sent anything, so go ahead and send now.
-            Some(now)
+            None
+        }
+    }
+
+    fn update_budget_with_time(&mut self, now: Instant) {
+        if let Some(last_sent) = self.last_sent {
+            if let Some(delta) = now.checked_duration_since(last_sent) {
+                self.media_debt = self
+                    .media_debt
+                    .saturating_sub(min(self.media_debt, self.config.media_send_rate * delta));
+                self.padding_debt = self.padding_debt.saturating_sub(min(
+                    self.padding_debt,
+                    self.config.padding_send_rate * delta,
+                ));
+                self.last_sent = Some(now);
+            }
+        } else {
+            self.last_sent = Some(now);
+        }
+    }
+
+    fn update_budget_with_sent_data(&mut self, size: DataSize) {
+        self.media_debt += size;
+        if self.config.media_send_rate != DataRate::ZERO {
+            self.media_debt = min(
+                self.media_debt,
+                self.config.media_send_rate * MAX_DEBT_IN_TIME,
+            );
+        }
+        // Any time a media packet is sent, the size is added to the media
+        // debt *and* the padding debt.
+        self.update_budget_with_sent_padding(size);
+    }
+
+    fn update_budget_with_sent_padding(&mut self, size: DataSize) {
+        self.padding_debt += size;
+        if self.config.padding_send_rate != DataRate::ZERO {
+            self.padding_debt = min(
+                self.padding_debt,
+                self.config.padding_send_rate * MAX_DEBT_IN_TIME,
+            );
         }
     }
 
@@ -141,7 +200,8 @@ impl Pacer {
         let was_empty = self.queue_is_empty();
         if was_empty && Self::past_send_time(next_media_send_time, now) {
             // Skip the queue
-            self.last_sent = Some((media.size(), now));
+            self.update_budget_with_time(now);
+            self.update_budget_with_sent_data(media.size());
             (Some(media), self.calculate_next_send_time(now))
         } else {
             self.queued_size += media.size();
@@ -209,7 +269,8 @@ impl Pacer {
                     }
                 }
                 if let Some(media) = self.pop_rtx(now).or_else(|| self.pop_video(now)) {
-                    self.last_sent = Some((media.size(), now));
+                    self.update_budget_with_time(now);
+                    self.update_budget_with_sent_data(media.size());
                     return (Some(media), self.calculate_next_send_time(now));
                 }
             } else {
@@ -238,7 +299,8 @@ impl Pacer {
                     }
                 }
                 if let Some(padding) = generate_padding(padding_ssrc) {
-                    self.last_sent = Some((padding.size(), now));
+                    self.update_budget_with_time(now);
+                    self.update_budget_with_sent_padding(padding.size());
                     (Some(padding), self.calculate_next_send_time(now))
                 } else {
                     // For some reason padding generation failed.
@@ -503,25 +565,19 @@ mod tests {
             vec![(19, 34), (20, 36), (21, 38), (22, 40), (23, 50)],
             media_sent_times_ms
         );
-        assert_eq!(vec![42, 44, 46, 48], padding_sent_times_ms);
+        // No padding at t: 42, because data packets 16 and 17 (t: 29, 30) was beyond padding rate.
+        // Padding debt will take 4 ms to pay off, before padding begins to be sent
+        assert_eq!(vec![44, 46, 48], padding_sent_times_ms);
         assert_eq!(0, pacer.queued_size().as_bytes());
 
-        // Edge case: send a padding packet and then queue in the middle of the time slot taken by it
+        // Edge case: send a padding packet and then queue media. Media is
+        // sent immediately, as there is no media debt.
         pacer.configure(5_000, 2_500, Some(padding_ssrc), 50);
-        let mut media_sent_times_ms = Vec::new();
-        let mut padding_sent_times_ms = Vec::new();
-        pacer.dequeue_until(
-            55,
-            &padding,
-            &mut media_sent_times_ms,
-            &mut padding_sent_times_ms,
-        );
-        assert_eq!(0, media_sent_times_ms.len());
-        assert_eq!(vec![54], padding_sent_times_ms);
         let (media_sent_times_ms, padding_sent_times_ms) =
             pacer.send(&[(24, 55)], &media, &padding);
-        assert_eq!(0, media_sent_times_ms.len());
-        assert_eq!(0, padding_sent_times_ms.len());
+        assert_eq!(vec![54], padding_sent_times_ms);
+        assert_eq!(vec![(24, 55)], media_sent_times_ms);
+
         let mut media_sent_times_ms = Vec::new();
         let mut padding_sent_times_ms = Vec::new();
         pacer.dequeue_until(
@@ -530,7 +586,7 @@ mod tests {
             &mut media_sent_times_ms,
             &mut padding_sent_times_ms,
         );
-        assert_eq!(vec![(24, 56)], media_sent_times_ms);
+        assert_eq!(0, media_sent_times_ms.len());
         assert_eq!(0, padding_sent_times_ms.len());
 
         // Disable sending
@@ -551,7 +607,7 @@ mod tests {
         let mut media_sent_times_ms = Vec::new();
         let mut padding_sent_times_ms = Vec::new();
         pacer.dequeue_until(
-            3021,
+            3050,
             &padding,
             &mut media_sent_times_ms,
             &mut padding_sent_times_ms,
@@ -560,6 +616,6 @@ mod tests {
         // pacer will discard packets over 3 seconds old, so packet 27 doesn't get sent at 3010
         // padding will be timed from the last send (3000)
         assert_eq!(vec![(25, 2990), (26, 3000)], media_sent_times_ms);
-        assert_eq!(vec![3020], padding_sent_times_ms);
+        assert_eq!(vec![3030], padding_sent_times_ms);
     }
 }
