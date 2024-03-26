@@ -276,7 +276,7 @@ mod authenticator_tests {
         // DecodeError: Encoded text cannot have a 6-bit remainder.
         assert_eq!(
             Authenticator::parse_authorization_header("Basic X"),
-            Err(AuthenticatorError::DecodeFailure(InvalidLength))
+            Err(AuthenticatorError::DecodeFailure(InvalidLength(1)))
         );
 
         // DecodeError: Invalid padding.

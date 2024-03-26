@@ -15,74 +15,74 @@ license = "AGPL-3.0-only"
 calling_common = { path = "../common" }
 
 # For error handling
-anyhow = "1.0"
-thiserror = "1.0"
-scopeguard = "1.1"
+anyhow = "1.0.81"
+thiserror = "1.0.58"
+scopeguard = "1.2.0"
 
 # For logging and command line operations
-log = "0.4"
-env_logger = "0.10.0"
-clap = { version = "4.4.6", features = ["derive"] }
+log = "0.4.21"
+env_logger = "0.11.3"
+clap = { version = "4.5.4", features = ["derive"] }
 
 # For runtime and threading
-tokio = { version = "1", features = ["full"] }
-parking_lot = "0.12"
-once_cell = "1.16.0"
-futures = "0.3"
-num_cpus = "1.13"
-async-trait = "0.1.74"
+tokio = { version = "1.36.0", features = ["full"] }
+parking_lot = "0.12.1"
+once_cell = "1.19.0"
+futures = "0.3.30"
+num_cpus = "1.16.0"
+async-trait = "0.1.79"
 
 # For http
-axum = { version = "0.6", features = ["headers"] }
-hyper = { version = "0.14", features = ["full"] }
-tower = "0.4"
+axum = { version = "0.6.20", features = ["headers"] }
+hyper = { version = "0.14.28", features = ["full"] }
+tower = "0.4.13"
 
 # For general conversions
-base64 = "0.21.3"
-byteorder = "1"
-hex = { version = "0.4", features = ["serde"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_with = { version = "3.3.0", features = ["base64"] }
+base64 = "0.22.0"
+byteorder = "1.5.0"
+hex = { version = "0.4.3", features = ["serde"] }
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.114"
+serde_with = { version = "3.7.0", features = ["base64"] }
 prost = "0.12.3"
-strum = "0.25.0"
-strum_macros = "0.25.2"
+strum = "0.26.2"
+strum_macros = "0.26.2"
 
 # For common
-sha2 = "0.10"
+sha2 = "0.10.8"
 
 # For ICE
-crc = "3.0"
-hmac = "0.12"
-sha-1 = "0.10"
+crc = "3.0.1"
+hmac = "0.12.1"
+sha-1 = "0.10.1"
 
 # For metrics
-rand = "0.8"
+rand = "0.8.5"
 
 # For SRTP key derivation using DHE
-hkdf = "0.12"
+hkdf = "0.12.4"
 # x25519-dalek is only compatible with rand/rand_core 0.5, so we need to pull these
 # in to make a source of OsRng that's compatible with both x25519-dalek and ecdsa.
-rand_core = { version = "0.6", features = [] }
+rand_core = { version = "0.6.4", features = [] }
 rand_core5 = { package = "rand_core", version = "0.5.1", features = [] }
-x25519-dalek = { version = "1.1" }
+x25519-dalek = { version = "1.2.0" }
 
 # For (S)RTP
-aes = "0.8"
-aes-gcm = "0.10"
-zeroize = "1.3"
+aes = "0.8.4"
+aes-gcm = "0.10.3"
+zeroize = "1.3.0"
 
 # For congestion control
-async-stream = "0.3"
+async-stream = "0.3.5"
 # For congestion-control-specific helpers
-pin-project = "1.0"
+pin-project = "1.1.5"
 
 # For low-level UDP sockets and tracking TCP sockets
 nix = { version = "0.26.4", optional = true }
-unique_id = "0.1"
+unique_id = "0.1.5"
 
 # For current process memory stats
-psutil = { version = "3.2.2", default-features = false, features = ["cpu", "process"] }
+psutil = { version = "3.3.0", default-features = false, features = ["cpu", "process"] }
 
 [target.'cfg(target_os="linux")'.dependencies]
 # Only currently needed for metrics (won't build on mac, see https://github.com/rust-lang/rust/issues/115149).
@@ -93,14 +93,14 @@ prost-build = "0.12.3"
 
 [dev-dependencies]
 hex-literal = "0.4.1"
-unzip3 = "1.0"
+unzip3 = "1.0.0"
 
 # For simulating passage of time in timing tests
-mock_instant = { version = "0.3" }
-tokio = { version = "1", features = ["test-util"] }
+mock_instant = { version = "0.3.2" }
+tokio = { version = "1.36.0", features = ["test-util"] }
 
 # For matching WebRTC's randomness
-rand_distr = "0.4.1"
+rand_distr = "0.4.3"
 
 [features]
 default = ["epoll"]
