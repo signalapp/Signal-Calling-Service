@@ -775,6 +775,16 @@ impl Header {
         let payload_end = packet.len() - SRTP_AUTH_TAG_LEN;
         let payload_range = payload_start..payload_end;
 
+        if has_padding && payload_range.is_empty() {
+            event!("calling.rtp.invalid.missing_padding_count");
+            debug!(
+                "Invalid RTP: has padding, but padding byte count is missing; payload_range={:?}; packet len = {}",
+                payload_range,
+                packet.len()
+            );
+            return None;
+        }
+
         Some(Self {
             marker,
             has_padding,

@@ -959,10 +959,16 @@ impl Call {
         let incoming_rtp = incoming_rtp.borrow();
         let incoming_vp8 = if incoming_rtp.payload_type() == rtp::VP8_PAYLOAD_TYPE {
             time_scope_us!("calling.call.handle_rtp.vp8_header");
-            let incoming_vp8 = sender
-                .parse_vp8_header_and_update_incoming_video_rate_and_resolution(&incoming_rtp, now)
-                .ok_or(Error::InvalidVp8Header)?;
-            Some(incoming_vp8)
+            if let Some(incoming_vp8) = sender
+                .parse_vp8_header_and_update_incoming_video_rate_and_resolution(
+                    &incoming_rtp,
+                    now,
+                )?
+            {
+                Some(incoming_vp8)
+            } else {
+                return Ok(vec![]);
+            }
         } else {
             None
         };
@@ -1783,11 +1789,11 @@ impl Client {
         &mut self,
         incoming_rtp: &rtp::Packet<&[u8]>,
         now: Instant,
-    ) -> Option<vp8::ParsedHeader> {
+    ) -> Result<Option<vp8::ParsedHeader>, Error> {
         let incoming_vp8 = if let Some(descriptor) = incoming_rtp.dependency_descriptor {
             vp8::ParsedHeader::from(descriptor)
         } else {
-            vp8::ParsedHeader::read(incoming_rtp.payload()).ok()?
+            vp8::ParsedHeader::read(incoming_rtp.payload()).map_err(|_| Error::InvalidVp8Header)?
         };
         let incoming_layer_id = LayerId::from_ssrc(incoming_rtp.ssrc());
         let size = incoming_rtp.size().as_bytes() as usize;
@@ -1795,7 +1801,7 @@ impl Client {
             event!("calling.bandwidth.incoming.padding_bytes", size);
             self.incoming_padding_rate.push_bytes(size, now);
             // Don't forward the packet if it only contains padding.
-            return None;
+            return Ok(None);
         }
 
         let incoming_video = match incoming_layer_id {
@@ -1813,7 +1819,7 @@ impl Client {
             }
             _ => {
                 event!("calling.bandwidth.incoming.video_unknown_layer_bytes", size);
-                return None;
+                return Err(Error::InvalidRtpLayerId);
             }
         };
 
@@ -1852,7 +1858,7 @@ impl Client {
                 _ => unreachable!("checked above"),
             }
         }
-        Some(incoming_vp8)
+        Ok(Some(incoming_vp8))
     }
 
     fn forward_audio_rtp(
