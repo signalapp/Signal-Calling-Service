@@ -20,11 +20,11 @@ use subtle::ConstantTimeEq;
 use zkgroup::call_links::CallLinkAuthCredentialPresentation;
 
 use crate::{
-    api::call_links::{verify_auth_credential_against_zkparams, RoomId},
+    api::call_links::{self, verify_auth_credential_against_zkparams, CallLinkState, RoomId},
     authenticator::UserAuthorization,
     frontend::{Frontend, JoinRequestWrapper, UserId},
     metrics::Timer,
-    storage::CallLinkRestrictions,
+    storage::{self, CallLinkRestrictions},
 };
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -45,6 +45,8 @@ pub struct ParticipantsResponse {
     pub creator: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub pending_clients: Vec<Participant>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_link_state: Option<CallLinkState>,
 }
 
 #[serde_as]
@@ -97,6 +99,18 @@ fn user_id_from_uuid_ciphertext(ciphertext: &zkgroup::groups::UuidCiphertext) ->
     bincode::serialize(&ciphertext).unwrap().encode_hex()
 }
 
+impl From<storage::CallLinkState> for call_links::CallLinkState {
+    fn from(value: storage::CallLinkState) -> Self {
+        CallLinkState {
+            name: value.encrypted_name,
+            restrictions: value.restrictions,
+            revoked: value.revoked,
+            expiration: value.expiration,
+            delete_at: value.delete_at,
+        }
+    }
+}
+
 /// Handler for the GET /conference/participants route.
 pub async fn get_participants(
     State(frontend): State<Arc<Frontend>>,
@@ -107,12 +121,13 @@ pub async fn get_participants(
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("get_participants:");
 
-    let (call, user_id) = match (group_auth, call_links_auth, room_id) {
+    let (call, user_id, call_link_state) = match (group_auth, call_links_auth, room_id) {
         (Some(Extension(user_authorization)), None, None) => (
             frontend
                 .get_call_record(&user_authorization.room_id)
                 .await?,
             user_authorization.user_id,
+            None,
         ),
         (None, Some(Extension(auth_credential)), Some(TypedHeader(room_id))) => {
             let room_id = room_id.into();
@@ -128,6 +143,7 @@ pub async fn get_participants(
                         (
                             call,
                             user_id_from_uuid_ciphertext(&auth_credential.get_user_id()),
+                            Some(state),
                         )
                     } else if state.revoked || state.expiration < SystemTime::now() {
                         return Ok(not_found("expired"));
@@ -167,12 +183,15 @@ pub async fn get_participants(
         })
         .collect();
 
+    let call_link_state = call_link_state.map(|s| s.into());
+
     Ok(Json(ParticipantsResponse {
         era_id: call.era_id,
         max_devices: frontend.config.max_clients_per_call,
         participants,
         creator: call.creator,
         pending_clients,
+        call_link_state,
     })
     .into_response())
 }
@@ -696,6 +715,7 @@ pub mod api_server_v2_tests {
             Some(USER_ID_2)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
+        assert!(participants_response.call_link_state.is_none());
     }
 
     /// Invoke the "GET /v2/conference/participants" in the case where the call is in a
@@ -1636,6 +1656,9 @@ pub mod api_server_v2_tests {
     async fn test_call_link_get_with_call() {
         let config = &CONFIG;
 
+        let call_link_state = default_call_link_state();
+        let expected_call_link_state_response = call_link_state.clone().into();
+
         // Create mocked dependencies with expectations.
         let mut storage = Box::new(MockStorage::new());
         storage
@@ -1644,7 +1667,7 @@ pub mod api_server_v2_tests {
             .once()
             .return_once(|_, _| {
                 Ok((
-                    Some(default_call_link_state()),
+                    Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
                 ))
             });
@@ -1697,6 +1720,10 @@ pub mod api_server_v2_tests {
             Some(USER_ID_2)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
+        assert_eq!(
+            participants_response.call_link_state.unwrap(),
+            expected_call_link_state_response
+        );
     }
 
     /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is a call
@@ -1704,6 +1731,9 @@ pub mod api_server_v2_tests {
     #[tokio::test]
     async fn test_call_link_get_with_pending_client() {
         let config = &CONFIG;
+
+        let call_link_state = default_call_link_state();
+        let expected_call_link_state_response = call_link_state.clone().into();
 
         // Create mocked dependencies with expectations.
         let mut storage = Box::new(MockStorage::new());
@@ -1713,7 +1743,7 @@ pub mod api_server_v2_tests {
             .once()
             .return_once(|_, _| {
                 Ok((
-                    Some(default_call_link_state()),
+                    Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
                 ))
             });
@@ -1792,6 +1822,10 @@ pub mod api_server_v2_tests {
             participants_response.pending_clients[0].demux_id,
             DEMUX_ID_2
         );
+        assert_eq!(
+            participants_response.call_link_state.unwrap(),
+            expected_call_link_state_response
+        );
     }
 
     /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is a call with
@@ -1801,6 +1835,9 @@ pub mod api_server_v2_tests {
     async fn test_call_link_get_with_pending_client_for_non_admin() {
         let config = &CONFIG;
 
+        let call_link_state = default_call_link_state();
+        let expected_call_link_state_response = call_link_state.clone().into();
+
         // Create mocked dependencies with expectations.
         let mut storage = Box::new(MockStorage::new());
         storage
@@ -1809,7 +1846,7 @@ pub mod api_server_v2_tests {
             .once()
             .return_once(|_, _| {
                 Ok((
-                    Some(default_call_link_state()),
+                    Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
                 ))
             });
@@ -1886,6 +1923,10 @@ pub mod api_server_v2_tests {
             participants_response.pending_clients[0].demux_id,
             DEMUX_ID_2
         );
+        assert_eq!(
+            participants_response.call_link_state.unwrap(),
+            expected_call_link_state_response
+        );
     }
 
     /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is a call
@@ -1897,6 +1938,7 @@ pub mod api_server_v2_tests {
         // Create mocked dependencies with expectations.
         let mut call_link_state = default_call_link_state();
         call_link_state.revoked = true;
+        let expected_call_link_state_response = call_link_state.clone().into();
 
         let mut storage = Box::new(MockStorage::new());
         storage
@@ -1958,6 +2000,10 @@ pub mod api_server_v2_tests {
             Some(USER_ID_2)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
+        assert_eq!(
+            participants_response.call_link_state.unwrap(),
+            expected_call_link_state_response
+        );
     }
 
     /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is a call
@@ -1969,6 +2015,7 @@ pub mod api_server_v2_tests {
         // Create mocked dependencies with expectations.
         let mut call_link_state = default_call_link_state();
         call_link_state.expiration = SystemTime::UNIX_EPOCH;
+        let expected_call_link_state_response = call_link_state.clone().into();
 
         let mut storage = Box::new(MockStorage::new());
         storage
@@ -2030,6 +2077,10 @@ pub mod api_server_v2_tests {
             Some(USER_ID_2)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
+        assert_eq!(
+            participants_response.call_link_state.unwrap(),
+            expected_call_link_state_response
+        );
     }
 
     /// Invoke the "GET /v2/conference/participants" for a call link in the case where the call is in a

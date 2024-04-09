@@ -35,16 +35,16 @@ fn empty_json_object() -> serde_json::Value {
 }
 
 #[serde_as]
-#[derive(Serialize, Debug)]
-struct CallLinkState {
-    restrictions: storage::CallLinkRestrictions,
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
+pub struct CallLinkState {
+    pub restrictions: storage::CallLinkRestrictions,
     #[serde_as(as = "serde_with::base64::Base64")]
-    name: Vec<u8>,
-    revoked: bool,
+    pub name: Vec<u8>,
+    pub revoked: bool,
     #[serde_as(as = "serde_with::TimestampSeconds<i64>")]
-    expiration: SystemTime,
+    pub expiration: SystemTime,
     #[serde_as(as = "serde_with::TimestampSeconds<i64>")]
-    delete_at: SystemTime,
+    pub delete_at: SystemTime,
 }
 
 /// A light wrapper around [`calling_common::RoomId`] that limits the maximum size when
