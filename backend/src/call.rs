@@ -1308,6 +1308,7 @@ impl Call {
                 .video_forwarder_by_sender_demux_id
                 .get_mut(&video_sender_demux_id);
             if let Some(video_forwarder) = video_forwarder {
+                event!("calling.rtcp.pli.incoming");
                 video_forwarder.set_needs_key_frame();
             }
         }
@@ -1619,6 +1620,10 @@ impl Call {
                 }
             })
             .collect();
+
+        if !key_frame_requests.is_empty() {
+            event!("calling.rtcp.pli.outgoing", key_frame_requests.len());
+        }
 
         self.key_frame_requests_sent = now;
         key_frame_requests
@@ -2414,12 +2419,20 @@ impl Vp8SimulcastRtpForwarder {
                     desired_incoming_ssrc,
                     self.outgoing_ssrc
                 );
+                match self.forwarding_ssrc() {
+                    Some(ssrc) if desired_incoming_ssrc > ssrc => {
+                        event!("calling.forwarding.layer_switch.higher")
+                    }
+                    Some(_) => event!("calling.forwarding.layer_switch.lower"),
+                    None => event!("calling.forwarding.layer_switch.start"),
+                }
                 self.switching =
                     Vp8SimulcastRtpSwitchingState::SwitchAtNextKeyFrame(desired_incoming_ssrc);
             }
         } else {
             if self.forwarding_ssrc().is_some() {
                 trace!("Stop forwarding to SSRC {}", self.outgoing_ssrc);
+                event!("calling.forwarding.layer_switch.stop");
             }
 
             self.forwarding = Vp8SimulcastRtpForwardingState::Paused;
