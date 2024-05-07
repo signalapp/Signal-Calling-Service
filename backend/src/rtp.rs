@@ -632,10 +632,6 @@ pub struct Header {
     pub ssrc: Ssrc,
     video_rotation: Option<VideoRotation>,
     audio_level: Option<audio::Level>,
-    // We parse the range as well in order to replace it easily.
-    audio_level_range: Option<Range<usize>>,
-    /// The value of the audio level extension, as it appears in the header.
-    raw_audio_level: Option<u8>,
     tcc_seqnum: Option<TruncatedSequenceNumber>,
     // We parse the range as well in order to replace it easily.
     tcc_seqnum_range: Option<Range<usize>>,
@@ -669,8 +665,6 @@ impl Header {
         let mut tcc_seqnum_range = None;
         let mut video_rotation = None;
         let mut audio_level = None;
-        let mut audio_level_range = None;
-        let mut raw_audio_level = None;
         let mut dependency_descriptor = None;
 
         let extensions_start = RTP_MIN_HEADER_LEN + csrcs_len;
@@ -743,8 +737,6 @@ impl Header {
                             // The spec says to use 127 here, but the clients are all decimating their values
                             // by a factor of 10, so this ends up being 120 as the lowest value (muted).
                             Some(120u8.saturating_sub(negative_audio_level_with_voice_activity & 0b0111_1111));
-                        audio_level_range = Some(extension_val_range);
-                        raw_audio_level = Some(*negative_audio_level_with_voice_activity);
                     }
                     (RTP_EXT_ID_DEPENDENCY_DESCRIPTOR, val) => {
                         dependency_descriptor = DependencyDescriptorReader::new(val)
@@ -794,8 +786,6 @@ impl Header {
             ssrc,
             video_rotation,
             audio_level,
-            audio_level_range,
-            raw_audio_level,
             tcc_seqnum,
             tcc_seqnum_range,
             payload_range,
@@ -2294,11 +2284,6 @@ impl Endpoint {
             incoming.padding_byte_count = incoming.payload()[incoming.payload().len() - 1];
         }
 
-        if let (Some(level), Some(range)) = (header.raw_audio_level, header.audio_level_range) {
-            // Clear lowest bit of audio level extension
-            incoming.write_in_header(range, &(level & 0b1111_1110).to_be_bytes());
-        }
-
         Some(incoming)
     }
 
@@ -2667,8 +2652,6 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: None,
-                audio_level_range: None,
-                raw_audio_level: None,
                 dependency_descriptor: None,
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
@@ -2705,8 +2688,6 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: None,
-                audio_level_range: None,
-                raw_audio_level: None,
                 dependency_descriptor: None,
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(17..19),
@@ -2787,8 +2768,6 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: Some(87),
-                audio_level_range: Some(20..21),
-                raw_audio_level: Some(0x21),
                 dependency_descriptor: None,
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(17..19),
@@ -2821,8 +2800,6 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: Some(87),
-                audio_level_range: Some(17..18),
-                raw_audio_level: Some(0x21),
                 dependency_descriptor: None,
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(19..21),
@@ -2857,8 +2834,6 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: Some(87),
-                audio_level_range: Some(17..18),
-                raw_audio_level: Some(0x21),
                 dependency_descriptor: None,
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(19..21),
@@ -2891,8 +2866,6 @@ mod test {
                 ssrc: 4,
                 video_rotation: Some(VideoRotation::Clockwise90),
                 audio_level: None,
-                audio_level_range: None,
-                raw_audio_level: None,
                 dependency_descriptor: None,
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
@@ -2922,8 +2895,6 @@ mod test {
                 ssrc: 4,
                 video_rotation: Some(VideoRotation::Clockwise180),
                 audio_level: None,
-                audio_level_range: None,
-                raw_audio_level: None,
                 dependency_descriptor: None,
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
@@ -2957,8 +2928,6 @@ mod test {
                 ssrc: 4,
                 video_rotation: Some(VideoRotation::Clockwise270),
                 audio_level: None,
-                audio_level_range: None,
-                raw_audio_level: None,
                 dependency_descriptor: None,
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
@@ -2994,8 +2963,6 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: None,
-                audio_level_range: None,
-                raw_audio_level: None,
                 dependency_descriptor: Some(DependencyDescriptor {
                     is_key_frame: false,
                     resolution: None,
@@ -3069,8 +3036,6 @@ mod test {
                 ssrc: 4,
                 video_rotation: Some(VideoRotation::Clockwise270),
                 audio_level: None,
-                audio_level_range: None,
-                raw_audio_level: None,
                 dependency_descriptor: Some(DependencyDescriptor {
                     is_key_frame: true,
                     resolution: Some(PixelSize {
