@@ -44,6 +44,9 @@ const KEY_FRAME_REQUEST_CALCULATION_INTERVAL: Duration = Duration::from_millis(5
 /// For a particular SSRC, we only want to send a key frame request this often.
 /// Sending more often than this probably doesn't help any and wastes bandwidth.
 const KEY_FRAME_REQUEST_RESEND_INTERVAL: Duration = Duration::from_millis(200);
+/// Don't send a key frame request more frequently than this for high resolution
+/// video. Key frames for higher resolution video tend to use more bandwidth.
+const HIGH_RES_KEY_FRAME_REQUEST_RESEND_INTERVAL: Duration = Duration::from_millis(500);
 /// Even if the target send rate changes really frequently,
 /// don't reallocate it more often than this.
 /// A lower value uses more CPU but makes layer switching more reactive.
@@ -1609,14 +1612,22 @@ impl Call {
                     // If we sent a key frame for this SSRC recently, wait to resend one.
                     None
                 } else {
-                    self.key_frame_request_sent_by_ssrc
-                        .insert(desired_incoming_ssrc, now);
-                    Some((
-                        DemuxId::from_ssrc(desired_incoming_ssrc),
-                        rtp::KeyFrameRequest {
-                            ssrc: desired_incoming_ssrc,
-                        },
-                    ))
+                    let video_height = self.incoming_video_height(desired_incoming_ssrc);
+                    if video_height.unwrap_or_default() > VideoHeight::from(720)
+                        && sent.is_some()
+                        && now < (sent.unwrap() + HIGH_RES_KEY_FRAME_REQUEST_RESEND_INTERVAL)
+                    {
+                        None
+                    } else {
+                        self.key_frame_request_sent_by_ssrc
+                            .insert(desired_incoming_ssrc, now);
+                        Some((
+                            DemuxId::from_ssrc(desired_incoming_ssrc),
+                            rtp::KeyFrameRequest {
+                                ssrc: desired_incoming_ssrc,
+                            },
+                        ))
+                    }
                 }
             })
             .collect();
@@ -1627,6 +1638,16 @@ impl Call {
 
         self.key_frame_requests_sent = now;
         key_frame_requests
+    }
+
+    fn incoming_video_height(&self, ssrc: rtp::Ssrc) -> Option<VideoHeight> {
+        let client = self.find_client(DemuxId::from_ssrc(ssrc))?;
+        match LayerId::from_ssrc(ssrc)? {
+            LayerId::Video0 => client.incoming_video0.height,
+            LayerId::Video1 => client.incoming_video1.height,
+            LayerId::Video2 => client.incoming_video2.height,
+            LayerId::Audio | LayerId::RtpData => None,
+        }
     }
 
     /// Get the DemuxIds and opaque user IDs for each client.  These are needed for signaling.
