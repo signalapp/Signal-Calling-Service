@@ -75,6 +75,8 @@ const RTX_SSRC_OFFSET: Ssrc = 1;
 // 3 second lifetime matches WebRTC's RTX history
 const PACKET_LIFETIME: Duration = Duration::from_secs(3);
 
+const MAX_NACK_RETRY_COUNT: u8 = 10;
+
 pub type Key = Zeroizing<[u8; SRTP_KEY_LEN]>;
 pub type Salt = [u8; SRTP_SALT_LEN];
 pub type Iv = [u8; SRTP_IV_LEN];
@@ -1693,7 +1695,7 @@ pub fn write_nack(
 }
 struct NackSender {
     limit: usize,
-    sent_by_seqnum: KeySortedCache<FullSequenceNumber, Option<(Instant, Instant)>>,
+    sent_by_seqnum: KeySortedCache<FullSequenceNumber, Option<(Instant, Instant, u8)>>,
     max_received: Option<FullSequenceNumber>,
 }
 
@@ -1747,17 +1749,21 @@ impl NackSender {
     fn send_nacks<'sender>(
         &'sender mut self,
         now: Instant,
+        rtt: Duration,
     ) -> Option<impl Iterator<Item = FullSequenceNumber> + 'sender> {
         let mut send_any = false;
         self.sent_by_seqnum.retain(|_seqnum, sent| {
-            if let Some((first_sent, last_sent)) = sent {
-                if now.saturating_duration_since(*first_sent) >= Duration::from_secs(2) {
+            if let Some((first_sent, last_sent, retry_count)) = sent {
+                if now.saturating_duration_since(*first_sent) >= Duration::from_secs(3)
+                    || *retry_count >= MAX_NACK_RETRY_COUNT
+                {
                     // Expire it.
                     false
-                } else if now.saturating_duration_since(*last_sent) >= Duration::from_millis(200) {
+                } else if now.saturating_duration_since(*last_sent) >= rtt {
                     // It has already been sent, but should be sent again.
                     send_any = true;
                     *last_sent = now;
+                    *retry_count += 1;
                     true
                 } else {
                     // It has already been sent and does not need to be sent again yet.
@@ -1766,7 +1772,11 @@ impl NackSender {
             } else {
                 // It hasn't been sent yet but should be.
                 send_any = true;
-                *sent = Some((now, now));
+                *sent = Some((
+                    now,
+                    now,
+                    sent.map(|(_, _, retry_count)| retry_count).unwrap_or(0) + 1,
+                ));
                 true
             }
         });
@@ -2412,6 +2422,7 @@ impl Endpoint {
     pub fn send_nacks<'endpoint>(
         &'endpoint mut self,
         now: Instant,
+        rtt: Duration,
     ) -> impl Iterator<Item = Vec<u8>> + 'endpoint {
         time_scope_us!("calling.rtp.send_nacks");
 
@@ -2425,7 +2436,7 @@ impl Endpoint {
         state_by_incoming_ssrc
             .iter_mut()
             .filter_map(move |(ssrc, state)| {
-                let seqnums = state.nack_sender.send_nacks(now)?;
+                let seqnums = state.nack_sender.send_nacks(now, rtt)?;
                 let payload = write_nack(*ssrc, seqnums);
                 Self::send_rtcp_and_increment_index(
                     RTCP_TYPE_GENERIC_FEEDBACK,
@@ -3121,67 +3132,106 @@ mod test {
         let now = Instant::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        assert_eq!(None, collect_seqnums(nack_sender.send_nacks(at(0))));
+        assert_eq!(
+            None,
+            collect_seqnums(nack_sender.send_nacks(at(0), Duration::from_millis(200)))
+        );
 
         nack_sender.remember_received(3);
-        assert_eq!(None, collect_seqnums(nack_sender.send_nacks(at(30))));
+        assert_eq!(
+            None,
+            collect_seqnums(nack_sender.send_nacks(at(30), Duration::from_millis(200)))
+        );
 
         nack_sender.remember_received(4);
-        assert_eq!(None, collect_seqnums(nack_sender.send_nacks(at(40))));
+        assert_eq!(
+            None,
+            collect_seqnums(nack_sender.send_nacks(at(40), Duration::from_millis(200)))
+        );
 
         // 5 went missing
         nack_sender.remember_received(6);
         assert_eq!(
             Some(vec![5]),
-            collect_seqnums(nack_sender.send_nacks(at(60)))
+            collect_seqnums(nack_sender.send_nacks(at(60), Duration::from_millis(200)))
         );
 
         // Not long enough for a resend
-        assert_eq!(None, collect_seqnums(nack_sender.send_nacks(at(70))));
-        assert_eq!(None, collect_seqnums(nack_sender.send_nacks(at(80))));
+        assert_eq!(
+            None,
+            collect_seqnums(nack_sender.send_nacks(at(70), Duration::from_millis(200)))
+        );
+        assert_eq!(
+            None,
+            collect_seqnums(nack_sender.send_nacks(at(80), Duration::from_millis(200)))
+        );
 
         nack_sender.remember_received(9);
         assert_eq!(
             Some(vec![7, 8]),
-            collect_seqnums(nack_sender.send_nacks(at(90)))
+            collect_seqnums(nack_sender.send_nacks(at(90), Duration::from_millis(200)))
         );
 
         // Long enough for a resend of 5 but not 7 or 8
         assert_eq!(
             Some(vec![5]),
-            collect_seqnums(nack_sender.send_nacks(at(260)))
+            collect_seqnums(nack_sender.send_nacks(at(260), Duration::from_millis(200)))
         );
 
         // Resending all of them
         assert_eq!(
             Some(vec![5, 7, 8]),
-            collect_seqnums(nack_sender.send_nacks(at(460)))
+            collect_seqnums(nack_sender.send_nacks(at(460), Duration::from_millis(200)))
         );
         assert_eq!(
             Some(vec![5, 7, 8]),
-            collect_seqnums(nack_sender.send_nacks(at(1860)))
+            collect_seqnums(nack_sender.send_nacks(at(1860), Duration::from_millis(200)))
         );
 
         // 5 has timed out but not 7 or 8
         assert_eq!(
             Some(vec![7, 8]),
-            collect_seqnums(nack_sender.send_nacks(at(2070)))
+            collect_seqnums(nack_sender.send_nacks(at(3070), Duration::from_millis(200)))
         );
 
         // Now they have all timed out
-        assert_eq!(None, collect_seqnums(nack_sender.send_nacks(at(2090))));
+        assert_eq!(
+            None,
+            collect_seqnums(nack_sender.send_nacks(at(3090), Duration::from_millis(200)))
+        );
 
         // And there's a limited history window
         nack_sender.remember_received(208);
         assert_eq!(
             Some(vec![203, 204, 205, 206, 207]),
-            collect_seqnums(nack_sender.send_nacks(at(2080)))
+            collect_seqnums(nack_sender.send_nacks(at(3080), Duration::from_millis(200)))
         );
 
         nack_sender.remember_received(60000);
         assert_eq!(
             Some(vec![59995, 59996, 59997, 59998, 59999]),
-            collect_seqnums(nack_sender.send_nacks(at(3000)))
+            collect_seqnums(nack_sender.send_nacks(at(4000), Duration::from_millis(200)))
+        );
+
+        // All are timed out now
+        assert_eq!(
+            None,
+            collect_seqnums(nack_sender.send_nacks(at(8000), Duration::from_millis(200)))
+        );
+
+        // The number of retries is limited
+        nack_sender.remember_received(60002);
+        for i in 0..10 {
+            assert_eq!(
+                Some(vec![60001]),
+                collect_seqnums(
+                    nack_sender.send_nacks(at(8000 + (i * 100)), Duration::from_millis(100))
+                )
+            );
+        }
+        assert_eq!(
+            None,
+            collect_seqnums(nack_sender.send_nacks(at(9000), Duration::from_millis(100)))
         );
     }
 
@@ -3395,7 +3445,12 @@ mod test {
         let received1 = received1.to_owned();
         assert_eq!(sent1, received1);
         let empty: Vec<Vec<u8>> = vec![];
-        assert_eq!(empty, receiver.send_nacks(at(20)).collect::<Vec<_>>());
+        assert_eq!(
+            empty,
+            receiver
+                .send_nacks(at(20), Duration::from_millis(200))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(Some(1), sent1.tcc_seqnum);
 
         let mut sent2 = sender
@@ -3438,7 +3493,9 @@ mod test {
         let received3 = received3.to_owned();
         assert_eq!(sent3, received3);
         assert_eq!(Some(3), sent3.tcc_seqnum);
-        let mut nacks: Vec<Vec<u8>> = receiver.send_nacks(at(40)).collect();
+        let mut nacks: Vec<Vec<u8>> = receiver
+            .send_nacks(at(40), Duration::from_millis(200))
+            .collect();
         assert_eq!(1, nacks.len());
         assert_eq!(
             Some(ProcessedControlPacket {
@@ -3472,7 +3529,12 @@ mod test {
         assert_eq!(Some(4), resent2.tcc_seqnum);
         // Give enough time to retransmit a NACK but make sure we don't retransmit
         // because we've now received it.
-        assert_eq!(empty, receiver.send_nacks(at(440)).collect::<Vec<_>>());
+        assert_eq!(
+            empty,
+            receiver
+                .send_nacks(at(440), Duration::from_millis(200))
+                .collect::<Vec<_>>()
+        );
 
         let mut forwarded2 = receiver
             .send_rtp(sent2.rewrite(33, 22, 44), at(70))

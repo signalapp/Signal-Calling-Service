@@ -560,10 +560,12 @@ impl Connection {
             }
         }
 
-        let rtp_endpoint = &mut self.rtp.endpoint;
         if let Some(outgoing_addr) = self.outgoing_addr {
+            let rtt = self.rtt();
+            let rtp_endpoint = &mut self.rtp.endpoint;
+
             let mut bytes = 0;
-            for nack_packet in rtp_endpoint.send_nacks(now) {
+            for nack_packet in rtp_endpoint.send_nacks(now, rtt) {
                 bytes += nack_packet.len();
                 packets_to_send.push((nack_packet, outgoing_addr));
             }
