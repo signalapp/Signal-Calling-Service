@@ -737,6 +737,7 @@ dependencies = [
  "hyper",
  "log",
  "mock_instant",
+ "mrp",
  "nix 0.26.4",
  "num_cpus",
  "once_cell",
@@ -1789,6 +1790,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "mrp"
+version = "2.43.0"
+source = "git+https://github.com/signalapp/ringrtc?tag=v2.43.0#0c5a897673a45ef1ad4bab70c9152eb8f43fb4e0"
+dependencies = [
+ "anyhow",
+ "log",
+ "thiserror",
 ]
 
 [[package]]

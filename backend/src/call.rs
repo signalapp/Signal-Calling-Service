@@ -19,6 +19,7 @@ use calling_common::{
 use hex::ToHex;
 use hyper::Uri;
 use log::*;
+use mrp::{self, MrpReceiveError, MrpStream};
 use prost::Message;
 use serde::Serialize;
 use thiserror::Error;
@@ -36,6 +37,7 @@ use approval_persistence::ApprovedUsers;
 
 pub const CLIENT_SERVER_DATA_SSRC: rtp::Ssrc = 1;
 pub const CLIENT_SERVER_DATA_PAYLOAD_TYPE: rtp::PayloadType = 101;
+pub const RELIABLE_CLIENT_SERVER_DATA_PAYLOAD_TYPE: rtp::PayloadType = 100;
 
 /// This is for throttling the CPU usage of calculating what key frame requests
 /// to send.  A higher value should use less CPU and a lower value should
@@ -61,6 +63,10 @@ const STATS_MESSAGE_INTERVAL: Duration = Duration::from_secs(1);
 const REMOVED_CLIENTS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 /// This is how often we send raised hands messages to clients.
 const RAISED_HANDS_MESSAGE_INTERVAL: Duration = Duration::from_secs(1);
+/// This should match the buffer size used by clients
+const MAX_MRP_WINDOW_SIZE: usize = 64;
+/// How long the SFU waits for an MRP ack before resending
+const MRP_SEND_TIMEOUT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A wrapper around Vec<u8> to identify a Call.
 /// It comes from signaling, but isn't known by the clients.
@@ -223,6 +229,8 @@ pub enum Error {
     UnauthorizedRtpSsrc(DemuxId, DemuxId),
     #[error("received RTP packet with invalid VP8 header")]
     InvalidVp8Header,
+    #[error("received RTP packet with invalid MRP header")]
+    InvalidMrpHeader(MrpReceiveError),
     #[error("received RTP packet with invalid layer ID")]
     InvalidRtpLayerId,
     #[error("unknown demux ID: {0:?}")]
@@ -814,36 +822,72 @@ impl Call {
         now: Instant,
     ) -> Result<Vec<RtpToSend>, Error> {
         if incoming_rtp.ssrc() == CLIENT_SERVER_DATA_SSRC
-            && incoming_rtp.payload_type() == CLIENT_SERVER_DATA_PAYLOAD_TYPE
+            && (incoming_rtp.payload_type() == CLIENT_SERVER_DATA_PAYLOAD_TYPE
+                || incoming_rtp.payload_type() == RELIABLE_CLIENT_SERVER_DATA_PAYLOAD_TYPE)
         {
             time_scope_us!("calling.call.handle_rtp.client_to_server_data");
-
             let proto = protos::DeviceToSfu::decode(incoming_rtp.payload())
                 .map_err(|_| Error::InvalidClientToServerProtobuf)?;
+            self.handle_device_to_sfu(proto, sender_demux_id, incoming_rtp, now)
+        } else {
+            self.handle_media_rtp(sender_demux_id, incoming_rtp, now)
+        }
+    }
 
-            // Check for "Leave" before requiring that the demux ID is valid. We allow it for
-            // pending and removed clients as well, and for some random other demux ID ignoring it
-            // and just closing the connection is safe.
-            if proto.leave.is_some() {
-                // "Leave" is the only message we allow from pending and removed clients.
-                info!(
-                    "call: {} removing client: {} (via RTP)",
-                    self.loggable_call_id(),
-                    sender_demux_id.as_u32()
-                );
-                self.drop_client(sender_demux_id, now);
-                return Err(Error::Leave);
-            }
+    fn handle_device_to_sfu(
+        &mut self,
+        proto: protos::DeviceToSfu,
+        sender_demux_id: DemuxId,
+        incoming_rtp: rtp::Packet<&mut [u8]>,
+        now: Instant,
+    ) -> Result<Vec<RtpToSend>, Error> {
+        // Check for "Leave" before requiring that the demux ID is valid. We allow it for
+        // pending and removed clients as well, and for some random other demux ID ignoring it
+        // and just closing the connection is safe.
+        if proto.leave.is_some() {
+            // "Leave" is the only message we allow from pending and removed clients.
+            info!(
+                "call: {} removing client: {} (via RTP)",
+                self.loggable_call_id(),
+                sender_demux_id.as_u32()
+            );
+            self.drop_client(sender_demux_id, now);
+            return Err(Error::Leave);
+        }
 
-            // Snapshot this so we can get a mutable reference to the sender.
-            let default_requested_max_send_rate = self.default_requested_max_send_rate;
+        let sender_mrp_stream = &mut self
+            .find_client_mut(sender_demux_id)
+            .ok_or(Error::UnknownDemuxId(sender_demux_id))?
+            .reliable_mrp_stream;
+        let ready_protos =
+            if incoming_rtp.payload_type() == RELIABLE_CLIENT_SERVER_DATA_PAYLOAD_TYPE {
+                if let Some(header) = proto.mrp_header.as_ref() {
+                    match sender_mrp_stream.receive(&header.into(), proto) {
+                        Ok(ready_protos) => ready_protos,
+                        Err(e) => {
+                            // received a malformed header, drop packet
+                            event!("calling.call.handle_rtp.malformed_mrp_header");
+                            return Err(Error::InvalidMrpHeader(e));
+                        }
+                    }
+                } else {
+                    // process as an unreliable payload
+                    event!("calling.call.handle_rtp.missing_mrp_header");
+                    vec![proto]
+                }
+            } else {
+                vec![proto]
+            };
 
+        // Snapshot this so we can get a mutable reference to the sender.
+        let default_requested_max_send_rate = self.default_requested_max_send_rate;
+
+        for proto in ready_protos {
             let sender = self
                 .find_client_mut(sender_demux_id)
                 .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
             // And snapshot this so we can drop 'sender' after processing video requests.
             let sender_is_admin = sender.is_admin;
-
             // The client resends this periodically, so we don't want to do anything
             // if it didn't change.
             if proto.video_request != sender.video_request_proto {
@@ -940,10 +984,21 @@ impl Call {
             if let Some(raise_hand) = proto.raise_hand {
                 self.handle_raise_hand(now, raise_hand, sender_demux_id);
             }
-
-            // There's nothing to forward
-            return Ok(vec![]);
         }
+
+        // There's nothing to forward
+        Ok(vec![])
+    }
+
+    fn handle_media_rtp(
+        &mut self,
+        sender_demux_id: DemuxId,
+        incoming_rtp: rtp::Packet<&mut [u8]>,
+        now: Instant,
+    ) -> Result<Vec<RtpToSend>, Error> {
+        let sender = self
+            .find_client_mut(sender_demux_id)
+            .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
 
         // Make sure to do this before processing audio level, etc.
         // Otherwise someone could fake the SSRC to change active speaker and that sort of thing.
@@ -954,10 +1009,6 @@ impl Call {
                 sender_demux_id,
             ));
         }
-
-        let sender = self
-            .find_client_mut(sender_demux_id)
-            .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
 
         let incoming_rtp = incoming_rtp.borrow();
         let incoming_vp8 = if incoming_rtp.payload_type() == rtp::VP8_PAYLOAD_TYPE {
@@ -1103,6 +1154,8 @@ impl Call {
                 trace!("No video from the active speaker. Not requesting key frames.");
             }
         }
+
+        self.send_mrp_updates(&mut rtp_to_send, now);
 
         (rtp_to_send, key_frame_requests_to_send)
     }
@@ -1526,15 +1579,66 @@ impl Call {
         }
     }
 
+    /// Preps and appends MRP acks and retries to clients in the call
+    fn send_mrp_updates(&mut self, rtp_to_send: &mut Vec<RtpToSend>, now: Instant) {
+        let unwrapped_now = now.into();
+        for client in &mut self.clients {
+            let client_demux_id = client.demux_id;
+            let _ = client.reliable_mrp_stream.try_send_ack(|header| {
+                let ack = protos::SfuToDevice {
+                    mrp_header: Some(header.into()),
+                    ..Default::default()
+                };
+                let update_rtp = Self::encode_reliable_sfu_to_device(
+                    &ack,
+                    &mut client.next_server_to_client_data_rtp_seqnum,
+                );
+                rtp_to_send.push((client_demux_id, update_rtp));
+                Ok(())
+            });
+            let _ = client.reliable_mrp_stream.try_resend(unwrapped_now, |pkt| {
+                let update_rtp = Self::encode_reliable_sfu_to_device(
+                    pkt,
+                    &mut client.next_server_to_client_data_rtp_seqnum,
+                );
+                rtp_to_send.push((client_demux_id, update_rtp));
+                Ok(unwrapped_now + MRP_SEND_TIMEOUT_INTERVAL.into())
+            });
+        }
+    }
+
     fn encode_sfu_to_device_update(
         update: &protos::SfuToDevice,
         next_server_to_client_data_rtp_seqnum: &mut rtp::FullSequenceNumber,
+    ) -> rtp::Packet<Vec<u8>> {
+        Self::encode_sfu_to_device_inner(
+            update,
+            next_server_to_client_data_rtp_seqnum,
+            CLIENT_SERVER_DATA_PAYLOAD_TYPE,
+        )
+    }
+
+    fn encode_reliable_sfu_to_device(
+        update: &protos::SfuToDevice,
+        next_server_to_client_data_rtp_seqnum: &mut rtp::FullSequenceNumber,
+    ) -> rtp::Packet<Vec<u8>> {
+        Self::encode_sfu_to_device_inner(
+            update,
+            next_server_to_client_data_rtp_seqnum,
+            RELIABLE_CLIENT_SERVER_DATA_PAYLOAD_TYPE,
+        )
+    }
+
+    fn encode_sfu_to_device_inner(
+        update: &protos::SfuToDevice,
+        next_server_to_client_data_rtp_seqnum: &mut rtp::FullSequenceNumber,
+        payload_type: rtp::PayloadType,
     ) -> rtp::Packet<Vec<u8>> {
         let seqnum: rtp::FullSequenceNumber = *next_server_to_client_data_rtp_seqnum;
         *next_server_to_client_data_rtp_seqnum += 1;
         let timestamp = seqnum as rtp::TruncatedTimestamp;
         rtp::Packet::with_empty_tag(
-            CLIENT_SERVER_DATA_PAYLOAD_TYPE,
+            payload_type,
             seqnum,
             timestamp,
             CLIENT_SERVER_DATA_SSRC,
@@ -1706,6 +1810,24 @@ impl From<Client> for NonParticipantClient {
     }
 }
 
+impl From<&protos::MrpHeader> for mrp::MrpHeader {
+    fn from(value: &protos::MrpHeader) -> Self {
+        Self {
+            ack_num: value.ack_num,
+            seqnum: value.seqnum,
+        }
+    }
+}
+
+impl From<mrp::MrpHeader> for protos::MrpHeader {
+    fn from(value: mrp::MrpHeader) -> Self {
+        Self {
+            ack_num: value.ack_num,
+            seqnum: value.seqnum,
+        }
+    }
+}
+
 /// The per-client state
 struct Client {
     // Immutable
@@ -1761,6 +1883,9 @@ struct Client {
     data_forwarder_by_sender_demux_id: HashMap<DemuxId, SingleSsrcRtpForwarder>,
     allocated_height_by_sender_demux_id: HashMap<DemuxId, VideoHeight>,
 
+    // Used for reliable RTP transmissions point-to-point
+    reliable_mrp_stream: mrp::MrpStream<protos::SfuToDevice, protos::DeviceToSfu>,
+
     // Update with each proto send from server to client
     next_server_to_client_data_rtp_seqnum: rtp::FullSequenceNumber,
 }
@@ -1805,6 +1930,8 @@ impl Client {
             video_forwarder_by_sender_demux_id: HashMap::new(),
             data_forwarder_by_sender_demux_id: HashMap::new(),
             allocated_height_by_sender_demux_id: HashMap::new(),
+
+            reliable_mrp_stream: MrpStream::new(MAX_MRP_WINDOW_SIZE),
 
             next_server_to_client_data_rtp_seqnum: pending_client_info
                 .next_server_to_client_data_rtp_seqnum,
@@ -3740,6 +3867,17 @@ mod call_tests {
     ) -> rtp::Packet<Vec<u8>> {
         let ssrc = CLIENT_SERVER_DATA_SSRC;
         let pt = CLIENT_SERVER_DATA_PAYLOAD_TYPE;
+        let tcc_seqnum = None;
+        let timestamp = seqnum as rtp::TruncatedTimestamp;
+        rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, tcc_seqnum, None, payload)
+    }
+
+    fn create_reliable_server_to_client_rtp(
+        seqnum: rtp::FullSequenceNumber,
+        payload: &[u8],
+    ) -> rtp::Packet<Vec<u8>> {
+        let ssrc = CLIENT_SERVER_DATA_SSRC;
+        let pt = RELIABLE_CLIENT_SERVER_DATA_PAYLOAD_TYPE;
         let tcc_seqnum = None;
         let timestamp = seqnum as rtp::TruncatedTimestamp;
         rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, tcc_seqnum, None, payload)
@@ -5870,6 +6008,178 @@ mod call_tests {
                 .map(UserId::as_str)
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn reliable_admin_messages() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(b"call_id", now, system_now);
+        call.new_clients_require_approval = true;
+
+        let alice_device_1 = add_admin(&mut call, "Alice", 1, at(100));
+        let bob_device_1 = add_client(&mut call, "Bob", 2, at(200));
+        assert_eq!(vec![bob_device_1], demux_ids(&call.pending_clients));
+        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+
+        fn mrp_header_with_seqnum(seqnum: u64) -> Option<protos::MrpHeader> {
+            Some(protos::MrpHeader {
+                seqnum: Some(seqnum),
+                ..Default::default()
+            })
+        }
+
+        let first_approval = protos::DeviceToSfu {
+            approve: vec![protos::device_to_sfu::GenericAdminAction {
+                target_demux_id: Some(bob_device_1.as_u32()),
+            }],
+            mrp_header: mrp_header_with_seqnum(1),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let second_deny = protos::DeviceToSfu {
+            deny: vec![protos::device_to_sfu::GenericAdminAction {
+                target_demux_id: Some(bob_device_1.as_u32()),
+            }],
+            mrp_header: mrp_header_with_seqnum(2),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        // Alice: Out of order deny, buffered and not processed, Bob still pending
+        let rtp_to_send = call
+            .handle_rtp(
+                alice_device_1,
+                create_reliable_server_to_client_rtp(2, &second_deny).borrow_mut(),
+                at(100),
+            )
+            .unwrap();
+        assert!(rtp_to_send.is_empty());
+
+        assert_eq!(
+            vec![bob_device_1] as Vec<DemuxId>,
+            demux_ids(&call.pending_clients)
+        );
+        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
+        assert!(call.removed_clients.is_empty());
+        assert!(call.denied_users.is_empty());
+
+        // Alice: Approve Bob, processes both the Approve then the Deny. Deny is then ignored
+        let rtp_to_send = call
+            .handle_rtp(
+                alice_device_1,
+                create_reliable_server_to_client_rtp(1, &first_approval).borrow_mut(),
+                at(300),
+            )
+            .unwrap();
+        assert!(rtp_to_send.is_empty());
+
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
+        assert!(call.removed_clients.is_empty());
+        assert!(call.denied_users.is_empty());
+
+        // Alice: Retransmits first approval, ignored, nothing changes
+        let rtp_to_send = call
+            .handle_rtp(
+                alice_device_1,
+                create_reliable_server_to_client_rtp(3, &first_approval).borrow_mut(),
+                at(500),
+            )
+            .unwrap();
+        assert!(rtp_to_send.is_empty());
+
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
+        assert!(call.removed_clients.is_empty());
+        assert!(call.denied_users.is_empty());
+
+        // Alice: Retransmits deny, ignored, nothing changes
+        let rtp_to_send = call
+            .handle_rtp(
+                alice_device_1,
+                create_reliable_server_to_client_rtp(4, &second_deny).borrow_mut(),
+                at(500),
+            )
+            .unwrap();
+        assert!(rtp_to_send.is_empty());
+
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
+        assert!(call.removed_clients.is_empty());
+        assert!(call.denied_users.is_empty());
+
+        // Carol: Joins
+        let carol_device_1 = add_client(&mut call, "Carol", 3, at(500));
+        let carol_user_id = UserId::from("Carol".to_string());
+        assert_eq!(vec![carol_device_1], demux_ids(&call.pending_clients));
+        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
+        assert!(call.removed_clients.is_empty());
+        assert!(call.denied_users.is_empty());
+
+        let third_deny = &protos::DeviceToSfu {
+            deny: vec![protos::device_to_sfu::GenericAdminAction {
+                target_demux_id: Some(carol_device_1.as_u32()),
+            }],
+            mrp_header: mrp_header_with_seqnum(3),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let fourth_approve = &protos::DeviceToSfu {
+            approve: vec![protos::device_to_sfu::GenericAdminAction {
+                target_demux_id: Some(carol_device_1.as_u32()),
+            }],
+            mrp_header: mrp_header_with_seqnum(4),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        // Alice: Denies then Approves Carol. Received out of in order. Results in Carol being denied
+
+        // Receive the approve first
+        let rtp_to_send = call
+            .handle_rtp(
+                alice_device_1,
+                create_reliable_server_to_client_rtp(6, fourth_approve).borrow_mut(),
+                at(600),
+            )
+            .unwrap();
+        assert!(rtp_to_send.is_empty());
+        assert_eq!(vec![carol_device_1], demux_ids(&call.pending_clients));
+        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
+        assert!(call.removed_clients.is_empty());
+        assert!(call.denied_users.is_empty());
+
+        // then receive the deny - results in being denied
+        let rtp_to_send = call
+            .handle_rtp(
+                alice_device_1,
+                create_reliable_server_to_client_rtp(5, third_deny).borrow_mut(),
+                at(600),
+            )
+            .unwrap();
+        assert!(rtp_to_send.is_empty());
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
+        assert!(carol_user_id == call.removed_clients[0].user_id);
+        assert!(HashSet::from([carol_user_id.clone()]) == call.denied_users);
+
+        // retransmitted deny - discarded, avoiding the accidental block
+        let rtp_to_send = call
+            .handle_rtp(
+                alice_device_1,
+                create_reliable_server_to_client_rtp(5, third_deny).borrow_mut(),
+                at(600),
+            )
+            .unwrap();
+        assert!(rtp_to_send.is_empty());
+        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
+        assert!(carol_user_id == call.removed_clients[0].user_id);
+        assert!(HashSet::from([carol_user_id.clone()]) == call.denied_users);
     }
 
     #[test]

@@ -12,6 +12,7 @@ description = "Media forwarding server for group calls."
 license = "AGPL-3.0-only"
 
 [dependencies]
+mrp = { git = "https://github.com/signalapp/ringrtc", tag = "v2.43.0" }
 calling_common = { path = "../common" }
 
 # For error handling
