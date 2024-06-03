@@ -384,6 +384,8 @@ pub struct DataRateTracker {
     history: VecDeque<(Instant, DataSize)>,
     accumulated_size: DataSize,
     rate: Option<DataRate>,
+    stable_rate: Option<DataRate>,
+    last_stable_rate: Option<DataRate>,
 }
 
 impl DataRateTracker {
@@ -392,6 +394,10 @@ impl DataRateTracker {
 
     pub fn rate(&self) -> Option<DataRate> {
         self.rate
+    }
+
+    pub fn stable_rate(&self) -> Option<DataRate> {
+        self.stable_rate
     }
 
     /// Old values don't get pushed off unless update() is called periodically.
@@ -426,7 +432,16 @@ impl DataRateTracker {
         } else {
             // Wait for more info
             None
-        }
+        };
+
+        self.last_stable_rate = self.stable_rate;
+        self.stable_rate = self.rate.map(|rate| {
+            let alpha = 0.9;
+            match self.last_stable_rate {
+                Some(last) => (last * alpha) + (rate * (1.0 - alpha)),
+                None => rate,
+            }
+        });
     }
 }
 

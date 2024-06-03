@@ -2108,7 +2108,7 @@ struct IncomingVideoState {
 
 impl IncomingVideoState {
     pub fn rate(&self) -> Option<DataRate> {
-        self.rate_tracker.rate()
+        self.rate_tracker.stable_rate()
     }
 
     fn apply_rotation(&mut self, rotation: VideoRotation) {
@@ -4443,7 +4443,7 @@ mod call_tests {
         assert_eq!(vec![(receiver1_demux_id, rewritten_rtp),], rtp_to_send);
 
         // If the incoming bitrate rate gets higher than the target send rate, drop back to the base layer
-        for _ in 0..200 {
+        for _ in 0..900 {
             seqnum_layer1 += 1;
             let mut rtp_layer1 = create_video_rtp(
                 sender_demux_id,
@@ -4457,8 +4457,26 @@ mod call_tests {
                 .unwrap();
         }
         let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(4000));
+        assert_eq!(vec![] as Vec<(DemuxId, _)>, outgoing_key_frame_requests);
+
+        for _ in 0..900 {
+            seqnum_layer1 += 1;
+            let mut rtp_layer1 = create_video_rtp(
+                sender_demux_id,
+                LayerId::Video1,
+                picture_id_layer1,
+                tl0_pic_idx_layer1,
+                seqnum_layer1,
+                Some(size_layer1),
+            );
+            call.handle_rtp(sender_demux_id, rtp_layer1.borrow_mut(), at(5000))
+                .unwrap();
+        }
+
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(5100));
+        dbg!(call.clients[0].incoming_video1.rate().unwrap().as_bps());
         assert_eq!(
-            Some(DataRate::from_bps(1002048)),
+            Some(DataRate::from_bps(1017282)),
             call.clients[0].incoming_video1.rate()
         );
         assert_eq!(
@@ -4487,15 +4505,15 @@ mod call_tests {
                     demux_id: receiver1_demux_id,
                     padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(sender_demux_id)),
                     target_send_rate: DataRate::from_kbps(600),
-                    requested_base_rate: DataRate::from_bps(14739),
-                    ideal_send_rate: DataRate::from_bps(1002048),
+                    requested_base_rate: DataRate::from_bps(33797),
+                    ideal_send_rate: DataRate::from_bps(1017282),
                 },
                 SendRateAllocationInfo {
                     demux_id: receiver2_demux_id,
                     padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(sender_demux_id)),
                     target_send_rate: DataRate::from_kbps(600),
-                    requested_base_rate: DataRate::from_bps(14739),
-                    ideal_send_rate: DataRate::from_bps(14739),
+                    requested_base_rate: DataRate::from_bps(33797),
+                    ideal_send_rate: DataRate::from_bps(33797),
                 }
             ],
             call.get_send_rate_allocation_info().collect::<Vec<_>>()
