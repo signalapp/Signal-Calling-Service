@@ -2244,8 +2244,15 @@ impl Endpoint {
             return None;
         }
 
+        if header.has_padding {
+            incoming.padding_byte_count = incoming.payload()[incoming.payload().len() - 1];
+        }
+
         // We have to do this after decrypting to get the seqnum in the payload.
-        if is_rtx_payload_type(header.payload_type) {
+        if is_rtx_payload_type(header.payload_type)
+            // Padding packets don't have a seqnum in their payload.
+            && (incoming.padding_byte_count as usize) < incoming.payload().len()
+        {
             let original_ssrc = from_rtx_ssrc(header.ssrc);
             let original_seqnum = if let Some((seqnum_in_payload, _)) = read_u16(incoming.payload())
             {
@@ -2288,10 +2295,6 @@ impl Endpoint {
 
         if let Some(tcc_seqnum) = incoming.tcc_seqnum {
             self.tcc_receiver.remember_received(tcc_seqnum, now);
-        }
-
-        if header.has_padding {
-            incoming.padding_byte_count = incoming.payload()[incoming.payload().len() - 1];
         }
 
         Some(incoming)
