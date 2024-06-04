@@ -37,7 +37,6 @@ use approval_persistence::ApprovedUsers;
 
 pub const CLIENT_SERVER_DATA_SSRC: rtp::Ssrc = 1;
 pub const CLIENT_SERVER_DATA_PAYLOAD_TYPE: rtp::PayloadType = 101;
-pub const RELIABLE_CLIENT_SERVER_DATA_PAYLOAD_TYPE: rtp::PayloadType = 100;
 
 /// This is for throttling the CPU usage of calculating what key frame requests
 /// to send.  A higher value should use less CPU and a lower value should
@@ -822,13 +821,12 @@ impl Call {
         now: Instant,
     ) -> Result<Vec<RtpToSend>, Error> {
         if incoming_rtp.ssrc() == CLIENT_SERVER_DATA_SSRC
-            && (incoming_rtp.payload_type() == CLIENT_SERVER_DATA_PAYLOAD_TYPE
-                || incoming_rtp.payload_type() == RELIABLE_CLIENT_SERVER_DATA_PAYLOAD_TYPE)
+            && incoming_rtp.payload_type() == CLIENT_SERVER_DATA_PAYLOAD_TYPE
         {
             time_scope_us!("calling.call.handle_rtp.client_to_server_data");
             let proto = protos::DeviceToSfu::decode(incoming_rtp.payload())
                 .map_err(|_| Error::InvalidClientToServerProtobuf)?;
-            self.handle_device_to_sfu(proto, sender_demux_id, incoming_rtp, now)
+            self.handle_device_to_sfu(proto, sender_demux_id, now)
         } else {
             self.handle_media_rtp(sender_demux_id, incoming_rtp, now)
         }
@@ -838,7 +836,6 @@ impl Call {
         &mut self,
         proto: protos::DeviceToSfu,
         sender_demux_id: DemuxId,
-        incoming_rtp: rtp::Packet<&mut [u8]>,
         now: Instant,
     ) -> Result<Vec<RtpToSend>, Error> {
         // Check for "Leave" before requiring that the demux ID is valid. We allow it for
@@ -859,25 +856,19 @@ impl Call {
             .find_client_mut(sender_demux_id)
             .ok_or(Error::UnknownDemuxId(sender_demux_id))?
             .reliable_mrp_stream;
-        let ready_protos =
-            if incoming_rtp.payload_type() == RELIABLE_CLIENT_SERVER_DATA_PAYLOAD_TYPE {
-                if let Some(header) = proto.mrp_header.as_ref() {
-                    match sender_mrp_stream.receive(&header.into(), proto) {
-                        Ok(ready_protos) => ready_protos,
-                        Err(e) => {
-                            // received a malformed header, drop packet
-                            event!("calling.call.handle_rtp.malformed_mrp_header");
-                            return Err(Error::InvalidMrpHeader(e));
-                        }
-                    }
-                } else {
-                    // process as an unreliable payload
-                    event!("calling.call.handle_rtp.missing_mrp_header");
-                    vec![proto]
+        let ready_protos = if let Some(header) = proto.mrp_header.as_ref() {
+            match sender_mrp_stream.receive(&header.into(), proto) {
+                Ok(ready_protos) => ready_protos,
+                Err(e) => {
+                    // received a malformed header, drop packet
+                    event!("calling.call.handle_rtp.malformed_mrp_header");
+                    return Err(Error::InvalidMrpHeader(e));
                 }
-            } else {
-                vec![proto]
-            };
+            }
+        } else {
+            // process as an unreliable payload
+            vec![proto]
+        };
 
         // Snapshot this so we can get a mutable reference to the sender.
         let default_requested_max_send_rate = self.default_requested_max_send_rate;
@@ -1625,7 +1616,7 @@ impl Call {
         Self::encode_sfu_to_device_inner(
             update,
             next_server_to_client_data_rtp_seqnum,
-            RELIABLE_CLIENT_SERVER_DATA_PAYLOAD_TYPE,
+            CLIENT_SERVER_DATA_PAYLOAD_TYPE,
         )
     }
 
@@ -3877,7 +3868,7 @@ mod call_tests {
         payload: &[u8],
     ) -> rtp::Packet<Vec<u8>> {
         let ssrc = CLIENT_SERVER_DATA_SSRC;
-        let pt = RELIABLE_CLIENT_SERVER_DATA_PAYLOAD_TYPE;
+        let pt = CLIENT_SERVER_DATA_PAYLOAD_TYPE;
         let tcc_seqnum = None;
         let timestamp = seqnum as rtp::TruncatedTimestamp;
         rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, tcc_seqnum, None, payload)
