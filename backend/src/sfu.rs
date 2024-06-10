@@ -595,10 +595,14 @@ impl Sfu {
                     sfu.lock().get_connection_from_address(&sender_addr)?;
                 let mut incoming_connection = incoming_connection.lock();
                 time_scope_us!("calling.sfu.handle_packet.rtp.in_incoming_connection_lock");
-                let incoming_rtp = incoming_connection
+                if let Some(incoming_rtp) = incoming_connection
                     .handle_rtp_packet(incoming_packet, Instant::now())
-                    .map_err(SfuError::ConnectionError)?;
-                (incoming_connection_id, incoming_rtp)
+                    .map_err(SfuError::ConnectionError)?
+                {
+                    (incoming_connection_id, incoming_rtp)
+                } else {
+                    return Ok(Default::default());
+                }
             };
 
             trace!("rtp packet:");
@@ -823,7 +827,7 @@ impl Sfu {
                                   client.video0_incoming_rate.unwrap_or_default().as_kbps(),
                                   client.video1_incoming_rate.unwrap_or_default().as_kbps(),
                                   client.video2_incoming_rate.unwrap_or_default().as_kbps(),
-                                  client.padding_incoming_rate.unwrap_or_default().as_kbps(),
+                                  client.connection_rates.incoming_padding_rate.as_kbps(),
                                   client.connection_rates.incoming_audio_rate.as_kbps(),
                                   client.connection_rates.incoming_rtx_rate.as_kbps(),
                                   client.connection_rates.incoming_non_media_rate.as_kbps(),

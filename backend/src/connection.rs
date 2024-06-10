@@ -85,6 +85,7 @@ pub struct Connection {
 
     incoming_audio_rate: DataRateTracker,
     incoming_rtx_rate: DataRateTracker,
+    incoming_padding_rate: DataRateTracker,
     incoming_non_media_rate: DataRateTracker,
     incoming_discard_rate: DataRateTracker,
 }
@@ -182,6 +183,7 @@ impl Connection {
 
             incoming_audio_rate: DataRateTracker::default(),
             incoming_rtx_rate: DataRateTracker::default(),
+            incoming_padding_rate: DataRateTracker::default(),
             incoming_non_media_rate: DataRateTracker::default(),
             incoming_discard_rate: DataRateTracker::default(),
         }
@@ -281,7 +283,7 @@ impl Connection {
         &mut self,
         incoming_packet: &'packet mut [u8],
         now: Instant,
-    ) -> Result<rtp::Packet<&'packet mut [u8]>, Error> {
+    ) -> Result<Option<rtp::Packet<&'packet mut [u8]>>, Error> {
         let rtp_endpoint = &mut self.rtp.endpoint;
         let size = incoming_packet.len();
         match rtp_endpoint.receive_rtp(incoming_packet, now) {
@@ -292,12 +294,17 @@ impl Connection {
                 } else if packet.is_audio() {
                     event!("calling.bandwidth.incoming.audio_bytes", size);
                     self.incoming_audio_rate.push_bytes(size, now);
+                } else if packet.padding_byte_count as usize >= packet.payload().len() {
+                    let size = packet.size().as_bytes() as usize;
+                    event!("calling.bandwidth.incoming.padding_bytes", size);
+                    self.incoming_padding_rate.push_bytes(size, now);
+                    return Ok(None);
                 } else if !packet.is_video() {
                     self.push_incoming_non_media_bytes(size, now);
                 }
                 // video packet datarate tracked by layer, in call.rs;
                 // includes data from original and retransmitted packets
-                Ok(packet)
+                Ok(Some(packet))
             }
             None => {
                 event!("calling.bandwidth.incoming.discard_bytes", size);
@@ -633,6 +640,7 @@ impl Connection {
 
         self.incoming_audio_rate.update(now);
         self.incoming_rtx_rate.update(now);
+        self.incoming_padding_rate.update(now);
         self.incoming_non_media_rate.update(now);
         self.incoming_discard_rate.update(now);
 
@@ -645,6 +653,7 @@ impl Connection {
 
             incoming_audio_rate: self.incoming_audio_rate.rate().unwrap_or(DataRate::ZERO),
             incoming_rtx_rate: self.incoming_rtx_rate.rate().unwrap_or(DataRate::ZERO),
+            incoming_padding_rate: self.incoming_padding_rate.rate().unwrap_or(DataRate::ZERO),
             incoming_non_media_rate: self
                 .incoming_non_media_rate
                 .rate()
@@ -698,6 +707,7 @@ pub struct ConnectionRates {
 
     pub incoming_audio_rate: DataRate,
     pub incoming_rtx_rate: DataRate,
+    pub incoming_padding_rate: DataRate,
     pub incoming_non_media_rate: DataRate,
     pub incoming_discard_rate: DataRate,
 }
@@ -984,6 +994,7 @@ mod connection_tests {
             connection
                 .handle_rtp_packet(&mut encrypted_rtp.into_serialized(), now)
                 .unwrap()
+                .unwrap()
                 .to_owned()
         );
 
@@ -999,6 +1010,7 @@ mod connection_tests {
             expected_decrypted_rtp.borrow().to_owned(),
             connection
                 .handle_rtp_packet(&mut encrypted_rtp.into_serialized(), now)
+                .unwrap()
                 .unwrap()
                 .to_owned()
         );
@@ -1241,6 +1253,7 @@ mod connection_tests {
                 &mut new_encrypted_rtp(1, Some(101), &decrypt, at(1)).into_serialized(),
                 at(1),
             )
+            .unwrap()
             .unwrap();
 
         connection
@@ -1248,6 +1261,7 @@ mod connection_tests {
                 &mut new_encrypted_rtp(3, Some(103), &decrypt, at(3)).into_serialized(),
                 at(3),
             )
+            .unwrap()
             .unwrap();
 
         let mut packets_to_send = vec![];
@@ -1299,6 +1313,7 @@ mod connection_tests {
                 &mut new_encrypted_rtp(2, Some(102), &decrypt, at(10002)).into_serialized(),
                 at(10002),
             )
+            .unwrap()
             .unwrap();
         connection.tick(&mut packets_to_send, at(1000));
         assert_eq!(4, packets_to_send.len());
