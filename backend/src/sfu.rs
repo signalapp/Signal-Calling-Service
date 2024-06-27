@@ -666,6 +666,7 @@ impl Sfu {
             time_scope_us!("calling.sfu.handle_packet.rtcp");
 
             let (
+                rtcp_now,
                 incoming_connection_id,
                 HandleRtcpResult {
                     incoming_key_frame_requests,
@@ -679,10 +680,11 @@ impl Sfu {
                 let mut incoming_connection = incoming_connection.lock();
 
                 time_scope_us!("calling.sfu.handle_packet.rtcp.in_incomin_connection_lock");
+                let rtcp_now = Instant::now();
                 let result = incoming_connection
-                    .handle_rtcp_packet(incoming_packet, Instant::now())
+                    .handle_rtcp_packet(incoming_packet, rtcp_now)
                     .map_err(SfuError::ConnectionError)?;
-                (incoming_connection_id, result)
+                (rtcp_now, incoming_connection_id, result)
             };
 
             let outgoing_key_frame_requests = {
@@ -693,9 +695,11 @@ impl Sfu {
                 time_scope_us!("calling.sfu.handle_packet.rtcp.in_call_lock");
 
                 if let Some(new_target_send_rate) = new_target_send_rate {
-                    if let Err(err) = call
-                        .set_target_send_rate(incoming_connection_id.demux_id, new_target_send_rate)
-                    {
+                    if let Err(err) = call.set_target_send_rate(
+                        incoming_connection_id.demux_id,
+                        new_target_send_rate,
+                        rtcp_now,
+                    ) {
                         debug!("Failed to set target send rate: {:?}", err);
                     }
                 }
@@ -819,7 +823,7 @@ impl Sfu {
                                 0
                             };
 
-                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), incoming_padding: {}, incoming_audio: {}, incoming_rtx: {}, incoming_non_media: {}, incoming_discard: {}, target: {}, requested_base: {}, ideal: {}, allocated: {}, queue_drain: {}, max_requested_height: {}, rtt_ms: {}, video_rate: {}, audio_rate: {}, rtx_rate: {}, padding_rate: {}, non_media_rate: {} }}",
+                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), incoming_padding: {}, incoming_audio: {}, incoming_rtx: {}, incoming_non_media: {}, incoming_discard: {}, min_target: {}, target: {}, requested_base: {}, ideal: {}, allocated: {}, queue_drain: {}, max_requested_height: {}, rtt_ms: {}, video_rate: {}, audio_rate: {}, rtx_rate: {}, padding_rate: {}, non_media_rate: {} }}",
                                   client.demux_id.as_u32(),
                                   client.video0_incoming_height.unwrap_or_default().as_u16(),
                                   client.video1_incoming_height.unwrap_or_default().as_u16(),
@@ -832,6 +836,7 @@ impl Sfu {
                                   client.connection_rates.incoming_rtx_rate.as_kbps(),
                                   client.connection_rates.incoming_non_media_rate.as_kbps(),
                                   client.connection_rates.incoming_discard_rate.as_kbps(),
+                                  client.min_target_send_rate.as_kbps(),
                                   client.target_send_rate.as_kbps(),
                                   client.requested_base_rate.as_kbps(),
                                   client.ideal_send_rate.as_kbps(),
