@@ -69,6 +69,8 @@ const MRP_SEND_TIMEOUT_INTERVAL: Duration = Duration::from_secs(1);
 /// How long the generations are for minimum target send rate; layer
 /// allocation uses the minimum target rate over the past two generations.
 const MIN_TARGET_SEND_RATE_GENERATION_INTERVAL: Duration = Duration::from_millis(2500);
+/// How much of the target send rate to allocate when the queue drain rate is high.
+const TARGET_RATE_MINIMUM_ALLOCATION_RATIO: f64 = 0.9;
 
 /// A wrapper around Vec<u8> to identify a Call.
 /// It comes from signaling, but isn't known by the clients.
@@ -2300,13 +2302,32 @@ fn allocate_send_rate(
     // We leave some target send rate unallocated to allow the queue to drain.
     // But if the ideal rate is lower than the target rate, there is room
     // between the ideal rate and the target rate to drain the queue.
+
+    // First use whichever is greater of (minimum target rate minus queue
+    // drain rate) and the minimum allocation ratio.
     let allocatable_rate_for_different_layers = max(
         min_target_send_rate.saturating_sub(outgoing_queue_drain_rate),
-        min_target_send_rate * 0.9,
+        min_target_send_rate * TARGET_RATE_MINIMUM_ALLOCATION_RATIO,
     );
+    // Now use the lesser of that result and the ideal send rate; layers
+    // must be under this bitrate to be allocated, if not currently
+    // selected.
     let allocatable_rate_for_different_layers =
         min(allocatable_rate_for_different_layers, ideal_send_rate);
-    let allocatable_rate_for_existing_layers = min(target_send_rate, ideal_send_rate);
+
+    // Do the same process with the current target rate
+    let allocatable_rate_for_existing_layers = max(
+        target_send_rate.saturating_sub(outgoing_queue_drain_rate),
+        target_send_rate * TARGET_RATE_MINIMUM_ALLOCATION_RATIO,
+    );
+
+    // This bitrate will be equal to or greater than the rate for different
+    // layers; allowing more bandwidth to be used to keep a currently
+    // selected layer than to switch layers, so there's less layer switching
+    // as available bandwidth changes.
+    let allocatable_rate_for_existing_layers =
+        min(allocatable_rate_for_existing_layers, ideal_send_rate);
+
     let mut allocated_by_sender_demux_id: HashMap<DemuxId, AllocatedVideo> = HashMap::new();
     let mut allocated_rate = DataRate::ZERO;
 
@@ -3381,7 +3402,7 @@ mod call_tests {
         assert_eq!(
             (3000, vec![(0x20, 0, 200), (0x30, 0, 200)]),
             allocate(
-                400,
+                600,
                 400,
                 200,
                 &[
@@ -3410,7 +3431,7 @@ mod call_tests {
         assert_eq!(
             (3000, vec![(0x10, 0, 200), (0x20, 0, 200), (0x30, 0, 200)]),
             allocate(
-                600,
+                667,
                 600,
                 100,
                 &[
@@ -3438,7 +3459,7 @@ mod call_tests {
         assert_eq!(
             (3000, vec![(0x10, 0, 200), (0x20, 0, 200), (0x30, 1, 800)]),
             allocate(
-                1200,
+                1334,
                 1200,
                 1000,
                 &[
@@ -3494,7 +3515,7 @@ mod call_tests {
         assert_eq!(
             (3000, vec![(0x10, 0, 200), (0x20, 1, 800), (0x30, 2, 2000)]),
             allocate(
-                3000,
+                4000,
                 3000,
                 1000,
                 &[
