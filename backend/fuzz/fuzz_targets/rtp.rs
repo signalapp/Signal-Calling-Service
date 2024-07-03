@@ -10,6 +10,6 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: Vec<u8>| {
     if rtp::looks_like_rtp(&data) {
-        let _ = rtp::parse_and_forward_rtp_for_fuzzing(data);
+        let _ = rtp::fuzz::parse_and_forward_rtp_for_fuzzing(data);
     }
 });

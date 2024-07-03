@@ -28,13 +28,13 @@ use crate::{
     call::{self, Call, LoggableCallId},
     config,
     connection::{self, AddressType, Connection, ConnectionRates, HandleRtcpResult, PacketToSend},
-    googcc, ice,
-    ice::BindingRequest,
+    googcc,
+    ice::{self, BindingRequest},
     metrics::{Histogram, Timer},
     pacer,
     packet_server::{PacketServerState, SocketLocator},
     region::Region,
-    rtp,
+    rtp::{self, new_master_key_material},
 };
 pub use crate::{
     call::{CallId, UserId},
@@ -452,8 +452,7 @@ impl Sfu {
         let server_secret = EphemeralSecret::new(OsRngCompatibleWithDalek);
         let server_dhe_public_key = PublicKey::from(&server_secret).to_bytes();
         let shared_secret = server_secret.diffie_hellman(&PublicKey::from(client_dhe_public_key));
-        let mut srtp_master_key_material =
-            zeroize::Zeroizing::new([0u8; rtp::MASTER_KEY_MATERIAL_LEN]);
+        let mut srtp_master_key_material = new_master_key_material();
         Hkdf::<Sha256>::new(None, shared_secret.as_bytes())
             .expand_multi_info(
                 &[

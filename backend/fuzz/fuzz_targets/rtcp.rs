@@ -11,6 +11,6 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: Vec<u8>| {
     let mut data = data;
     if rtp::looks_like_rtcp(&data) {
-        rtp::parse_rtcp(&mut data);
+        rtp::fuzz::parse_rtcp(&mut data);
     }
 });

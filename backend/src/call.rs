@@ -1028,7 +1028,7 @@ impl Call {
         }
 
         let incoming_rtp = incoming_rtp.borrow();
-        let incoming_vp8 = if incoming_rtp.payload_type() == rtp::VP8_PAYLOAD_TYPE {
+        let incoming_vp8 = if incoming_rtp.is_vp8() {
             time_scope_us!("calling.call.handle_rtp.vp8_header");
             if let Some(incoming_vp8) = sender
                 .parse_vp8_header_and_update_incoming_video_rate_and_resolution(

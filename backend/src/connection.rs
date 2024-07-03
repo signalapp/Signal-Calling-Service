@@ -719,6 +719,7 @@ mod connection_tests {
     use super::*;
     use crate::transportcc as tcc;
     use calling_common::Writer;
+    use rtp::{key_from, salt_from};
 
     fn new_connection(now: Instant) -> Connection {
         let ice_request_username = b"server:client";
@@ -745,22 +746,22 @@ mod connection_tests {
     fn new_srtp_keys(seed: u8) -> (rtp::KeysAndSalts, rtp::KeysAndSalts) {
         let decrypt = rtp::KeysAndSalts {
             rtp: rtp::KeyAndSalt {
-                key: [seed + 1; rtp::SRTP_KEY_LEN].into(),
-                salt: [seed + 2; rtp::SRTP_SALT_LEN],
+                key: key_from(seed + 1),
+                salt: salt_from(seed + 2),
             },
             rtcp: rtp::KeyAndSalt {
-                key: [seed + 3; rtp::SRTP_KEY_LEN].into(),
-                salt: [seed + 4; rtp::SRTP_SALT_LEN],
+                key: key_from(seed + 3),
+                salt: salt_from(seed + 4),
             },
         };
         let encrypt = rtp::KeysAndSalts {
             rtp: rtp::KeyAndSalt {
-                key: [seed + 5; rtp::SRTP_KEY_LEN].into(),
-                salt: [seed + 6; rtp::SRTP_SALT_LEN],
+                key: key_from(seed + 5),
+                salt: salt_from(seed + 6),
             },
             rtcp: rtp::KeyAndSalt {
-                key: [seed + 7; rtp::SRTP_KEY_LEN].into(),
-                salt: [seed + 8; rtp::SRTP_SALT_LEN],
+                key: key_from(seed + 7),
+                salt: salt_from(seed + 8),
             },
         };
         (decrypt, encrypt)
@@ -1166,9 +1167,7 @@ mod connection_tests {
             rtp_to_send
         );
 
-        let mut nacks = rtp::ControlPacket::serialize_and_encrypt(
-            rtp::RTCP_TYPE_GENERIC_FEEDBACK,
-            rtp::RTCP_FORMAT_NACK,
+        let mut nacks = rtp::ControlPacket::serialize_and_encrypt_nack(
             RTCP_SENDER_SSRC,
             rtp::write_nack(
                 encrypted_rtp.ssrc(),
@@ -1204,9 +1203,7 @@ mod connection_tests {
         );
 
         // The first one is resent again, and the second one is sent for the first time.
-        let mut nacks2 = rtp::ControlPacket::serialize_and_encrypt(
-            rtp::RTCP_TYPE_GENERIC_FEEDBACK,
-            rtp::RTCP_FORMAT_NACK,
+        let mut nacks2 = rtp::ControlPacket::serialize_and_encrypt_nack(
             RTCP_SENDER_SSRC,
             rtp::write_nack(
                 encrypted_rtp.ssrc(),
@@ -1353,9 +1350,7 @@ mod connection_tests {
         connection.set_srtp_keys(decrypt.clone(), encrypt, now);
 
         let ssrc = 1000u32;
-        let mut rtcp = rtp::ControlPacket::serialize_and_encrypt(
-            rtp::RTCP_TYPE_SPECIFIC_FEEDBACK,
-            rtp::RTCP_FORMAT_PLI,
+        let mut rtcp = rtp::ControlPacket::serialize_and_encrypt_pli(
             RTCP_SENDER_SSRC,
             ssrc,
             1,
@@ -1390,9 +1385,7 @@ mod connection_tests {
             let unencrypted_rtp = decrypt_rtp(&encrypted_rtp, &encrypt);
             connection.send_or_enqueue_rtp(unencrypted_rtp, &mut vec![], &mut vec![], sent);
 
-            let mut acks = rtp::ControlPacket::serialize_and_encrypt(
-                rtp::RTCP_TYPE_GENERIC_FEEDBACK,
-                rtp::RTCP_FORMAT_TRANSPORT_CC,
+            let mut acks = rtp::ControlPacket::serialize_and_encrypt_acks(
                 RTCP_SENDER_SSRC,
                 tcc::write_feedback(10000, &mut 0, now, vec![(seqnum, received)].into_iter())
                     .collect::<Vec<_>>(),
