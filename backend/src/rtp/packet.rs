@@ -39,6 +39,7 @@ const RTP_EXT_ID_TCC_SEQNUM: u8 = 1; // Really u4
 const RTP_EXT_ID_VIDEO_ORIENTATION: u8 = 4; // Really u4
 const RTP_EXT_ID_AUDIO_LEVEL: u8 = 5; // Really u4
 const RTP_EXT_ID_DEPENDENCY_DESCRIPTOR: u8 = 6;
+const RTP_DEPENDENCY_DESCRIPTOR_MIN_LEN: usize = 3;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum HeaderExtensionsProfile {
@@ -92,7 +93,8 @@ pub struct Header {
     // The payload end isn't technically part of the "Header",
     // but it's convenient to parse at the same time.
     pub payload_range: Range<usize>,
-    dependency_descriptor: Option<DependencyDescriptor>,
+    // We store the range as well in order to replace the frame number easily.
+    dependency_descriptor: Option<(DependencyDescriptor, Range<usize>)>,
 }
 
 impl Header {
@@ -192,13 +194,24 @@ impl Header {
                             Some(120u8.saturating_sub(negative_audio_level_with_voice_activity & 0b0111_1111));
                     }
                     (RTP_EXT_ID_DEPENDENCY_DESCRIPTOR, val) => {
+                        if val.len() < RTP_DEPENDENCY_DESCRIPTOR_MIN_LEN {
+                            event!("calling.rtp.invalid.dependency_descriptor_too_short");
+                            debug!(
+                                "Invalid RTP: dependency descriptor value only {} bytes long",
+                                val.len()
+                            );
+                            return None;
+                        }
+
                         dependency_descriptor = DependencyDescriptorReader::new(val)
                             .read()
                             .ok()
                             .or(Some(DependencyDescriptor {
                                 is_key_frame: false,
                                 resolution: None,
-                            }));
+                                truncated_frame_number: None,
+                            }))
+                            .map(|descriptor| (descriptor, extension_val_range));
                     }
                     _ => {}
                 }
@@ -252,6 +265,7 @@ impl Header {
 pub struct DependencyDescriptor {
     pub is_key_frame: bool,
     pub resolution: Option<PixelSize>,
+    pub truncated_frame_number: Option<u16>,
 }
 
 /// Parser for DependencyDescriptor
@@ -279,15 +293,17 @@ impl<'a> DependencyDescriptorReader<'a> {
     /// The meaning of each parsed field is here:
     /// https://aomediacodec.github.io/av1-rtp-spec/#a83-semantics
     pub fn read(mut self) -> Result<DependencyDescriptor> {
-        if self.bytes.len() <= 3 {
+        // Ignore start_of_frame, end_of_frame, and frame_dependency_template_id.
+        self.byte_index = 1;
+
+        let truncated_frame_number = self.read_u16().ok();
+        if self.bytes.len() == 3 {
             return Ok(DependencyDescriptor {
                 is_key_frame: false,
                 resolution: None,
+                truncated_frame_number,
             });
         }
-
-        // Ignore start_of_frame, end_of_frame, frame_dependency_template_id, and frame_number.
-        self.byte_index = 3;
 
         let template_dependency_structure_present_flag = self.read_u8(1)? == 1;
         let _active_decode_targets_present_flag = self.read_u8(1)?;
@@ -299,6 +315,7 @@ impl<'a> DependencyDescriptorReader<'a> {
             return Ok(DependencyDescriptor {
                 is_key_frame: false,
                 resolution: None,
+                truncated_frame_number,
             });
         }
 
@@ -339,6 +356,7 @@ impl<'a> DependencyDescriptorReader<'a> {
         Ok(DependencyDescriptor {
             is_key_frame: true,
             resolution,
+            truncated_frame_number,
         })
     }
 
@@ -447,7 +465,8 @@ pub struct Packet<T> {
     pub timestamp: TruncatedTimestamp,
     pub video_rotation: Option<VideoRotation>,
     pub audio_level: Option<audio::Level>,
-    pub dependency_descriptor: Option<DependencyDescriptor>,
+    // The range is relative to self.serialized.
+    pub dependency_descriptor: Option<(DependencyDescriptor, Range<usize>)>,
     pub(super) tcc_seqnum: Option<tcc::FullSequenceNumber>,
 
     // These are relative to self.serialized.
@@ -493,7 +512,7 @@ impl<T> Packet<T> {
             timestamp: header.timestamp,
             video_rotation: header.video_rotation,
             audio_level: header.audio_level,
-            dependency_descriptor: header.dependency_descriptor,
+            dependency_descriptor: header.dependency_descriptor.clone(),
             tcc_seqnum,
             tcc_seqnum_range: header.tcc_seqnum_range.clone(),
             payload_range_in_header: header.payload_range.clone(),
@@ -596,7 +615,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             timestamp: self.timestamp,
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
-            dependency_descriptor: self.dependency_descriptor,
+            dependency_descriptor: self.dependency_descriptor.clone(),
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
@@ -619,7 +638,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             timestamp: self.timestamp,
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
-            dependency_descriptor: self.dependency_descriptor,
+            dependency_descriptor: self.dependency_descriptor.clone(),
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
@@ -768,6 +787,20 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
         }
     }
 
+    pub fn set_frame_number_in_header(&mut self, frame_number: FullFrameNumber) {
+        let Some((_, range)) = &self.dependency_descriptor else {
+            return;
+        };
+
+        // Refer to https://aomediacodec.github.io/av1-rtp-spec/#a82-syntax for dependency
+        // descriptor format.
+        let frame_number_start = range.start + 1;
+        self.write_in_header(
+            frame_number_start..(frame_number_start + std::mem::size_of::<TruncatedFrameNumber>()),
+            &(frame_number as TruncatedFrameNumber).to_be_bytes(),
+        );
+    }
+
     pub(super) fn set_seqnum_in_payload(&mut self, seqnum: FullSequenceNumber) {
         // Clearing the seqnum in the payload makes us be non-RTX temporarily
         // which is a quick and dirty way to write to the non-RTX payload.
@@ -795,7 +828,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
             timestamp: self.timestamp,
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
-            dependency_descriptor: self.dependency_descriptor,
+            dependency_descriptor: self.dependency_descriptor.clone(),
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
@@ -951,6 +984,7 @@ impl Packet<Vec<u8>> {
                 ssrc_in_header: to_rtx_ssrc(self.ssrc_in_header),
                 seqnum_in_header: rtx_seqnum,
                 seqnum_in_payload: Some(self.seqnum_in_header),
+                dependency_descriptor: self.dependency_descriptor.clone(),
                 tcc_seqnum_range: self.tcc_seqnum_range.clone(),
                 payload_range_in_header: self.payload_range_in_header.start
                     ..(self.payload_range_in_header.end + 2),
@@ -1558,10 +1592,14 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: None,
-                dependency_descriptor: Some(DependencyDescriptor {
-                    is_key_frame: false,
-                    resolution: None,
-                }),
+                dependency_descriptor: Some((
+                    DependencyDescriptor {
+                        is_key_frame: false,
+                        resolution: None,
+                        truncated_frame_number: Some(357),
+                    },
+                    17..20
+                )),
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,
@@ -1631,13 +1669,17 @@ mod test {
                 ssrc: 4,
                 video_rotation: Some(VideoRotation::Clockwise270),
                 audio_level: None,
-                dependency_descriptor: Some(DependencyDescriptor {
-                    is_key_frame: true,
-                    resolution: Some(PixelSize {
-                        width: 640,
-                        height: 480,
-                    }),
-                }),
+                dependency_descriptor: Some((
+                    DependencyDescriptor {
+                        is_key_frame: true,
+                        resolution: Some(PixelSize {
+                            width: 640,
+                            height: 480,
+                        }),
+                        truncated_frame_number: Some(2135),
+                    },
+                    21..44
+                )),
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,

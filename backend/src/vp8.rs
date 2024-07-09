@@ -8,8 +8,6 @@ use byteorder::{ReadBytesExt, BE, LE};
 use calling_common::{expand_truncated_counter, Bits, PixelSize, ReadSliceExt};
 use thiserror::Error;
 
-use crate::rtp;
-
 pub type TruncatedPictureId = u16;
 pub type FullPictureId = u64;
 pub type TruncatedTl0PicIdx = u8;
@@ -56,8 +54,6 @@ pub struct ParsedHeader {
     /// Subsequent frames must have the same resolution.
     /// Really u14s.
     pub resolution: Option<PixelSize>,
-
-    pub from_dependency_descriptor: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -124,18 +120,6 @@ impl PayloadHeader {
 pub enum Vp8Error {
     #[error("Got a 7-bit VP8 picture ID. Expecting only 15-bit picture IDs.")]
     SevenBitPictureId,
-}
-
-impl From<rtp::DependencyDescriptor> for ParsedHeader {
-    fn from(value: rtp::DependencyDescriptor) -> Self {
-        Self {
-            picture_id: None,
-            tl0_pic_idx: None,
-            is_key_frame: value.is_key_frame,
-            resolution: value.resolution,
-            from_dependency_descriptor: true,
-        }
-    }
 }
 
 impl ParsedHeader {
@@ -468,7 +452,6 @@ mod parsed_header_tests {
                     width: 640,
                     height: 360
                 }),
-                from_dependency_descriptor: false,
             }
         );
     }
@@ -495,7 +478,6 @@ mod parsed_header_tests {
                     width: 1920,
                     height: 1080
                 }),
-                from_dependency_descriptor: false,
             }
         );
     }
@@ -519,7 +501,6 @@ mod parsed_header_tests {
                     width: 640,
                     height: 360
                 }),
-                from_dependency_descriptor: false,
             }
         );
     }
@@ -542,29 +523,6 @@ mod parsed_header_tests {
                 .downcast::<Vp8Error>()
                 .unwrap(),
             Vp8Error::SevenBitPictureId
-        );
-    }
-
-    #[test]
-    fn from_dependency_descriptor() {
-        assert_eq!(
-            ParsedHeader::from(rtp::DependencyDescriptor {
-                is_key_frame: true,
-                resolution: Some(PixelSize {
-                    width: 640,
-                    height: 360
-                })
-            }),
-            ParsedHeader {
-                picture_id: None,
-                tl0_pic_idx: None,
-                is_key_frame: true,
-                resolution: Some(PixelSize {
-                    width: 640,
-                    height: 360
-                }),
-                from_dependency_descriptor: true,
-            }
         );
     }
 }

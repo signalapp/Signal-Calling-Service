@@ -100,6 +100,13 @@ pub fn expand_timestamp(
     expand_truncated_counter(timestamp, max_timestamp, 32)
 }
 
+pub fn expand_frame_number(
+    frame_number: TruncatedFrameNumber,
+    max_frame_number: &mut FullFrameNumber,
+) -> FullFrameNumber {
+    expand_truncated_counter(frame_number, max_frame_number, 16)
+}
+
 fn is_media_payload_type(pt: PayloadType) -> bool {
     pt == OPUS_PAYLOAD_TYPE || pt == VP8_PAYLOAD_TYPE
 }
