@@ -14,7 +14,7 @@ use pin_project::pin_project;
 /// The type of [`StreamExt::last`].
 ///
 /// Manually expanded once so you never have to type it again.
-#[allow(dead_code)] // Silence the warning about 'pub'; it affects the docs for StreamExt.
+#[cfg(test)]
 pub type Last<S> = futures::stream::Fold<
     S,
     futures::future::Ready<Option<<S as Stream>::Item>>,
@@ -27,6 +27,7 @@ pub type Last<S> = futures::stream::Fold<
 
 /// Additional adapters for [`Stream`] in the style of [`futures::StreamExt`].
 pub trait StreamExt: futures::StreamExt {
+    #[cfg(test)]
     fn last(self) -> Last<Self>
     where
         Self: Sized,

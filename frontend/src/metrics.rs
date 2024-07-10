@@ -132,10 +132,10 @@ impl Datadog {
 
         let sink = UdpEventSink::new(host).unwrap();
 
-        let point_tags = vec![
-            ("region", config.region.to_string()),
-            ("version", config.version.to_string()),
-            ("source", config.server_ip.to_string()),
+        let point_tags = [
+            ("region", &config.region),
+            ("version", &config.version),
+            ("source", &config.server_ip.to_string()),
         ];
 
         let constant_tags: Vec<_> = point_tags
