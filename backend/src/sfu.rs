@@ -449,7 +449,7 @@ impl Sfu {
         // video base layer, so use that.
         let ack_ssrc = call::LayerId::Video0.to_ssrc(demux_id);
 
-        let server_secret = EphemeralSecret::new(OsRngCompatibleWithDalek);
+        let server_secret = EphemeralSecret::random_from_rng(OsRng);
         let server_dhe_public_key = PublicKey::from(&server_secret).to_bytes();
         let shared_secret = server_secret.diffie_hellman(&PublicKey::from(client_dhe_public_key));
         let mut srtp_master_key_material = new_master_key_material();
@@ -1130,28 +1130,6 @@ pub struct CallSignalingInfo {
     pub client_ids: Vec<(DemuxId, UserId)>,
     pub pending_client_ids: Vec<(DemuxId, Option<UserId>)>,
 }
-
-struct OsRngCompatibleWithDalek;
-
-impl rand_core5::RngCore for OsRngCompatibleWithDalek {
-    fn next_u32(&mut self) -> u32 {
-        rand_core::RngCore::next_u32(&mut OsRng)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        rand_core::RngCore::next_u64(&mut OsRng)
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        rand_core::RngCore::fill_bytes(&mut OsRng, dest)
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core5::Error> {
-        rand_core::RngCore::try_fill_bytes(&mut OsRng, dest).map_err(rand_core5::Error::new)
-    }
-}
-
-impl rand_core5::CryptoRng for OsRngCompatibleWithDalek {}
 
 #[cfg(test)]
 mod sfu_tests {

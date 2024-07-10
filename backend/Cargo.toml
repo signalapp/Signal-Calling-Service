@@ -62,16 +62,13 @@ rand = "0.8.5"
 
 # For SRTP key derivation using DHE
 hkdf = "0.12.4"
-# x25519-dalek is only compatible with rand/rand_core 0.5, so we need to pull these
-# in to make a source of OsRng that's compatible with both x25519-dalek and ecdsa.
 rand_core = { version = "0.6.4", features = [] }
-rand_core5 = { package = "rand_core", version = "0.5.1", features = [] }
-x25519-dalek = { version = "1.2.0" }
+x25519-dalek = { version = "2.0.1" }
 
 # For (S)RTP
 aes = "0.8.4"
 aes-gcm = "0.10.3"
-zeroize = "1.3.0"
+zeroize = "1.8.1"
 
 # For congestion control
 async-stream = "0.3.5"

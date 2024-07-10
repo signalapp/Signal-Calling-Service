@@ -143,11 +143,13 @@ impl From<CallLinkUpdate> for storage::CallLinkUpdate {
     }
 }
 
-fn current_time_in_seconds_since_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("server clock is correct")
-        .as_secs()
+fn current_time() -> zkgroup::Timestamp {
+    zkgroup::Timestamp::from_epoch_seconds(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("server clock is correct")
+            .as_secs(),
+    )
 }
 
 pub fn verify_auth_credential_against_zkparams(
@@ -161,11 +163,7 @@ pub fn verify_auth_credential_against_zkparams(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     auth_credential
-        .verify(
-            current_time_in_seconds_since_epoch(),
-            &frontend.zkparams,
-            &call_link_params,
-        )
+        .verify(current_time(), &frontend.zkparams, &call_link_params)
         .map_err(|_| {
             event!("calling.frontend.api.call_links.bad_credential");
             StatusCode::FORBIDDEN
@@ -255,7 +253,7 @@ pub async fn update_call_link(
         create_credential
             .verify(
                 &room_id_bytes,
-                current_time_in_seconds_since_epoch(),
+                current_time(),
                 &frontend.zkparams,
                 &call_link_params,
             )
@@ -570,18 +568,24 @@ pub mod tests {
         })
     }
 
-    fn start_of_today() -> Duration {
+    fn start_of_today() -> zkgroup::Timestamp {
         let now: Duration = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("time moves forwards")
             .into();
-        now.truncated_to(Duration::from_secs(24 * 60 * 60))
+
+        zkgroup::Timestamp::from_epoch_seconds(
+            now.truncated_to(Duration::from_secs(24 * 60 * 60))
+                .as_secs(),
+        )
     }
 
     pub fn create_authorization_header_for_user(frontend: &Frontend, user_id: &str) -> String {
         let public_server_params = frontend.zkparams.get_public_params();
-        let user_id = FromHex::from_hex(user_id).expect("valid user ID");
-        let redemption_time = start_of_today().as_secs();
+        let user_id = libsignal_core::Aci::from_uuid_bytes(
+            FromHex::from_hex(user_id).expect("valid user ID"),
+        );
+        let redemption_time = start_of_today();
         let credential = CallLinkAuthCredentialResponse::issue_credential(
             user_id,
             redemption_time,
@@ -605,13 +609,15 @@ pub mod tests {
 
     pub fn create_authorization_header_for_creator(frontend: &Frontend, user_id: &str) -> String {
         let public_server_params = frontend.zkparams.get_public_params();
-        let user_id = FromHex::from_hex(user_id).expect("valid user ID");
+        let user_id = libsignal_core::Aci::from_uuid_bytes(
+            FromHex::from_hex(user_id).expect("valid user ID"),
+        );
         let room_id = Vec::from_hex(ROOM_ID).expect("valid room ID");
 
         let request_context = CreateCallLinkCredentialRequestContext::new(&room_id, rand::random());
         let response = request_context.get_request().issue(
             user_id,
-            start_of_today().as_secs(),
+            start_of_today(),
             &frontend.zkparams,
             rand::random(),
         );
