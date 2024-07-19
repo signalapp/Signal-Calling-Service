@@ -9,6 +9,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aws-config = "1.1.8"
-aws-sdk-dynamodb = "1.19.0"
-tokio = { version = "1.36.0", features = ["full"] }
+aws-config = "1.5.4"
+aws-sdk-dynamodb = "1.38.0"
+tokio = { version = "1.38.0", features = ["full"] }
