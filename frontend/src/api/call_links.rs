@@ -261,6 +261,11 @@ pub async fn update_call_link(
                 event!("calling.frontend.api.update_call_link.bad_credential");
                 StatusCode::UNAUTHORIZED
             })?;
+
+        // default to AdminApproval when no restrictions are specfied during creation
+        let _ = update
+            .restrictions
+            .get_or_insert(storage::CallLinkRestrictions::AdminApproval);
     } else if let Some(Extension(auth_credential)) = auth_credential {
         has_create_credential = false;
         zkparams_for_create = None;
@@ -993,7 +998,7 @@ pub mod tests {
                     new_attributes,
                     storage::CallLinkUpdate {
                         admin_passkey: ADMIN_PASSKEY.into(),
-                        restrictions: None,
+                        restrictions: Some(CallLinkRestrictions::AdminApproval),
                         encrypted_name: None,
                         revoked: None,
                     }
@@ -1132,7 +1137,7 @@ pub mod tests {
                     new_attributes,
                     storage::CallLinkUpdate {
                         admin_passkey: ADMIN_PASSKEY.into(),
-                        restrictions: None,
+                        restrictions: Some(CallLinkRestrictions::AdminApproval),
                         encrypted_name: None,
                         revoked: None,
                     }
