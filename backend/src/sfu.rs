@@ -285,10 +285,14 @@ impl Sfu {
         let mut remembered_packet_count = Histogram::default();
         let mut remembered_packet_bytes = Histogram::default();
         let mut outgoing_queue_size = Histogram::default();
+        let mut outgoing_queue_delay_ms = Histogram::default();
         let mut udp_v4_connections = 0;
         let mut udp_v6_connections = 0;
         let mut tcp_v4_connections = 0;
         let mut tcp_v6_connections = 0;
+        let mut connections_with_video_available = 0;
+
+        let now = Instant::now();
 
         for connection in self.connection_by_id.values() {
             let connection = connection.lock();
@@ -304,6 +308,10 @@ impl Sfu {
                     AddressType::TcpV6 => tcp_v6_connections += 1,
                 }
             }
+            if let Some(delay) = connection.outgoing_queue_delay(now) {
+                outgoing_queue_delay_ms.push(delay.as_millis() as usize);
+                connections_with_video_available += 1;
+            }
         }
         histograms.insert(
             "calling.sfu.connections.remembered_packets.count",
@@ -316,6 +324,10 @@ impl Sfu {
         histograms.insert(
             "calling.sfu.connections.outgoing_queue_size_bytes",
             outgoing_queue_size,
+        );
+        histograms.insert(
+            "calling.sfu.connections.outgoing_queue_delay_ms",
+            outgoing_queue_delay_ms,
         );
         values.insert(
             "calling.sfu.connections.udp_v4_count",
@@ -332,6 +344,10 @@ impl Sfu {
         values.insert(
             "calling.sfu.connections.tcp_v6_count",
             tcp_v6_connections as f32,
+        );
+        values.insert(
+            "calling.sfu.connections.video_available",
+            connections_with_video_available as f32,
         );
 
         SfuStats { histograms, values }

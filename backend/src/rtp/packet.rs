@@ -585,6 +585,10 @@ impl<T> Packet<T> {
             Some(deadline) => now > deadline,
         }
     }
+
+    pub fn entry_time(&self) -> Option<Instant> {
+        self.deadline.map(|deadline| deadline - PACKET_LIFETIME)
+    }
 }
 
 impl<T: Borrow<[u8]>> Packet<T> {

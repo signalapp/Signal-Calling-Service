@@ -608,6 +608,10 @@ impl Connection {
         self.congestion_control.pacer.queued_size()
     }
 
+    pub fn outgoing_queue_delay(&self, now: Instant) -> Option<Duration> {
+        self.congestion_control.pacer.queue_delay(now)
+    }
+
     pub fn rtp_endpoint_stats(&self) -> rtp::EndpointStats {
         self.rtp.endpoint.stats()
     }
