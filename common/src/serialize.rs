@@ -129,6 +129,15 @@ impl Writer for U48 {
     }
 }
 
+impl Writer for u64 {
+    fn written_len(&self) -> usize {
+        8
+    }
+    fn write(&self, out: &mut dyn Writable) {
+        self.to_be_bytes().write(out)
+    }
+}
+
 impl Writer for Box<dyn Writer> {
     fn written_len(&self) -> usize {
         (**self).written_len()

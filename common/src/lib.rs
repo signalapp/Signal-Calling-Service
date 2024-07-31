@@ -74,6 +74,10 @@ pub fn parse_u48(bytes: &[u8]) -> U48 {
     U48::from_be_bytes(bytes[0..U48::SIZE].try_into().unwrap())
 }
 
+pub fn parse_u64(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes(bytes[0..8].try_into().unwrap())
+}
+
 #[cfg(test)]
 mod parse_tests {
     use std::convert::TryFrom;

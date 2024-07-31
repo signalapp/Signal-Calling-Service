@@ -13,7 +13,8 @@ use std::{
 use aes::cipher::{generic_array::GenericArray, KeyInit};
 use aes_gcm::{AeadInPlace, Aes128Gcm};
 use calling_common::{
-    parse_u16, parse_u32, round_up_to_multiple_of, CheckedSplitAt, Instant, Writer, U24,
+    parse_u16, parse_u24, parse_u32, parse_u64, round_up_to_multiple_of, CheckedSplitAt, Instant,
+    Writer, U24,
 };
 use log::*;
 
@@ -52,6 +53,7 @@ pub struct ControlPacket<'packet> {
     // pub for tests
     pub tcc_feedbacks: Vec<&'packet [u8]>,
     pub nacks: Vec<Nack>,
+    pub sender_reports: Vec<SenderReport>,
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -98,50 +100,58 @@ impl<'packet> ControlPacket<'packet> {
 
         let len_without_tag_and_footer = serialized.len() - SRTP_AUTH_TAG_LEN - SRTCP_FOOTER_LEN;
         let mut compound_packets = &serialized[..len_without_tag_and_footer];
-        while compound_packets.len() >= RTCP_HEADER_LEN {
-            let (header, after_header) = compound_packets.checked_split_at(RTCP_HEADER_LEN)?;
-            let count_or_format = header[0] & 0b11111;
-            let pt = header[1];
-            // Spec says "minus 1" including 2-word header, which is really "plus 1" excluding the header.
-            let payload_len_in_words_plus_1 = parse_u16(&header[RTCP_PAYLOAD_LEN_RANGE.clone()]);
-            let _sender_ssrc = parse_u32(&header[RTCP_SENDER_SSRC_RANGE.clone()]);
-
-            if payload_len_in_words_plus_1 == 0 {
+        while compound_packets.len() >= RtcpHeader::LENGTH {
+            let header = RtcpHeader::from_bytes(compound_packets);
+            if header.length_in_words == 0 {
                 // This could only happen if we received an RTCP packet without a sender_ssrc, which should never happen.
                 warn!("Ignoring RTCP packet with expressed len of 0");
                 return None;
             }
-            let payload_len = (payload_len_in_words_plus_1 as usize - 1) * 4;
 
-            let (payload, after_payload) = after_header.checked_split_at(payload_len)?;
-            compound_packets = after_payload;
-            match (pt, count_or_format) {
-                (RTCP_TYPE_SENDER_REPORT, _) => {}
+            let (packet, after_packet) =
+                compound_packets.checked_split_at(header.packet_length_in_bytes())?;
+            // used by SR, RR, and SDES
+            let payload = &packet[RtcpHeader::LENGTH..];
+            // used by feedback packets
+            let ignore_sender_ssrc_payload = &payload[4..];
+            compound_packets = after_packet;
+            match (header.payload_type, header.count_or_format) {
+                (RTCP_TYPE_SENDER_REPORT, _) => {
+                    match SenderReport::from_bytes_after_header(payload, header) {
+                        Ok(sr) => incoming.sender_reports.push(sr),
+                        Err(err) => warn!("Failed to parse RTCP sender report: {}", err),
+                    }
+                }
                 (RTCP_TYPE_RECEIVER_REPORT, _) => {}
                 (RTCP_TYPE_EXTENDED_REPORT, _) => {}
                 (RTCP_TYPE_SDES, _) => {}
                 (RTCP_TYPE_BYE, _) => {}
                 (RTCP_TYPE_SPECIFIC_FEEDBACK, RTCP_FORMAT_LOSS_NOTIFICATION) => {}
-                (RTCP_TYPE_GENERIC_FEEDBACK, RTCP_FORMAT_NACK) => match parse_nack(payload) {
-                    Ok(nack) => incoming.nacks.push(nack),
-                    Err(err) => warn!("Failed to parse RTCP nack: {}", err),
-                },
+                (RTCP_TYPE_GENERIC_FEEDBACK, RTCP_FORMAT_NACK) => {
+                    match parse_nack(ignore_sender_ssrc_payload) {
+                        Ok(nack) => incoming.nacks.push(nack),
+                        Err(err) => warn!("Failed to parse RTCP nack: {}", err),
+                    }
+                }
                 (RTCP_TYPE_GENERIC_FEEDBACK, RTCP_FORMAT_TRANSPORT_CC) => {
                     // We use the unparsed payload here because parsing of the feedback is stateful
                     // (it requires expanding the seqnums), so we pass it into the tcc::Sender instead.
-                    incoming.tcc_feedbacks.push(payload);
+                    incoming.tcc_feedbacks.push(ignore_sender_ssrc_payload);
                 }
                 (RTCP_TYPE_SPECIFIC_FEEDBACK, RTCP_FORMAT_PLI) => {
                     // PLI See https://tools.ietf.org/html/rfc4585
-                    if payload.len() < 4 {
+                    if ignore_sender_ssrc_payload.len() < 4 {
                         warn!("RTCP PLI is too small.");
                         return None;
                     }
-                    let ssrc = parse_u32(&payload[0..4]);
+                    let ssrc = parse_u32(&ignore_sender_ssrc_payload[0..4]);
                     incoming.key_frame_requests.push(KeyFrameRequest { ssrc });
                 }
                 _ => {
-                    warn!("Got weird unexpected RTCP: ({}, {})", pt, count_or_format);
+                    warn!(
+                        "Got unexpected RTCP: ({}, {})",
+                        header.payload_type, header.count_or_format
+                    );
                 }
             }
         }
@@ -303,7 +313,8 @@ pub struct ProcessedControlPacket {
     pub nacks: Vec<Nack>,
 }
 
-pub(super) struct ReceiverReportSender {
+pub(super) struct RtcpReportSender {
+    // receiver report stats
     max_seqnum: Option<u32>,
     max_seqnum_in_last: Option<u32>,
     cumulative_loss: u32,
@@ -311,9 +322,11 @@ pub(super) struct ReceiverReportSender {
     last_receive_time: Instant,
     last_rtp_timestamp: u32,
     jitter_q4: u32,
+    last_sender_report_received_ntp_timestamp: u64,
+    last_sender_report_received_time: Instant,
 }
 
-impl ReceiverReportSender {
+impl RtcpReportSender {
     pub(super) fn new() -> Self {
         Self {
             max_seqnum: None,
@@ -323,7 +336,23 @@ impl ReceiverReportSender {
             last_receive_time: Instant::now(),
             last_rtp_timestamp: 0,
             jitter_q4: 0,
+            last_sender_report_received_ntp_timestamp: 0,
+            last_sender_report_received_time: Instant::now(),
         }
+    }
+
+    pub(super) fn remember_received_sender_report(
+        &mut self,
+        sender_report: SenderReport,
+        receive_time: Instant,
+    ) {
+        // ignore older sender reports
+        if sender_report.sender_info.ntp_ts <= self.last_sender_report_received_ntp_timestamp {
+            return;
+        }
+
+        self.last_sender_report_received_time = receive_time;
+        self.last_sender_report_received_ntp_timestamp = sender_report.sender_info.ntp_ts;
     }
 
     pub(super) fn remember_received(
@@ -411,7 +440,11 @@ impl ReceiverReportSender {
         }
     }
 
-    pub(super) fn write_receiver_report_block(&mut self, ssrc: Ssrc) -> Option<Vec<u8>> {
+    pub(super) fn write_receiver_report_block(
+        &mut self,
+        ssrc: Ssrc,
+        now: Instant,
+    ) -> Option<Vec<u8>> {
         if let (Some(max_seqnum), Some(max_seqnum_in_last)) =
             (self.max_seqnum, self.max_seqnum_in_last)
         {
@@ -440,9 +473,15 @@ impl ReceiverReportSender {
 
             let interarrival_jitter: u32 = self.jitter_q4 >> 4;
 
-            // Not used yet.
-            let last_sender_report_timestamp: u32 = 0;
-            let delay_since_last_sender_report: u32 = 0;
+            let (last_sender_report_timestamp, delay_since_last_sender_report) =
+                if self.last_sender_report_received_ntp_timestamp != 0 {
+                    (
+                        get_lsr(self.last_sender_report_received_ntp_timestamp),
+                        calculate_delay_since_sr(self.last_sender_report_received_time, now),
+                    )
+                } else {
+                    (0, 0)
+                };
 
             Some(
                 (
@@ -463,6 +502,229 @@ impl ReceiverReportSender {
     }
 }
 
+// The middle 32 bits in the NTP timestamp from the most recent RTCP sender report (SR) packet
+// from source SSRC_n. If no SR has been received yet, the field is set to zero.
+fn get_lsr(last_ntp_timestamp: u64) -> u32 {
+    const LSR_MASK: u64 = 0x0000_FFFF_FFFF_0000;
+    ((last_ntp_timestamp & LSR_MASK) >> 16) as u32
+}
+
+// The delay, expressed in units of 1/2^16 seconds, between receiving the last SR packet from
+// source SSRC_n and sending this reception report block.
+// If no SR packet has been received yet from SSRC_n, the DLSR field is set to zero.
+fn calculate_delay_since_sr(sr_last_received_time: Instant, now: Instant) -> u32 {
+    // Max delay representable is 2^16 seconds (a bit over 18 hours). After that, we start
+    // to return 0's. 1/2^16 is roughly 0.000015259, which requires nanosecond precision
+    // To avoid underflow calculate from duration.as_nanos()/15259
+    const NANOS_TO_DELAY_UNIT: u128 = 15259;
+    (now.saturating_duration_since(sr_last_received_time)
+        .as_nanos()
+        / NANOS_TO_DELAY_UNIT)
+        .try_into()
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RtcpHeader {
+    has_padding: bool,
+    count_or_format: u8,
+    payload_type: u8,
+    /// length of the RTCP packet in words, minus the 1-word header
+    length_in_words: u16,
+}
+
+impl RtcpHeader {
+    pub const LENGTH: usize = 4;
+    const PADDING_MASK: u8 = 0b00100000;
+    const RC_MASK: u8 = 0b00011111;
+    const PACKET_LENGTH_RANGE: Range<usize> = 2..4;
+
+    // Parses the following binary format into a RtcpHeader. Note that this is
+    // is the common header - the one used by SR, RR, and SDES. SSRCs will be contained
+    // in the payload type.
+    // See https://datatracker.ietf.org/doc/html/rfc1889#section-6.3.1
+    //
+    //     0                   1                   2                   3
+    //     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |V=2|P|    RC   |   PT=SR=200   |             length            | header
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    fn from_bytes(value: &[u8]) -> Self {
+        let has_padding = value[0] & Self::PADDING_MASK > 0;
+        let count_or_format = value[0] & Self::RC_MASK;
+        let payload_type = value[1];
+        let length_in_words = parse_u16(&value[Self::PACKET_LENGTH_RANGE]);
+
+        Self {
+            has_padding,
+            count_or_format,
+            payload_type,
+            length_in_words,
+        }
+    }
+
+    /// Number of bytes in the packet, header & padding included
+    pub fn packet_length_in_bytes(&self) -> usize {
+        (self.length_in_words as usize + 1) * 4
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ReportBlock {
+    ssrc: Ssrc,
+    fraction_loss: u8,
+    cumulative_loss_count: U24,
+    highest_sequence_num: u32,
+    jitter: u32,
+    last_sender_report: u32,
+    delay_last_sender_report: u32,
+}
+
+impl ReportBlock {
+    const BLOCK_LENGTH: usize = 24;
+    const SSRC_RANGE: Range<usize> = 0..4;
+    const FRACTION_LOSS_RANGE: usize = 4;
+    const CUMULATIVE_LOSS_RANGE: Range<usize> = 5..8;
+    const HIGHEST_SEQUENCE_NUMBER_RANGE: Range<usize> = 8..12;
+    const INTERARRIVAL_JITTER_RANGE: Range<usize> = 12..16;
+    const LAST_SENDER_REPORT_RANGE: Range<usize> = 16..20;
+    const DELAY_LAST_SENDER_REPORT_RANGE: Range<usize> = 20..24;
+
+    fn from_bytes(value: &[u8]) -> Result<Self, String> {
+        if value.len() < Self::BLOCK_LENGTH {
+            return Err("Malformed Report Block: too few bytes".to_owned());
+        }
+
+        Ok(Self {
+            ssrc: parse_u32(&value[Self::SSRC_RANGE]),
+            fraction_loss: value[ReportBlock::FRACTION_LOSS_RANGE],
+            cumulative_loss_count: parse_u24(&value[Self::CUMULATIVE_LOSS_RANGE]),
+            highest_sequence_num: parse_u32(&value[Self::HIGHEST_SEQUENCE_NUMBER_RANGE]),
+            jitter: parse_u32(&value[Self::INTERARRIVAL_JITTER_RANGE]),
+            last_sender_report: parse_u32(&value[Self::LAST_SENDER_REPORT_RANGE]),
+            delay_last_sender_report: parse_u32(&value[Self::DELAY_LAST_SENDER_REPORT_RANGE]),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SenderInfo {
+    ssrc: Ssrc,
+    ntp_ts: u64,
+    rtp_ts: TruncatedTimestamp,
+    packet_count: u32,
+    octet_count: u32,
+}
+
+impl SenderInfo {
+    const SENDER_INFO_LENGTH: usize = 24;
+    const SSRC_RANGE: Range<usize> = 0..4;
+    const NTS_RANGE: Range<usize> = 4..12;
+    const RTS_RANGE: Range<usize> = 12..16;
+    const SPC_RANGE: Range<usize> = 16..20;
+    const SOC_RANGE: Range<usize> = 20..24;
+
+    fn from_bytes(b: &[u8]) -> Self {
+        Self {
+            ssrc: parse_u32(&b[Self::SSRC_RANGE]),
+            ntp_ts: parse_u64(&b[Self::NTS_RANGE]),
+            rtp_ts: parse_u32(&b[Self::RTS_RANGE]),
+            packet_count: parse_u32(&b[Self::SPC_RANGE]),
+            octet_count: parse_u32(&b[Self::SOC_RANGE]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SenderReport {
+    header: RtcpHeader,
+    sender_info: SenderInfo,
+    report_blocks: Vec<ReportBlock>,
+}
+
+impl SenderReport {
+    // Parses the following binary format into a sender report.
+    // See https://datatracker.ietf.org/doc/html/rfc1889#section-6.3.1
+    //
+    //     0                   1                   2                   3
+    //     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |V=2|P|    RC   |   PT=SR=200   |             length            | header
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |                         SSRC of sender                        | sender info
+    //    +=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
+    //    |              NTP timestamp, most significant word             |
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |             NTP timestamp, least significant word             |
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |                         RTP timestamp                         |
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |                     sender's packet count                     |
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |                      sender's octet count                     |
+    //    +=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
+    //    |                 SSRC_1 (SSRC of first source)                 | report
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+ block
+    //    | fraction lost |       cumulative number of packets lost       |   1
+    //    -+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |           extended highest sequence number received           |
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |                      interarrival jitter                      |
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |                         last SR (LSR)                         |
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //    |                   delay since last SR (DLSR)                  |
+    //    +=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
+    //    |                 SSRC_2 (SSRC of second source)                | report
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+ block
+    //    :                               ...                             :   2
+    //    +=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
+    //    |                  profile-specific extensions                  |
+    //    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    #[cfg(test)]
+    pub fn from_bytes(value: &[u8]) -> Result<Self, String> {
+        if value.len() < RtcpHeader::LENGTH + SenderInfo::SENDER_INFO_LENGTH {
+            return Err("Malformed Sender Report: too few bytes".to_owned());
+        }
+        let header = RtcpHeader::from_bytes(value);
+        Self::from_bytes_after_header(&value[RtcpHeader::LENGTH..], header)
+    }
+
+    fn from_bytes_after_header(value: &[u8], header: RtcpHeader) -> Result<Self, String> {
+        let header_length = header.length_in_words as usize * 4;
+        let minimum_expected_length = SenderInfo::SENDER_INFO_LENGTH
+            + header.count_or_format as usize * ReportBlock::BLOCK_LENGTH;
+        if header_length < minimum_expected_length || value.len() < header_length {
+            return Err(format!(
+                "Malformed Sender Report: header_size={}, report_count={}, actual_size={}",
+                header_length,
+                header.count_or_format,
+                value.len()
+            ));
+        }
+
+        let sender_info = SenderInfo::from_bytes(value);
+        let report_count = header.count_or_format.into();
+        let mut report_blocks = Vec::with_capacity(report_count);
+        let mut bytes_left = &value[SenderInfo::SENDER_INFO_LENGTH..];
+
+        while report_blocks.len() < report_count {
+            report_blocks.push(ReportBlock::from_bytes(bytes_left)?);
+            bytes_left = &bytes_left[ReportBlock::BLOCK_LENGTH..];
+        }
+
+        Ok(Self {
+            header,
+            sender_info,
+            report_blocks,
+        })
+    }
+
+    pub fn ssrc(&self) -> Ssrc {
+        self.sender_info.ssrc
+    }
+}
+
 #[cfg(test)]
 mod test {
     use calling_common::{Duration, Writer};
@@ -470,8 +732,72 @@ mod test {
     use super::*;
 
     #[test]
+    fn test_parse_sender_report() {
+        let report_count: u8 = 2;
+        let pt = RTCP_TYPE_SENDER_REPORT;
+        let length: u16 = (SenderInfo::SENDER_INFO_LENGTH
+            + report_count as usize * ReportBlock::BLOCK_LENGTH)
+            .try_into()
+            .unwrap();
+        let length_in_words = length / 4;
+        let raw_header: Vec<u8> = ([0b1000_0000 | report_count, pt], length_in_words).to_vec();
+        let parsed_header = RtcpHeader::from_bytes(&raw_header);
+        assert_eq!(report_count, parsed_header.count_or_format);
+        assert_eq!(pt, parsed_header.payload_type);
+        assert_eq!(length_in_words, parsed_header.length_in_words);
+
+        let ssrc: u32 = 10000;
+        let ntp: u64 = 1234567898765432;
+        let rtp_ts: u32 = 1234567876;
+        let packet_count: u32 = 155;
+        let octet_count: u32 = 155 * 1500;
+        let raw_sender_info: Vec<u8> = (ssrc, ntp, rtp_ts, packet_count, octet_count).to_vec();
+        let parsed_sender_info = SenderInfo::from_bytes(&raw_sender_info);
+        assert_eq!(ssrc, parsed_sender_info.ssrc);
+        assert_eq!(ntp, parsed_sender_info.ntp_ts);
+        assert_eq!(rtp_ts, parsed_sender_info.rtp_ts);
+        assert_eq!(packet_count, parsed_sender_info.packet_count);
+        assert_eq!(octet_count, parsed_sender_info.octet_count);
+
+        let fraction_loss = 0u8;
+        let num_lost = U24::from(0);
+        let ehsn = 1493824u32;
+        let jitter = 10u32;
+        let lsr = 123784329u32;
+        let dlsr = 6000u32;
+        let raw_report: Vec<u8> =
+            (ssrc, [fraction_loss], num_lost, ehsn, jitter, lsr, dlsr).to_vec();
+        let parsed_report_block = ReportBlock::from_bytes(&raw_report).unwrap();
+        assert_eq!(fraction_loss, parsed_report_block.fraction_loss);
+        assert_eq!(num_lost, parsed_report_block.cumulative_loss_count);
+        assert_eq!(ehsn, parsed_report_block.highest_sequence_num);
+        assert_eq!(jitter, parsed_report_block.jitter);
+        assert_eq!(lsr, parsed_report_block.last_sender_report);
+        assert_eq!(dlsr, parsed_report_block.delay_last_sender_report);
+
+        let raw_sender_report =
+            (raw_header, raw_sender_info, raw_report.clone(), raw_report).to_vec();
+        let parsed_sender_report = SenderReport::from_bytes(&raw_sender_report).unwrap();
+        assert_eq!(parsed_header, parsed_sender_report.header);
+        assert_eq!(parsed_sender_info, parsed_sender_report.sender_info);
+        assert_eq!(
+            report_count as usize,
+            parsed_sender_report.report_blocks.len()
+        );
+        assert_eq!(parsed_report_block, parsed_sender_report.report_blocks[0]);
+        assert_eq!(parsed_report_block, parsed_sender_report.report_blocks[1]);
+
+        let parsed_sender_report_2 = SenderReport::from_bytes_after_header(
+            &raw_sender_report[RtcpHeader::LENGTH..],
+            parsed_header,
+        )
+        .unwrap();
+        assert_eq!(parsed_sender_report, parsed_sender_report_2);
+    }
+
+    #[test]
     fn test_receiver_report_sender_packet_loss() {
-        let mut receiver_report_sender = ReceiverReportSender::new();
+        let mut receiver_report_sender = RtcpReportSender::new();
 
         fn expected_bytes(
             ssrc: Ssrc,
@@ -498,98 +824,102 @@ mod test {
         }
 
         let ssrc = 123456;
+        let now = Instant::now();
+        let at = |millis| now + Duration::from_millis(millis);
 
         // We don't send a report before receiving anything.
         assert_eq!(
             None,
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(5))
         );
 
         // Receiving all packets in order means no loss.
+        // We receive all packets at(0) so there is no jitter
+        // We write out all report blocks at(5) so the receptions are counted
         for seqnum in 1000..=1004 {
-            receiver_report_sender.remember_received(seqnum, OPUS_PAYLOAD_TYPE, 0, Instant::now());
+            receiver_report_sender.remember_received(seqnum, OPUS_PAYLOAD_TYPE, 0, at(0));
         }
 
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 0, 1004)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(5))
         );
 
         // Even if packets are received out of order, if there are no gaps, then there's no loss.
         for seqnum in &[1009, 1005, 1007, 1008, 1010, 1006] {
-            receiver_report_sender.remember_received(*seqnum, OPUS_PAYLOAD_TYPE, 0, Instant::now());
+            receiver_report_sender.remember_received(*seqnum, OPUS_PAYLOAD_TYPE, 0, at(0));
         }
 
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 0, 1010)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(5))
         );
 
         // Now we lose 1011..=1019
-        receiver_report_sender.remember_received(1020, OPUS_PAYLOAD_TYPE, 0, Instant::now());
+        receiver_report_sender.remember_received(1020, OPUS_PAYLOAD_TYPE, 0, at(0));
 
         // ... which means that we lost 9 packets (230 / 256).
         assert_eq!(
             Some(expected_bytes(ssrc, 230, 9, 1020)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(5))
         );
 
         // Receiving duplicate packets reduces the cumulative loss
         for _ in 0..4 {
-            receiver_report_sender.remember_received(1020, OPUS_PAYLOAD_TYPE, 0, Instant::now());
+            receiver_report_sender.remember_received(1020, OPUS_PAYLOAD_TYPE, 0, at(0));
         }
 
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 5, 1020)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(5))
         );
 
         for _ in 0..10 {
-            receiver_report_sender.remember_received(1020, OPUS_PAYLOAD_TYPE, 0, Instant::now());
+            receiver_report_sender.remember_received(1020, OPUS_PAYLOAD_TYPE, 0, at(0));
         }
 
         // ... but we don't support negative loss.
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 0, 1020)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(5))
         );
 
         // Increase loss again
-        receiver_report_sender.remember_received(1050, OPUS_PAYLOAD_TYPE, 0, Instant::now());
+        receiver_report_sender.remember_received(1050, OPUS_PAYLOAD_TYPE, 0, at(0));
 
         assert_eq!(
             Some(expected_bytes(ssrc, 247, 29, 1050)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(5))
         );
 
-        receiver_report_sender.remember_received(3050, OPUS_PAYLOAD_TYPE, 0, Instant::now());
+        receiver_report_sender.remember_received(3050, OPUS_PAYLOAD_TYPE, 0, at(0));
 
         // ... to show that a large increase in seqnums causes the statistics to be reset.
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 0, 3050)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(5))
         );
 
         // Increase loss again
-        receiver_report_sender.remember_received(3060, OPUS_PAYLOAD_TYPE, 0, Instant::now());
+        receiver_report_sender.remember_received(3060, OPUS_PAYLOAD_TYPE, 0, at(0));
 
         assert_eq!(
             Some(expected_bytes(ssrc, 230, 9, 3060)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(5))
         );
 
-        receiver_report_sender.remember_received(0, OPUS_PAYLOAD_TYPE, 0, Instant::now());
+        receiver_report_sender.remember_received(0, OPUS_PAYLOAD_TYPE, 0, at(0));
 
         // ... to show that a large decrease in seqnums causes the statistics to be reset.
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 0, 0)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(5))
         );
     }
 
     #[test]
     fn test_receiver_report_sender_jitter() {
-        let mut receiver_report_sender = ReceiverReportSender::new();
+        let mut receiver_report_sender = RtcpReportSender::new();
 
         fn expected_bytes(ssrc: Ssrc, interarrival_jitter: u32, max_seqnum: u32) -> Vec<u8> {
             let last_sender_report_timestamp: u32 = 0;
@@ -625,7 +955,7 @@ mod test {
 
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 12)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(65))
         );
 
         // Receiving older packets doesn't update jitter
@@ -633,7 +963,7 @@ mod test {
 
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 12)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(90))
         );
 
         // We were previously expecting packets to be received every 20 ms, but this is received 40
@@ -646,7 +976,7 @@ mod test {
         // 50, ptime = 20.
         assert_eq!(
             Some(expected_bytes(ssrc, 60, 13)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(105))
         );
 
         // A large increase in sequence numbers is treated as a stream reset, and the jitter is
@@ -660,13 +990,13 @@ mod test {
 
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 1000)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(125))
         );
     }
 
     #[test]
     fn test_receiver_report_sender_jitter_recovery() {
-        let mut receiver_report_sender = ReceiverReportSender::new();
+        let mut receiver_report_sender = RtcpReportSender::new();
 
         fn expected_bytes(ssrc: Ssrc, interarrival_jitter: u32, max_seqnum: u32) -> Vec<u8> {
             let last_sender_report_timestamp: u32 = 0;
@@ -716,7 +1046,7 @@ mod test {
 
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 12)),
-            receiver_report_sender.write_receiver_report_block(ssrc)
+            receiver_report_sender.write_receiver_report_block(ssrc, at(65))
         );
 
         // Now interarrival time increases to 21 ms and jitter increases.
@@ -741,7 +1071,7 @@ mod test {
 
             assert_eq!(
                 Some(expected_bytes(ssrc, *expected_jitter, seqnum as u32)),
-                receiver_report_sender.write_receiver_report_block(ssrc)
+                receiver_report_sender.write_receiver_report_block(ssrc, at(time))
             );
         }
 
@@ -766,8 +1096,129 @@ mod test {
 
             assert_eq!(
                 Some(expected_bytes(ssrc, *expected_jitter, seqnum as u32)),
-                receiver_report_sender.write_receiver_report_block(ssrc)
+                receiver_report_sender.write_receiver_report_block(ssrc, at(time))
             );
         }
+    }
+
+    #[test]
+    fn test_receiver_report_after_sender_report() {
+        let mut receiver_report_sender = RtcpReportSender::new();
+        let mut sent = 1;
+
+        fn expected_bytes(
+            ssrc: Ssrc,
+            interarrival_jitter: u32,
+            max_seqnum: u32,
+            last_sender_report_timestamp: u32,
+            delay_since_last_sender_report: u32,
+        ) -> Vec<u8> {
+            (
+                ssrc,
+                [0u8],
+                U24::from(0),
+                max_seqnum,
+                (
+                    interarrival_jitter,
+                    last_sender_report_timestamp,
+                    delay_since_last_sender_report,
+                ),
+            )
+                .to_vec()
+        }
+
+        let ssrc = 123456;
+
+        // Given a 20 ms ptime (50 packets / second) and a sample rate of 48000, RTP timestamps
+        // would increment by this amount assuming no other delays.
+        let rtp_interval = 48000 / 50;
+
+        let now = Instant::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut seqnum = 10;
+        let mut receive_opus = |ts: Instant| {
+            receiver_report_sender.remember_received(
+                seqnum,
+                OPUS_PAYLOAD_TYPE,
+                sent * rtp_interval,
+                ts,
+            );
+            seqnum += 1;
+            sent += 1;
+        };
+
+        receive_opus(at(20));
+        receive_opus(at(40));
+        receive_opus(at(60));
+
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 12, 0, 0)),
+            receiver_report_sender.write_receiver_report_block(ssrc, at(65))
+        );
+
+        // make it so only the middle 32 bits match the mask
+        let ntp_ts = 0xFFFF_FFFF_FFF0_FFFF;
+        let rtp_ts = 10000000;
+        let mut sender_report = SenderReport {
+            header: RtcpHeader {
+                has_padding: false,
+                count_or_format: 0,
+                payload_type: RTCP_TYPE_SENDER_REPORT,
+                length_in_words: 6,
+            },
+            sender_info: SenderInfo {
+                ssrc,
+                ntp_ts,
+                rtp_ts,
+                packet_count: 2,
+                octet_count: 100,
+            },
+            report_blocks: vec![],
+        };
+        receiver_report_sender.remember_received_sender_report(sender_report.clone(), at(80));
+
+        // 5 millis duration to nanos
+        let delay = 5_000_000 / 15259;
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 12, 0xFFFFFFF0, delay)),
+            receiver_report_sender.write_receiver_report_block(ssrc, at(85))
+        );
+
+        // earlier sender report is ignored
+        sender_report.sender_info.ntp_ts = 0xFFFF_FFFF_FF00_FFFF;
+        receiver_report_sender.remember_received_sender_report(sender_report.clone(), at(90));
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 12, 0xFFFFFFF0, delay)),
+            receiver_report_sender.write_receiver_report_block(ssrc, at(85))
+        );
+
+        // newer reports are remembered
+        sender_report.sender_info.ntp_ts = 0xFFFF_FFFF_FFFF_FFFF;
+        receiver_report_sender.remember_received_sender_report(sender_report, at(125));
+
+        let delay = 10_000_000 / 15259;
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 12, 0xFFFFFFFF, delay)),
+            receiver_report_sender.write_receiver_report_block(ssrc, at(135))
+        );
+    }
+
+    #[test]
+    fn test_delay_from_last_sr() {
+        let now = Instant::now();
+        let last_sr_time = now - Duration::from_secs(5);
+
+        // check if close to expected value (within 150 microseconds)
+        assert!((5 * 2_u32.pow(16)).abs_diff(calculate_delay_since_sr(last_sr_time, now)) < 10);
+
+        // within 15ms after 15mins.
+        let last_sr_time = now - Duration::from_secs(60 * 15);
+        assert!(
+            (60 * 15 * 2_u32.pow(16)).abs_diff(calculate_delay_since_sr(last_sr_time, now)) < 1000
+        );
+
+        let too_old_to_matter = now - Duration::from_secs(2_u64.pow(16) + 1);
+        assert_eq!(0, calculate_delay_since_sr(too_old_to_matter, now));
     }
 }

@@ -595,7 +595,7 @@ impl Connection {
         }
 
         if let Some(outgoing_addr) = self.outgoing_addr {
-            if let Some(receiver_report_packet) = self.rtp.endpoint.send_receiver_report() {
+            if let Some(receiver_report_packet) = self.rtp.endpoint.send_receiver_report(now) {
                 self.push_outgoing_non_media_bytes(receiver_report_packet.len(), now);
                 packets_to_send.push((receiver_report_packet, outgoing_addr));
             }

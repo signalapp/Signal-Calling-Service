@@ -166,7 +166,7 @@ struct IncomingSsrcState {
     max_seqnum: FullSequenceNumber,
     seqnum_reuse_detector: SequenceNumberReuseDetector,
     nack_sender: NackSender,
-    receiver_report_sender: ReceiverReportSender,
+    rtcp_report_sender: RtcpReportSender,
 }
 
 pub struct EndpointStats {
@@ -308,7 +308,7 @@ impl Endpoint {
         if is_media_payload_type(incoming.payload_type()) {
             let ssrc_state = self.get_incoming_ssrc_state_mut(incoming.ssrc());
 
-            ssrc_state.receiver_report_sender.remember_received(
+            ssrc_state.rtcp_report_sender.remember_received(
                 incoming.seqnum(),
                 incoming.payload_type(),
                 incoming.timestamp,
@@ -332,7 +332,7 @@ impl Endpoint {
                 // A 1KB RTCP payload with 4 bytes each would allow only 250
                 // in the worst case scenario.
                 nack_sender: NackSender::new(250),
-                receiver_report_sender: ReceiverReportSender::new(),
+                rtcp_report_sender: RtcpReportSender::new(),
             })
     }
 
@@ -356,6 +356,11 @@ impl Endpoint {
             acks = self
                 .tcc_sender
                 .process_feedback_and_correlate_acks(incoming.tcc_feedbacks.into_iter(), now);
+        }
+        for sender_report in incoming.sender_reports {
+            self.get_incoming_ssrc_state_mut(sender_report.ssrc())
+                .rtcp_report_sender
+                .remember_received_sender_report(sender_report, now);
         }
         Some(ProcessedControlPacket {
             key_frame_requests: incoming.key_frame_requests,
@@ -482,14 +487,14 @@ impl Endpoint {
         self.send_rtcp(RTCP_TYPE_SPECIFIC_FEEDBACK, RTCP_FORMAT_PLI, pli_ssrc)
     }
 
-    pub fn send_receiver_report(&mut self) -> Option<Vec<u8>> {
+    pub fn send_receiver_report(&mut self, now: Instant) -> Option<Vec<u8>> {
         let blocks: Vec<Vec<u8>> = self
             .state_by_incoming_ssrc
             .iter_mut()
             .filter_map(|(ssrc, state)| {
                 state
-                    .receiver_report_sender
-                    .write_receiver_report_block(*ssrc)
+                    .rtcp_report_sender
+                    .write_receiver_report_block(*ssrc, now)
             })
             .collect();
         let count = blocks.len() as u8;
