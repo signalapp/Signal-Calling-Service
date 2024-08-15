@@ -146,8 +146,23 @@ impl Header {
             // extension_start is relative to extensions (relative to extensions_start + RTP_EXTENSIONS_HEADER_LEN)
             let mut extension_start = 0;
             while extensions.len() > extension_start {
-                let (extension_header, extension_val) =
-                    extensions[extension_start..].checked_split_at(extensions_profile.len())?;
+                let Some((extension_header, extension_val)) =
+                    extensions[extension_start..].checked_split_at(extensions_profile.len())
+                else {
+                    if extensions_profile == HeaderExtensionsProfile::TwoByte
+                        && extensions[extension_start] == 0
+                    {
+                        // Tail padding
+                        break;
+                    }
+
+                    event!("calling.rtp.invalid.extension_too_short");
+                    debug!(
+                        "Invalid RTP: too short for extension ID / len, profile={extensions_profile:?}, next byte {}",
+                        extensions[extension_start]
+                    );
+                    return None;
+                };
                 let extension_id = match extensions_profile {
                     HeaderExtensionsProfile::OneByte => extension_header[0] >> 4,
                     HeaderExtensionsProfile::TwoByte => extension_header[0],
@@ -1614,13 +1629,6 @@ mod test {
 
     #[test]
     fn test_parse_rtp_header_two_byte_extensions() {
-        fn write_two_byte_extension(id: u8, value: impl Writer) -> impl Writer {
-            assert_ne!(id, 0, "id must not be 0");
-            let length = value.written_len();
-            let header = [id, length.try_into().expect("length must fit in 8 bits")];
-            (header, value)
-        }
-
         let extensions = (
             write_two_byte_extension(RTP_EXT_ID_VIDEO_ORIENTATION, [0x3u8]),
             write_two_byte_extension(
@@ -1690,5 +1698,80 @@ mod test {
             }),
             Header::parse(&packet)
         );
+    }
+
+    #[test]
+    fn test_parse_rtp_header_two_byte_extensions_with_tail_padding() {
+        let extensions = (
+            write_two_byte_extension(RTP_EXT_ID_TCC_SEQNUM, [0, 28u8]),
+            write_two_byte_extension(
+                RTP_EXT_ID_DEPENDENCY_DESCRIPTOR,
+                [
+                    0b10000000u8,
+                    0b00000000,
+                    0b00000010,
+                    0b10000000, // The first bit in this byte indicates that this is for a key frame.
+                    0b00000001,
+                    0b00000100,
+                    0b11101010,
+                    0b10101100,
+                    0b10000101,
+                    0b00010100,
+                    0b01010000,
+                    0b01000110,
+                    0b00000100,
+                    0b00101100,
+                    0b11111100,
+                    0b00011001,
+                    0b01001100,
+                ],
+            ),
+            [0u8], // tail padding
+        );
+
+        let (packet, payload_range) = Packet::write_serialized(
+            false,
+            1,
+            2,
+            3,
+            4,
+            extensions,
+            HeaderExtensionsProfile::TwoByte,
+            &[],
+        );
+        assert_eq!(
+            Some(Header {
+                marker: false,
+                has_padding: false,
+                payload_type: 1,
+                seqnum: 2,
+                timestamp: 3,
+                ssrc: 4,
+                video_rotation: None,
+                audio_level: None,
+                dependency_descriptor: Some((
+                    DependencyDescriptor {
+                        is_key_frame: true,
+                        resolution: Some(PixelSize {
+                            width: 2880,
+                            height: 1620,
+                        }),
+                        truncated_frame_number: Some(2),
+                    },
+                    22..39
+                )),
+                tcc_seqnum: Some(28),
+                tcc_seqnum_range: Some(18..20),
+                payload_range,
+            }),
+            Header::parse(&packet)
+        );
+    }
+
+    fn write_two_byte_extension(id: u8, value: impl Writer) -> impl Writer {
+        assert_ne!(id, 0, "id must not be 0");
+        let length = value.written_len();
+        let header = [id, length.try_into().expect("length must fit in 8 bits")];
+        (header, value)
     }
 }
