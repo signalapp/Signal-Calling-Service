@@ -137,16 +137,42 @@ pub fn rtp_iv(ssrc: u32, seqnum: u64, salt: &[u8; 12]) -> [u8; 12] {
     ]
 }
 
-#[cfg(test)]
 /// Creates a test key by repeating the byte
+#[cfg(test)]
 pub fn key_from(seed: u8) -> Key {
     [seed; SRTP_KEY_LEN].into()
 }
 
-#[cfg(test)]
 /// Creates a test salt by repeating the byte
+#[cfg(test)]
 pub fn salt_from(seed: u8) -> Salt {
     [seed; SRTP_SALT_LEN]
+}
+
+/// returns (decrypt, encrypt) pair of keys
+#[cfg(test)]
+pub fn new_srtp_keys(seed: u8) -> (KeysAndSalts, KeysAndSalts) {
+    let decrypt = KeysAndSalts {
+        rtp: KeyAndSalt {
+            key: key_from(seed + 1),
+            salt: salt_from(seed + 2),
+        },
+        rtcp: KeyAndSalt {
+            key: key_from(seed + 3),
+            salt: salt_from(seed + 4),
+        },
+    };
+    let encrypt = KeysAndSalts {
+        rtp: KeyAndSalt {
+            key: key_from(seed + 5),
+            salt: salt_from(seed + 6),
+        },
+        rtcp: KeyAndSalt {
+            key: key_from(seed + 7),
+            salt: salt_from(seed + 8),
+        },
+    };
+    (decrypt, encrypt)
 }
 
 #[cfg(test)]

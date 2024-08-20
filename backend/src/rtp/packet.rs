@@ -24,7 +24,7 @@ use crate::rtp::tcc;
 use super::{
     from_rtx_payload_type, from_rtx_ssrc, is_audio_payload_type, is_padding_payload_type,
     is_video_payload_type, srtp::*, to_rtx_payload_type, to_rtx_ssrc, types::*, VideoRotation,
-    PACKET_LIFETIME, VERSION, VP8_PAYLOAD_TYPE,
+    CLIENT_SERVER_DATA_PAYLOAD_TYPE, PACKET_LIFETIME, VERSION, VP8_PAYLOAD_TYPE,
 };
 
 const RTP_MIN_HEADER_LEN: usize = 12;
@@ -574,6 +574,11 @@ impl<T> Packet<T> {
         }
     }
 
+    pub(super) fn payload_size_bytes(&self) -> usize {
+        let payload_range = self.payload_range();
+        payload_range.end - payload_range.start
+    }
+
     pub fn into_serialized(self) -> T {
         self.serialized
     }
@@ -592,6 +597,10 @@ impl<T> Packet<T> {
 
     pub fn is_vp8(&self) -> bool {
         self.payload_type() == VP8_PAYLOAD_TYPE
+    }
+
+    pub fn is_data(&self) -> bool {
+        self.payload_type() == CLIENT_SERVER_DATA_PAYLOAD_TYPE
     }
 
     pub fn is_past_deadline(&self, now: Instant) -> bool {

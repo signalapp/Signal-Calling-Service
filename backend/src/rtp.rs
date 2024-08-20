@@ -27,17 +27,20 @@ pub use srtp::{new_master_key_material, KeyAndSalt, KeysAndSalts, MasterKeyMater
 pub use types::*;
 
 #[cfg(test)]
-pub use srtp::{key_from, salt_from};
+pub use srtp::{key_from, new_srtp_keys, salt_from};
 
 use std::{collections::HashMap, convert::TryInto};
 
-use calling_common::{expand_truncated_counter, read_u16, Bits, Duration, Instant, Writer};
+use calling_common::{
+    expand_truncated_counter, read_u16, Bits, Duration, Instant, SystemTime, Writer,
+};
 use log::*;
 
 use crate::transportcc as tcc;
 
 const VERSION: u8 = 2;
 const PADDING_PAYLOAD_TYPE: PayloadType = 99;
+const CLIENT_SERVER_DATA_PAYLOAD_TYPE: PayloadType = 101;
 const OPUS_PAYLOAD_TYPE: PayloadType = 102;
 const VP8_PAYLOAD_TYPE: PayloadType = 108;
 
@@ -418,11 +421,28 @@ impl Endpoint {
         Some(outgoing)
     }
 
-    pub fn remember_sent_for_tcc(&mut self, outgoing: &Packet<Vec<u8>>, now: Instant) {
+    pub fn remember_sent(&mut self, outgoing: &Packet<Vec<u8>>, now: Instant) {
+        self.remember_sent_for_tcc(outgoing, now);
+        self.remember_sent_for_reports(outgoing, now);
+    }
+
+    fn remember_sent_for_tcc(&mut self, outgoing: &Packet<Vec<u8>>, now: Instant) {
         if let Some(tcc_seqnum) = outgoing.tcc_seqnum {
             self.tcc_sender
                 .remember_sent(tcc_seqnum, outgoing.size(), now);
         }
+    }
+
+    // counts packets/bytes and remembers timestamps for sender reports
+    // does not consider RTX packets or Client <-> SFU data packets
+    pub fn remember_sent_for_reports(&mut self, outgoing: &Packet<Vec<u8>>, now: Instant) {
+        if outgoing.is_rtx() || outgoing.is_data() {
+            return;
+        }
+
+        self.get_incoming_ssrc_state_mut(outgoing.ssrc())
+            .rtcp_report_sender
+            .remember_sent(outgoing, now);
     }
 
     // Returns serialized RTCP packets containing ACKs, not just ACK payloads.
@@ -439,6 +459,7 @@ impl Endpoint {
             Self::send_rtcp_and_increment_index(
                 RTCP_TYPE_GENERIC_FEEDBACK,
                 RTCP_FORMAT_TRANSPORT_CC,
+                false,
                 rtcp_sender_ssrc,
                 payload,
                 next_outgoing_srtcp_index,
@@ -472,6 +493,7 @@ impl Endpoint {
                 Self::send_rtcp_and_increment_index(
                     RTCP_TYPE_GENERIC_FEEDBACK,
                     RTCP_FORMAT_NACK,
+                    false,
                     rtcp_sender_ssrc,
                     payload,
                     next_outgoing_srtcp_index,
@@ -484,29 +506,69 @@ impl Endpoint {
     // Returns a new, encrypted RTCP packet for a PLI (keyframe request).
     // TODO: Use Result instead of Option.
     pub fn send_pli(&mut self, pli_ssrc: Ssrc) -> Option<Vec<u8>> {
-        self.send_rtcp(RTCP_TYPE_SPECIFIC_FEEDBACK, RTCP_FORMAT_PLI, pli_ssrc)
+        self.send_rtcp(
+            RTCP_TYPE_SPECIFIC_FEEDBACK,
+            RTCP_FORMAT_PLI,
+            false,
+            pli_ssrc,
+        )
     }
 
-    pub fn send_receiver_report(&mut self, now: Instant) -> Option<Vec<u8>> {
-        let blocks: Vec<Vec<u8>> = self
-            .state_by_incoming_ssrc
-            .iter_mut()
-            .filter_map(|(ssrc, state)| {
-                state
-                    .rtcp_report_sender
-                    .write_receiver_report_block(*ssrc, now)
-            })
-            .collect();
-        let count = blocks.len() as u8;
-        self.send_rtcp(RTCP_TYPE_RECEIVER_REPORT, count, blocks)
+    /// WebRTC deviates from RFC 3550's definition of a compound packet.
+    /// According to spec, a compound packet should consist of a 4 byte header, an SR or RR,
+    /// an SDES, and report blocks.
+    /// However, WebRTC treats compound packets like concantenated RTCP packets. For example, we can
+    /// send (Header-1, SR-1, Header-2, RR-1, Header-3, SR-2) as a valid RTCP packet.
+    /// https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/modules/rtp_rtcp/source/rtcp_receiver.cc;l=380;drc=2017cd8a8925f180257662f78eaf9eb93e8e394d
+    /// Since this can only include SR and RRs, there is no padding.
+    pub fn send_rtcp_report(&mut self, now: Instant, sys_now: SystemTime) -> Option<Vec<u8>> {
+        let mut report_buffer = self.create_buffer_for_rtcp_reports()?;
+        let mut is_first = true;
+        let mut first_ssrc = 0u32;
+        let mut block_buffer = Vec::with_capacity(RECEIVER_REPORT_MIN_LENGTH);
+        for (ssrc, state) in &mut self.state_by_incoming_ssrc {
+            block_buffer.clear();
+            let Some((payload_type, block_count, report_length)) = state
+                .rtcp_report_sender
+                .write_report_block_in_place(*ssrc, now, sys_now, &mut block_buffer)
+            else {
+                continue;
+            };
+
+            state.rtcp_report_sender.remember_report_sent();
+            let header = RtcpHeader::new(
+                false,
+                block_count,
+                payload_type,
+                (report_length >> 2) as u16,
+            );
+
+            if is_first {
+                first_ssrc = *ssrc;
+                is_first = false;
+            }
+
+            header.write(&mut report_buffer);
+            block_buffer[..report_length].write(&mut report_buffer);
+        }
+
+        report_buffer.resize(report_buffer.capacity(), 0);
+        self.encrypt_rtcp_packet_and_increment_index(first_ssrc, report_buffer)
     }
 
     // Returns a new, encrypted RTCP packet.
     // TODO: Use Result instead of Option.
-    fn send_rtcp(&mut self, pt: u8, count_or_format: u8, payload: impl Writer) -> Option<Vec<u8>> {
+    fn send_rtcp(
+        &mut self,
+        pt: u8,
+        count_or_format: u8,
+        is_padded: bool,
+        payload: impl Writer,
+    ) -> Option<Vec<u8>> {
         Self::send_rtcp_and_increment_index(
             pt,
             count_or_format,
+            is_padded,
             self.rtcp_sender_ssrc,
             payload,
             &mut self.next_outgoing_srtcp_index,
@@ -515,9 +577,11 @@ impl Endpoint {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_rtcp_and_increment_index(
         pt: u8,
         count_or_format: u8,
+        is_padded: bool,
         sender_ssrc: Ssrc,
         payload: impl Writer,
         next_outgoing_srtcp_index: &mut u32,
@@ -527,6 +591,7 @@ impl Endpoint {
         let serialized = ControlPacket::serialize_and_encrypt(
             pt,
             count_or_format,
+            is_padded,
             sender_ssrc,
             payload,
             *next_outgoing_srtcp_index,
@@ -537,12 +602,55 @@ impl Endpoint {
         Some(serialized)
     }
 
+    fn encrypt_rtcp_packet_and_increment_index(
+        &mut self,
+        sender_ssrc: Ssrc,
+        packet: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        let encrypted = ControlPacket::encrypt(
+            packet,
+            sender_ssrc,
+            self.next_outgoing_srtcp_index,
+            &self.encrypt.rtcp.key,
+            &self.encrypt.rtcp.salt,
+        )?;
+        self.next_outgoing_srtcp_index += 1;
+        Some(encrypted)
+    }
+
     pub fn stats(&self) -> EndpointStats {
         let (remembered_packet_count, remembered_packet_bytes) =
             self.rtx_sender.remembered_packet_stats();
         EndpointStats {
             remembered_packet_count,
             remembered_packet_bytes,
+        }
+    }
+
+    /// returns
+    /// - a buffer that can hold all the reports that are ready, SRTP Tag, and SRTP Footer.
+    ///     There is NO possibility of padding since the sizes are all multiples of four.
+    /// - the number of reports to serialize
+    fn create_buffer_for_rtcp_reports(&self) -> Option<Vec<u8>> {
+        let expected_report_size = self.state_by_incoming_ssrc.iter().fold(
+            0usize,
+            |total_bytes, (ssrc, state)| match state.rtcp_report_sender.rtcp_report_payload_type() {
+                Some(RTCP_TYPE_SENDER_REPORT) => total_bytes + SenderReport::MIN_LENGTH,
+                Some(RTCP_TYPE_RECEIVER_REPORT) => total_bytes + RECEIVER_REPORT_MIN_LENGTH,
+                Some(unknown) => {
+                    warn!("Unexpected report type `{}` returned by {}", unknown, ssrc);
+                    total_bytes
+                }
+                None => total_bytes,
+            },
+        );
+
+        if expected_report_size == 0 {
+            None
+        } else {
+            Some(Vec::with_capacity(
+                expected_report_size + SRTP_AUTH_TAG_LEN + SRTCP_FOOTER_LEN,
+            ))
         }
     }
 }

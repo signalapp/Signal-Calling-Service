@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use super::{OPUS_PAYLOAD_TYPE, VP8_PAYLOAD_TYPE};
+use super::{Packet, OPUS_PAYLOAD_TYPE, VP8_PAYLOAD_TYPE};
 
 use std::{
     convert::TryFrom,
@@ -13,10 +13,11 @@ use std::{
 use aes::cipher::{generic_array::GenericArray, KeyInit};
 use aes_gcm::{AeadInPlace, Aes128Gcm};
 use calling_common::{
-    parse_u16, parse_u24, parse_u32, parse_u64, round_up_to_multiple_of, CheckedSplitAt, Instant,
-    Writer, U24,
+    parse_u16, parse_u24, parse_u32, parse_u64, round_up_to_multiple_of, CheckedSplitAt, Duration,
+    Instant, SystemTime, Writable, Writer, U24,
 };
 use log::*;
+use once_cell::sync::Lazy;
 
 use crate::transportcc as tcc;
 
@@ -28,16 +29,19 @@ use super::{
 };
 
 const RTCP_HEADER_LEN: usize = 8;
+const RTCP_RECEIVER_REPORT_BLOCK_LEN: usize = 28;
 pub const RTCP_PAYLOAD_TYPE_OFFSET: usize = 1;
 const RTCP_PAYLOAD_LEN_RANGE: Range<usize> = 2..4;
 const RTCP_SENDER_SSRC_RANGE: Range<usize> = 4..8;
-const SRTCP_FOOTER_LEN: usize = 4;
-const RTCP_TYPE_SENDER_REPORT: u8 = 200;
+pub const SRTCP_FOOTER_LEN: usize = 4;
+pub const RTCP_TYPE_SENDER_REPORT: u8 = 200;
 pub const RTCP_TYPE_RECEIVER_REPORT: u8 = 201;
 const RTCP_TYPE_EXTENDED_REPORT: u8 = 207;
 const RTCP_TYPE_SDES: u8 = 202;
 pub const RTCP_TYPE_BYE: u8 = 203;
 const SEQNUM_GAP_THRESHOLD: u32 = 500;
+const FULL_SEQNUM_GAP_THRESHOLD: u64 = 500;
+const FULL_SEQNUM_ROLLOVER_THRESHOLD: u64 = 150;
 const RTCP_FORMAT_LOSS_NOTIFICATION: u8 = 15;
 pub const RTCP_PAYLOAD_TYPES: RangeInclusive<u8> = 64..=95;
 pub const RTCP_TYPE_GENERIC_FEEDBACK: u8 = 205;
@@ -45,6 +49,10 @@ pub const RTCP_FORMAT_NACK: u8 = 1;
 pub const RTCP_FORMAT_TRANSPORT_CC: u8 = 15;
 pub const RTCP_TYPE_SPECIFIC_FEEDBACK: u8 = 206;
 pub const RTCP_FORMAT_PLI: u8 = 1;
+pub const RECEIVER_REPORT_MIN_LENGTH: usize = 32;
+// 1900 Jan 1st 00:00:00 UTC, RTP's chosen EPOCH
+static NTP_EPOCH: Lazy<SystemTime> =
+    Lazy::new(|| (std::time::UNIX_EPOCH - std::time::Duration::from_secs(2_208_988_800)).into());
 
 #[derive(Default, Debug)]
 pub struct ControlPacket<'packet> {
@@ -159,9 +167,11 @@ impl<'packet> ControlPacket<'packet> {
     }
 
     // pub for tests
+    #[allow(clippy::too_many_arguments)]
     pub fn serialize_and_encrypt(
         pt: u8,
         count_or_format: u8,
+        is_padded: bool,
         sender_ssrc: Ssrc,
         payload_writer: impl Writer,
         srtcp_index: u32,
@@ -174,7 +184,7 @@ impl<'packet> ControlPacket<'packet> {
         // Spec says "minus 1" including 2-word header, which is really "plus 1" excluding the header.
         let padded_payload_len_in_words_plus_1 = ((padded_payload_len / 4) + 1) as u16;
 
-        serialized[0] = (VERSION << 6) | count_or_format;
+        serialized[0] = (VERSION << 6) | is_padded_mask(is_padded) | count_or_format;
         serialized[RTCP_PAYLOAD_TYPE_OFFSET] = pt;
         serialized[RTCP_PAYLOAD_LEN_RANGE.clone()]
             .copy_from_slice(&padded_payload_len_in_words_plus_1.to_be_bytes());
@@ -182,17 +192,29 @@ impl<'packet> ControlPacket<'packet> {
         // TODO: Make this more efficient by copying less.
         serialized[RTCP_HEADER_LEN..][..payload_writer.written_len()]
             .copy_from_slice(&payload_writer.to_vec());
-        serialized[RTCP_HEADER_LEN + padded_payload_len + SRTP_AUTH_TAG_LEN..]
-            .copy_from_slice(&(srtcp_index | 0x80000000/* "encrypted" */).to_be_bytes());
 
+        Self::encrypt(serialized, sender_ssrc, srtcp_index, key, salt)
+    }
+
+    // Encrypts an SRTP packet. Packet should have space for SRTP tag and footer already
+    pub fn encrypt(
+        mut packet: Vec<u8>,
+        sender_ssrc: Ssrc,
+        srtcp_index: u32,
+        key: &Key,
+        salt: &Salt,
+    ) -> Option<Vec<u8>> {
+        let packet_len = packet.len();
+        packet[packet_len - SRTCP_FOOTER_LEN..]
+            .copy_from_slice(&(srtcp_index | 0x80000000/* "encrypted" */).to_be_bytes());
         let (cipher, nonce, aad, plaintext, tag) =
-            Self::prepare_for_crypto(&mut serialized, sender_ssrc, srtcp_index, key, salt)?;
+            Self::prepare_for_crypto(&mut packet, sender_ssrc, srtcp_index, key, salt)?;
         let nonce = GenericArray::from_slice(&nonce);
         let computed_tag = cipher
             .encrypt_in_place_detached(nonce, &aad, plaintext)
             .ok()?;
         tag.copy_from_slice(&computed_tag);
-        Some(serialized)
+        Some(packet)
     }
 
     #[cfg(test)]
@@ -206,6 +228,7 @@ impl<'packet> ControlPacket<'packet> {
         ControlPacket::serialize_and_encrypt(
             RTCP_TYPE_GENERIC_FEEDBACK,
             RTCP_FORMAT_NACK,
+            false,
             sender_ssrc,
             payload_writer,
             srtcp_index,
@@ -225,6 +248,7 @@ impl<'packet> ControlPacket<'packet> {
         ControlPacket::serialize_and_encrypt(
             RTCP_TYPE_GENERIC_FEEDBACK,
             RTCP_FORMAT_TRANSPORT_CC,
+            false,
             sender_ssrc,
             payload_writer,
             srtcp_index,
@@ -244,6 +268,7 @@ impl<'packet> ControlPacket<'packet> {
         ControlPacket::serialize_and_encrypt(
             RTCP_TYPE_SPECIFIC_FEEDBACK,
             RTCP_FORMAT_PLI,
+            false,
             sender_ssrc,
             payload_writer,
             srtcp_index,
@@ -304,6 +329,14 @@ fn rtcp_iv(sender_ssrc: Ssrc, index: u32, salt: &Salt) -> Option<Iv> {
     ])
 }
 
+fn is_padded_mask(is_padded: bool) -> u8 {
+    if is_padded {
+        0b00100000
+    } else {
+        0b0
+    }
+}
+
 // This is almost the same as ControlPacket.
 // But it processes the transport-cc feedback into Acks based on previously sent packets.
 #[derive(Debug, PartialEq, Eq)]
@@ -324,20 +357,37 @@ pub(super) struct RtcpReportSender {
     jitter_q4: u32,
     last_sender_report_received_ntp_timestamp: u64,
     last_sender_report_received_time: Instant,
+    // sender report stats
+    sent_since_last_report: bool,
+    packets_sent: u32,
+    total_payload_bytes_sent: u32,
+    max_sent_seqnum: Option<u64>,
+    last_sent_time: Instant,
+    last_sent_rtp_timestamp: u32,
+    sent_sample_freq: u64,
 }
 
 impl RtcpReportSender {
     pub(super) fn new() -> Self {
+        let now = Instant::now();
         Self {
             max_seqnum: None,
             max_seqnum_in_last: None,
             cumulative_loss: 0,
             cumulative_loss_in_last: 0,
-            last_receive_time: Instant::now(),
+            last_receive_time: now,
             last_rtp_timestamp: 0,
             jitter_q4: 0,
             last_sender_report_received_ntp_timestamp: 0,
-            last_sender_report_received_time: Instant::now(),
+            last_sender_report_received_time: now,
+
+            sent_since_last_report: false,
+            packets_sent: 0,
+            total_payload_bytes_sent: 0,
+            max_sent_seqnum: None,
+            last_sent_time: now,
+            last_sent_rtp_timestamp: 0,
+            sent_sample_freq: 90000,
         }
     }
 
@@ -364,9 +414,8 @@ impl RtcpReportSender {
     ) {
         let seqnum = seqnum as u32;
         if let Some(max_seqnum) = self.max_seqnum {
-            if seqnum.abs_diff(max_seqnum) > SEQNUM_GAP_THRESHOLD {
-                // Large seqnum gaps are caused by stream restarts. When this happens, reset the
-                // state since the values for the old stream may not be relevant anymore.
+            if maybe_receive_stream_restart(seqnum, max_seqnum) {
+                // Reset state since the values for the old stream may not be relevant anymore.
                 self.cumulative_loss = 0;
                 self.cumulative_loss_in_last = 0;
                 self.max_seqnum = Some(seqnum);
@@ -401,15 +450,51 @@ impl RtcpReportSender {
         }
     }
 
-    fn update_jitter(
-        &mut self,
-        payload_type: PayloadType,
-        rtp_timestamp: u32,
-        receive_time: Instant,
-    ) {
-        let receive_diff = receive_time.saturating_duration_since(self.last_receive_time);
+    pub(super) fn remember_sent(&mut self, outgoing: &Packet<Vec<u8>>, now: Instant) {
+        if outgoing.is_rtx() || outgoing.is_data() {
+            return;
+        }
 
-        let payload_freq_hz = if payload_type == OPUS_PAYLOAD_TYPE {
+        // we want to remember the rtp timestamp so we use it to interpolate a timestamp for an SR
+        // even though we may forward out of order, the max_sent_seqnum has the closest timestamp
+        let seqnum = outgoing.seqnum();
+        if let Some(max_seqnum) = self.max_sent_seqnum {
+            // if we think the stream rolled over, keep the stats. In pathological cases, max_seqnum
+            // will change between high and low values, but still preserve the stats.
+            // In the unfortunate case that we get a high seqnum very delayed, we may
+            // trigger the stream restart condition.
+            let restarted = maybe_send_stream_restart(seqnum, max_seqnum);
+            let rolledover = maybe_stream_rollover(seqnum, max_seqnum);
+            if seqnum > max_seqnum || rolledover || restarted {
+                self.max_sent_seqnum = Some(seqnum);
+                self.last_sent_rtp_timestamp = outgoing.timestamp;
+                self.last_sent_time = now;
+            }
+            if restarted && !rolledover {
+                self.packets_sent = 0;
+                self.total_payload_bytes_sent = 0;
+            }
+        } else {
+            self.max_sent_seqnum = Some(seqnum);
+            self.last_sent_rtp_timestamp = outgoing.timestamp;
+            self.last_sent_time = now;
+        }
+
+        self.sent_since_last_report = true;
+        // the spec is to wrap around these counts
+        // must ignore padding bytes (though not padding packets)
+        self.packets_sent = self.packets_sent.wrapping_add(1);
+        let net_bytes = (outgoing.payload_size_bytes() as u32)
+            .saturating_sub(outgoing.padding_byte_count as u32);
+        self.total_payload_bytes_sent = self.total_payload_bytes_sent.wrapping_add(net_bytes);
+
+        if outgoing.is_audio() || outgoing.is_video() {
+            self.sent_sample_freq = Self::estimate_sample_freq(outgoing.payload_type()) as u64;
+        }
+    }
+
+    fn estimate_sample_freq(payload_type: PayloadType) -> u32 {
+        if payload_type == OPUS_PAYLOAD_TYPE {
             48000
         } else if payload_type == VP8_PAYLOAD_TYPE {
             90000
@@ -419,12 +504,26 @@ impl RtcpReportSender {
                 payload_type
             );
             90000
-        };
+        }
+    }
+
+    // converts duration to units of RTP timestamp
+    fn duration_to_rtp_duration(duration: Duration, sample_freq: u32) -> u32 {
+        (duration.as_millis() as u32).saturating_mul(sample_freq) / 1000
+    }
+
+    fn update_jitter(
+        &mut self,
+        payload_type: PayloadType,
+        rtp_timestamp: u32,
+        receive_time: Instant,
+    ) {
+        let receive_diff = receive_time.saturating_duration_since(self.last_receive_time);
+        let payload_freq_hz = Self::estimate_sample_freq(payload_type);
 
         // The difference in receive time (interarrival time) converted to the units of the RTP
         // timestamps.
-        let receive_diff_rtp =
-            (receive_diff.as_millis() as u32).saturating_mul(payload_freq_hz) / 1000;
+        let receive_diff_rtp = Self::duration_to_rtp_duration(receive_diff, payload_freq_hz);
 
         // The difference in transmission time represented in the units of RTP timestamps.
         let tx_diff_rtp = (receive_diff_rtp as i64)
@@ -440,66 +539,181 @@ impl RtcpReportSender {
         }
     }
 
-    pub(super) fn write_receiver_report_block(
+    /// Appends a sender report or receiver report to buffer depending on whether
+    /// any packets have been forwarded for that SSRC on this endpoint.
+    ///
+    /// SenderReports will never have a reception block since we never forward media
+    /// back to the original sender
+    ///
+    /// returns (payload type, report count, and num bytes appended to buffer)
+    pub(super) fn write_report_block_in_place(
         &mut self,
         ssrc: Ssrc,
         now: Instant,
-    ) -> Option<Vec<u8>> {
-        if let (Some(max_seqnum), Some(max_seqnum_in_last)) =
-            (self.max_seqnum, self.max_seqnum_in_last)
-        {
-            let expected_since_last = max_seqnum.saturating_sub(max_seqnum_in_last);
-            let lost_since_last = self
-                .cumulative_loss
-                .saturating_sub(self.cumulative_loss_in_last);
-            let fraction_lost_since_last = if expected_since_last == 0 {
-                0
-            } else {
-                (256 * lost_since_last / expected_since_last) as u8
-            };
+        sys_now: SystemTime,
+        buffer: &mut dyn Writable,
+    ) -> Option<(u8, u8, usize)> {
+        match self.rtcp_report_payload_type()? {
+            RTCP_TYPE_SENDER_REPORT => {
+                self.write_sender_report_block_in_place(ssrc, now, sys_now, buffer);
+                Some((RTCP_TYPE_SENDER_REPORT, 0u8, SenderInfo::SENDER_INFO_LENGTH))
+            }
+            RTCP_TYPE_RECEIVER_REPORT => {
+                self.write_receiver_report_block_in_place(ssrc, now, buffer);
+                Some((
+                    RTCP_TYPE_RECEIVER_REPORT,
+                    1u8,
+                    RTCP_RECEIVER_REPORT_BLOCK_LEN,
+                ))
+            }
+            unknown => {
+                warn!("Unexpected report type `{}` when writing report", unknown);
+                None
+            }
+        }
+    }
 
-            // Negative cumulative loss isn't supported because it can cause problems with WebRTC
-            // https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/modules/rtp_rtcp/source/receive_statistics_impl.h;l=91-94;drc=18649971ab02d2f3fc8f360aee2e3c573652b7bd
-            const MAX_I24: u32 = (1 << 23) - 1;
-            let cumulative_loss_i24 =
-                U24::try_from(std::cmp::min(self.cumulative_loss, MAX_I24)).unwrap();
-
-            self.max_seqnum_in_last = self.max_seqnum;
-            // cumulative_loss_in_last is used to figure out how many packets have been lost since
-            // the last report. We can't update it based off lost_since_last since cumulative_loss
-            // can decrease (given duplicate packets), and lost_since_last wouldn't account for
-            // that.
-            self.cumulative_loss_in_last = self.cumulative_loss;
-
-            let interarrival_jitter: u32 = self.jitter_q4 >> 4;
-
-            let (last_sender_report_timestamp, delay_since_last_sender_report) =
-                if self.last_sender_report_received_ntp_timestamp != 0 {
-                    (
-                        get_lsr(self.last_sender_report_received_ntp_timestamp),
-                        calculate_delay_since_sr(self.last_sender_report_received_time, now),
-                    )
-                } else {
-                    (0, 0)
-                };
-
-            Some(
-                (
-                    ssrc,
-                    [fraction_lost_since_last],
-                    cumulative_loss_i24,
-                    max_seqnum,
-                    interarrival_jitter,
-                    last_sender_report_timestamp,
-                    delay_since_last_sender_report,
-                )
-                    .to_vec(),
-            )
+    /// returns the next report's payload type
+    pub(super) fn rtcp_report_payload_type(&self) -> Option<u8> {
+        if self.sent_since_last_report {
+            Some(RTCP_TYPE_SENDER_REPORT)
+        } else if self.max_seqnum.is_some() && self.max_seqnum_in_last.is_some() {
+            Some(RTCP_TYPE_RECEIVER_REPORT)
         } else {
-            // We haven't received a packet yet, so we can't send a receiver report.
             None
         }
     }
+
+    #[cfg(test)]
+    fn write_receiver_report_block(&mut self, ssrc: Ssrc, now: Instant) -> Option<Vec<u8>> {
+        let mut buffer = Vec::with_capacity(RTCP_RECEIVER_REPORT_BLOCK_LEN);
+        match self.rtcp_report_payload_type() {
+            Some(RTCP_TYPE_RECEIVER_REPORT) => {
+                self.write_receiver_report_block_in_place(ssrc, now, &mut buffer);
+                Some(buffer)
+            }
+            _ => None,
+        }
+    }
+
+    fn write_receiver_report_block_in_place(
+        &mut self,
+        ssrc: Ssrc,
+        now: Instant,
+        out: &mut dyn Writable,
+    ) {
+        let (Some(max_seqnum), Some(max_seqnum_in_last)) =
+            (self.max_seqnum, self.max_seqnum_in_last)
+        else {
+            return;
+        };
+        let expected_since_last = max_seqnum.saturating_sub(max_seqnum_in_last);
+        let lost_since_last = self
+            .cumulative_loss
+            .saturating_sub(self.cumulative_loss_in_last);
+        let fraction_lost_since_last = if expected_since_last == 0 {
+            0
+        } else {
+            (256 * lost_since_last / expected_since_last) as u8
+        };
+
+        // Negative cumulative loss isn't supported because it can cause problems with WebRTC
+        // https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/modules/rtp_rtcp/source/receive_statistics_impl.h;l=91-94;drc=18649971ab02d2f3fc8f360aee2e3c573652b7bd
+        const MAX_I24: u32 = (1 << 23) - 1;
+        let cumulative_loss_i24 =
+            U24::try_from(std::cmp::min(self.cumulative_loss, MAX_I24)).unwrap();
+
+        self.max_seqnum_in_last = self.max_seqnum;
+        // cumulative_loss_in_last is used to figure out how many packets have been lost since
+        // the last report. We can't update it based off lost_since_last since cumulative_loss
+        // can decrease (given duplicate packets), and lost_since_last wouldn't account for
+        // that.
+        self.cumulative_loss_in_last = self.cumulative_loss;
+
+        let interarrival_jitter: u32 = self.jitter_q4 >> 4;
+
+        let (last_sender_report_timestamp, delay_since_last_sender_report) =
+            if self.last_sender_report_received_ntp_timestamp != 0 {
+                (
+                    get_lsr(self.last_sender_report_received_ntp_timestamp),
+                    calculate_delay_since_sr(self.last_sender_report_received_time, now),
+                )
+            } else {
+                (0, 0)
+            };
+
+        (
+            ssrc, // sender_ssrc - matches source ssrc since we send a separate report for every SSRC
+            ssrc, // source_ssrc
+            [fraction_lost_since_last],
+            cumulative_loss_i24,
+            max_seqnum,
+            interarrival_jitter,
+            last_sender_report_timestamp,
+            delay_since_last_sender_report,
+        )
+            .write(out);
+    }
+
+    /// Creates a SenderReport. Since we never forward media back to the original sender,
+    /// there are no reception report blocks.
+    fn write_sender_report_block_in_place(
+        &mut self,
+        ssrc: Ssrc,
+        now: Instant,
+        sys_now: SystemTime,
+        buffer: &mut dyn Writable,
+    ) {
+        let ntp_ts = convert_to_ntp(sys_now);
+        // we use sys time as our wall clock timestamp, Instants can only measure elapsed times
+        // interpolate based off last sent rtp timestamp, elapsed time, and sample freq
+        let rtp_ts_elapsed: u32 = (now
+            .saturating_duration_since(self.last_sent_time)
+            .as_micros() as u64
+            * self.sent_sample_freq
+            / 1_000_000)
+            .try_into()
+            .unwrap_or(0);
+        let rtp_ts = self.last_sent_rtp_timestamp.wrapping_add(rtp_ts_elapsed);
+        let packet_count = self.packets_sent;
+        let octet_count = self.total_payload_bytes_sent;
+
+        SenderInfo {
+            ssrc,
+            ntp_ts,
+            rtp_ts,
+            packet_count,
+            octet_count,
+        }
+        .write(buffer);
+    }
+
+    pub(super) fn remember_report_sent(&mut self) {
+        self.sent_since_last_report = false;
+    }
+}
+
+/// Large seqnum gaps are caused by stream restarts. Use seqnums to guess if there was a
+/// stream restart
+fn maybe_receive_stream_restart(seqnum: u32, max_seqnum: u32) -> bool {
+    seqnum.abs_diff(max_seqnum) > SEQNUM_GAP_THRESHOLD
+}
+
+/// Large seqnum gaps are caused by stream restarts. Use seqnums to guess if there was a
+/// stream restart
+fn maybe_send_stream_restart(seqnum: FullSequenceNumber, max_seqnum: FullSequenceNumber) -> bool {
+    seqnum.abs_diff(max_seqnum) > FULL_SEQNUM_GAP_THRESHOLD
+}
+
+// stream rollovers happen when the seqnum wraps around. We check for wrap around
+// less than a certain gap. Note, there is a VERY small chance that the stream
+// has restarted instead of rolledover.
+fn maybe_stream_rollover(seqnum: FullSequenceNumber, max_seqnum: FullSequenceNumber) -> bool {
+    let delta = seqnum.abs_diff(max_seqnum);
+    seqnum < max_seqnum
+        && max_seqnum > u64::MAX - delta
+        && seqnum < FULL_SEQNUM_ROLLOVER_THRESHOLD
+        && u64::MAX - max_seqnum < FULL_SEQNUM_ROLLOVER_THRESHOLD
 }
 
 // The middle 32 bits in the NTP timestamp from the most recent RTCP sender report (SR) packet
@@ -524,13 +738,22 @@ fn calculate_delay_since_sr(sr_last_received_time: Instant, now: Instant) -> u32
         .unwrap_or_default()
 }
 
+/// Converts to NTP TS in seconds. Returns 0 if the SystemTime is before NTP epoch (Jan 01, 1900)
+/// Full length NTP timestamp is 32 bits for seconds since epoch, and 32 bits for fractions of a second
+/// Seconds roll over every u32::MAX seconds after NTP Epoch
+pub fn convert_to_ntp(ts: SystemTime) -> u64 {
+    const ROLLOVER_LIMIT: u64 = u32::MAX as u64 + 1;
+    let elapsed = ts.saturating_duration_since(*NTP_EPOCH);
+    ((elapsed.as_secs() % ROLLOVER_LIMIT) << 32) + elapsed.subsec_nanos() as u64
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RtcpHeader {
     has_padding: bool,
-    count_or_format: u8,
-    payload_type: u8,
+    pub count_or_format: u8,
+    pub payload_type: u8,
     /// length of the RTCP packet in words, minus the 1-word header
-    length_in_words: u16,
+    pub length_in_words: u16,
 }
 
 impl RtcpHeader {
@@ -538,6 +761,20 @@ impl RtcpHeader {
     const PADDING_MASK: u8 = 0b00100000;
     const RC_MASK: u8 = 0b00011111;
     const PACKET_LENGTH_RANGE: Range<usize> = 2..4;
+
+    pub fn new(
+        has_padding: bool,
+        count_or_format: u8,
+        payload_type: u8,
+        length_in_words: u16,
+    ) -> Self {
+        Self {
+            has_padding,
+            count_or_format,
+            payload_type,
+            length_in_words,
+        }
+    }
 
     // Parses the following binary format into a RtcpHeader. Note that this is
     // is the common header - the one used by SR, RR, and SDES. SSRCs will be contained
@@ -569,8 +806,23 @@ impl RtcpHeader {
     }
 }
 
+impl Writer for RtcpHeader {
+    fn written_len(&self) -> usize {
+        Self::LENGTH
+    }
+
+    fn write(&self, out: &mut dyn calling_common::Writable) {
+        let first_two_bytes = [
+            (VERSION << 6) | is_padded_mask(self.has_padding) | self.count_or_format,
+            self.payload_type,
+        ];
+        first_two_bytes.write(out);
+        self.length_in_words.write(out);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-struct ReportBlock {
+pub struct ReportBlock {
     ssrc: Ssrc,
     fraction_loss: u8,
     cumulative_loss_count: U24,
@@ -581,7 +833,7 @@ struct ReportBlock {
 }
 
 impl ReportBlock {
-    const BLOCK_LENGTH: usize = 24;
+    pub const BLOCK_LENGTH: usize = 24;
     const SSRC_RANGE: Range<usize> = 0..4;
     const FRACTION_LOSS_RANGE: usize = 4;
     const CUMULATIVE_LOSS_RANGE: Range<usize> = 5..8;
@@ -604,6 +856,22 @@ impl ReportBlock {
             last_sender_report: parse_u32(&value[Self::LAST_SENDER_REPORT_RANGE]),
             delay_last_sender_report: parse_u32(&value[Self::DELAY_LAST_SENDER_REPORT_RANGE]),
         })
+    }
+}
+
+impl Writer for ReportBlock {
+    fn written_len(&self) -> usize {
+        Self::BLOCK_LENGTH
+    }
+
+    fn write(&self, out: &mut dyn calling_common::Writable) {
+        self.ssrc.write(out);
+        [self.fraction_loss].write(out);
+        self.cumulative_loss_count.write(out);
+        self.highest_sequence_num.write(out);
+        self.jitter.write(out);
+        self.last_sender_report.write(out);
+        self.delay_last_sender_report.write(out);
     }
 }
 
@@ -635,6 +903,20 @@ impl SenderInfo {
     }
 }
 
+impl Writer for SenderInfo {
+    fn written_len(&self) -> usize {
+        Self::SENDER_INFO_LENGTH
+    }
+
+    fn write(&self, out: &mut dyn calling_common::Writable) {
+        self.ssrc.write(out);
+        self.ntp_ts.write(out);
+        self.rtp_ts.write(out);
+        self.packet_count.write(out);
+        self.octet_count.write(out);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SenderReport {
     header: RtcpHeader,
@@ -643,6 +925,7 @@ pub struct SenderReport {
 }
 
 impl SenderReport {
+    pub const MIN_LENGTH: usize = RtcpHeader::LENGTH + SenderInfo::SENDER_INFO_LENGTH;
     // Parses the following binary format into a sender report.
     // See https://datatracker.ietf.org/doc/html/rfc1889#section-6.3.1
     //
@@ -725,9 +1008,25 @@ impl SenderReport {
     }
 }
 
+impl Writer for SenderReport {
+    fn written_len(&self) -> usize {
+        self.header.packet_length_in_bytes()
+    }
+
+    fn write(&self, out: &mut dyn calling_common::Writable) {
+        self.header.write(out);
+        self.sender_info.write(out);
+        for report in &self.report_blocks {
+            report.write(out);
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use calling_common::{Duration, Writer};
+
+    use crate::{call::CLIENT_SERVER_DATA_PAYLOAD_TYPE, rtp::new_srtp_keys};
 
     use super::*;
 
@@ -810,6 +1109,7 @@ mod test {
             let delay_since_last_sender_report: u32 = 0;
 
             (
+                ssrc,
                 ssrc,
                 [fraction_lost_since_last],
                 U24::try_from(cumulative_loss).unwrap(),
@@ -927,6 +1227,7 @@ mod test {
 
             (
                 ssrc,
+                ssrc,
                 [0u8],
                 U24::from(0),
                 max_seqnum,
@@ -1003,6 +1304,7 @@ mod test {
             let delay_since_last_sender_report: u32 = 0;
 
             (
+                ssrc,
                 ssrc,
                 [0u8],
                 U24::from(0),
@@ -1115,6 +1417,7 @@ mod test {
         ) -> Vec<u8> {
             (
                 ssrc,
+                ssrc,
                 [0u8],
                 U24::from(0),
                 max_seqnum,
@@ -1220,5 +1523,165 @@ mod test {
 
         let too_old_to_matter = now - Duration::from_secs(2_u64.pow(16) + 1);
         assert_eq!(0, calculate_delay_since_sr(too_old_to_matter, now));
+    }
+
+    #[test]
+    fn test_convert_to_ntp() {
+        // NTP Epoch is Jan 01, 1900 00:00:00 UTC
+        // Unix Epoch is Jan 01, 1970 00:00:00 UTC
+        let unix_epoch = std::time::UNIX_EPOCH.into();
+        assert_eq!(
+            ((70 * 365 * 24 * 60 * 60) + (17 * 24 * 60 * 60)) << 32,
+            convert_to_ntp(unix_epoch),
+        );
+
+        assert_eq!(
+            (((70 * 365 * 24 * 60 * 60) + (17 * 24 * 60 * 60)) << 32) + 550_500,
+            convert_to_ntp(unix_epoch + Duration::from_nanos(550_500)),
+        );
+    }
+
+    #[test]
+    fn test_sender_report_basic() {
+        let mut report_sender = RtcpReportSender::new();
+
+        let ssrc = 123456;
+        // Given a 20 ms ptime (50 packets / second) and a sample rate of 48000, RTP timestamps
+        // would increment by this amount assuming no other delays.
+        let sample_rate = 48000;
+        let packet_rate = 50;
+        let rtp_interval = sample_rate / packet_rate;
+        // rtp duration for 5 milliseconds
+        let rtp_elapsed = 5 * sample_rate / 1000;
+        let now = Instant::now();
+        let sys_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| sys_now + Duration::from_millis(millis);
+        let mut seqnum: FullSequenceNumber = 1;
+        let mut sent = 0;
+        let mut next_packet = |pt, packet_size| {
+            let packet = Packet::with_empty_tag(
+                pt,
+                seqnum,
+                sent * rtp_interval,
+                ssrc,
+                None,
+                None,
+                &vec![1u8; packet_size],
+            );
+            seqnum += 1;
+            sent += 1;
+            packet
+        };
+
+        assert_eq!(
+            None,
+            report_sender.rtcp_report_payload_type(),
+            "Nothing received or sent, should have no report"
+        );
+        assert_eq!(
+            None,
+            report_sender.write_report_block_in_place(ssrc, now, sys_now, &mut vec![]),
+            "Nothing received or sent, should have no report"
+        );
+
+        let mut buffer = vec![];
+        report_sender.remember_sent(&next_packet(OPUS_PAYLOAD_TYPE, 5), at(20));
+        assert_eq!(
+            Some(RTCP_TYPE_SENDER_REPORT),
+            report_sender.rtcp_report_payload_type()
+        );
+        report_sender.write_report_block_in_place(ssrc, at(25), sys_at(25), &mut buffer);
+        assert_eq!(
+            SenderInfo {
+                ssrc,
+                ntp_ts: convert_to_ntp(sys_at(25)),
+                rtp_ts: rtp_elapsed,
+                packet_count: 1,
+                octet_count: 5
+            },
+            SenderInfo::from_bytes(&buffer),
+        );
+
+        assert_eq!(
+            Some(RTCP_TYPE_SENDER_REPORT),
+            report_sender.rtcp_report_payload_type(),
+            "Writing the report block does not reset pending report status"
+        );
+        report_sender.remember_report_sent();
+        assert_eq!(
+            None,
+            report_sender.rtcp_report_payload_type(),
+            "Report status cleared, should be none pending"
+        );
+
+        let mut buffer = vec![];
+        report_sender.remember_sent(&next_packet(OPUS_PAYLOAD_TYPE, 100), at(40));
+        report_sender.write_report_block_in_place(ssrc, at(45), sys_at(45), &mut buffer);
+        assert_eq!(
+            SenderInfo {
+                ssrc,
+                ntp_ts: convert_to_ntp(sys_at(45)),
+                rtp_ts: rtp_interval + rtp_elapsed,
+                packet_count: 2,
+                octet_count: 105
+            },
+            SenderInfo::from_bytes(&buffer),
+            "SenderReport correctly updates"
+        );
+        report_sender.remember_report_sent();
+        assert_eq!(
+            None,
+            report_sender.rtcp_report_payload_type(),
+            "Report status cleared, should be none pending"
+        );
+
+        report_sender.remember_sent(&next_packet(CLIENT_SERVER_DATA_PAYLOAD_TYPE, 100), at(40));
+        assert_eq!(
+            None,
+            report_sender.rtcp_report_payload_type(),
+            "Should ignore data packets"
+        );
+        let mut rtx_packet = next_packet(OPUS_PAYLOAD_TYPE, 100);
+        rtx_packet.set_seqnum_in_payload(123545);
+        report_sender.remember_sent(&rtx_packet, at(40));
+        assert_eq!(
+            None,
+            report_sender.rtcp_report_payload_type(),
+            "Should ignore RTX packets"
+        );
+    }
+
+    #[test]
+    fn test_encrypt() {
+        let (_, encrypt) = new_srtp_keys(0);
+        let report = SenderReport {
+            header: RtcpHeader {
+                length_in_words: 6,
+                has_padding: false,
+                count_or_format: 0,
+                payload_type: 200,
+            },
+            sender_info: SenderInfo {
+                ssrc: 100,
+                ntp_ts: 8888888,
+                rtp_ts: 8888888,
+                packet_count: 32,
+                octet_count: 64,
+            },
+            report_blocks: vec![],
+        };
+        let mut packet = report.to_vec();
+        packet.extend_from_slice(&[0u8; 20]);
+
+        let mut encrypted =
+            ControlPacket::encrypt(packet, 100, 1, &encrypt.rtcp.key, &encrypt.rtcp.salt).unwrap();
+        let decrypted = ControlPacket::parse_and_decrypt_in_place(
+            &mut encrypted,
+            &encrypt.rtcp.key,
+            &encrypt.rtcp.salt,
+        )
+        .unwrap();
+        assert_eq!(decrypted.sender_reports[0], report)
     }
 }

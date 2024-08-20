@@ -79,6 +79,78 @@ impl SubAssign<Duration> for Instant {
     }
 }
 
+/// A wrapper around [`std::time::SystemTime`] that does not expose errors in the `duration_since` operations.
+///
+/// Instead of subtraction, use `checked_duration_since` or `saturating_duration_since`.
+///
+/// Note that addition and subtraction of durations that would result in distant-future or
+/// distant-past SystemTime may still panic. Only operations that might result in a negative
+/// duration have been forbidden.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SystemTime(std::time::SystemTime);
+
+impl SystemTime {
+    pub fn checked_duration_since(&self, earlier: SystemTime) -> Option<Duration> {
+        self.0.duration_since(earlier.0).ok().map(Duration)
+    }
+
+    pub fn saturating_duration_since(&self, earlier: SystemTime) -> Duration {
+        self.0
+            .duration_since(earlier.0)
+            .map_or(Duration::ZERO, Duration)
+    }
+
+    pub fn now() -> SystemTime {
+        SystemTime(std::time::SystemTime::now())
+    }
+}
+
+impl From<std::time::SystemTime> for SystemTime {
+    fn from(value: std::time::SystemTime) -> Self {
+        Self(value)
+    }
+}
+
+impl From<SystemTime> for std::time::SystemTime {
+    fn from(value: SystemTime) -> Self {
+        value.0
+    }
+}
+
+impl Debug for SystemTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Add<Duration> for SystemTime {
+    type Output = SystemTime;
+
+    fn add(self, rhs: Duration) -> Self::Output {
+        Self(self.0 + rhs.0)
+    }
+}
+
+impl AddAssign<Duration> for SystemTime {
+    fn add_assign(&mut self, rhs: Duration) {
+        self.0 += rhs.0
+    }
+}
+
+impl Sub<Duration> for SystemTime {
+    type Output = SystemTime;
+
+    fn sub(self, rhs: Duration) -> Self::Output {
+        Self(self.0 - rhs.0)
+    }
+}
+
+impl SubAssign<Duration> for SystemTime {
+    fn sub_assign(&mut self, rhs: Duration) {
+        self.0 -= rhs.0
+    }
+}
+
 /// A wrapper around [`std::time::Duration`] that does not expose panicking difference operations.
 ///
 /// Instead of subtraction, use `checked_sub` or `saturating_sub`.
@@ -135,6 +207,10 @@ impl Duration {
 
     pub const fn as_nanos(&self) -> u128 {
         self.0.as_nanos()
+    }
+
+    pub const fn subsec_nanos(&self) -> u32 {
+        self.0.subsec_nanos()
     }
 
     pub fn checked_sub(&self, rhs: Duration) -> Option<Duration> {

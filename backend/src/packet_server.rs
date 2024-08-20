@@ -94,7 +94,11 @@ pub async fn start(
             tokio::time::sleep(tick_interval.into()).await;
             time_scope_us!("calling.udp_server.tick.processing");
 
-            let tick_output = { sfu_for_tick.lock().tick(Instant::now()) };
+            let tick_output = {
+                sfu_for_tick
+                    .lock()
+                    .tick(Instant::now(), calling_common::SystemTime::now())
+            };
 
             // Process outside the scope of the lock on the sfu.
             match packet_handler_state_for_tick.tick(tick_output) {

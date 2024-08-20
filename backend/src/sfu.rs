@@ -806,7 +806,7 @@ impl Sfu {
     /// For every tick, we need to iterate all calls, with the goal of iterating
     /// only once. Since we need to sometimes remove clients or calls, we will
     /// generally iterate with retain().
-    pub fn tick(&mut self, now: Instant) -> TickOutput {
+    pub fn tick(&mut self, now: Instant, sys_now: calling_common::SystemTime) -> TickOutput {
         time_scope_us!("calling.sfu.tick");
         let config = self.config;
         let mut packets_to_send = vec![];
@@ -921,7 +921,7 @@ impl Sfu {
                 false
             } else {
                 // Don't remove the connection; it's still active!
-                connection.tick(&mut packets_to_send, now);
+                connection.tick(&mut packets_to_send, now, sys_now);
                 outgoing_queue_sizes_by_call_id
                     .entry(connection_id.call_id.clone())
                     .or_default()
@@ -1465,6 +1465,7 @@ mod sfu_tests {
     #[tokio::test]
     async fn test_remove_clients() {
         let initial_now = Instant::now();
+        let initial_sys_now = calling_common::SystemTime::now();
         let sfu = new_sfu(initial_now, &CUSTOM_CONFIG);
 
         // 1000 calls with 8 users each.
@@ -1500,7 +1501,8 @@ mod sfu_tests {
 
             // Run the tick for (inactivity_timeout_secs * 1000) / tick_interval_ms times.
             for i in 0..((INACTIVITY_TIMEOUT_SECS * 1000) / TICK_PERIOD_MS) {
-                sfu.tick(initial_now.add(Duration::from_millis((i + 1) * TICK_PERIOD_MS)));
+                let elapsed = Duration::from_millis((i + 1) * TICK_PERIOD_MS);
+                sfu.tick(initial_now.add(elapsed), initial_sys_now.add(elapsed));
             }
 
             // The calls should now be gone.

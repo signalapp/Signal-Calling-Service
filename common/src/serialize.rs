@@ -172,6 +172,7 @@ impl_writer_tuple! { A B C D }
 impl_writer_tuple! { A B C D E }
 impl_writer_tuple! { A B C D E F }
 impl_writer_tuple! { A B C D E F G }
+impl_writer_tuple! { A B C D E F G H }
 
 impl<T: Writer, const N: usize> Writer for [T; N] {
     fn written_len(&self) -> usize {
