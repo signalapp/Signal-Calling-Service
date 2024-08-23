@@ -286,6 +286,7 @@ impl Sfu {
         let mut remembered_packet_bytes = Histogram::default();
         let mut outgoing_queue_size = Histogram::default();
         let mut outgoing_queue_delay_ms = Histogram::default();
+        let mut client_rtt_ms = Histogram::default();
         let mut udp_v4_connections = 0;
         let mut udp_v6_connections = 0;
         let mut tcp_v4_connections = 0;
@@ -295,8 +296,11 @@ impl Sfu {
         let now = Instant::now();
 
         for connection in self.connection_by_id.values() {
-            let connection = connection.lock();
-            let stats = connection.rtp_endpoint_stats();
+            let mut connection = connection.lock();
+            let stats = connection.rtp_endpoint_stats(now);
+            if let Some(rtt_estimate) = stats.rtt_estimate {
+                client_rtt_ms.push(rtt_estimate.as_millis() as usize);
+            }
             remembered_packet_count.push(stats.remembered_packet_count);
             remembered_packet_bytes.push(stats.remembered_packet_bytes);
             outgoing_queue_size.push(connection.outgoing_queue_size().as_bytes() as usize);
@@ -329,6 +333,7 @@ impl Sfu {
             "calling.sfu.connections.outgoing_queue_delay_ms",
             outgoing_queue_delay_ms,
         );
+        histograms.insert("calling.sfu.connections.rtt_ms", client_rtt_ms);
         values.insert(
             "calling.sfu.connections.udp_v4_count",
             udp_v4_connections as f32,

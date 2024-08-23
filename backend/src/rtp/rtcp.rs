@@ -49,7 +49,8 @@ pub const RTCP_FORMAT_NACK: u8 = 1;
 pub const RTCP_FORMAT_TRANSPORT_CC: u8 = 15;
 pub const RTCP_TYPE_SPECIFIC_FEEDBACK: u8 = 206;
 pub const RTCP_FORMAT_PLI: u8 = 1;
-pub const RECEIVER_REPORT_MIN_LENGTH: usize = 32;
+pub const RTT_ESTIMATE_AGE_LIMIT: Duration = Duration::from_secs(15);
+const RTT_ESTIMATE_AGE_LIMIT_SECS_F64: f64 = 15.0;
 // 1900 Jan 1st 00:00:00 UTC, RTP's chosen EPOCH
 static NTP_EPOCH: Lazy<SystemTime> =
     Lazy::new(|| (std::time::UNIX_EPOCH - std::time::Duration::from_secs(2_208_988_800)).into());
@@ -62,6 +63,7 @@ pub struct ControlPacket<'packet> {
     pub tcc_feedbacks: Vec<&'packet [u8]>,
     pub nacks: Vec<Nack>,
     pub sender_reports: Vec<SenderReport>,
+    pub receiver_reports: Vec<ReceiverReport>,
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -126,11 +128,16 @@ impl<'packet> ControlPacket<'packet> {
             match (header.payload_type, header.count_or_format) {
                 (RTCP_TYPE_SENDER_REPORT, _) => {
                     match SenderReport::from_bytes_after_header(payload, header) {
-                        Ok(sr) => incoming.sender_reports.push(sr),
+                        Ok(report) => incoming.sender_reports.push(report),
                         Err(err) => warn!("Failed to parse RTCP sender report: {}", err),
                     }
                 }
-                (RTCP_TYPE_RECEIVER_REPORT, _) => {}
+                (RTCP_TYPE_RECEIVER_REPORT, _) => {
+                    match ReceiverReport::from_bytes_after_header(payload, header) {
+                        Ok(report) => incoming.receiver_reports.push(report),
+                        Err(err) => warn!("Failed to parse RTCP receiver report: {}", err),
+                    }
+                }
                 (RTCP_TYPE_EXTENDED_REPORT, _) => {}
                 (RTCP_TYPE_SDES, _) => {}
                 (RTCP_TYPE_BYE, _) => {}
@@ -365,6 +372,13 @@ pub(super) struct RtcpReportSender {
     last_sent_time: Instant,
     last_sent_rtp_timestamp: u32,
     sent_sample_freq: u64,
+    // additional stats state
+    last_sender_report_sent_time: Instant,
+    last_sender_report_sent_time_ntp: u64,
+    last_receiver_report_received_time: Instant,
+    last_receiver_report_dlsr: u32,
+    rtt_estimate: Option<Duration>,
+    rtt_estimate_last_updated: Option<Instant>,
 }
 
 impl RtcpReportSender {
@@ -388,6 +402,13 @@ impl RtcpReportSender {
             last_sent_time: now,
             last_sent_rtp_timestamp: 0,
             sent_sample_freq: 90000,
+
+            last_sender_report_sent_time: now,
+            last_sender_report_sent_time_ntp: 0,
+            last_receiver_report_received_time: now,
+            last_receiver_report_dlsr: 0,
+            rtt_estimate: None,
+            rtt_estimate_last_updated: None,
         }
     }
 
@@ -403,6 +424,53 @@ impl RtcpReportSender {
 
         self.last_sender_report_received_time = receive_time;
         self.last_sender_report_received_ntp_timestamp = sender_report.sender_info.ntp_ts;
+    }
+
+    pub(super) fn remember_report_block(&mut self, report_block: ReportBlock, now: Instant) {
+        if report_block.delay_last_sender_report == 0 || report_block.last_sender_report == 0 {
+            return;
+        }
+        // Ignore reports for old SenderReports. In pathological cases, we may always ignore reports
+        // if we always receive them too late. Remembering the last few sender reports would reduce
+        // this issue, but shouldn't be an issue given reporting rates
+        if report_block.last_sender_report != get_lsr(self.last_sender_report_sent_time_ntp) {
+            return;
+        }
+
+        // When our reporting interval is longer than the clients RR interval, the SFU will receive
+        // multiple RR's with the same LSR referencing the same SR. These RR's may arrive out of
+        // order - we prioritize the newest RR. We differentiate age of RR's based on their DLSR
+        if report_block.delay_last_sender_report < self.last_receiver_report_dlsr {
+            return;
+        }
+
+        let delay = dlsr_to_duration(report_block.delay_last_sender_report);
+        let new_rtt_estimate = now
+            .saturating_duration_since(self.last_sender_report_sent_time)
+            .saturating_sub(delay);
+
+        self.update_rtt_estimate(new_rtt_estimate, now);
+        self.last_receiver_report_received_time = now;
+        self.last_receiver_report_dlsr = report_block.delay_last_sender_report;
+    }
+
+    /// Update the rtt_estimate. Smoothes the changing of RTT estimates. Ages out estimates older than 15 seconds.
+    fn update_rtt_estimate(&mut self, new_rtt_estimate: Duration, now: Instant) {
+        if let Some(old_rtt_estimate) = self.rtt_estimate {
+            let estimate_age =
+                now.saturating_duration_since(self.last_receiver_report_received_time);
+            let weight = RTT_ESTIMATE_AGE_LIMIT
+                .saturating_sub(estimate_age)
+                .as_secs_f64()
+                / RTT_ESTIMATE_AGE_LIMIT_SECS_F64;
+            self.rtt_estimate = Some(Duration::from_secs_f64(
+                weight * old_rtt_estimate.as_secs_f64()
+                    + ((1.0 - weight) * new_rtt_estimate.as_secs_f64()),
+            ))
+        } else {
+            self.rtt_estimate = Some(new_rtt_estimate);
+        }
+        self.rtt_estimate_last_updated = Some(now);
     }
 
     pub(super) fn remember_received(
@@ -636,7 +704,7 @@ impl RtcpReportSender {
             if self.last_sender_report_received_ntp_timestamp != 0 {
                 (
                     get_lsr(self.last_sender_report_received_ntp_timestamp),
-                    calculate_delay_since_sr(self.last_sender_report_received_time, now),
+                    calculate_dlsr(self.last_sender_report_received_time, now),
                 )
             } else {
                 (0, 0)
@@ -665,6 +733,7 @@ impl RtcpReportSender {
         buffer: &mut dyn Writable,
     ) {
         let ntp_ts = convert_to_ntp(sys_now);
+        self.last_sender_report_sent_time_ntp = ntp_ts;
         // we use sys time as our wall clock timestamp, Instants can only measure elapsed times
         // interpolate based off last sent rtp timestamp, elapsed time, and sample freq
         let rtp_ts_elapsed: u32 = (now
@@ -678,6 +747,10 @@ impl RtcpReportSender {
         let packet_count = self.packets_sent;
         let octet_count = self.total_payload_bytes_sent;
 
+        self.sent_since_last_report = false;
+        self.last_receiver_report_dlsr = 0;
+        self.last_sender_report_sent_time = now;
+
         SenderInfo {
             ssrc,
             ntp_ts,
@@ -688,8 +761,9 @@ impl RtcpReportSender {
         .write(buffer);
     }
 
-    pub(super) fn remember_report_sent(&mut self) {
-        self.sent_since_last_report = false;
+    /// returns the rtt estimate and when the estimate was last updated
+    pub(super) fn rtt_estimate(&self) -> Option<(Duration, Instant)> {
+        Some((self.rtt_estimate?, self.rtt_estimate_last_updated?))
     }
 }
 
@@ -726,7 +800,7 @@ fn get_lsr(last_ntp_timestamp: u64) -> u32 {
 // The delay, expressed in units of 1/2^16 seconds, between receiving the last SR packet from
 // source SSRC_n and sending this reception report block.
 // If no SR packet has been received yet from SSRC_n, the DLSR field is set to zero.
-fn calculate_delay_since_sr(sr_last_received_time: Instant, now: Instant) -> u32 {
+fn calculate_dlsr(sr_last_received_time: Instant, now: Instant) -> u32 {
     // Max delay representable is 2^16 seconds (a bit over 18 hours). After that, we start
     // to return 0's. 1/2^16 is roughly 0.000015259, which requires nanosecond precision
     // To avoid underflow calculate from duration.as_nanos()/15259
@@ -736,6 +810,11 @@ fn calculate_delay_since_sr(sr_last_received_time: Instant, now: Instant) -> u32
         / NANOS_TO_DELAY_UNIT)
         .try_into()
         .unwrap_or_default()
+}
+
+fn dlsr_to_duration(delay_since_sr: u32) -> Duration {
+    const NANOS_TO_DELAY_UNIT: u64 = 15259;
+    Duration::from_nanos(delay_since_sr as u64 * NANOS_TO_DELAY_UNIT)
 }
 
 /// Converts to NTP TS in seconds. Returns 0 if the SystemTime is before NTP epoch (Jan 01, 1900)
@@ -823,17 +902,18 @@ impl Writer for RtcpHeader {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReportBlock {
-    ssrc: Ssrc,
+    pub ssrc: Ssrc,
     fraction_loss: u8,
     cumulative_loss_count: U24,
     highest_sequence_num: u32,
     jitter: u32,
+    // middle 32 bits of last receiver sender reports 64bit NTP TS
     last_sender_report: u32,
     delay_last_sender_report: u32,
 }
 
 impl ReportBlock {
-    pub const BLOCK_LENGTH: usize = 24;
+    pub const LENGTH: usize = 24;
     const SSRC_RANGE: Range<usize> = 0..4;
     const FRACTION_LOSS_RANGE: usize = 4;
     const CUMULATIVE_LOSS_RANGE: Range<usize> = 5..8;
@@ -843,7 +923,7 @@ impl ReportBlock {
     const DELAY_LAST_SENDER_REPORT_RANGE: Range<usize> = 20..24;
 
     fn from_bytes(value: &[u8]) -> Result<Self, String> {
-        if value.len() < Self::BLOCK_LENGTH {
+        if value.len() < Self::LENGTH {
             return Err("Malformed Report Block: too few bytes".to_owned());
         }
 
@@ -861,7 +941,7 @@ impl ReportBlock {
 
 impl Writer for ReportBlock {
     fn written_len(&self) -> usize {
-        Self::BLOCK_LENGTH
+        Self::LENGTH
     }
 
     fn write(&self, out: &mut dyn calling_common::Writable) {
@@ -974,9 +1054,15 @@ impl SenderReport {
     }
 
     fn from_bytes_after_header(value: &[u8], header: RtcpHeader) -> Result<Self, String> {
+        if header.payload_type != RTCP_TYPE_SENDER_REPORT {
+            return Err(format!(
+                "Malformed Sender Report: expected payload type {}, found {}",
+                RTCP_TYPE_RECEIVER_REPORT, header.payload_type
+            ));
+        }
         let header_length = header.length_in_words as usize * 4;
-        let minimum_expected_length = SenderInfo::SENDER_INFO_LENGTH
-            + header.count_or_format as usize * ReportBlock::BLOCK_LENGTH;
+        let minimum_expected_length =
+            SenderInfo::SENDER_INFO_LENGTH + header.count_or_format as usize * ReportBlock::LENGTH;
         if header_length < minimum_expected_length || value.len() < header_length {
             return Err(format!(
                 "Malformed Sender Report: header_size={}, report_count={}, actual_size={}",
@@ -993,7 +1079,7 @@ impl SenderReport {
 
         while report_blocks.len() < report_count {
             report_blocks.push(ReportBlock::from_bytes(bytes_left)?);
-            bytes_left = &bytes_left[ReportBlock::BLOCK_LENGTH..];
+            bytes_left = &bytes_left[ReportBlock::LENGTH..];
         }
 
         Ok(Self {
@@ -1022,6 +1108,69 @@ impl Writer for SenderReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReceiverReport {
+    header: RtcpHeader,
+    sender_ssrc: Ssrc,
+    pub report_blocks: Vec<ReportBlock>,
+}
+
+impl ReceiverReport {
+    const SSRC_LENGTH: usize = 4;
+    const SENDER_SSRC_RANGE: Range<usize> = 0..Self::SSRC_LENGTH;
+    pub const MIN_LENGTH: usize = RtcpHeader::LENGTH + Self::SSRC_LENGTH;
+
+    /// Parses binary into ReceiverReport. Format is similar to SenderReport without
+    /// the sender info
+    #[cfg(test)]
+    fn from_bytes(value: &[u8]) -> Result<Self, String> {
+        if value.len() < Self::MIN_LENGTH {
+            return Err("Malformed Receiver Report: too few bytes".to_owned());
+        }
+        let header = RtcpHeader::from_bytes(value);
+        Self::from_bytes_after_header(&value[RtcpHeader::LENGTH..], header)
+    }
+
+    fn from_bytes_after_header(value: &[u8], header: RtcpHeader) -> Result<Self, String> {
+        if header.payload_type != RTCP_TYPE_RECEIVER_REPORT {
+            return Err(format!(
+                "Malformed Receiver Report: expected payload type {}, found {}",
+                RTCP_TYPE_RECEIVER_REPORT, header.payload_type
+            ));
+        }
+        let header_length = header.length_in_words as usize * 4;
+        let report_count = header.count_or_format.into();
+        let minimum_expected_length = Self::SSRC_LENGTH + report_count * ReportBlock::LENGTH;
+        if header_length < minimum_expected_length || value.len() < header_length {
+            return Err(format!(
+                "Malformed Receiver Report: header_size={}, report_count={}, actual_size={}",
+                header_length,
+                header.count_or_format,
+                value.len()
+            ));
+        }
+
+        let sender_ssrc = parse_u32(&value[Self::SENDER_SSRC_RANGE]);
+        let mut report_blocks = Vec::with_capacity(report_count);
+        let mut bytes_left = &value[Self::SENDER_SSRC_RANGE.end..];
+
+        while report_blocks.len() < report_count {
+            report_blocks.push(ReportBlock::from_bytes(bytes_left)?);
+            bytes_left = &bytes_left[ReportBlock::LENGTH..];
+        }
+
+        Ok(Self {
+            header,
+            sender_ssrc,
+            report_blocks,
+        })
+    }
+
+    pub fn ssrc(&self) -> Ssrc {
+        self.sender_ssrc
+    }
+}
+
 #[cfg(test)]
 mod test {
     use calling_common::{Duration, Writer};
@@ -1031,11 +1180,11 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_parse_sender_report() {
+    fn test_parse_rtcp_reports() {
         let report_count: u8 = 2;
         let pt = RTCP_TYPE_SENDER_REPORT;
         let length: u16 = (SenderInfo::SENDER_INFO_LENGTH
-            + report_count as usize * ReportBlock::BLOCK_LENGTH)
+            + report_count as usize * ReportBlock::LENGTH)
             .try_into()
             .unwrap();
         let length_in_words = length / 4;
@@ -1044,6 +1193,9 @@ mod test {
         assert_eq!(report_count, parsed_header.count_or_format);
         assert_eq!(pt, parsed_header.payload_type);
         assert_eq!(length_in_words, parsed_header.length_in_words);
+        let mut buf = vec![];
+        parsed_header.write(&mut buf);
+        assert_eq!(buf, raw_header);
 
         let ssrc: u32 = 10000;
         let ntp: u64 = 1234567898765432;
@@ -1074,8 +1226,13 @@ mod test {
         assert_eq!(lsr, parsed_report_block.last_sender_report);
         assert_eq!(dlsr, parsed_report_block.delay_last_sender_report);
 
-        let raw_sender_report =
-            (raw_header, raw_sender_info, raw_report.clone(), raw_report).to_vec();
+        let raw_sender_report = (
+            raw_header.clone(),
+            raw_sender_info,
+            raw_report.clone(),
+            raw_report.clone(),
+        )
+            .to_vec();
         let parsed_sender_report = SenderReport::from_bytes(&raw_sender_report).unwrap();
         assert_eq!(parsed_header, parsed_sender_report.header);
         assert_eq!(parsed_sender_info, parsed_sender_report.sender_info);
@@ -1088,10 +1245,42 @@ mod test {
 
         let parsed_sender_report_2 = SenderReport::from_bytes_after_header(
             &raw_sender_report[RtcpHeader::LENGTH..],
-            parsed_header,
+            parsed_header.clone(),
         )
         .unwrap();
         assert_eq!(parsed_sender_report, parsed_sender_report_2);
+
+        let report_count: u8 = 2;
+        let pt = RTCP_TYPE_RECEIVER_REPORT;
+        let length: u16 = (ReceiverReport::MIN_LENGTH - RtcpHeader::LENGTH
+            + report_count as usize * ReportBlock::LENGTH)
+            .try_into()
+            .unwrap();
+        let length_in_words = length / 4;
+        let rr_header = RtcpHeader {
+            payload_type: pt,
+            has_padding: false,
+            count_or_format: report_count,
+            length_in_words,
+        };
+        let raw_receiver_report =
+            (rr_header.clone(), ssrc, raw_report.clone(), raw_report).to_vec();
+        let parsed_receiver_report = ReceiverReport::from_bytes(&raw_receiver_report).unwrap();
+        assert_eq!(rr_header, parsed_receiver_report.header);
+        assert_eq!(ssrc, parsed_receiver_report.ssrc());
+        assert_eq!(
+            report_count as usize,
+            parsed_receiver_report.report_blocks.len()
+        );
+        assert_eq!(parsed_report_block, parsed_receiver_report.report_blocks[0]);
+        assert_eq!(parsed_report_block, parsed_receiver_report.report_blocks[1]);
+
+        let parsed_receiver_report_2 = ReceiverReport::from_bytes_after_header(
+            &raw_receiver_report[RtcpHeader::LENGTH..],
+            rr_header,
+        )
+        .unwrap();
+        assert_eq!(parsed_receiver_report, parsed_receiver_report_2);
     }
 
     #[test]
@@ -1513,16 +1702,14 @@ mod test {
         let last_sr_time = now - Duration::from_secs(5);
 
         // check if close to expected value (within 150 microseconds)
-        assert!((5 * 2_u32.pow(16)).abs_diff(calculate_delay_since_sr(last_sr_time, now)) < 10);
+        assert!((5 * 2_u32.pow(16)).abs_diff(calculate_dlsr(last_sr_time, now)) < 10);
 
         // within 15ms after 15mins.
         let last_sr_time = now - Duration::from_secs(60 * 15);
-        assert!(
-            (60 * 15 * 2_u32.pow(16)).abs_diff(calculate_delay_since_sr(last_sr_time, now)) < 1000
-        );
+        assert!((60 * 15 * 2_u32.pow(16)).abs_diff(calculate_dlsr(last_sr_time, now)) < 1000);
 
         let too_old_to_matter = now - Duration::from_secs(2_u64.pow(16) + 1);
-        assert_eq!(0, calculate_delay_since_sr(too_old_to_matter, now));
+        assert_eq!(0, calculate_dlsr(too_old_to_matter, now));
     }
 
     #[test]
@@ -1604,12 +1791,6 @@ mod test {
         );
 
         assert_eq!(
-            Some(RTCP_TYPE_SENDER_REPORT),
-            report_sender.rtcp_report_payload_type(),
-            "Writing the report block does not reset pending report status"
-        );
-        report_sender.remember_report_sent();
-        assert_eq!(
             None,
             report_sender.rtcp_report_payload_type(),
             "Report status cleared, should be none pending"
@@ -1629,7 +1810,6 @@ mod test {
             SenderInfo::from_bytes(&buffer),
             "SenderReport correctly updates"
         );
-        report_sender.remember_report_sent();
         assert_eq!(
             None,
             report_sender.rtcp_report_payload_type(),

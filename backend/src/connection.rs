@@ -619,8 +619,8 @@ impl Connection {
         self.congestion_control.pacer.queue_delay(now)
     }
 
-    pub fn rtp_endpoint_stats(&self) -> rtp::EndpointStats {
-        self.rtp.endpoint.stats()
+    pub fn rtp_endpoint_stats(&mut self, now: Instant) -> rtp::EndpointStats {
+        self.rtp.endpoint.update_stats(now)
     }
 
     pub fn configure_congestion_control(

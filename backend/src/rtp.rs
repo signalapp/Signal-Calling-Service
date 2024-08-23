@@ -172,9 +172,14 @@ struct IncomingSsrcState {
     rtcp_report_sender: RtcpReportSender,
 }
 
+#[derive(Debug)]
 pub struct EndpointStats {
     pub remembered_packet_count: usize,
     pub remembered_packet_bytes: usize,
+
+    /// Average RTT across all SSRCs based on last 15 seconds
+    /// returns None if stat is not currently available or recent
+    pub rtt_estimate: Option<Duration>,
 }
 
 impl Endpoint {
@@ -365,6 +370,8 @@ impl Endpoint {
                 .rtcp_report_sender
                 .remember_received_sender_report(sender_report, now);
         }
+        self.remember_receiver_reports(incoming.receiver_reports, now);
+
         Some(ProcessedControlPacket {
             key_frame_requests: incoming.key_frame_requests,
             acks,
@@ -443,6 +450,24 @@ impl Endpoint {
         self.get_incoming_ssrc_state_mut(outgoing.ssrc())
             .rtcp_report_sender
             .remember_sent(outgoing, now);
+    }
+
+    fn remember_receiver_reports(&mut self, reports: Vec<ReceiverReport>, now: Instant) {
+        for rr in reports {
+            if !self.state_by_incoming_ssrc.contains_key(&rr.ssrc()) {
+                continue;
+            }
+
+            for block in rr.report_blocks {
+                if !self.state_by_incoming_ssrc.contains_key(&block.ssrc) {
+                    continue;
+                }
+
+                self.get_incoming_ssrc_state_mut(block.ssrc)
+                    .rtcp_report_sender
+                    .remember_report_block(block, now);
+            }
+        }
     }
 
     // Returns serialized RTCP packets containing ACKs, not just ACK payloads.
@@ -525,7 +550,7 @@ impl Endpoint {
         let mut report_buffer = self.create_buffer_for_rtcp_reports()?;
         let mut is_first = true;
         let mut first_ssrc = 0u32;
-        let mut block_buffer = Vec::with_capacity(RECEIVER_REPORT_MIN_LENGTH);
+        let mut block_buffer = Vec::with_capacity(ReceiverReport::MIN_LENGTH + ReportBlock::LENGTH);
         for (ssrc, state) in &mut self.state_by_incoming_ssrc {
             block_buffer.clear();
             let Some((payload_type, block_count, report_length)) = state
@@ -535,7 +560,6 @@ impl Endpoint {
                 continue;
             };
 
-            state.rtcp_report_sender.remember_report_sent();
             let header = RtcpHeader::new(
                 false,
                 block_count,
@@ -618,12 +642,38 @@ impl Endpoint {
         Some(encrypted)
     }
 
-    pub fn stats(&self) -> EndpointStats {
+    pub fn update_stats(&mut self, now: Instant) -> EndpointStats {
         let (remembered_packet_count, remembered_packet_bytes) =
             self.rtx_sender.remembered_packet_stats();
+
         EndpointStats {
             remembered_packet_count,
             remembered_packet_bytes,
+            rtt_estimate: self.calculate_rtt(now),
+        }
+    }
+
+    /// Average RTT estimates across all SSRCS that are not too old.
+    /// If all the estimates are old, then return None.
+    fn calculate_rtt(&self, now: Instant) -> Option<Duration> {
+        let mut count = 0;
+        let mut sum = Duration::from_secs(0);
+
+        for ssrc_state in self.state_by_incoming_ssrc.values() {
+            if let Some((estimate, last_updated)) = ssrc_state.rtcp_report_sender.rtt_estimate() {
+                if now.saturating_duration_since(last_updated) >= RTT_ESTIMATE_AGE_LIMIT {
+                    continue;
+                }
+
+                sum += estimate;
+                count += 1;
+            }
+        }
+
+        if count != 0 {
+            Some(sum / count)
+        } else {
+            None
         }
     }
 
@@ -632,6 +682,7 @@ impl Endpoint {
     ///     There is NO possibility of padding since the sizes are all multiples of four.
     /// - the number of reports to serialize
     fn create_buffer_for_rtcp_reports(&self) -> Option<Vec<u8>> {
+        const RECEIVER_REPORT_MIN_LENGTH: usize = ReceiverReport::MIN_LENGTH + ReportBlock::LENGTH;
         let expected_report_size = self.state_by_incoming_ssrc.iter().fold(
             0usize,
             |total_bytes, (ssrc, state)| match state.rtcp_report_sender.rtcp_report_payload_type() {
