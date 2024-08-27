@@ -34,8 +34,9 @@ num_cpus = "1.16.0"
 async-trait = "0.1.81"
 
 # For http
-axum = { version = "0.6.20", features = ["headers"] }
-hyper = { version = "0.14.30", features = ["full"] }
+axum = { version = "0.7.5" }
+axum-extra = { version = "0.9.3", default-features = false, features = ["typed-header"] }
+hyper = { version = "1.4.1", features = ["full"] }
 reqwest = { version = "0.12.6", default-features = false, features = ["json"] }
 tower = "0.4.13"
 

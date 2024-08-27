@@ -9,8 +9,9 @@ use anyhow::Result;
 use axum::{
     extract::{OriginalUri, Query, State},
     response::{IntoResponse, Redirect},
-    Extension, Json, TypedHeader,
+    Extension, Json,
 };
+use axum_extra::TypedHeader;
 use hex::ToHex;
 use http::StatusCode;
 use log::*;
@@ -370,13 +371,13 @@ pub mod api_server_v2_tests {
     use std::str;
     use std::time::SystemTime;
 
+    use axum::body::Body;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use calling_common::{DemuxId, RoomId};
     use hex::{FromHex, ToHex};
     use hmac::Mac;
     use http::{header, Request};
-    use hyper::Body;
     use mockall::predicate::*;
     use mockall::Sequence;
     use once_cell::sync::Lazy;
@@ -690,7 +691,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(participants_response.era_id, ERA_ID_1);
@@ -920,7 +923,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_1);
         assert_eq!(join_response.port, 8080);
@@ -1025,7 +1030,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
@@ -1130,7 +1137,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
@@ -1480,7 +1489,9 @@ pub mod api_server_v2_tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert!(body.is_empty());
     }
 
@@ -1522,7 +1533,9 @@ pub mod api_server_v2_tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error_response.reason, "expired");
     }
@@ -1565,7 +1578,9 @@ pub mod api_server_v2_tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error_response.reason, "expired");
     }
@@ -1605,7 +1620,9 @@ pub mod api_server_v2_tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error_response.reason, "invalid");
     }
@@ -1645,7 +1662,9 @@ pub mod api_server_v2_tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error_response.reason, "invalid");
     }
@@ -1695,7 +1714,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(participants_response.era_id, ERA_ID_1);
@@ -1793,7 +1814,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(participants_response.era_id, ERA_ID_1);
@@ -1896,7 +1919,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(participants_response.era_id, ERA_ID_1);
@@ -1975,7 +2000,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(participants_response.era_id, ERA_ID_1);
@@ -2052,7 +2079,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let participants_response: ParticipantsResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(participants_response.era_id, ERA_ID_1);
@@ -2321,7 +2350,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_1);
         assert_eq!(join_response.port, 8080);
@@ -2451,7 +2482,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_1);
         assert_eq!(join_response.port, 8080);
@@ -2582,7 +2615,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_1);
         assert_eq!(join_response.port, 8080);
@@ -2687,7 +2722,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
@@ -2792,7 +2829,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
@@ -2853,7 +2892,9 @@ pub mod api_server_v2_tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error_response.reason, "expired");
     }
@@ -2902,7 +2943,9 @@ pub mod api_server_v2_tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error_response.reason, "expired");
     }
@@ -2997,7 +3040,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
@@ -3103,7 +3148,9 @@ pub mod api_server_v2_tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
@@ -3160,7 +3207,9 @@ pub mod api_server_v2_tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error_response.reason, "expired");
     }
@@ -3206,7 +3255,9 @@ pub mod api_server_v2_tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error_response.reason, "expired");
     }
@@ -3250,7 +3301,9 @@ pub mod api_server_v2_tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error_response.reason, "invalid");
     }
@@ -3294,7 +3347,9 @@ pub mod api_server_v2_tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error_response.reason, "invalid");
     }

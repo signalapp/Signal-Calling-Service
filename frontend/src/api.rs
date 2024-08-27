@@ -15,7 +15,7 @@ use std::{
 
 use anyhow::Result;
 use axum::{
-    extract::{MatchedPath, State},
+    extract::{MatchedPath, Request, State},
     middleware::{self, Next},
     response::IntoResponse,
     routing::get,
@@ -23,7 +23,7 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use http::{header, Method, Request, StatusCode};
+use http::{header, Method, StatusCode};
 use log::*;
 use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
@@ -51,7 +51,7 @@ impl From<FrontendError> for StatusCode {
     }
 }
 
-fn get_request_path<B>(req: &Request<B>) -> &str {
+fn get_request_path(req: &Request) -> &str {
     if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
         matched_path.as_str()
     } else {
@@ -59,7 +59,7 @@ fn get_request_path<B>(req: &Request<B>) -> &str {
     }
 }
 
-fn get_user_agent<B>(req: &Request<B>) -> Result<&str, StatusCode> {
+fn get_user_agent(req: &Request) -> Result<&str, StatusCode> {
     req.headers()
         .get(header::USER_AGENT)
         .and_then(|header| header.to_str().ok())
@@ -93,10 +93,10 @@ fn user_agent_event_string(user_agent: &str) -> &str {
 }
 
 /// Middleware to process metrics after a response is sent.
-async fn metrics<B>(
+async fn metrics(
     State(frontend): State<Arc<Frontend>>,
-    req: Request<B>,
-    next: Next<B>,
+    req: Request,
+    next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
     trace!("metrics");
 
@@ -162,10 +162,10 @@ async fn metrics<B>(
 }
 
 /// Middleware to handle the authorization header.
-async fn authorize<B>(
+async fn authorize(
     State(frontend): State<Arc<Frontend>>,
-    mut req: Request<B>,
-    next: Next<B>,
+    mut req: Request,
+    next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
     trace!("authorize");
 
@@ -232,13 +232,12 @@ async fn authorize<B>(
             Ok(next.run(req).await)
         }
         Bearer(token) => {
+            let method = req.method();
             let fail_malformed = |err: &dyn Display| {
                 event!("calling.frontend.api.authorization.malformed.zkcredential");
                 info!(
                     "authorize: malformed credentials for {} from {}: {}",
-                    req.method(),
-                    user_agent,
-                    err
+                    method, user_agent, err
                 );
                 StatusCode::BAD_REQUEST
             };
@@ -283,11 +282,11 @@ async fn authorize<B>(
     }
 }
 
-async fn extra_call_link_metrics<B>(
+async fn extra_call_link_metrics(
     State(frontend): State<Arc<Frontend>>,
     create_auth: Option<Extension<Arc<CreateCallLinkCredentialPresentation>>>,
-    req: Request<B>,
-    next: Next<B>,
+    req: Request,
+    next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
     if create_auth.is_none() || req.method() != Method::PUT {
         return Ok(next.run(req).await);
@@ -399,9 +398,9 @@ fn app(frontend: Arc<Frontend>) -> Router {
 pub async fn start(frontend: Arc<Frontend>, ender_rx: Receiver<()>) -> Result<()> {
     let addr = SocketAddr::new(frontend.config.server_ip, frontend.config.server_port);
 
-    let server = axum::Server::try_bind(&addr)?
-        .serve(app(frontend).into_make_service())
-        .with_graceful_shutdown(async {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let server =
+        axum::serve(listener, app(frontend).into_make_service()).with_graceful_shutdown(async {
             let _ = ender_rx.await;
         });
 

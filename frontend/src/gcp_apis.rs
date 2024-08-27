@@ -225,7 +225,7 @@ impl InstanceLister {
             .client
             .post(self.instance_group_url.clone())
             .json("{}")
-            .header("authorization", format!("Bearer {}", token))
+            .header(http::header::AUTHORIZATION, format!("Bearer {}", token))
             .send()
             .await?;
 
@@ -265,7 +265,7 @@ impl InstanceLister {
         let response = self
             .client
             .get(url)
-            .header("authorization", format!("Bearer {}", token))
+            .header(http::header::AUTHORIZATION, format!("Bearer {}", token))
             .send()
             .await?;
 

@@ -13,12 +13,11 @@ use std::{net::SocketAddr, str, sync::Arc, time::UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use axum::{
+    http::StatusCode, middleware, response::IntoResponse, routing::get, Extension, Json, Router,
+};
+use axum_extra::{
     headers::{self, authorization::Basic, Authorization},
-    http::StatusCode,
-    middleware,
-    response::IntoResponse,
-    routing::get,
-    Extension, Json, Router, TypedHeader,
+    TypedHeader,
 };
 use hex::{FromHex, ToHex};
 use log::*;
@@ -409,15 +408,16 @@ pub async fn start(
 ) -> Result<()> {
     let addr = SocketAddr::new(config.binding_ip, config.signaling_port);
 
-    let server = axum::Server::try_bind(&addr)?
-        .serve(
-            app(sfu, config)
-                .layer(middleware::from_fn(log_response))
-                .into_make_service(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = http_ender_rx.await;
-        });
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let server = axum::serve(
+        listener,
+        app(sfu, config)
+            .layer(middleware::from_fn(log_response))
+            .into_make_service(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = http_ender_rx.await;
+    });
 
     info!("http_server ready: {}", addr);
     if let Err(err) = server.await {

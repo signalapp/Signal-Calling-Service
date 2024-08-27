@@ -3,13 +3,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 use calling_common::Instant;
-use hyper::{header, Request};
+use hyper::header;
 use log::*;
 
-pub async fn log_response<B>(req: Request<B>, next: Next<B>) -> Response {
+pub async fn log_response(req: Request, next: Next) -> Response {
     let started = Instant::now();
 
     let method = req.method().clone();

@@ -122,7 +122,7 @@ impl ApprovedUsers {
                     let response = reqwest::Client::new()
                         .put(url.clone())
                         .header("X-Room-Id", room_id.as_ref())
-                        .header("Content-Type", "application/json")
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
                         .body(body)
                         .send()
                         .map_err(anyhow::Error::from);

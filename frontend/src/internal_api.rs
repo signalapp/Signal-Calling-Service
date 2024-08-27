@@ -7,13 +7,14 @@ use std::{collections::HashMap, net::SocketAddr, str, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use axum::{
-    extract::{MatchedPath, Path, State},
+    extract::{MatchedPath, Path, Request, State},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{delete, get, put},
-    Json, Router, TypedHeader,
+    Json, Router,
 };
-use http::{Request, StatusCode};
+use axum_extra::TypedHeader;
+use http::StatusCode;
 use log::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot::Receiver;
@@ -32,7 +33,7 @@ pub struct ApiMetrics {
     pub counts: HashMap<String, u64>,
 }
 
-fn get_request_path<B>(req: &Request<B>) -> &str {
+fn get_request_path(req: &Request) -> &str {
     if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
         matched_path.as_str()
     } else {
@@ -41,10 +42,10 @@ fn get_request_path<B>(req: &Request<B>) -> &str {
 }
 
 /// Middleware to process metrics after a response is sent.
-async fn metrics<B>(
+async fn metrics(
     State(frontend): State<Arc<Frontend>>,
-    req: Request<B>,
-    next: Next<B>,
+    req: Request,
+    next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
     trace!("metrics");
 
@@ -147,8 +148,8 @@ pub async fn start(frontend: Arc<Frontend>, ender_rx: Receiver<()>) -> Result<()
         Some(port) => {
             let addr = SocketAddr::new(frontend.config.internal_api_ip, port);
 
-            let server = axum::Server::try_bind(&addr)?
-                .serve(app(frontend).into_make_service())
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            let server = axum::serve(listener, app(frontend).into_make_service())
                 .with_graceful_shutdown(async {
                     let _ = ender_rx.await;
                 });

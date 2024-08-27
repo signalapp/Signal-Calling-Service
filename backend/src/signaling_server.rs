@@ -23,12 +23,15 @@ use std::{
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{Path, State},
-    headers::{self, Header},
     http::StatusCode,
     middleware,
     response::IntoResponse,
     routing::{get, post},
-    Extension, Json, Router, TypedHeader,
+    Extension, Json, Router,
+};
+use axum_extra::{
+    headers::{self, Header},
+    TypedHeader,
 };
 use calling_common::{DemuxId, RoomId};
 use hex::{FromHex, ToHex};
@@ -425,15 +428,16 @@ pub async fn start(
 
     start_monitor(monitor_ender_rx, cpu_idle_pct.clone());
 
-    let server = axum::Server::try_bind(&addr)?
-        .serve(
-            signaling_api(config, sfu, is_healthy, cpu_idle_pct)
-                .layer(middleware::from_fn(log_response))
-                .into_make_service(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = ender_rx.await;
-        });
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let server = axum::serve(
+        listener,
+        signaling_api(config, sfu, is_healthy, cpu_idle_pct)
+            .layer(middleware::from_fn(log_response))
+            .into_make_service(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = ender_rx.await;
+    });
 
     info!("signaling_server ready: {}", addr);
     if let Err(err) = server.await {
@@ -665,7 +669,9 @@ mod signaling_server_tests {
             "application/json"
         );
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(&body[..], br#"{"directAccessIp":"127.0.0.1"}"#);
     }
 
@@ -733,7 +739,9 @@ mod signaling_server_tests {
             response.headers().get("content-type").unwrap(),
             "application/json"
         );
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             &body[..],
             format!(
@@ -765,7 +773,9 @@ mod signaling_server_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             &body[..],
             format!(
@@ -791,7 +801,9 @@ mod signaling_server_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             &body[..],
             format!(
@@ -816,7 +828,9 @@ mod signaling_server_tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             &body[..],
             br#"{"endpointIds":[],"demuxIds":[],"pendingClients":[]}"#
@@ -870,7 +884,9 @@ mod signaling_server_tests {
             response.headers().get("content-type").unwrap(),
             "application/json"
         );
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             &body[..],
             format!(
@@ -902,7 +918,9 @@ mod signaling_server_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             &body[..],
             format!(
@@ -930,7 +948,9 @@ mod signaling_server_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             &body[..],
             format!(
@@ -958,7 +978,9 @@ mod signaling_server_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             &body[..],
             format!(
@@ -1151,7 +1173,9 @@ mod signaling_server_tests {
             "application/json"
         );
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(response.server_ip, "127.0.0.1");
         assert_eq!(response.server_port, 10000);

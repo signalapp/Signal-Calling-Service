@@ -44,12 +44,13 @@ hmac = "0.12.1"
 subtle = "2.6.1"
 
 # For http client and server
-hyper = { version = "0.14.30", features = ["full"] }
-axum = { version = "0.6.20", features = ["headers"] }
+axum = { version = "0.7.5" }
+axum-extra = { version = "0.9.3", default-features = false, features = ["typed-header"] }
+hyper = { version = "1.4.1", features = ["full"] }
 tower = "0.4.13"
 reqwest = { version = "0.12.6", default-features = false, features = ["json", "rustls-tls"] }
 mime = "0.3.17"
-http = "0.2.12"
+http = "1.1.0"
 
 # For storage access to DynamoDB
 aws-types = "1.3.3"

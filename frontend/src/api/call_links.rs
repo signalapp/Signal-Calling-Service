@@ -6,11 +6,10 @@
 use std::{fmt::Debug, sync::Arc, time::SystemTime};
 
 use anyhow::Result;
-use axum::{
-    extract::State,
+use axum::{extract::State, response::IntoResponse, Extension, Json};
+use axum_extra::{
     headers::{self, Header, HeaderName, HeaderValue},
-    response::IntoResponse,
-    Extension, Json, TypedHeader,
+    TypedHeader,
 };
 use bincode::Options;
 use http::StatusCode;
@@ -498,12 +497,12 @@ pub async fn reset_call_link_approvals(
 pub mod tests {
     use super::*;
 
+    use axum::body::Body;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use calling_common::Duration;
     use hex::FromHex;
     use http::{header, Request};
-    use hyper::Body;
     use mockall::predicate::*;
     use once_cell::sync::Lazy;
     use tower::ServiceExt;
@@ -815,7 +814,9 @@ pub mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
@@ -867,7 +868,9 @@ pub mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
@@ -1038,7 +1041,9 @@ pub mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
@@ -1112,7 +1117,9 @@ pub mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
@@ -1447,7 +1454,9 @@ pub mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
@@ -1525,7 +1534,9 @@ pub mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
@@ -1604,7 +1615,9 @@ pub mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         // Compare as JSON values to check the encoding of the non-primitive types.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
@@ -1747,7 +1760,9 @@ pub mod tests {
         // Submit the request.
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body = String::from_utf8(bytes.to_vec()).expect("valid utf-8");
         assert_eq!(body, "{}");
     }
