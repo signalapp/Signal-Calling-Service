@@ -4,10 +4,9 @@
 //
 
 use anyhow::{anyhow, Result};
-use http::StatusCode;
-use hyper::{body::Buf, client::HttpConnector, Client as HttpClient, Uri};
 use log::*;
 use rand::{thread_rng, Rng};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use std::{collections::HashMap, net::Ipv4Addr};
 use tokio::{
@@ -188,19 +187,19 @@ impl LoadBalancerTask {
 
     fn start_healthcheck(ip: Ipv4Addr, mut rx: oneshot::Receiver<()>, tx: LoadBalancerSender) {
         tokio::spawn(async move {
-            let client: HttpClient<HttpConnector> = HttpClient::builder().build_http();
-            let mut last_weight = None;
-            let uri: Uri = (format!("http://{}:{}/health", ip, BACKEND_PORT))
-                .parse()
+            let client = reqwest::Client::builder()
+                .timeout(HEALTHCHECK_INTERVAL)
+                .build()
                 .unwrap();
+            let mut last_weight = None;
+            let uri = format!("http://{}:{}/health", ip, BACKEND_PORT);
 
             loop {
-                let request = client.get(uri.clone());
+                let request = client.get(uri.clone()).send();
                 let timeout = time::sleep(HEALTHCHECK_INTERVAL);
                 tokio::pin!(timeout);
 
                 let weight = tokio::select!(
-                    _ = &mut timeout => 0,
                     _ = &mut rx => {
                         info!("healthchecker shutdown {}", ip);
                         break;
@@ -208,13 +207,8 @@ impl LoadBalancerTask {
                     response = request => match response {
                         Ok(r) if r.status() == StatusCode::OK => {
                             // if status is OK, return at least 1
-                            if let Ok(body) = hyper::body::aggregate(r).await {
-                                if let Ok(h) = serde_json::from_reader(body.reader()) {
-                                    let h: HealthResponse = h;
-                                    1 + h.cpu_idle_pct
-                                } else {
-                                    1
-                                }
+                            if let Ok(h) = r.json::<HealthResponse>().await {
+                                1 + h.cpu_idle_pct
                             } else {
                                 1
                             }

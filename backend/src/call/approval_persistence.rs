@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use calling_common::RoomId;
 use futures::{future::BoxFuture, FutureExt, TryFutureExt};
-use hyper::{client::HttpConnector, Body, Client as HttpClient, Method, Request, StatusCode, Uri};
 use log::*;
+use reqwest::{StatusCode, Url};
 use serde::Serialize;
 use tokio::{runtime::Handle, task::JoinHandle};
 
@@ -28,20 +28,20 @@ struct FlatApprovedUsers<'a> {
 
 #[cfg(test)]
 type PersistenceCallback =
-    fn(body: Vec<u8>) -> BoxFuture<'static, anyhow::Result<hyper::Response<Body>>>;
+    fn(body: Vec<u8>) -> BoxFuture<'static, anyhow::Result<reqwest::Response>>;
 
 #[derive(Debug, Clone)]
 enum PersistenceMode {
     Off,
-    Uri(&'static hyper::Uri, RoomId),
+    Url(&'static reqwest::Url, RoomId),
     #[cfg(test)]
     Callback(PersistenceCallback),
 }
 
-impl From<Option<(&'static hyper::Uri, RoomId)>> for PersistenceMode {
-    fn from(value: Option<(&'static hyper::Uri, RoomId)>) -> Self {
+impl From<Option<(&'static reqwest::Url, RoomId)>> for PersistenceMode {
+    fn from(value: Option<(&'static reqwest::Url, RoomId)>) -> Self {
         match value {
-            Some((uri, room_id)) => Self::Uri(uri, room_id),
+            Some((url, room_id)) => Self::Url(url, room_id),
             None => Self::Off,
         }
     }
@@ -58,13 +58,13 @@ pub struct ApprovedUsers {
 impl ApprovedUsers {
     pub fn new(
         users: impl IntoIterator<Item = UserId>,
-        uri_and_room_id: Option<(&'static Uri, RoomId)>,
+        url_and_room_id: Option<(&'static Url, RoomId)>,
     ) -> Self {
         Self {
             set: HashSet::from_iter(users),
             future: None,
             modified: false,
-            persistence_mode: uri_and_room_id.into(),
+            persistence_mode: url_and_room_id.into(),
             retry_count: 0,
         }
     }
@@ -118,16 +118,15 @@ impl ApprovedUsers {
                 PersistenceMode::Off => {
                     unreachable!("checked above");
                 }
-                PersistenceMode::Uri(uri, room_id) => {
-                    let client: HttpClient<HttpConnector> = HttpClient::builder().build_http();
-                    let req = Request::builder()
-                        .method(Method::PUT)
-                        .uri(uri)
+                PersistenceMode::Url(url, room_id) => {
+                    let response = reqwest::Client::new()
+                        .put(url.clone())
                         .header("X-Room-Id", room_id.as_ref())
-                        .header("Content-type", "application/json")
-                        .body(Body::from(body))
-                        .unwrap();
-                    Box::pin(client.request(req).map_err(anyhow::Error::from))
+                        .header("Content-Type", "application/json")
+                        .body(body)
+                        .send()
+                        .map_err(anyhow::Error::from);
+                    Box::pin(response)
                 }
                 #[cfg(test)]
                 PersistenceMode::Callback(callback) => callback(body),
@@ -245,7 +244,7 @@ mod tests {
                     .map(|user| user.as_str().expect("each user ID is a string"))
                     .collect::<Vec<_>>(),
             );
-            Box::pin(async { Ok(hyper::Response::builder().body(Body::empty())?) })
+            Box::pin(async { Ok(http::Response::new("").into()) })
         });
 
         users.insert("user".to_string().into());
@@ -360,13 +359,15 @@ mod tests {
         users.persistence_mode = PersistenceMode::Callback(|_body| {
             let round = CALLBACK_COUNT.fetch_add(1, SeqCst);
             Box::pin(async move {
-                Ok(hyper::Response::builder()
+                Ok(http::Response::builder()
                     .status(if round == 0 {
                         StatusCode::INTERNAL_SERVER_ERROR
                     } else {
                         StatusCode::OK
                     })
-                    .body(Body::empty())?)
+                    .body("")
+                    .unwrap()
+                    .into())
             })
         });
 
@@ -422,7 +423,7 @@ mod tests {
                     .collect::<HashSet<_>>(),
             );
             CALLBACK_COUNT.fetch_add(1, SeqCst);
-            Box::pin(async { Ok(hyper::Response::builder().body(Body::empty())?) })
+            Box::pin(async { Ok(http::Response::new("").into()) })
         });
 
         users.insert("C".to_string().into());
@@ -461,7 +462,7 @@ mod tests {
                     .collect::<HashSet<_>>(),
             );
             CALLBACK_COUNT.fetch_add(1, SeqCst);
-            Box::pin(async { Ok(hyper::Response::builder().body(Body::empty())?) })
+            Box::pin(async { Ok(http::Response::new("").into()) })
         });
 
         users.remove(&"B".to_string().into());
@@ -496,7 +497,7 @@ mod tests {
                     .map(|user| user.as_str().expect("each user ID is a string"))
                     .collect::<HashSet<_>>(),
             );
-            Box::pin(async { Ok(hyper::Response::builder().body(Body::empty())?) })
+            Box::pin(async { Ok(http::Response::new("").into()) })
         });
 
         users.insert("C".to_string().into());
@@ -549,7 +550,7 @@ mod tests {
                     .map(|user| user.as_str().expect("each user ID is a string"))
                     .collect::<HashSet<_>>(),
             );
-            Box::pin(async { Ok(hyper::Response::builder().body(Body::empty())?) })
+            Box::pin(async { Ok(http::Response::new("").into()) })
         });
 
         users.insert("C".to_string().into());
@@ -602,7 +603,7 @@ mod tests {
                     .map(|user| user.as_str().expect("each user ID is a string"))
                     .collect::<HashSet<_>>(),
             );
-            Box::pin(async { Ok(hyper::Response::builder().body(Body::empty())?) })
+            Box::pin(async { Ok(http::Response::new("").into()) })
         });
 
         users.insert("C".to_string().into());

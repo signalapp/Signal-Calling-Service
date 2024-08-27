@@ -4,15 +4,13 @@
 //
 
 use anyhow::{anyhow, Context, Result};
-use http::StatusCode;
-use hyper::{body::Buf, client::HttpConnector, Body, Client as HttpClient, Method, Request, Uri};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use log::*;
+use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use std::{collections::HashMap, net::Ipv4Addr, str::FromStr};
 use tokio::{
     sync::oneshot,
-    time::{self, timeout, Duration, Instant},
+    time::{self, Duration, Instant},
 };
 
 use crate::load_balancer::{LoadBalancer, LoadBalancerSender};
@@ -20,7 +18,7 @@ use crate::load_balancer::{LoadBalancer, LoadBalancerSender};
 const INSTANCE_LIST_INTERVAL: Duration = Duration::from_secs(30);
 
 struct GoogleToken {
-    uri: Uri,
+    url: Url,
     adjusted_expiration: Duration,
     backoff: Duration,
     fetch_start: Instant,
@@ -45,7 +43,7 @@ impl GoogleToken {
     fn new(url: String) -> Result<Self> {
         let now = Instant::now();
         Ok(Self {
-            uri: url.parse()?,
+            url: url.parse()?,
             fetch_start: now,
             fetch_attempt: now,
             adjusted_expiration: Duration::ZERO,
@@ -54,7 +52,7 @@ impl GoogleToken {
         })
     }
 
-    async fn refresh(&mut self, client: HttpClient<HttpsConnector<HttpConnector>>) -> Result<&str> {
+    async fn refresh(&mut self, client: reqwest::Client) -> Result<&str> {
         let now = Instant::now();
         if self.token.is_none()
             || (now.duration_since(self.fetch_start) > self.adjusted_expiration
@@ -79,20 +77,18 @@ impl GoogleToken {
         }
     }
 
-    async fn fetch(&mut self, client: HttpClient<HttpsConnector<HttpConnector>>) -> Result<()> {
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri(self.uri.clone())
+    async fn fetch(&mut self, client: reqwest::Client) -> Result<()> {
+        let response = client
+            .get(self.url.clone())
             .header("Metadata-Flavor", "Google")
-            .body(Body::empty())?;
-        let response = timeout(GCP_TIMEOUT, client.request(request)).await??;
+            .send()
+            .await?;
 
         match response.status() {
             StatusCode::OK => {
-                let body = hyper::body::aggregate(response)
+                let token: TokenResponse = response
+                    .json()
                     .await
-                    .context("failed to get aggregate body for Google Token")?;
-                let token: TokenResponse = serde_json::from_reader(body.reader())
                     .context("failed to convert body to token response")?;
                 self.token = Some(token.access_token);
                 self.adjusted_expiration =
@@ -138,9 +134,9 @@ struct NetworkInterface {
 }
 
 pub struct InstanceLister {
-    instance_group_uri: Uri,
+    instance_group_url: Url,
     token: GoogleToken,
-    client: HttpClient<HttpsConnector<HttpConnector>>,
+    client: reqwest::Client,
 }
 
 impl InstanceLister {
@@ -149,15 +145,13 @@ impl InstanceLister {
         identity_token_url: String,
         load_balancer_sender: LoadBalancerSender,
     ) -> Result<oneshot::Sender<()>> {
-        let https = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .build();
-        let client = HttpClient::builder().build::<_, hyper::Body>(https);
+        let client = reqwest::Client::builder()
+            .timeout(GCP_TIMEOUT)
+            .build()
+            .unwrap();
 
         let mut lister = Self {
-            instance_group_uri: instance_group_url.parse()?,
+            instance_group_url: instance_group_url.parse()?,
             token: GoogleToken::new(identity_token_url)?,
             client,
         };
@@ -227,19 +221,19 @@ impl InstanceLister {
 
     async fn get_list(&mut self) -> Result<Vec<String>> {
         let token = self.token.refresh(self.client.clone()).await?;
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri(self.instance_group_uri.clone())
+        let response = self
+            .client
+            .post(self.instance_group_url.clone())
+            .json("{}")
             .header("authorization", format!("Bearer {}", token))
-            .body(Body::from("{}"))?;
-        let response = timeout(GCP_TIMEOUT, self.client.request(request)).await??;
+            .send()
+            .await?;
 
         match response.status() {
             StatusCode::OK => {
-                let body = hyper::body::aggregate(response)
+                let list_response: GroupList = response
+                    .json()
                     .await
-                    .context("failed to get body for instance group")?;
-                let list_response: GroupList = serde_json::from_reader(body.reader())
                     .context("failed to convert body to list response")?;
 
                 if list_response.kind != "compute#regionInstanceGroupsListInstances" {
@@ -267,20 +261,19 @@ impl InstanceLister {
 
     async fn get_instance_ip(&mut self, instance_url: String) -> Result<Ipv4Addr> {
         let token = self.token.refresh(self.client.clone()).await?;
-        let uri: Uri = format!("{}?fields=networkInterfaces.networkIP", instance_url).parse()?;
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri(uri)
+        let url: Url = format!("{}?fields=networkInterfaces.networkIP", instance_url).parse()?;
+        let response = self
+            .client
+            .get(url)
             .header("authorization", format!("Bearer {}", token))
-            .body(Body::empty())?;
-        let response = timeout(GCP_TIMEOUT, self.client.request(request)).await??;
+            .send()
+            .await?;
 
         match response.status() {
             StatusCode::OK => {
-                let body = hyper::body::aggregate(response)
+                let instance_response: Instance = response
+                    .json()
                     .await
-                    .context("failed to get body for instance")?;
-                let instance_response: Instance = serde_json::from_reader(body.reader())
                     .context("failed to convert body to instance response")?;
                 if let Some(interface) = instance_response.network_interfaces.first() {
                     Ok(Ipv4Addr::from_str(&interface.network_ip)?)

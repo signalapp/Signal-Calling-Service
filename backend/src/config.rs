@@ -111,12 +111,12 @@ pub struct Config {
 
     /// The URL to PUT the list of approved users to.
     #[arg(long)]
-    pub approved_users_persistence_url: Option<hyper::Uri>,
+    pub approved_users_persistence_url: Option<reqwest::Url>,
 
     /// The base URL to DELETE individual and batch of call records.
     /// An empty URL disables backend initiated call record removal.
     #[arg(long)]
-    pub remove_call_records_base_url: Option<hyper::Uri>,
+    pub remove_call_records_base_url: Option<reqwest::Url>,
 
     /// Amount of time to wait before failing a call to the calling frontend.
     #[arg(long, default_value = "5000")]

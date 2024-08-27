@@ -16,8 +16,6 @@ use aws_smithy_async::rt::sleep::default_async_sleep;
 use aws_smithy_types::{retry::RetryConfigBuilder, timeout::TimeoutConfig, Blob};
 use aws_types::region::Region;
 use calling_common::{Duration, RoomId};
-use hyper::client::HttpConnector;
-use hyper::{Body, Method, Request};
 use log::*;
 use serde::{Deserialize, Serialize};
 use serde_dynamo::{from_item, to_item, Item};
@@ -920,7 +918,7 @@ impl Storage for DynamoDb {
 /// Supports the DynamoDB storage implementation by periodically refreshing an identity
 /// token file at the location given by `identity_token_path`.
 pub struct IdentityFetcher {
-    client: hyper::Client<HttpConnector>,
+    client: reqwest::Client,
     fetch_interval: Duration,
     identity_token_path: PathBuf,
     identity_token_url: Option<String>,
@@ -929,7 +927,7 @@ pub struct IdentityFetcher {
 impl IdentityFetcher {
     pub fn new(config: &'static config::Config, identity_token_path: &str) -> Self {
         IdentityFetcher {
-            client: hyper::client::Client::builder().build_http(),
+            client: reqwest::Client::new(),
             fetch_interval: Duration::from_millis(config.identity_fetcher_interval_ms),
             identity_token_path: PathBuf::from(identity_token_path),
             identity_token_url: config.identity_token_url.to_owned(),
@@ -938,16 +936,15 @@ impl IdentityFetcher {
 
     pub async fn fetch_token(&self) -> Result<()> {
         if let Some(url) = &self.identity_token_url {
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri(url)
-                .header("Metadata-Flavor", "Google")
-                .body(Body::empty())?;
-
             debug!("Fetching identity token from {}", url);
 
-            let body = self.client.request(request).await?;
-            let body = hyper::body::to_bytes(body).await?;
+            let response = self
+                .client
+                .get(url)
+                .header("Metadata-Flavor", "Google")
+                .send()
+                .await?;
+            let body = response.bytes().await?;
             let temp_name = self.identity_token_path.with_extension("bak");
             let mut temp_file = tokio::fs::File::create(&temp_name).await?;
             temp_file.write_all(&body).await?;

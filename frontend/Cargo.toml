@@ -45,9 +45,9 @@ subtle = "2.6.1"
 
 # For http client and server
 hyper = { version = "0.14.30", features = ["full"] }
-hyper-rustls = { version = "0.24.2", features = ["webpki-roots"] }
 axum = { version = "0.6.20", features = ["headers"] }
 tower = "0.4.13"
+reqwest = { version = "0.12.6", default-features = false, features = ["json", "rustls-tls"] }
 mime = "0.3.17"
 http = "0.2.12"
 

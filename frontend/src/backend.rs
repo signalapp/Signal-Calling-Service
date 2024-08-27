@@ -8,15 +8,10 @@ use std::net::{IpAddr, SocketAddr};
 use anyhow::{anyhow, Context, Error};
 use async_trait::async_trait;
 use calling_common::{DemuxId, RoomId};
-use http::{header, Method, Request, StatusCode};
-use hyper::{
-    body::Buf,
-    client::HttpConnector,
-    {Body, Client as HttpClient},
-};
 use log::*;
+use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
-use tokio::time::{error::Elapsed, timeout, Duration};
+use tokio::time::{error::Elapsed, Duration};
 
 #[cfg(test)]
 use mockall::{automock, predicate::*};
@@ -151,7 +146,7 @@ pub trait Backend: Sync + Send {
 }
 
 pub struct BackendHttpClient {
-    http_client: HttpClient<HttpConnector>,
+    http_client: reqwest::Client,
     /// URL used when invoking the get_info() API so that the request goes through
     /// an external load balancer.
     base_url: Option<String>,
@@ -161,7 +156,10 @@ pub struct BackendHttpClient {
 
 impl BackendHttpClient {
     pub async fn from_config(config: &'static config::Config) -> anyhow::Result<Self> {
-        let http_client = HttpClient::builder().build_http();
+        let http_client = reqwest::Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .unwrap();
         let base_url = config.calling_server_url.as_ref().cloned();
         let load_balancer = match (
             config.backend_list_instances_url.as_ref(),
@@ -219,21 +217,22 @@ impl Backend for BackendHttpClient {
             Some(url) => format!("{}/v1/info", url),
         };
 
-        let uri = base_v1_info_uri_string
+        let url: Url = base_v1_info_uri_string
             .parse()
             .context("failed to parse info uri for backend")?;
 
-        let response = timeout(DEFAULT_TIMEOUT, self.http_client.get(uri))
-            .await?
+        let response = self
+            .http_client
+            .get(url)
+            .send()
+            .await
             .context("failed to make backend request `get info`")?;
 
         match response.status() {
             StatusCode::OK => {
-                let body = hyper::body::aggregate(response)
+                let info_response = response
+                    .json()
                     .await
-                    .context("failed to aggregate body for info response")?;
-
-                let info_response = serde_json::from_reader(body.reader())
                     .context("failed to convert body to info response")?;
 
                 Ok(info_response)
@@ -258,28 +257,23 @@ impl Backend for BackendHttpClient {
             call_id
         );
 
-        let mut request = Request::get(uri_string);
+        let mut request = self.http_client.get(uri_string);
         if let Some(user_id) = user_id {
             request = request.header("X-User-Id", user_id.as_str());
         }
-        let request = request
-            .body(Body::empty())
-            .context("failed to build request")?;
 
-        let response = timeout(DEFAULT_TIMEOUT, self.http_client.request(request))
-            .await?
-            .context(format!(
+        let response = request.send().await.with_context(|| {
+            format!(
                 "failed to make backend request `get clients` to `{}`",
                 backend_address.ip()
-            ))?;
+            )
+        })?;
 
         match response.status() {
             StatusCode::OK => {
-                let body = hyper::body::aggregate(response)
+                let clients_response = response
+                    .json()
                     .await
-                    .context("failed to aggregate body for clients response")?;
-
-                let clients_response = serde_json::from_reader(body.reader())
                     .context("failed to convert body to clients response")?;
 
                 Ok(clients_response)
@@ -313,30 +307,24 @@ impl Backend for BackendHttpClient {
             }
         }
 
-        let request_body =
-            serde_json::to_vec(join_request).context("failed to convert join request to body")?;
-
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri(uri_string)
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .body(Body::from(request_body))
-            .context("failed to form the join request")?;
-
-        let response = timeout(DEFAULT_TIMEOUT, self.http_client.request(request))
-            .await?
-            .context(format!(
-                "failed to make backend request `post client` to `{}`",
-                backend_address.ip()
-            ))?;
+        let response = self
+            .http_client
+            .post(uri_string)
+            .json(join_request)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to make backend request `post client` to `{}`",
+                    backend_address.ip()
+                )
+            })?;
 
         match response.status() {
             StatusCode::OK => {
-                let body = hyper::body::aggregate(response)
+                let join_response = response
+                    .json()
                     .await
-                    .context("failed to aggregate body for join response")?;
-
-                let join_response = serde_json::from_reader(body.reader())
                     .context("failed to convert body to join response")?;
 
                 Ok(join_response)

@@ -17,10 +17,10 @@ use calling_common::{
     VideoHeight,
 };
 use hex::ToHex;
-use hyper::Uri;
 use log::*;
 use mrp::{self, MrpReceiveError, MrpStream};
 use prost::Message;
+use reqwest::Url;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -366,7 +366,7 @@ impl Call {
         now: Instant,
         system_now: SystemTime,
         approved_users: Option<Vec<UserId>>,
-        approved_users_persistence_url: Option<&'static Uri>,
+        approved_users_persistence_url: Option<&'static Url>,
     ) -> Self {
         info!("call: {} creating", loggable_call_id);
         Self {

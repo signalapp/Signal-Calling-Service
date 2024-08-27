@@ -6,13 +6,9 @@
 use crate::{config, sfu::CallId};
 use async_trait::async_trait;
 use calling_common::RoomId;
-use futures::TryFutureExt;
 use hex::ToHex;
-use hyper::{
-    client::HttpConnector,
-    header, Method, Request, Uri, {Body, Client as HttpClient},
-};
 use log::*;
+use reqwest::Url;
 use serde::Serialize;
 use std::time::Duration;
 
@@ -50,19 +46,20 @@ pub trait Frontend: Sync + Send {
 }
 
 pub struct FrontendHttpClient {
-    operation_timeout: Duration,
-    http_client: HttpClient<HttpConnector>,
-    remove_call_records_base_url: Option<Uri>,
+    http_client: reqwest::Client,
+    remove_call_records_base_url: Option<Url>,
 }
 
 impl FrontendHttpClient {
     pub fn from_config(config: &'static config::Config) -> Self {
         let operation_timeout = Duration::from_millis(config.frontend_operation_timeout_ms);
-        let http_client = HttpClient::builder().build_http();
+        let http_client = reqwest::Client::builder()
+            .timeout(operation_timeout)
+            .build()
+            .unwrap();
         let remove_call_records_base_url = config.remove_call_records_base_url.clone();
 
         Self {
-            operation_timeout,
             http_client,
             remove_call_records_base_url,
         }
@@ -87,38 +84,26 @@ impl Frontend for FrontendHttpClient {
             call_key.room_id,
             call_key.call_id.as_slice().encode_hex::<String>()
         );
-        let request = Request::builder()
-            .method(Method::DELETE)
-            .uri(url)
-            .body(Body::empty())
-            .unwrap();
-        let future = tokio::time::timeout(
-            self.operation_timeout,
-            self.http_client
-                .request(request)
-                .map_err(anyhow::Error::from),
-        );
+        let result = self.http_client.delete(url).send().await;
 
-        match future.await {
-            Ok(result) => match result {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        Ok(())
-                    } else {
-                        let status = response.status();
-                        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-                        let res_body = String::from_utf8(bytes.into_iter().collect())
-                            .expect("Could not parse body as UTF-8");
-                        Err(FrontendError::UnexpectedError(anyhow::anyhow!(
-                            "Received non-success response. status={:?}, body={:?}",
-                            status,
-                            res_body
-                        )))
-                    }
+        match result {
+            Ok(response) => {
+                if response.status().is_success() {
+                    Ok(())
+                } else {
+                    let status = response.status();
+                    let bytes = response.bytes().await.unwrap();
+                    let res_body =
+                        String::from_utf8(bytes.into()).expect("Could not parse body as UTF-8");
+                    Err(FrontendError::UnexpectedError(anyhow::anyhow!(
+                        "Received non-success response. status={:?}, body={:?}",
+                        status,
+                        res_body
+                    )))
                 }
-                Err(err) => Err(FrontendError::UnexpectedError(err)),
-            },
-            _ => Err(FrontendError::Timeout),
+            }
+            Err(err) if err.is_timeout() => Err(FrontendError::Timeout),
+            Err(err) => Err(FrontendError::UnexpectedError(anyhow::Error::from(err))),
         }
     }
 
@@ -126,42 +111,32 @@ impl Frontend for FrontendHttpClient {
         let Some(base_url) = self.remove_call_records_base_url.as_ref() else {
             return Err(FrontendError::ClientNotConfigured);
         };
-        let url = format!("{}", base_url);
-        let body = serde_json::to_vec(&RemoveBatchCallRecordsRequest { call_keys }).unwrap();
-        let request = Request::builder()
-            .method(Method::DELETE)
-            .uri(url.clone())
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .unwrap();
 
-        let future = tokio::time::timeout(
-            self.operation_timeout,
-            self.http_client
-                .request(request)
-                .map_err(anyhow::Error::from),
-        );
+        let result = self
+            .http_client
+            .delete(base_url.clone())
+            .json(&RemoveBatchCallRecordsRequest { call_keys })
+            .send()
+            .await;
 
-        match future.await {
-            Ok(result) => match result {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        Ok(())
-                    } else {
-                        let status = response.status();
-                        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
-                        let res_body = String::from_utf8(bytes.into_iter().collect())
-                            .expect("Could not parse body as UTF-8");
-                        Err(FrontendError::UnexpectedError(anyhow::anyhow!(
-                            "Received non-success response. status={:?}, body={:?}",
-                            status,
-                            res_body
-                        )))
-                    }
+        match result {
+            Ok(response) => {
+                if response.status().is_success() {
+                    Ok(())
+                } else {
+                    let status = response.status();
+                    let bytes = response.bytes().await.unwrap();
+                    let res_body =
+                        String::from_utf8(bytes.into()).expect("Could not parse body as UTF-8");
+                    Err(FrontendError::UnexpectedError(anyhow::anyhow!(
+                        "Received non-success response. status={:?}, body={:?}",
+                        status,
+                        res_body
+                    )))
                 }
-                Err(err) => Err(FrontendError::UnexpectedError(err)),
-            },
-            _ => Err(FrontendError::Timeout),
+            }
+            Err(err) if err.is_timeout() => Err(FrontendError::Timeout),
+            Err(err) => Err(FrontendError::UnexpectedError(anyhow::Error::from(err))),
         }
     }
 }
