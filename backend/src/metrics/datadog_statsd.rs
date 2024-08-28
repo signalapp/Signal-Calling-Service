@@ -15,6 +15,8 @@ use std::{
 
 use log::*;
 
+pub type Tags<'a> = Option<&'a Vec<&'a str>>;
+
 #[derive(Debug)]
 pub enum StatsdError {
     IoError(Error),
@@ -208,15 +210,9 @@ impl<E: EventSink> Client<E> {
     }
 
     /// Send a timer value at a specified sample rate in 0..1 range.
-    pub fn timer_at_rate(
-        &mut self,
-        metric: &str,
-        milliseconds: f64,
-        rate: f64,
-        tags: &Option<Vec<&str>>,
-    ) {
+    pub fn timer_at_rate(&mut self, metric: &str, milliseconds: f64, rate: f64, tags: Tags) {
         let data =
-            self.prepare_with_tags(format!("{}:{}|ms|@{}", metric, milliseconds, rate), tags);
+            self.prepare_with_tags_ref(format!("{}:{}|ms|@{}", metric, milliseconds, rate), tags);
         self.send(data);
     }
 
@@ -230,6 +226,25 @@ impl<E: EventSink> Client<E> {
 
     fn prepare_with_tags<T: AsRef<str>>(&self, data: T, tags: &Option<Vec<&str>>) -> String {
         self.append_tags(self.prepare(data), tags)
+    }
+
+    fn prepare_with_tags_ref<T: AsRef<str>>(&self, data: T, tags: Tags) -> String {
+        self.append_tags_ref(self.prepare(data), tags)
+    }
+
+    fn append_tags_ref<T: AsRef<str>>(&self, data: T, tags: Tags) -> String {
+        if self.constant_tags.is_empty() && tags.is_none() {
+            data.as_ref().to_string()
+        } else {
+            let mut all_tags = self.constant_tags.clone();
+            if let Some(v) = tags {
+                for tag in v {
+                    all_tags.push(tag.to_string());
+                }
+            };
+
+            format!("{}|#{}", data.as_ref(), all_tags.join(","))
+        }
     }
 
     fn append_tags<T: AsRef<str>>(&self, data: T, tags: &Option<Vec<&str>>) -> String {
@@ -281,14 +296,8 @@ impl<E: EventSink> Client<E> {
     }
 
     /// Send a histogram value at a specified sample rate in 0..1 range.
-    pub fn histogram_at_rate(
-        &mut self,
-        metric: &str,
-        value: f64,
-        rate: f64,
-        tags: &Option<Vec<&str>>,
-    ) {
-        let data = self.prepare_with_tags(format!("{}:{}|h|@{}", metric, value, rate), tags);
+    pub fn histogram_at_rate(&mut self, metric: &str, value: f64, rate: f64, tags: Tags) {
+        let data = self.prepare_with_tags_ref(format!("{}:{}|h|@{}", metric, value, rate), tags);
         self.send(data);
     }
 
@@ -299,14 +308,8 @@ impl<E: EventSink> Client<E> {
     }
 
     /// Send a distribution value at a specified sample rate in 0..1 range.
-    pub fn distribution_at_rate(
-        &mut self,
-        metric: &str,
-        value: f64,
-        rate: f64,
-        tags: &Option<Vec<&str>>,
-    ) {
-        let data = self.prepare_with_tags(format!("{}.d:{}|d|@{}", metric, value, rate), tags);
+    pub fn distribution_at_rate(&mut self, metric: &str, value: f64, rate: f64, tags: Tags) {
+        let data = self.prepare_with_tags_ref(format!("{}.d:{}|d|@{}", metric, value, rate), tags);
         self.send(data);
     }
 
@@ -513,7 +516,7 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", None);
 
-        client.timer_at_rate("metric", 21.39, 0.123, &None);
+        client.timer_at_rate("metric", 21.39, 0.123, None);
 
         assert_eq!("myapp.metric:21.39|ms|@0.123", server.read_packet());
         server.expect_no_more_packets();
@@ -530,7 +533,7 @@ mod test {
         server.expect_no_more_packets();
 
         // with tags
-        client.histogram_at_rate("metric", 9.1, 0.2, &Some(vec!["tag1", "tag2:test"]));
+        client.histogram_at_rate("metric", 9.1, 0.2, Some(&vec!["tag1", "tag2:test"]));
         assert_eq!(
             "myapp.metric:9.1|h|@0.2|#tag1,tag2:test",
             server.read_packet()
@@ -565,7 +568,7 @@ mod test {
         server.expect_no_more_packets();
 
         // repeat
-        client.histogram_at_rate("metric", 19.12, 0.2, tags);
+        client.histogram_at_rate("metric", 19.12, 0.2, tags.as_ref());
         assert_eq!(
             "myapp.metric:19.12|h|@0.2|#tag1common,tag2common:test,tag1,tag2:test",
             server.read_packet()
@@ -584,7 +587,7 @@ mod test {
         server.expect_no_more_packets();
 
         // with tags
-        client.distribution_at_rate("metric", 9.1, 0.1, &Some(vec!["tag1", "tag2:test"]));
+        client.distribution_at_rate("metric", 9.1, 0.1, Some(&vec!["tag1", "tag2:test"]));
         assert_eq!(
             "myapp.metric.d:9.1|d|@0.1|#tag1,tag2:test",
             server.read_packet()

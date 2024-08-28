@@ -48,7 +48,7 @@ impl DataSize {
         Self { bits }
     }
 
-    pub fn as_bits(&self) -> u64 {
+    pub const fn as_bits(&self) -> u64 {
         self.bits
     }
 
@@ -297,7 +297,7 @@ impl DataRate {
         Self::per_second(DataSize::from_kilobits(kbps))
     }
 
-    pub fn as_bps(&self) -> u64 {
+    pub const fn as_bps(&self) -> u64 {
         self.size_per_second.as_bits()
     }
 

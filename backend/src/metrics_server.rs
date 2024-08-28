@@ -19,10 +19,10 @@ use psutil::process::Process;
 use tokio::sync::oneshot::Receiver;
 
 use crate::{
-    config,
-    config::Config,
+    config::{self, Config},
     metrics::{
-        Client as DatadogClient, Histogram, HistogramReport, PipelineSink, Precision, UdpEventSink,
+        Client as DatadogClient, Histogram, HistogramReport, PipelineSink, Precision, Tags,
+        UdpEventSink,
     },
     sfu::Sfu,
 };
@@ -70,8 +70,10 @@ pub async fn start(
                         // Note that we are including the time waiting for the lock in this stat.
 
                         let stats = sfu.lock().get_stats();
-                        for (name, histogram) in stats.histograms {
-                            datadog.send_count_histogram(name, &histogram, &None);
+                        for (name, histogram_map) in stats.histograms {
+                            for (tags, histogram) in histogram_map {
+                                datadog.send_count_histogram(name, &histogram, tags);
+                            }
                         }
                         for (name, value) in stats.values {
                             datadog.gauge(name, value as f64, &None);
@@ -80,7 +82,7 @@ pub async fn start(
 
                     let report = metrics!().report();
                     for report in report.histograms {
-                        datadog.send_timer_histogram(&report, &None);
+                        datadog.send_timer_histogram(&report, None);
                     }
                     for report in report.events {
                         datadog.count(report.name(), report.event_count() as f64, &None);
@@ -174,11 +176,7 @@ impl<'a> DerefMut for DatadogPipeline<'a> {
 }
 
 impl<'a> DatadogPipeline<'a> {
-    fn send_timer_histogram(
-        &mut self,
-        histogram_report: &HistogramReport,
-        tags: &Option<Vec<&str>>,
-    ) {
+    fn send_timer_histogram(&mut self, histogram_report: &HistogramReport, tags: Tags) {
         let name = histogram_report.name();
 
         let precision = histogram_report.sample_precision();
@@ -210,7 +208,7 @@ impl<'a> DatadogPipeline<'a> {
         &mut self,
         metric_name: &str,
         histogram: &Histogram<usize>,
-        tags: &Option<Vec<&str>>,
+        tags: Tags,
     ) {
         for (value, frequency) in histogram.iter() {
             self.histogram_at_rate(metric_name, *value as f64, 1f64 / (*frequency as f64), tags);

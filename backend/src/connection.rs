@@ -11,6 +11,7 @@ use crate::{
     googcc, ice,
     pacer::{self, Pacer},
     packet_server::SocketLocator,
+    region::RegionRelation,
     rtp::{self, TruncatedSequenceNumber},
 };
 
@@ -61,6 +62,7 @@ pub enum AddressType {
 /// retransmissions, congestion control, and IP mobility.
 pub struct Connection {
     created: Instant,
+    region_relation: RegionRelation,
 
     /// How long we should wait without an incoming ICE binding request
     /// before we treat the client as "inactive".  Once "inactive", the SFU
@@ -139,6 +141,7 @@ impl Connection {
         ack_ssrc: rtp::Ssrc,
         googcc_config: googcc::Config,
         inactivity_timeout: Duration,
+        region_relation: RegionRelation,
         now: Instant,
     ) -> Self {
         let (decrypt, encrypt) =
@@ -148,6 +151,7 @@ impl Connection {
         let rtp_endpoint = rtp::Endpoint::new(decrypt, encrypt, now, RTCP_SENDER_SSRC, ack_ssrc);
         Self {
             created: now,
+            region_relation,
 
             inactivity_timeout,
 
@@ -642,6 +646,10 @@ impl Connection {
         self.congestion_control.controller.rtt()
     }
 
+    pub fn region_relation(&self) -> RegionRelation {
+        self.region_relation
+    }
+
     pub fn current_rates(&mut self, now: Instant) -> ConnectionRates {
         self.video_rate.update(now);
         self.audio_rate.update(now);
@@ -723,6 +731,12 @@ pub struct ConnectionRates {
     pub incoming_discard_rate: DataRate,
 }
 
+impl ConnectionRates {
+    pub const fn outgoing_rate_bps(&self) -> u64 {
+        self.audio_rate.as_bps() + self.video_rate.as_bps() + self.non_media_rate.as_bps()
+    }
+}
+
 #[cfg(test)]
 mod connection_tests {
     use std::borrow::Borrow;
@@ -750,6 +764,7 @@ mod connection_tests {
             ack_ssrc,
             googcc_config,
             inactivity_timeout,
+            RegionRelation::Unknown,
             now,
         )
     }

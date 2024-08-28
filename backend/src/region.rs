@@ -5,9 +5,9 @@
 
 //! Enum of valid regions; used to constrain logging to known strings.
 
-use strum_macros::{Display, EnumString};
+use strum_macros::{Display, EnumIter, EnumString};
 
-#[derive(EnumString, Display, PartialEq)]
+#[derive(EnumString, Clone, Copy, Display, PartialEq)]
 #[strum(serialize_all = "kebab-case")]
 pub enum Region {
     Unset,
@@ -78,5 +78,25 @@ impl Region {
     pub fn same_area(&self, other: &Region) -> bool {
         let myarea = self.area();
         myarea.is_some() && myarea == other.area()
+    }
+}
+
+#[derive(EnumString, EnumIter, Clone, Copy, Display, Eq, PartialEq, Hash)]
+pub enum RegionRelation {
+    Unknown,
+    SameRegion,
+    SameArea,
+    DifferentArea,
+}
+
+impl RegionRelation {
+    // Use &str to avoid strings or iteration code to take references to Strings
+    pub const fn as_tag(&self) -> &'static str {
+        match self {
+            RegionRelation::Unknown => "region-relation:unknown",
+            RegionRelation::SameRegion => "region-relation:same_region",
+            RegionRelation::SameArea => "region-relation:same_area",
+            RegionRelation::DifferentArea => "region-relation:different_area",
+        }
     }
 }

@@ -22,12 +22,14 @@ use mrp::{self, MrpReceiveError, MrpStream};
 use prost::Message;
 use reqwest::Url;
 use serde::Serialize;
+use strum_macros::{EnumIter, EnumString};
 use thiserror::Error;
 
 use crate::{
     audio,
     connection::ConnectionRates,
     protos,
+    region::RegionRelation,
     rtp::{self, VideoRotation},
     vp8,
 };
@@ -71,6 +73,54 @@ const MRP_SEND_TIMEOUT_INTERVAL: Duration = Duration::from_secs(1);
 const MIN_TARGET_SEND_RATE_GENERATION_INTERVAL: Duration = Duration::from_millis(2500);
 /// How much of the target send rate to allocate when the queue drain rate is high.
 const TARGET_RATE_MINIMUM_ALLOCATION_RATIO: f64 = 0.9;
+
+#[derive(Debug, EnumString, EnumIter, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum CallSizeBucket {
+    Empty,
+    Solo,
+    Pair,
+    From3To6,
+    From7To9,
+    From10To19,
+    From20To29,
+    From30To49,
+    From50To79,
+    BeyondLimit,
+}
+
+impl CallSizeBucket {
+    pub const fn as_tag(&self) -> &'static str {
+        match self {
+            Self::Empty => "call-size:0",
+            Self::Solo => "call-size:1",
+            Self::Pair => "call-size:2",
+            Self::From3To6 => "call-size:3-6",
+            Self::From7To9 => "call-size:7-9",
+            Self::From10To19 => "call-size:10-19",
+            Self::From20To29 => "call-size:20-29",
+            Self::From30To49 => "call-size:30-49",
+            Self::From50To79 => "call-size:50-79",
+            Self::BeyondLimit => "call-size:BEYOND_LIMIT",
+        }
+    }
+}
+
+impl From<usize> for CallSizeBucket {
+    fn from(value: usize) -> Self {
+        match value {
+            0 => Self::Empty,
+            1 => Self::Solo,
+            2 => Self::Pair,
+            i if (3..=6).contains(&i) => Self::From3To6,
+            i if (7..=9).contains(&i) => Self::From7To9,
+            i if (10..=19).contains(&i) => Self::From10To19,
+            i if (20..=29).contains(&i) => Self::From20To29,
+            i if (30..=49).contains(&i) => Self::From30To49,
+            i if (50..=79).contains(&i) => Self::From50To79,
+            _ => Self::BeyondLimit,
+        }
+    }
+}
 
 /// A wrapper around Vec<u8> to identify a Call.
 /// It comes from signaling, but isn't known by the clients.
@@ -430,6 +480,10 @@ impl Call {
         self.clients.len()
     }
 
+    pub fn size_bucket(&self) -> CallSizeBucket {
+        CallSizeBucket::from(self.size())
+    }
+
     pub fn is_inactive(&mut self, now: &Instant, inactivity_timeout: &Duration) -> bool {
         self.approved_users.tick();
         self.is_empty()
@@ -474,12 +528,14 @@ impl Call {
         demux_id: DemuxId,
         user_id: UserId,
         is_admin: bool,
+        region_relation: RegionRelation,
         now: Instant,
     ) -> ClientStatus {
         let pending_client = NonParticipantClient {
             demux_id,
             user_id,
             is_admin,
+            region_relation,
             next_server_to_client_data_rtp_seqnum: 1,
         };
         if self.blocked_users.contains(&pending_client.user_id) {
@@ -1849,6 +1905,7 @@ struct NonParticipantClient {
     demux_id: DemuxId,
     user_id: UserId,
     is_admin: bool,
+    region_relation: RegionRelation,
 
     // Update with each proto send from server to client
     next_server_to_client_data_rtp_seqnum: rtp::FullSequenceNumber,
@@ -1860,6 +1917,7 @@ impl From<Client> for NonParticipantClient {
             demux_id: client.demux_id,
             user_id: client.user_id,
             is_admin: client.is_admin,
+            region_relation: client.region_relation,
 
             next_server_to_client_data_rtp_seqnum: client.next_server_to_client_data_rtp_seqnum,
         }
@@ -1944,6 +2002,7 @@ struct Client {
     demux_id: DemuxId,
     user_id: UserId,
     is_admin: bool,
+    region_relation: RegionRelation,
 
     // Updated by incoming video packets
     incoming_video0: IncomingVideoState,
@@ -2014,6 +2073,7 @@ impl Client {
             demux_id: pending_client_info.demux_id,
             user_id: pending_client_info.user_id,
             is_admin: pending_client_info.is_admin,
+            region_relation: pending_client_info.region_relation,
 
             incoming_video0: IncomingVideoState::default(),
             incoming_video1: IncomingVideoState::default(),
@@ -4092,7 +4152,7 @@ mod call_tests {
     ) -> DemuxId {
         let demux_id = demux_id_from_unshifted(demux_id_without_shifting);
         let user_id = UserId::from(user_id.to_string());
-        call.add_client(demux_id, user_id, false, now);
+        call.add_client(demux_id, user_id, false, RegionRelation::Unknown, now);
         demux_id
     }
 
@@ -4104,7 +4164,7 @@ mod call_tests {
     ) -> DemuxId {
         let demux_id = demux_id_from_unshifted(demux_id_without_shifting);
         let user_id = UserId::from(user_id.to_string());
-        call.add_client(demux_id, user_id, true, now);
+        call.add_client(demux_id, user_id, true, RegionRelation::Unknown, now);
         demux_id
     }
 
