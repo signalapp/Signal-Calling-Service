@@ -31,7 +31,6 @@ use crate::{
     protos,
     region::RegionRelation,
     rtp::{self, VideoRotation},
-    vp8,
 };
 
 mod approval_persistence;
@@ -1976,48 +1975,6 @@ impl From<mrp::MrpHeader> for protos::MrpHeader {
     }
 }
 
-enum VideoHeader {
-    DependencyDescriptor(rtp::DependencyDescriptor),
-}
-
-impl VideoHeader {
-    fn is_key_frame(&self) -> bool {
-        match self {
-            VideoHeader::DependencyDescriptor(descriptor) => descriptor.is_key_frame,
-        }
-    }
-
-    fn resolution(&self) -> Option<PixelSize> {
-        match self {
-            VideoHeader::DependencyDescriptor(descriptor) => descriptor.resolution,
-        }
-    }
-
-    fn picture_id(&self) -> Option<vp8::TruncatedPictureId> {
-        match self {
-            VideoHeader::DependencyDescriptor(_) => None,
-        }
-    }
-
-    fn tl0_pic_idx(&self) -> Option<vp8::TruncatedTl0PicIdx> {
-        match self {
-            VideoHeader::DependencyDescriptor(_) => None,
-        }
-    }
-
-    fn truncated_frame_number(&self) -> Option<u16> {
-        match self {
-            VideoHeader::DependencyDescriptor(descriptor) => descriptor.truncated_frame_number,
-        }
-    }
-}
-
-impl From<rtp::DependencyDescriptor> for VideoHeader {
-    fn from(value: rtp::DependencyDescriptor) -> Self {
-        Self::DependencyDescriptor(value)
-    }
-}
-
 /// The per-client state
 struct Client {
     // Immutable
@@ -2141,9 +2098,9 @@ impl Client {
         &mut self,
         incoming_rtp: &rtp::Packet<&[u8]>,
         now: Instant,
-    ) -> Result<Option<(VideoHeader, bool)>, Error> {
+    ) -> Result<Option<(rtp::DependencyDescriptor, bool)>, Error> {
         let incoming_vp8 = if let Some((descriptor, _)) = incoming_rtp.dependency_descriptor {
-            VideoHeader::from(descriptor)
+            descriptor
         } else {
             return Err(Error::InvalidVp8Header);
         };
@@ -2168,7 +2125,7 @@ impl Client {
         }
 
         let old_resolution = incoming_video.original_resolution;
-        if let Some(resolution) = incoming_vp8.resolution() {
+        if let Some(resolution) = incoming_vp8.resolution {
             incoming_video.apply_resolution(resolution, self.video_rotation);
         } else if old_resolution.is_none() && !incoming_video.needs_resolution {
             // Record that we have data on the stream, when the resolution has been cleared.
@@ -2182,7 +2139,7 @@ impl Client {
 
         // If this is a key frame, and it was not allocatable before, update the bitrate and run
         // allocation; this allows for switching to a new stream on the first key frame.
-        if incoming_vp8.is_key_frame()
+        if incoming_vp8.is_key_frame
             && (old_resolution.is_none() || incoming_video.rate().unwrap_or_default().as_bps() == 0)
         {
             incoming_video.rate_tracker.update(now);
@@ -2280,7 +2237,7 @@ impl Client {
     fn forward_video_rtp(
         &mut self,
         incoming_rtp: &rtp::Packet<&[u8]>,
-        incoming_vp8: Option<&VideoHeader>,
+        incoming_vp8: Option<&rtp::DependencyDescriptor>,
     ) -> Option<rtp::Packet<Vec<u8>>> {
         let incoming_vp8 = incoming_vp8?;
 
@@ -2300,13 +2257,6 @@ impl Client {
                 descriptor.truncated_frame_number = Some(frame_number as rtp::TruncatedFrameNumber);
             }
             outgoing_rtp.set_frame_number_in_header(frame_number);
-        }
-        if let (Some(picture_id), Some(tl0_pic_idx)) = (outgoing.picture_id, outgoing.tl0_pic_idx) {
-            vp8::modify_header(
-                outgoing_rtp.payload_mut(),
-                picture_id as vp8::TruncatedPictureId,
-                tl0_pic_idx as vp8::TruncatedTl0PicIdx,
-            );
         }
         Some(outgoing_rtp)
     }
@@ -2735,14 +2685,12 @@ enum Vp8SimulcastRtpForwardingState {
 
 /// The IDs that we rewrite when forwarding VP8.
 ///
-/// This is a convenience for keep track of all 4 together, which is a common
+/// This is a convenience for keep track of all 3 together, which is a common
 /// thing in Vp8SimulcastRtpForwarder.
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct Vp8RewrittenIds {
     seqnum: rtp::FullSequenceNumber,
     timestamp: rtp::FullTimestamp,
-    picture_id: Option<vp8::FullPictureId>,
-    tl0_pic_idx: Option<vp8::FullTl0PicIdx>,
     frame_number: Option<rtp::FullFrameNumber>,
 }
 
@@ -2751,8 +2699,6 @@ impl Default for Vp8RewrittenIds {
         Self {
             seqnum: 0,
             timestamp: 0,
-            picture_id: Some(0),
-            tl0_pic_idx: Some(0),
             frame_number: Some(1),
         }
     }
@@ -2762,30 +2708,16 @@ impl Vp8RewrittenIds {
     fn new(
         seqnum: rtp::FullSequenceNumber,
         timestamp: rtp::FullTimestamp,
-        picture_id: Option<vp8::FullPictureId>,
-        tl0_pic_idx: Option<vp8::FullTl0PicIdx>,
         frame_number: Option<rtp::FullFrameNumber>,
     ) -> Self {
         Self {
             seqnum,
             timestamp,
-            picture_id,
-            tl0_pic_idx,
             frame_number,
         }
     }
 
     fn checked_sub(&self, other: &Self) -> Option<Self> {
-        let picture_id = if let (Some(lhs), Some(rhs)) = (self.picture_id, other.picture_id) {
-            Some(lhs.checked_sub(rhs)?)
-        } else {
-            None
-        };
-        let tl0_pic_idx = if let (Some(lhs), Some(rhs)) = (self.tl0_pic_idx, other.tl0_pic_idx) {
-            Some(lhs.checked_sub(rhs)?)
-        } else {
-            None
-        };
         let frame_number = if let (Some(lhs), Some(rhs)) = (self.frame_number, other.frame_number) {
             Some(lhs.checked_sub(rhs)?)
         } else {
@@ -2794,23 +2726,11 @@ impl Vp8RewrittenIds {
         Some(Self::new(
             self.seqnum.checked_sub(other.seqnum)?,
             self.timestamp.checked_sub(other.timestamp)?,
-            picture_id,
-            tl0_pic_idx,
             frame_number,
         ))
     }
 
     fn checked_add(&self, other: &Self) -> Option<Self> {
-        let picture_id = if let (Some(lhs), Some(rhs)) = (self.picture_id, other.picture_id) {
-            Some(lhs.checked_add(rhs)?)
-        } else {
-            None
-        };
-        let tl0_pic_idx = if let (Some(lhs), Some(rhs)) = (self.tl0_pic_idx, other.tl0_pic_idx) {
-            Some(lhs.checked_add(rhs)?)
-        } else {
-            None
-        };
         let frame_number = if let (Some(lhs), Some(rhs)) = (self.frame_number, other.frame_number) {
             Some(lhs.checked_add(rhs)?)
         } else {
@@ -2819,8 +2739,6 @@ impl Vp8RewrittenIds {
         Some(Self::new(
             self.seqnum.checked_add(other.seqnum)?,
             self.timestamp.checked_add(other.timestamp)?,
-            picture_id,
-            tl0_pic_idx,
             frame_number,
         ))
     }
@@ -2829,8 +2747,6 @@ impl Vp8RewrittenIds {
         Self::new(
             max(self.seqnum, other.seqnum),
             max(self.timestamp, other.timestamp),
-            max(self.picture_id, other.picture_id),
-            max(self.tl0_pic_idx, other.tl0_pic_idx),
             max(self.frame_number, other.frame_number),
         )
     }
@@ -2948,15 +2864,10 @@ impl Vp8SimulcastRtpForwarder {
     fn forward_vp8_rtp(
         &mut self,
         incoming_rtp: &rtp::Packet<&[u8]>,
-        incoming_vp8: &VideoHeader,
+        incoming_vp8: &rtp::DependencyDescriptor,
     ) -> Option<(rtp::Ssrc, Vp8RewrittenIds)> {
-        // Both IDs are None when a dependency descriptor is used.
-        if incoming_vp8.picture_id().is_some() || incoming_vp8.tl0_pic_idx().is_some() {
-            return None;
-        }
-
         if self.switching_ssrc() == Some(incoming_rtp.ssrc())
-            && incoming_vp8.is_key_frame()
+            && incoming_vp8.is_key_frame
             && (incoming_rtp.is_max_seqnum || self.forwarding_ssrc().is_none())
         {
             // When switching from forwarding one SSRC to another, we only
@@ -2992,12 +2903,8 @@ impl Vp8SimulcastRtpForwarder {
                 // In other words, we are only tracking the ROC since the switching point,
                 // and that is now, so the ROC is 0.
                 incoming_rtp.timestamp as rtp::FullTimestamp,
-                incoming_vp8.picture_id().map(|id| id as vp8::FullPictureId),
                 incoming_vp8
-                    .tl0_pic_idx()
-                    .map(|idx| idx as vp8::FullTl0PicIdx),
-                incoming_vp8
-                    .truncated_frame_number()
+                    .truncated_frame_number
                     .map(|num| num as rtp::FullFrameNumber),
             );
             // We make two simplifying assumptions here:
@@ -3011,13 +2918,9 @@ impl Vp8SimulcastRtpForwarder {
             // and the first seqnum/picture_id after the switch and doesn't require any fancy logic or queuing.
             // Ok, there is a gap of 1 seqnum to signify to the encoder that the
             // previous frame was (probably) incomplete.  That's why there's a 2 for the seqnum.
-            let first_outgoing = self.max_outgoing.checked_add(&Vp8RewrittenIds::new(
-                2,
-                1,
-                Some(1),
-                Some(1),
-                Some(1),
-            ))?;
+            let first_outgoing =
+                self.max_outgoing
+                    .checked_add(&Vp8RewrittenIds::new(2, 1, Some(1)))?;
 
             self.forwarding = Vp8SimulcastRtpForwardingState::Forwarding {
                 incoming_ssrc: incoming_rtp.ssrc(),
@@ -3028,7 +2931,7 @@ impl Vp8SimulcastRtpForwarder {
             };
             self.switching = Vp8SimulcastRtpSwitchingState::DoNotSwitch;
             self.max_outgoing = first_outgoing;
-        } else if self.switching_ssrc() == Some(incoming_rtp.ssrc()) && incoming_vp8.is_key_frame()
+        } else if self.switching_ssrc() == Some(incoming_rtp.ssrc()) && incoming_vp8.is_key_frame
         {
             event!("calling.forwarding.layer_switch.wait_for_in_order_key_frame");
             trace!(
@@ -3049,23 +2952,8 @@ impl Vp8SimulcastRtpForwarder {
         } = &mut self.forwarding
         {
             if *incoming_ssrc == incoming_rtp.ssrc() {
-                let expanded_picture_id = if let (Some(incoming), Some(max_incoming)) =
-                    (incoming_vp8.picture_id(), max_incoming.picture_id.as_mut())
-                {
-                    Some(vp8::expand_picture_id(incoming, max_incoming))
-                } else {
-                    None
-                };
-                let expanded_tl0_pic_idx = if let (Some(incoming), Some(max_incoming)) = (
-                    incoming_vp8.tl0_pic_idx(),
-                    max_incoming.tl0_pic_idx.as_mut(),
-                ) {
-                    Some(vp8::expand_tl0_pic_idx(incoming, max_incoming))
-                } else {
-                    None
-                };
                 let expanded_frame_number = if let (Some(incoming), Some(max_incoming)) = (
-                    incoming_vp8.truncated_frame_number(),
+                    incoming_vp8.truncated_frame_number,
                     max_incoming.frame_number.as_mut(),
                 ) {
                     Some(rtp::expand_frame_number(incoming, max_incoming))
@@ -3076,8 +2964,6 @@ impl Vp8SimulcastRtpForwarder {
                 let incoming = Vp8RewrittenIds::new(
                     incoming_rtp.seqnum(),
                     rtp::expand_timestamp(incoming_rtp.timestamp, &mut max_incoming.timestamp),
-                    expanded_picture_id,
-                    expanded_tl0_pic_idx,
                     expanded_frame_number,
                 );
                 // If the sub fails, it's because the incoming packet predates the switch (before the key frame)
@@ -3085,7 +2971,7 @@ impl Vp8SimulcastRtpForwarder {
                     first_outgoing.checked_add(&incoming.checked_sub(first_incoming)?)?;
                 self.max_outgoing = self.max_outgoing.max(&outgoing);
 
-                if incoming_vp8.is_key_frame() {
+                if incoming_vp8.is_key_frame {
                     *needs_key_frame = false;
                 }
                 trace!(
@@ -3315,7 +3201,7 @@ mod call_tests {
                 &self,
                 forwarder: &mut Vp8SimulcastRtpForwarder,
             ) -> Option<(rtp::Ssrc, Vp8RewrittenIds)> {
-                forwarder.forward_vp8_rtp(&self.rtp.borrow(), &self.dependency_descriptor.into())
+                forwarder.forward_vp8_rtp(&self.rtp.borrow(), &self.dependency_descriptor)
             }
         }
 
@@ -3331,8 +3217,6 @@ mod call_tests {
                 Vp8RewrittenIds {
                     seqnum,
                     timestamp,
-                    picture_id: None,
-                    tl0_pic_idx: None,
                     frame_number: Some(frame_number),
                 },
             ))

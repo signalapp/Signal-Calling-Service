@@ -25,4 +25,3 @@ pub mod rtp;
 pub mod sfu;
 pub mod signaling_server;
 pub mod transportcc;
-pub mod vp8;
