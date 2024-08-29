@@ -2252,12 +2252,10 @@ impl Client {
             outgoing.seqnum,
             outgoing.timestamp as rtp::TruncatedTimestamp,
         );
-        if let Some(frame_number) = outgoing.frame_number {
-            if let Some((descriptor, _)) = &mut outgoing_rtp.dependency_descriptor {
-                descriptor.truncated_frame_number = Some(frame_number as rtp::TruncatedFrameNumber);
-            }
-            outgoing_rtp.set_frame_number_in_header(frame_number);
+        if let Some((descriptor, _)) = &mut outgoing_rtp.dependency_descriptor {
+            descriptor.truncated_frame_number = outgoing.frame_number as rtp::TruncatedFrameNumber;
         }
+        outgoing_rtp.set_frame_number_in_header(outgoing.frame_number);
         Some(outgoing_rtp)
     }
 
@@ -2691,7 +2689,7 @@ enum Vp8SimulcastRtpForwardingState {
 struct Vp8RewrittenIds {
     seqnum: rtp::FullSequenceNumber,
     timestamp: rtp::FullTimestamp,
-    frame_number: Option<rtp::FullFrameNumber>,
+    frame_number: rtp::FullFrameNumber,
 }
 
 impl Default for Vp8RewrittenIds {
@@ -2699,7 +2697,7 @@ impl Default for Vp8RewrittenIds {
         Self {
             seqnum: 0,
             timestamp: 0,
-            frame_number: Some(1),
+            frame_number: 1,
         }
     }
 }
@@ -2708,7 +2706,7 @@ impl Vp8RewrittenIds {
     fn new(
         seqnum: rtp::FullSequenceNumber,
         timestamp: rtp::FullTimestamp,
-        frame_number: Option<rtp::FullFrameNumber>,
+        frame_number: rtp::FullFrameNumber,
     ) -> Self {
         Self {
             seqnum,
@@ -2718,28 +2716,18 @@ impl Vp8RewrittenIds {
     }
 
     fn checked_sub(&self, other: &Self) -> Option<Self> {
-        let frame_number = if let (Some(lhs), Some(rhs)) = (self.frame_number, other.frame_number) {
-            Some(lhs.checked_sub(rhs)?)
-        } else {
-            None
-        };
         Some(Self::new(
             self.seqnum.checked_sub(other.seqnum)?,
             self.timestamp.checked_sub(other.timestamp)?,
-            frame_number,
+            self.frame_number.checked_sub(other.frame_number)?,
         ))
     }
 
     fn checked_add(&self, other: &Self) -> Option<Self> {
-        let frame_number = if let (Some(lhs), Some(rhs)) = (self.frame_number, other.frame_number) {
-            Some(lhs.checked_add(rhs)?)
-        } else {
-            None
-        };
         Some(Self::new(
             self.seqnum.checked_add(other.seqnum)?,
             self.timestamp.checked_add(other.timestamp)?,
-            frame_number,
+            self.frame_number.checked_add(other.frame_number)?,
         ))
     }
 
@@ -2903,9 +2891,7 @@ impl Vp8SimulcastRtpForwarder {
                 // In other words, we are only tracking the ROC since the switching point,
                 // and that is now, so the ROC is 0.
                 incoming_rtp.timestamp as rtp::FullTimestamp,
-                incoming_vp8
-                    .truncated_frame_number
-                    .map(|num| num as rtp::FullFrameNumber),
+                incoming_vp8.truncated_frame_number as rtp::FullFrameNumber,
             );
             // We make two simplifying assumptions here:
             // 1. The first packet we received is the first packet of the key frame.
@@ -2915,12 +2901,12 @@ impl Vp8SimulcastRtpForwarder {
             // If this is false, the last frame of the previous layer will be dropped by the receiving client.
             // Which hopefully will not be noticeable.
             // These assumptions allow us to have no gap between the last seqnum before the switch
-            // and the first seqnum/picture_id after the switch and doesn't require any fancy logic or queuing.
+            // and the first frame_number after the switch and doesn't require any fancy logic or queuing.
             // Ok, there is a gap of 1 seqnum to signify to the encoder that the
             // previous frame was (probably) incomplete.  That's why there's a 2 for the seqnum.
-            let first_outgoing =
-                self.max_outgoing
-                    .checked_add(&Vp8RewrittenIds::new(2, 1, Some(1)))?;
+            let first_outgoing = self
+                .max_outgoing
+                .checked_add(&Vp8RewrittenIds::new(2, 1, 1))?;
 
             self.forwarding = Vp8SimulcastRtpForwardingState::Forwarding {
                 incoming_ssrc: incoming_rtp.ssrc(),
@@ -2952,14 +2938,10 @@ impl Vp8SimulcastRtpForwarder {
         } = &mut self.forwarding
         {
             if *incoming_ssrc == incoming_rtp.ssrc() {
-                let expanded_frame_number = if let (Some(incoming), Some(max_incoming)) = (
+                let expanded_frame_number = rtp::expand_frame_number(
                     incoming_vp8.truncated_frame_number,
-                    max_incoming.frame_number.as_mut(),
-                ) {
-                    Some(rtp::expand_frame_number(incoming, max_incoming))
-                } else {
-                    None
-                };
+                    &mut max_incoming.frame_number,
+                );
 
                 let incoming = Vp8RewrittenIds::new(
                     incoming_rtp.seqnum(),
@@ -3171,7 +3153,7 @@ mod call_tests {
                     index,
                     rtp,
                     dependency_descriptor: rtp::DependencyDescriptor {
-                        truncated_frame_number: Some(((1000 * ssrc) + index) as u16),
+                        truncated_frame_number: ((1000 * ssrc) + index) as u16,
                         is_key_frame,
                         resolution,
                     },
@@ -3190,7 +3172,7 @@ mod call_tests {
                 Self {
                     rtp,
                     dependency_descriptor: rtp::DependencyDescriptor {
-                        truncated_frame_number: Some(truncated_frame_number),
+                        truncated_frame_number,
                         ..self.dependency_descriptor
                     },
                     ..self.clone()
@@ -3217,7 +3199,7 @@ mod call_tests {
                 Vp8RewrittenIds {
                     seqnum,
                     timestamp,
-                    frame_number: Some(frame_number),
+                    frame_number,
                 },
             ))
         };
@@ -4205,7 +4187,7 @@ mod call_tests {
     fn create_video_rtp(
         sender_demux_id: DemuxId,
         layer_id: LayerId,
-        frame_number: u16,
+        truncated_frame_number: u16,
         seqnum: rtp::FullSequenceNumber,
         key_frame_size: Option<PixelSize>,
     ) -> rtp::Packet<Vec<u8>> {
@@ -4223,7 +4205,7 @@ mod call_tests {
             rtp::DependencyDescriptor {
                 is_key_frame: key_frame_size.is_some(),
                 resolution: key_frame_size,
-                truncated_frame_number: Some(frame_number),
+                truncated_frame_number,
             },
             &payload,
         )

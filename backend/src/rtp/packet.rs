@@ -223,11 +223,6 @@ impl Header {
 
                         dependency_descriptor = read_dependency_descriptor(val)
                             .ok()
-                            .or(Some(DependencyDescriptor {
-                                is_key_frame: false,
-                                resolution: None,
-                                truncated_frame_number: None,
-                            }))
                             .map(|descriptor| (descriptor, extension_val_range));
                     }
                     (RTP_EXT_ID_VIDEO_LAYERS_ALLOCATION, val) => {
@@ -409,7 +404,7 @@ impl<'a> BitBuffer<'a> {
 pub struct DependencyDescriptor {
     pub is_key_frame: bool,
     pub resolution: Option<PixelSize>,
-    pub truncated_frame_number: Option<u16>,
+    pub truncated_frame_number: u16,
 }
 
 /// An implementation of the pseudocode from the following section of the spec:
@@ -423,7 +418,7 @@ fn read_dependency_descriptor(bytes: &[u8]) -> Result<DependencyDescriptor> {
     // Ignore start_of_frame, end_of_frame, and frame_dependency_template_id.
     data.byte_index = 1;
 
-    let truncated_frame_number = data.read_u16().ok();
+    let truncated_frame_number = data.read_u16()?;
     if data.bytes.len() == 3 {
         return Ok(DependencyDescriptor {
             is_key_frame: false,
@@ -1034,10 +1029,7 @@ fn write_two_byte_extension(id: u8, value: impl Writer) -> impl Writer {
 // Supports the subset of dependency descriptor features that the tests need.
 #[cfg(test)]
 fn write_dependency_descriptor(dependency_descriptor: DependencyDescriptor) -> Box<dyn Writer> {
-    let frame_number = dependency_descriptor
-        .truncated_frame_number
-        .expect("frame number is present for serialization")
-        .to_be_bytes();
+    let frame_number = dependency_descriptor.truncated_frame_number.to_be_bytes();
 
     if let Some(PixelSize { width, height }) = dependency_descriptor.resolution {
         // key frame
@@ -2093,7 +2085,7 @@ mod test {
         let dependency_descriptor = DependencyDescriptor {
             is_key_frame: false,
             resolution: None,
-            truncated_frame_number: Some(357),
+            truncated_frame_number: 357,
         };
         let extensions = write_dependency_descriptor(dependency_descriptor);
         let (packet, payload_range) = Packet::write_serialized(
@@ -2134,7 +2126,7 @@ mod test {
                 width: 640,
                 height: 480,
             }),
-            truncated_frame_number: Some(2135),
+            truncated_frame_number: 2135,
         };
         let extensions = (
             write_two_byte_extension(RTP_EXT_ID_VIDEO_ORIENTATION, [0x3u8]),
@@ -2227,7 +2219,7 @@ mod test {
                             width: 2880,
                             height: 1620,
                         }),
-                        truncated_frame_number: Some(2),
+                        truncated_frame_number: 2,
                     },
                     22..39
                 )),
