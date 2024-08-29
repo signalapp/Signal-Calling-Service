@@ -37,12 +37,6 @@ test = false
 doc = false
 
 [[bin]]
-name = "vp8"
-path = "fuzz_targets/vp8.rs"
-test = false
-doc = false
-
-[[bin]]
 name = "rtcp"
 path = "fuzz_targets/rtcp.rs"
 test = false

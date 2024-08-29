@@ -1977,50 +1977,38 @@ impl From<mrp::MrpHeader> for protos::MrpHeader {
 }
 
 enum VideoHeader {
-    VP8(vp8::ParsedHeader),
     DependencyDescriptor(rtp::DependencyDescriptor),
 }
 
 impl VideoHeader {
     fn is_key_frame(&self) -> bool {
         match self {
-            VideoHeader::VP8(header) => header.is_key_frame,
             VideoHeader::DependencyDescriptor(descriptor) => descriptor.is_key_frame,
         }
     }
 
     fn resolution(&self) -> Option<PixelSize> {
         match self {
-            VideoHeader::VP8(header) => header.resolution,
             VideoHeader::DependencyDescriptor(descriptor) => descriptor.resolution,
         }
     }
 
     fn picture_id(&self) -> Option<vp8::TruncatedPictureId> {
         match self {
-            VideoHeader::VP8(header) => header.picture_id,
             VideoHeader::DependencyDescriptor(_) => None,
         }
     }
 
     fn tl0_pic_idx(&self) -> Option<vp8::TruncatedTl0PicIdx> {
         match self {
-            VideoHeader::VP8(header) => header.tl0_pic_idx,
             VideoHeader::DependencyDescriptor(_) => None,
         }
     }
 
     fn truncated_frame_number(&self) -> Option<u16> {
         match self {
-            VideoHeader::VP8(_) => None,
             VideoHeader::DependencyDescriptor(descriptor) => descriptor.truncated_frame_number,
         }
-    }
-}
-
-impl From<vp8::ParsedHeader> for VideoHeader {
-    fn from(value: vp8::ParsedHeader) -> Self {
-        Self::VP8(value)
     }
 }
 
@@ -2157,10 +2145,7 @@ impl Client {
         let incoming_vp8 = if let Some((descriptor, _)) = incoming_rtp.dependency_descriptor {
             VideoHeader::from(descriptor)
         } else {
-            VideoHeader::from(
-                vp8::ParsedHeader::read(incoming_rtp.payload())
-                    .map_err(|_| Error::InvalidVp8Header)?,
-            )
+            return Err(Error::InvalidVp8Header);
         };
         let incoming_layer_index =
             LayerId::layer_index_from_ssrc(incoming_rtp.ssrc()).ok_or(Error::InvalidRtpLayerId)?;
@@ -2965,19 +2950,9 @@ impl Vp8SimulcastRtpForwarder {
         incoming_rtp: &rtp::Packet<&[u8]>,
         incoming_vp8: &VideoHeader,
     ) -> Option<(rtp::Ssrc, Vp8RewrittenIds)> {
-        // Both IDs are None when a dependency descriptor is used, otherwise they're both Some.
-        match (
-            incoming_vp8,
-            incoming_vp8.picture_id(),
-            incoming_vp8.tl0_pic_idx(),
-        ) {
-            (VideoHeader::VP8(_), None, _)
-            | (VideoHeader::VP8(_), _, None)
-            | (VideoHeader::DependencyDescriptor(_), Some(_), _)
-            | (VideoHeader::DependencyDescriptor(_), _, Some(_)) => {
-                return None;
-            }
-            _ => {}
+        // Both IDs are None when a dependency descriptor is used.
+        if incoming_vp8.picture_id().is_some() || incoming_vp8.tl0_pic_idx().is_some() {
+            return None;
         }
 
         if self.switching_ssrc() == Some(incoming_rtp.ssrc())
