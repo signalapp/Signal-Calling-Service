@@ -291,12 +291,14 @@ pub enum Error {
     InvalidClientToServerProtobuf,
     #[error("received RTP packet with unauthorized SSRC.  Authorized DemuxId: {0:?}.  Received DemuxId: {1:?}")]
     UnauthorizedRtpSsrc(DemuxId, DemuxId),
-    #[error("received RTP packet with invalid VP8 header")]
-    InvalidVp8Header,
+    #[error("received RTP packet without dependency descriptor")]
+    MissingDependencyDescriptor,
     #[error("received RTP packet with invalid MRP header")]
     InvalidMrpHeader(MrpReceiveError),
     #[error("received RTP packet with invalid layer ID")]
     InvalidRtpLayerId,
+    #[error("received RTP packet with invalid video layers allocation header extension")]
+    InvalidVideoLayersAllocation,
     #[error("unknown demux ID: {0:?}")]
     UnknownDemuxId(DemuxId),
     #[error("received RTP leave")]
@@ -1110,18 +1112,15 @@ impl Call {
             sender.incoming_audio_levels.push(audio_level);
             // Active speaker is recalculated in tick()
         }
-        let incoming_vp8 = if incoming_rtp.is_vp8() {
+        let dependency_descriptor = if incoming_rtp.is_vp8() {
             time_scope_us!("calling.call.handle_rtp.vp8_header");
-            if let Some((incoming_vp8, need_reallocation)) = sender
-                .parse_vp8_header_and_update_incoming_video_rate_and_resolution(
-                    &incoming_rtp,
-                    now,
-                )?
+            if let Some((dependency_descriptor, need_reallocation)) =
+                sender.update_incoming_video_rate_and_resolution(&incoming_rtp, now)?
             {
                 if need_reallocation {
                     self.reallocate_target_send_rates(now);
                 }
-                Some(incoming_vp8)
+                Some(dependency_descriptor)
             } else {
                 return Ok(vec![]);
             }
@@ -1151,7 +1150,7 @@ impl Call {
                 }
                 LayerId::RtpData => receiver.forward_data_rtp(&incoming_rtp),
                 LayerId::Video0 | LayerId::Video1 | LayerId::Video2 => {
-                    receiver.forward_video_rtp(&incoming_rtp, incoming_vp8.as_ref())
+                    receiver.forward_video_rtp(&incoming_rtp, dependency_descriptor.as_ref())
                 }
             } {
                 rtp_to_send.push((receiver.demux_id, rtp_to_forward));
@@ -2094,16 +2093,17 @@ impl Client {
         }
     }
 
-    fn parse_vp8_header_and_update_incoming_video_rate_and_resolution(
+    fn update_incoming_video_rate_and_resolution(
         &mut self,
         incoming_rtp: &rtp::Packet<&[u8]>,
         now: Instant,
     ) -> Result<Option<(rtp::DependencyDescriptor, bool)>, Error> {
-        let incoming_vp8 = if let Some((descriptor, _)) = incoming_rtp.dependency_descriptor {
-            descriptor
-        } else {
-            return Err(Error::InvalidVp8Header);
-        };
+        let dependency_descriptor =
+            if let Some((descriptor, _)) = incoming_rtp.dependency_descriptor {
+                descriptor
+            } else {
+                return Err(Error::MissingDependencyDescriptor);
+            };
         let incoming_layer_index =
             LayerId::layer_index_from_ssrc(incoming_rtp.ssrc()).ok_or(Error::InvalidRtpLayerId)?;
         let incoming_video = &mut self.incoming_video[incoming_layer_index];
@@ -2125,7 +2125,7 @@ impl Client {
         }
 
         let old_resolution = incoming_video.original_resolution;
-        if let Some(resolution) = incoming_vp8.resolution {
+        if let Some(resolution) = dependency_descriptor.resolution {
             incoming_video.apply_resolution(resolution, self.video_rotation);
         } else if old_resolution.is_none() && !incoming_video.needs_resolution {
             // Record that we have data on the stream, when the resolution has been cleared.
@@ -2139,7 +2139,7 @@ impl Client {
 
         // If this is a key frame, and it was not allocatable before, update the bitrate and run
         // allocation; this allows for switching to a new stream on the first key frame.
-        if incoming_vp8.is_key_frame
+        if dependency_descriptor.is_key_frame
             && (old_resolution.is_none() || incoming_video.rate().unwrap_or_default().as_bps() == 0)
         {
             incoming_video.rate_tracker.update(now);
@@ -2149,7 +2149,9 @@ impl Client {
         if let Some(allocations) = &incoming_rtp.video_layers_allocation {
             for i in 0..self.incoming_video.len() {
                 if allocations.len() > i && !allocations[i].is_empty() {
-                    let layer = allocations[i].last().ok_or(Error::InvalidVp8Header)?;
+                    let layer = allocations[i]
+                        .last()
+                        .ok_or(Error::InvalidVideoLayersAllocation)?;
                     self.incoming_video[i]
                         .rate_tracker
                         .set_target(layer.max_rate());
@@ -2214,7 +2216,7 @@ impl Client {
             }
         }
 
-        Ok(Some((incoming_vp8, need_reallocation)))
+        Ok(Some((dependency_descriptor, need_reallocation)))
     }
 
     fn forward_audio_rtp(
@@ -2237,16 +2239,17 @@ impl Client {
     fn forward_video_rtp(
         &mut self,
         incoming_rtp: &rtp::Packet<&[u8]>,
-        incoming_vp8: Option<&rtp::DependencyDescriptor>,
+        dependency_descriptor: Option<&rtp::DependencyDescriptor>,
     ) -> Option<rtp::Packet<Vec<u8>>> {
-        let incoming_vp8 = incoming_vp8?;
+        let dependency_descriptor = dependency_descriptor?;
 
         let sender_demux_id = DemuxId::from_ssrc(incoming_rtp.ssrc());
         let forwarder = self
             .video_forwarder_by_sender_demux_id
             .get_mut(&sender_demux_id)?;
 
-        let (outgoing_ssrc, outgoing) = forwarder.forward_vp8_rtp(incoming_rtp, incoming_vp8)?;
+        let (outgoing_ssrc, outgoing) =
+            forwarder.forward_vp8_rtp(incoming_rtp, dependency_descriptor)?;
         let mut outgoing_rtp = incoming_rtp.rewrite(
             outgoing_ssrc,
             outgoing.seqnum,
@@ -2639,9 +2642,9 @@ impl SingleSsrcRtpForwarder {
     }
 }
 
-// State to allow forwarding a set of N video SSRCs as 1 video SSRC by
-// changing the seqnums and VP8 picture IDs and VP8 TL0 Picture Indexes
-// to make it appear that it's one stream rather than N.
+// State to allow forwarding a set of N video SSRCs as 1 video SSRC by changing
+// the seqnums and dependency descriptor frame numbers to make it appear that
+// it's one stream rather than N.
 struct Vp8SimulcastRtpForwarder {
     // The outgoing SSRC.  It never changes.
     outgoing_ssrc: rtp::Ssrc,
@@ -2652,7 +2655,7 @@ struct Vp8SimulcastRtpForwarder {
     // (generally, the max + 1).  And we have to retain
     // that outside of the forwarding state below so we
     // retain it across various pause/forward cycles.
-    max_outgoing: Vp8RewrittenIds,
+    max_outgoing: VideoRewrittenIds,
 }
 enum Vp8SimulcastRtpSwitchingState {
     DoNotSwitch,
@@ -2670,29 +2673,29 @@ enum Vp8SimulcastRtpForwardingState {
         // maintain the relative relationship that they did in the
         // unmodified stream of packets.
         // "first" here means "first since latest switch".
-        first_incoming: Vp8RewrittenIds,
-        first_outgoing: Vp8RewrittenIds,
+        first_incoming: VideoRewrittenIds,
+        first_outgoing: VideoRewrittenIds,
 
         // We have to keep track of the max incoming IDs
         // to be able to expand the IDs from truncated to full.
         // otherwise, rollover would mess up the "max outgoing"
         // below.
-        max_incoming: Vp8RewrittenIds,
+        max_incoming: VideoRewrittenIds,
     },
 }
 
-/// The IDs that we rewrite when forwarding VP8.
+/// The IDs that we rewrite when forwarding video.
 ///
 /// This is a convenience for keep track of all 3 together, which is a common
 /// thing in Vp8SimulcastRtpForwarder.
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct Vp8RewrittenIds {
+struct VideoRewrittenIds {
     seqnum: rtp::FullSequenceNumber,
     timestamp: rtp::FullTimestamp,
     frame_number: rtp::FullFrameNumber,
 }
 
-impl Default for Vp8RewrittenIds {
+impl Default for VideoRewrittenIds {
     fn default() -> Self {
         Self {
             seqnum: 0,
@@ -2702,7 +2705,7 @@ impl Default for Vp8RewrittenIds {
     }
 }
 
-impl Vp8RewrittenIds {
+impl VideoRewrittenIds {
     fn new(
         seqnum: rtp::FullSequenceNumber,
         timestamp: rtp::FullTimestamp,
@@ -2746,7 +2749,7 @@ impl Vp8SimulcastRtpForwarder {
             outgoing_ssrc,
             forwarding: Vp8SimulcastRtpForwardingState::Paused,
             switching: Vp8SimulcastRtpSwitchingState::DoNotSwitch,
-            max_outgoing: Vp8RewrittenIds::default(),
+            max_outgoing: VideoRewrittenIds::default(),
         }
     }
 
@@ -2847,15 +2850,15 @@ impl Vp8SimulcastRtpForwarder {
         }
     }
 
-    // Selects a new seqnum, VP8 Picture ID, and VP8 Tl0PicIdx.  If None is returned, that means
+    // Selects a new seqnum and dependency descriptor frame number.  If None is returned, that means
     // don't forward the packet.
     fn forward_vp8_rtp(
         &mut self,
         incoming_rtp: &rtp::Packet<&[u8]>,
-        incoming_vp8: &rtp::DependencyDescriptor,
-    ) -> Option<(rtp::Ssrc, Vp8RewrittenIds)> {
+        dependency_descriptor: &rtp::DependencyDescriptor,
+    ) -> Option<(rtp::Ssrc, VideoRewrittenIds)> {
         if self.switching_ssrc() == Some(incoming_rtp.ssrc())
-            && incoming_vp8.is_key_frame
+            && dependency_descriptor.is_key_frame
             && (incoming_rtp.is_max_seqnum || self.forwarding_ssrc().is_none())
         {
             // When switching from forwarding one SSRC to another, we only
@@ -2884,14 +2887,14 @@ impl Vp8SimulcastRtpForwarder {
                 needs_key_frame,
             );
 
-            let first_incoming = Vp8RewrittenIds::new(
+            let first_incoming = VideoRewrittenIds::new(
                 incoming_rtp.seqnum(),
                 // These are OK to expand without one of the expand_X functions because
                 // they are only used as a base for future values.
                 // In other words, we are only tracking the ROC since the switching point,
                 // and that is now, so the ROC is 0.
                 incoming_rtp.timestamp as rtp::FullTimestamp,
-                incoming_vp8.truncated_frame_number as rtp::FullFrameNumber,
+                dependency_descriptor.truncated_frame_number as rtp::FullFrameNumber,
             );
             // We make two simplifying assumptions here:
             // 1. The first packet we received is the first packet of the key frame.
@@ -2906,7 +2909,7 @@ impl Vp8SimulcastRtpForwarder {
             // previous frame was (probably) incomplete.  That's why there's a 2 for the seqnum.
             let first_outgoing = self
                 .max_outgoing
-                .checked_add(&Vp8RewrittenIds::new(2, 1, 1))?;
+                .checked_add(&VideoRewrittenIds::new(2, 1, 1))?;
 
             self.forwarding = Vp8SimulcastRtpForwardingState::Forwarding {
                 incoming_ssrc: incoming_rtp.ssrc(),
@@ -2917,7 +2920,8 @@ impl Vp8SimulcastRtpForwarder {
             };
             self.switching = Vp8SimulcastRtpSwitchingState::DoNotSwitch;
             self.max_outgoing = first_outgoing;
-        } else if self.switching_ssrc() == Some(incoming_rtp.ssrc()) && incoming_vp8.is_key_frame
+        } else if self.switching_ssrc() == Some(incoming_rtp.ssrc())
+            && dependency_descriptor.is_key_frame
         {
             event!("calling.forwarding.layer_switch.wait_for_in_order_key_frame");
             trace!(
@@ -2939,11 +2943,11 @@ impl Vp8SimulcastRtpForwarder {
         {
             if *incoming_ssrc == incoming_rtp.ssrc() {
                 let expanded_frame_number = rtp::expand_frame_number(
-                    incoming_vp8.truncated_frame_number,
+                    dependency_descriptor.truncated_frame_number,
                     &mut max_incoming.frame_number,
                 );
 
-                let incoming = Vp8RewrittenIds::new(
+                let incoming = VideoRewrittenIds::new(
                     incoming_rtp.seqnum(),
                     rtp::expand_timestamp(incoming_rtp.timestamp, &mut max_incoming.timestamp),
                     expanded_frame_number,
@@ -2953,7 +2957,7 @@ impl Vp8SimulcastRtpForwarder {
                     first_outgoing.checked_add(&incoming.checked_sub(first_incoming)?)?;
                 self.max_outgoing = self.max_outgoing.max(&outgoing);
 
-                if incoming_vp8.is_key_frame {
+                if dependency_descriptor.is_key_frame {
                     *needs_key_frame = false;
                 }
                 trace!(
@@ -3182,7 +3186,7 @@ mod call_tests {
             fn forward(
                 &self,
                 forwarder: &mut Vp8SimulcastRtpForwarder,
-            ) -> Option<(rtp::Ssrc, Vp8RewrittenIds)> {
+            ) -> Option<(rtp::Ssrc, VideoRewrittenIds)> {
                 forwarder.forward_vp8_rtp(&self.rtp.borrow(), &self.dependency_descriptor)
             }
         }
@@ -3193,10 +3197,10 @@ mod call_tests {
         let outgoing = |seqnum: rtp::FullSequenceNumber,
                         timestamp: rtp::FullTimestamp,
                         frame_number: rtp::FullFrameNumber|
-         -> Option<(rtp::Ssrc, Vp8RewrittenIds)> {
+         -> Option<(rtp::Ssrc, VideoRewrittenIds)> {
             Some((
                 outgoing_ssrc,
-                Vp8RewrittenIds {
+                VideoRewrittenIds {
                     seqnum,
                     timestamp,
                     frame_number,
