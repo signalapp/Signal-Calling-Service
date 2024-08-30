@@ -882,6 +882,64 @@ pub fn write_extension(id: u8, value: impl Writer) -> impl Writer {
     ([header], value)
 }
 
+#[cfg(test)]
+fn write_two_byte_extension(id: u8, value: impl Writer) -> impl Writer {
+    assert_ne!(id, 0, "id must not be 0");
+    let length = value.written_len();
+    let header = [id, length.try_into().expect("length must fit in 8 bits")];
+    (header, value)
+}
+
+// Supports the subset of dependency descriptor features that the tests need.
+#[cfg(test)]
+fn write_dependency_descriptor(dependency_descriptor: DependencyDescriptor) -> Box<dyn Writer> {
+    let frame_number = dependency_descriptor
+        .truncated_frame_number
+        .expect("frame number is present for serialization")
+        .to_be_bytes();
+
+    if let Some(PixelSize { width, height }) = dependency_descriptor.resolution {
+        // key frame
+        let width_minus_1 = width - 1;
+        let height_minus_1 = height - 1;
+        Box::new(write_two_byte_extension(
+            RTP_EXT_ID_DEPENDENCY_DESCRIPTOR,
+            (
+                [0b10000000u8],
+                frame_number,
+                [
+                    0b10000000u8, // The first bit in this byte indicates that this is for a key frame.
+                    0b00000010,
+                    0b00000100,
+                    0b01001110,
+                    0b10101010,
+                    0b10101111,
+                    0b00101000,
+                    0b01100000,
+                    0b01000001,
+                    0b01001101,
+                    0b00110100,
+                    0b01010011,
+                    0b10001010,
+                    0b00001001,
+                    0b01000000,
+                    0b0100_0000 | ((width_minus_1 >> 10) as u8), // width - 1 from 3rd bit
+                    ((width_minus_1 >> 2) & 0xFF) as u8,
+                    (((width_minus_1 & 0b0000_0011) << 6) as u8) | ((height_minus_1 >> 10) as u8), // height - 1 from 3rd bit
+                    ((height_minus_1 >> 2) & 0xFF) as u8,
+                    ((height_minus_1 & 0b0000_0011) << 6) as u8,
+                ],
+            ),
+        ))
+    } else {
+        // delta frame
+        Box::new(write_extension(
+            RTP_EXT_ID_DEPENDENCY_DESCRIPTOR,
+            ([0b10000011u8], frame_number),
+        ))
+    }
+}
+
 impl Packet<Vec<u8>> {
     /// Writes a valid RTP packet with the given parameters.
     ///
@@ -988,6 +1046,52 @@ impl Packet<Vec<u8>> {
             payload_range_in_header: payload_range,
             encrypted: false,
             deadline: deadline_start.map(|deadline_start| deadline_start + PACKET_LIFETIME),
+            padding_byte_count: 0,
+            serialized,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_dependency_descriptor(
+        pt: PayloadType,
+        seqnum: FullSequenceNumber,
+        timestamp: TruncatedTimestamp,
+        ssrc: Ssrc,
+        dependency_descriptor: DependencyDescriptor,
+        payload: &[u8],
+    ) -> Self {
+        let marker = false;
+        let extensions = write_dependency_descriptor(dependency_descriptor);
+        let extensions_len = extensions.written_len();
+        let profile = if extensions_len > 16 || extensions_len == 0 {
+            HeaderExtensionsProfile::TwoByte
+        } else {
+            HeaderExtensionsProfile::OneByte
+        };
+        let (serialized, payload_range) = Self::write_serialized(
+            marker, pt, seqnum, timestamp, ssrc, extensions, profile, payload,
+        );
+        let dependency_descriptor_val_offset = 16 + profile.len();
+        Self {
+            marker,
+            payload_type_in_header: pt,
+            ssrc_in_header: ssrc,
+            seqnum_in_header: seqnum,
+            seqnum_in_payload: None,
+            pending_retransmission: false,
+            timestamp,
+            video_rotation: None,
+            audio_level: None,
+            dependency_descriptor: Some((
+                dependency_descriptor,
+                dependency_descriptor_val_offset
+                    ..(dependency_descriptor_val_offset + extensions_len),
+            )),
+            tcc_seqnum: None,
+            tcc_seqnum_range: None,
+            payload_range_in_header: payload_range,
+            encrypted: false,
+            deadline: None,
             padding_byte_count: 0,
             serialized,
         }
@@ -1596,10 +1700,12 @@ mod test {
 
     #[test]
     fn test_parse_rtp_header_with_dependency_descriptor() {
-        let extensions = write_extension(
-            RTP_EXT_ID_DEPENDENCY_DESCRIPTOR,
-            [0b10000011u8, 0b00000001, 0b01100101],
-        );
+        let dependency_descriptor = DependencyDescriptor {
+            is_key_frame: false,
+            resolution: None,
+            truncated_frame_number: Some(357),
+        };
+        let extensions = write_dependency_descriptor(dependency_descriptor);
         let (packet, payload_range) = Packet::write_serialized(
             false,
             1,
@@ -1620,14 +1726,7 @@ mod test {
                 ssrc: 4,
                 video_rotation: None,
                 audio_level: None,
-                dependency_descriptor: Some((
-                    DependencyDescriptor {
-                        is_key_frame: false,
-                        resolution: None,
-                        truncated_frame_number: Some(357),
-                    },
-                    17..20
-                )),
+                dependency_descriptor: Some((dependency_descriptor, 17..20)),
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,
@@ -1638,36 +1737,17 @@ mod test {
 
     #[test]
     fn test_parse_rtp_header_two_byte_extensions() {
+        let dependency_descriptor = DependencyDescriptor {
+            is_key_frame: true,
+            resolution: Some(PixelSize {
+                width: 640,
+                height: 480,
+            }),
+            truncated_frame_number: Some(2135),
+        };
         let extensions = (
             write_two_byte_extension(RTP_EXT_ID_VIDEO_ORIENTATION, [0x3u8]),
-            write_two_byte_extension(
-                RTP_EXT_ID_DEPENDENCY_DESCRIPTOR,
-                [
-                    0b10000000u8,
-                    0b00001000,
-                    0b01010111,
-                    0b10000000, // The first bit in this byte indicates that this is for a key frame.
-                    0b00000010,
-                    0b00000100,
-                    0b01001110,
-                    0b10101010,
-                    0b10101111,
-                    0b00101000,
-                    0b01100000,
-                    0b01000001,
-                    0b01001101,
-                    0b00110100,
-                    0b01010011,
-                    0b10001010,
-                    0b00001001,
-                    0b01000000,
-                    0b0100_0000, // width - 1 is 639 / 0b0000_0010_0111_1111 (starting on the 3rd bit)
-                    0b1001_1111,
-                    0b1100_0000, // height - 1 is 479 / 0b0000_0001_1101_1111 (from the 3rd bit)
-                    0b0111_0111,
-                    0b1100_0000,
-                ],
-            ),
+            write_dependency_descriptor(dependency_descriptor),
         );
 
         let (packet, payload_range) = Packet::write_serialized(
@@ -1690,17 +1770,7 @@ mod test {
                 ssrc: 4,
                 video_rotation: Some(VideoRotation::Clockwise270),
                 audio_level: None,
-                dependency_descriptor: Some((
-                    DependencyDescriptor {
-                        is_key_frame: true,
-                        resolution: Some(PixelSize {
-                            width: 640,
-                            height: 480,
-                        }),
-                        truncated_frame_number: Some(2135),
-                    },
-                    21..44
-                )),
+                dependency_descriptor: Some((dependency_descriptor, 21..44)),
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,
@@ -1775,12 +1845,5 @@ mod test {
             }),
             Header::parse(&packet)
         );
-    }
-
-    fn write_two_byte_extension(id: u8, value: impl Writer) -> impl Writer {
-        assert_ne!(id, 0, "id must not be 0");
-        let length = value.written_len();
-        let header = [id, length.try_into().expect("length must fit in 8 bits")];
-        (header, value)
     }
 }

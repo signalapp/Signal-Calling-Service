@@ -2224,6 +2224,9 @@ impl Client {
             outgoing.timestamp as rtp::TruncatedTimestamp,
         );
         if let Some(frame_number) = outgoing.frame_number {
+            if let Some((descriptor, _)) = &mut outgoing_rtp.dependency_descriptor {
+                descriptor.truncated_frame_number = Some(frame_number as rtp::TruncatedFrameNumber);
+            }
             outgoing_rtp.set_frame_number_in_header(frame_number);
         }
         if let (Some(picture_id), Some(tl0_pic_idx)) = (outgoing.picture_id, outgoing.tl0_pic_idx) {
@@ -3122,7 +3125,7 @@ mod call_tests {
             ssrc: u32,
             index: u32,
             rtp: rtp::Packet<Vec<u8>>,
-            vp8: vp8::ParsedHeader,
+            dependency_descriptor: rtp::DependencyDescriptor,
         }
 
         impl Incoming {
@@ -3144,7 +3147,7 @@ mod call_tests {
                     self.rtp.ssrc(),
                     self.index + 1,
                     is_key_frame,
-                    self.vp8.resolution,
+                    self.dependency_descriptor.resolution,
                 )
             }
 
@@ -3161,9 +3164,8 @@ mod call_tests {
                     ssrc,
                     index,
                     rtp: rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, None, None, &[]),
-                    vp8: vp8::ParsedHeader {
-                        picture_id: Some(((1000 * ssrc) + index) as u16),
-                        tl0_pic_idx: Some(((100 * ssrc) + index) as u8),
+                    dependency_descriptor: rtp::DependencyDescriptor {
+                        truncated_frame_number: Some(((1000 * ssrc) + index) as u16),
                         is_key_frame,
                         resolution,
                     },
@@ -3174,18 +3176,16 @@ mod call_tests {
                 &self,
                 seqnum: rtp::FullSequenceNumber,
                 timestamp: rtp::TruncatedTimestamp,
-                picture_id: vp8::TruncatedPictureId,
-                tl0_pic_idx: vp8::TruncatedTl0PicIdx,
+                truncated_frame_number: rtp::TruncatedFrameNumber,
             ) -> Self {
                 let mut rtp = self.rtp.clone();
                 rtp.set_seqnum_in_header(seqnum);
                 rtp.set_timestamp_in_header(timestamp);
                 Self {
                     rtp,
-                    vp8: vp8::ParsedHeader {
-                        picture_id: Some(picture_id),
-                        tl0_pic_idx: Some(tl0_pic_idx),
-                        ..self.vp8.clone()
+                    dependency_descriptor: rtp::DependencyDescriptor {
+                        truncated_frame_number: Some(truncated_frame_number),
+                        ..self.dependency_descriptor
                     },
                     ..self.clone()
                 }
@@ -3195,7 +3195,7 @@ mod call_tests {
                 &self,
                 forwarder: &mut Vp8SimulcastRtpForwarder,
             ) -> Option<(rtp::Ssrc, Vp8RewrittenIds)> {
-                forwarder.forward_vp8_rtp(&self.rtp.borrow(), &self.vp8.clone().into())
+                forwarder.forward_vp8_rtp(&self.rtp.borrow(), &self.dependency_descriptor.into())
             }
         }
 
@@ -3204,17 +3204,16 @@ mod call_tests {
         // This is a convenience function to make the test more readable.
         let outgoing = |seqnum: rtp::FullSequenceNumber,
                         timestamp: rtp::FullTimestamp,
-                        picture_id: vp8::FullPictureId,
-                        tl0_pic_idx: vp8::FullTl0PicIdx|
+                        frame_number: rtp::FullFrameNumber|
          -> Option<(rtp::Ssrc, Vp8RewrittenIds)> {
             Some((
                 outgoing_ssrc,
                 Vp8RewrittenIds {
                     seqnum,
                     timestamp,
-                    picture_id: Some(picture_id),
-                    tl0_pic_idx: Some(tl0_pic_idx),
-                    frame_number: None,
+                    picture_id: None,
+                    tl0_pic_idx: None,
+                    frame_number: Some(frame_number),
                 },
             ))
         };
@@ -3229,9 +3228,9 @@ mod call_tests {
         // Layer 0 desired.  Send key frame requests and forward a key frame and subsequent packets.
         forwarder.set_desired_ssrc(Some(layer0.ssrc));
         assert_eq!(Some(layer0.ssrc), forwarder.needs_key_frame());
-        assert_eq!(outgoing(2, 1, 1, 1), layer0.forward(&mut forwarder));
+        assert_eq!(outgoing(2, 1, 2), layer0.forward(&mut forwarder));
         let layer0 = layer0.increment_without_key_frame();
-        assert_eq!(outgoing(3, 30001, 2, 2), layer0.forward(&mut forwarder));
+        assert_eq!(outgoing(3, 30001, 3), layer0.forward(&mut forwarder));
 
         let layer1 = Incoming::start_with_key_frame(1, 640, 360);
         let layer1_original = layer1.clone();
@@ -3257,18 +3256,18 @@ mod call_tests {
         let layer0 = layer0.increment_with_key_frame();
         // There is a gap in the sequence number on purpose to indicate the last frame of the previous
         // layer wasn't finished.
-        assert_eq!(outgoing(5, 30002, 3, 3), layer0.forward(&mut forwarder));
+        assert_eq!(outgoing(5, 30002, 4), layer0.forward(&mut forwarder));
 
         // We no longer need a key frame
         assert_eq!(None, forwarder.needs_key_frame());
         let layer0 = layer0.increment_without_key_frame();
-        assert_eq!(outgoing(6, 60002, 4, 4), layer0.forward(&mut forwarder));
+        assert_eq!(outgoing(6, 60002, 5), layer0.forward(&mut forwarder));
 
         // Request a switch to a higher layer
         // Continue to forward the existing layer until a key frame comes.
         forwarder.set_desired_ssrc(Some(layer1.ssrc));
         let layer0 = layer0.increment_without_key_frame();
-        assert_eq!(outgoing(7, 90002, 5, 5), layer0.forward(&mut forwarder));
+        assert_eq!(outgoing(7, 90002, 6), layer0.forward(&mut forwarder));
         let layer1 = layer1.increment_without_key_frame();
         assert_eq!(None, layer1.forward(&mut forwarder));
         let layer2 = layer2.increment_without_key_frame();
@@ -3276,7 +3275,7 @@ mod call_tests {
 
         // Once we get a key frame, switch
         let layer1 = layer1.increment_with_key_frame();
-        assert_eq!(outgoing(9, 90003, 6, 6), layer1.forward(&mut forwarder));
+        assert_eq!(outgoing(9, 90003, 7), layer1.forward(&mut forwarder));
         assert_eq!(None, forwarder.needs_key_frame());
         let layer0 = layer0.increment_with_key_frame();
         assert_eq!(None, layer0.forward(&mut forwarder));
@@ -3295,12 +3294,12 @@ mod call_tests {
         let layer0 = layer0.increment_with_key_frame();
         assert_eq!(None, layer0.forward(&mut forwarder));
         let layer1 = layer1.increment_without_key_frame();
-        assert_eq!(outgoing(10, 120003, 7, 7), layer1.forward(&mut forwarder));
+        assert_eq!(outgoing(10, 120003, 8), layer1.forward(&mut forwarder));
         let layer2 = layer2.increment_without_key_frame();
         assert_eq!(None, layer2.forward(&mut forwarder));
 
         let layer2 = layer2.increment_with_key_frame();
-        assert_eq!(outgoing(12, 120004, 8, 8), layer2.forward(&mut forwarder));
+        assert_eq!(outgoing(12, 120004, 9), layer2.forward(&mut forwarder));
         let layer0 = layer0.increment_with_key_frame();
         assert_eq!(None, layer0.forward(&mut forwarder));
         let layer1 = layer1.increment_with_key_frame();
@@ -3314,10 +3313,10 @@ mod call_tests {
         let layer1 = layer1.increment_with_key_frame();
         assert_eq!(None, layer1.forward(&mut forwarder));
         let layer2 = layer2.increment_without_key_frame();
-        assert_eq!(outgoing(13, 150004, 9, 9), layer2.forward(&mut forwarder));
+        assert_eq!(outgoing(13, 150004, 10), layer2.forward(&mut forwarder));
 
         let layer0 = layer0.increment_with_key_frame();
-        assert_eq!(outgoing(15, 150005, 10, 10), layer0.forward(&mut forwarder));
+        assert_eq!(outgoing(15, 150005, 11), layer0.forward(&mut forwarder));
         let layer1 = layer1.increment_with_key_frame();
         assert_eq!(None, layer1.forward(&mut forwarder));
         let layer2 = layer2.increment_with_key_frame();
@@ -3328,7 +3327,7 @@ mod call_tests {
         forwarder.set_needs_key_frame();
         assert_eq!(Some(layer0.ssrc), forwarder.needs_key_frame());
         let layer0 = layer0.increment_with_key_frame();
-        assert_eq!(outgoing(16, 180005, 11, 11), layer0.forward(&mut forwarder));
+        assert_eq!(outgoing(16, 180005, 12), layer0.forward(&mut forwarder));
         assert_eq!(None, forwarder.needs_key_frame());
 
         // Unless we desire a higher layer, then request that instead.
@@ -3340,14 +3339,8 @@ mod call_tests {
         // Also forward packets even if they're out of order
         let layer0a = layer0.increment_without_key_frame();
         let layer0b = layer0a.increment_without_key_frame();
-        assert_eq!(
-            outgoing(18, 240005, 13, 13),
-            layer0b.forward(&mut forwarder)
-        );
-        assert_eq!(
-            outgoing(17, 210005, 12, 12),
-            layer0a.forward(&mut forwarder)
-        );
+        assert_eq!(outgoing(18, 240005, 14), layer0b.forward(&mut forwarder));
+        assert_eq!(outgoing(17, 210005, 13), layer0a.forward(&mut forwarder));
 
         // And deal with roll over properly (pretend there's a long gap of no forwarding)
         forwarder.set_desired_ssrc(None);
@@ -3359,21 +3352,18 @@ mod call_tests {
         forwarder.set_desired_ssrc(Some(layer0.ssrc));
         let max_seqnum = u16::MAX as u64;
         let max_timestamp = u32::MAX;
-        let max_picture_id = u16::MAX / 2;
-        let max_tl0_pic_idx = u8::MAX;
-        let layer0_before_rollover = layer0.increment_with_key_frame().skip_to(
-            max_seqnum,
-            max_timestamp,
-            max_picture_id,
-            max_tl0_pic_idx,
-        );
-        let layer0_after_rollover = layer0.skip_to(max_seqnum + 1, 0, 0, 0);
+        let max_frame_number = u16::MAX;
+        let layer0_before_rollover =
+            layer0
+                .increment_with_key_frame()
+                .skip_to(max_seqnum, max_timestamp, max_frame_number);
+        let layer0_after_rollover = layer0.skip_to(max_seqnum + 1, 0, 0);
         assert_eq!(
-            outgoing(20, 240006, 14, 14),
+            outgoing(20, 240006, 15),
             layer0_before_rollover.forward(&mut forwarder)
         );
         assert_eq!(
-            outgoing(21, 240007, 15, 15),
+            outgoing(21, 240007, 16),
             layer0_after_rollover.forward(&mut forwarder)
         );
     }
@@ -4210,49 +4200,28 @@ mod call_tests {
     fn create_video_rtp(
         sender_demux_id: DemuxId,
         layer_id: LayerId,
-        picture_id: u16,
-        tl0_pic_idx: u8,
+        frame_number: u16,
         seqnum: rtp::FullSequenceNumber,
         key_frame_size: Option<PixelSize>,
     ) -> rtp::Packet<Vec<u8>> {
         // Simulate big video packets
-        let mut payload = vec![0; 1200];
-        write_vp8_header(picture_id, tl0_pic_idx, key_frame_size, &mut payload);
-        create_rtp(sender_demux_id, layer_id, seqnum, &payload[..])
-    }
+        let payload = vec![0; 1200];
 
-    fn write_vp8_header(
-        picture_id: u16,
-        tl0_pic_idx: u8,
-        key_frame_size: Option<PixelSize>,
-        payload: &mut [u8],
-    ) {
-        // We always have extensions (for picture ID, etc)
-        let x_bit = 1u8 << 7;
-        // N bit is 0, but it doesn't matter.
-        let s_bit = (key_frame_size.is_some() as u8) << 4;
-        // Partition ID is 0, which it must be for a key frame.  It doesn't matter for other frames.
-        payload[0] = x_bit | s_bit;
-
-        // We always have a picture ID.
-        let i_bit = 1u8 << 7;
-        // We always have a TL0 PIC IDX.
-        let l_bit = 1u8 << 6;
-        // We won't include the TID or key_idx (T bit and K bit).
-        payload[1] = i_bit | l_bit;
-
-        // We always use 15-bit picture IDs
-        payload[2..4].copy_from_slice(&((picture_id | 0b1000_0000_0000_0000).to_be_bytes()));
-        payload[4] = tl0_pic_idx;
-
-        if let Some(PixelSize { width, height }) = key_frame_size {
-            // The P bit is 0, which means "this is a key frame".
-            payload[5] = 0;
-            // 5 bytes are ignored by the SFU.
-            // It just wants the width and height.
-            payload[11..13].copy_from_slice(&(width & 0b11_1111_1111_1111).to_le_bytes());
-            payload[13..15].copy_from_slice(&(height & 0b11_1111_1111_1111).to_le_bytes());
-        }
+        let ssrc = layer_id.to_ssrc(sender_demux_id);
+        let pt = 108;
+        let timestamp = seqnum as rtp::TruncatedTimestamp;
+        rtp::Packet::with_dependency_descriptor(
+            pt,
+            seqnum,
+            timestamp,
+            ssrc,
+            rtp::DependencyDescriptor {
+                is_key_frame: key_frame_size.is_some(),
+                resolution: key_frame_size,
+                truncated_frame_number: Some(frame_number),
+            },
+            &payload,
+        )
     }
 
     fn create_server_to_client_rtp(
@@ -4542,8 +4511,7 @@ mod call_tests {
         let mut call = create_call(b"call_id", now, system_now);
 
         let sender_demux_id = demux_id_from_unshifted(1);
-        let mut picture_id = 101;
-        let mut tl0_pic_idx = 11;
+        let mut frame_number = 101;
         let mut seqnum = 1;
         let size = PixelSize {
             width: 320,
@@ -4552,8 +4520,7 @@ mod call_tests {
         let mut rtp = create_video_rtp(
             sender_demux_id,
             LayerId::Video0,
-            picture_id,
-            tl0_pic_idx,
+            frame_number,
             seqnum,
             Some(size),
         );
@@ -4574,8 +4541,7 @@ mod call_tests {
         let mut rtp = create_video_rtp(
             sender_demux_id,
             LayerId::Video0,
-            picture_id,
-            tl0_pic_idx,
+            frame_number,
             seqnum,
             Some(size),
         );
@@ -4588,7 +4554,7 @@ mod call_tests {
         // We don't trust the incoming rate for 500ms.
         call.tick(at(501));
         assert_eq!(
-            Some(DataRate::from_bps(39296)),
+            Some(DataRate::from_bps(40320)),
             call.clients[0].incoming_video0.rate()
         );
         assert_eq!(
@@ -4599,18 +4565,11 @@ mod call_tests {
         let receiver1_demux_id = add_client(&mut call, "receiver1", 2, at(502));
         let receiver2_demux_id = add_client(&mut call, "receiver2", 3, at(503));
 
-        picture_id += 1;
-        tl0_pic_idx += 1;
+        frame_number += 1;
         seqnum += 1;
         // Note: This is not a key frame, so it's not forwarded right away
-        let mut rtp = create_video_rtp(
-            sender_demux_id,
-            LayerId::Video0,
-            picture_id,
-            tl0_pic_idx,
-            seqnum,
-            None,
-        );
+        let mut rtp =
+            create_video_rtp(sender_demux_id, LayerId::Video0, frame_number, seqnum, None);
         let rtp_to_send = call
             .handle_rtp(sender_demux_id, rtp.borrow_mut(), at(504))
             .unwrap();
@@ -4631,14 +4590,8 @@ mod call_tests {
 
         // Still not a key frame.  Keep ignoring.
         seqnum += 1;
-        let mut rtp = create_video_rtp(
-            sender_demux_id,
-            LayerId::Video0,
-            picture_id,
-            tl0_pic_idx,
-            seqnum,
-            None,
-        );
+        let mut rtp =
+            create_video_rtp(sender_demux_id, LayerId::Video0, frame_number, seqnum, None);
         let rtp_to_send = call
             .handle_rtp(sender_demux_id, rtp.borrow_mut(), at(505))
             .unwrap();
@@ -4652,14 +4605,12 @@ mod call_tests {
         );
 
         // Now we get a key frame we can forward
-        picture_id += 1;
-        tl0_pic_idx += 1;
+        frame_number += 1;
         seqnum += 1;
         let mut rtp = create_video_rtp(
             sender_demux_id,
             LayerId::Video0,
-            picture_id,
-            tl0_pic_idx,
+            frame_number,
             seqnum,
             Some(size),
         );
@@ -4667,15 +4618,13 @@ mod call_tests {
             .handle_rtp(sender_demux_id, rtp.borrow_mut(), at(708))
             .unwrap();
 
-        let rewritten_picture_id = 1;
-        let rewritten_tl0_pic_idx = 1;
+        let rewritten_frame_number = 2;
         let rewritten_timestamp = 1;
         let rewritten_seqnum = 2;
         let mut rewritten_rtp = create_video_rtp(
             sender_demux_id,
             LayerId::Video0,
-            rewritten_picture_id,
-            rewritten_tl0_pic_idx,
+            rewritten_frame_number,
             rewritten_timestamp,
             Some(size),
         );
@@ -4705,8 +4654,7 @@ mod call_tests {
         );
 
         // Get the sender sending a higher layer
-        let mut picture_id_layer1 = 201;
-        let mut tl0_pic_idx_layer1 = 21;
+        let mut frame_number_layer1 = 201;
         let mut seqnum_layer1 = 0;
         let size_layer1 = PixelSize {
             width: 640,
@@ -4718,8 +4666,7 @@ mod call_tests {
             let mut rtp_layer1 = create_video_rtp(
                 sender_demux_id,
                 LayerId::Video1,
-                picture_id_layer1,
-                tl0_pic_idx_layer1,
+                frame_number_layer1,
                 seqnum_layer1,
                 Some(size_layer1),
             );
@@ -4734,7 +4681,7 @@ mod call_tests {
         // We don't trust the incoming rate for 500ms.
         call.tick(at(2500));
         assert_eq!(
-            Some(DataRate::from_bps(58944)),
+            Some(DataRate::from_bps(60480)),
             call.clients[0].incoming_video1.rate()
         );
         assert_eq!(
@@ -4772,14 +4719,12 @@ mod call_tests {
         );
 
         // But the lower layer is still forwarded until a key frame for the higher layer comes in.
-        picture_id += 1;
-        tl0_pic_idx += 1;
+        frame_number += 1;
         seqnum += 1;
         let mut rtp = create_video_rtp(
             sender_demux_id,
             LayerId::Video0,
-            picture_id,
-            tl0_pic_idx,
+            frame_number,
             seqnum,
             Some(size),
         );
@@ -4787,15 +4732,13 @@ mod call_tests {
             .handle_rtp(sender_demux_id, rtp.borrow_mut(), at(2802))
             .unwrap();
 
-        let rewritten_picture_id = 2;
-        let rewritten_tl0_pic_idx = 2;
+        let rewritten_frame_number = 3;
         let rewritten_timestamp = 2;
         let rewritten_seqnum = 3;
         let mut rewritten_rtp = create_video_rtp(
             sender_demux_id,
             LayerId::Video0,
-            rewritten_picture_id,
-            rewritten_tl0_pic_idx,
+            rewritten_frame_number,
             rewritten_timestamp,
             Some(size),
         );
@@ -4808,28 +4751,24 @@ mod call_tests {
             rtp_to_send
         );
 
-        picture_id_layer1 += 1;
-        tl0_pic_idx_layer1 += 1;
+        frame_number_layer1 += 1;
         let mut rtp_layer1 = create_video_rtp(
             sender_demux_id,
             LayerId::Video1,
-            picture_id_layer1,
-            tl0_pic_idx_layer1,
+            frame_number_layer1,
             seqnum_layer1,
             Some(size_layer1),
         );
         let rtp_to_send = call
             .handle_rtp(sender_demux_id, rtp_layer1.borrow_mut(), at(2803))
             .unwrap();
-        let rewritten_picture_id = 3;
-        let rewritten_tl0_pic_idx = 3;
+        let rewritten_frame_number = 4;
         let rewritten_timestamp = 3;
         let rewritten_seqnum = 5;
         let mut rewritten_rtp = create_video_rtp(
             sender_demux_id,
             LayerId::Video0,
-            rewritten_picture_id,
-            rewritten_tl0_pic_idx,
+            rewritten_frame_number,
             rewritten_timestamp,
             Some(size_layer1),
         );
@@ -4842,8 +4781,7 @@ mod call_tests {
             let mut rtp_layer1 = create_video_rtp(
                 sender_demux_id,
                 LayerId::Video1,
-                picture_id_layer1,
-                tl0_pic_idx_layer1,
+                frame_number_layer1,
                 seqnum_layer1,
                 Some(size_layer1),
             );
@@ -4858,8 +4796,7 @@ mod call_tests {
             let mut rtp_layer1 = create_video_rtp(
                 sender_demux_id,
                 LayerId::Video1,
-                picture_id_layer1,
-                tl0_pic_idx_layer1,
+                frame_number_layer1,
                 seqnum_layer1,
                 Some(size_layer1),
             );
@@ -4870,7 +4807,7 @@ mod call_tests {
         let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(5100));
         dbg!(call.clients[0].incoming_video1.rate().unwrap().as_bps());
         assert_eq!(
-            Some(DataRate::from_bps(1017282)),
+            Some(DataRate::from_bps(1043790)),
             call.clients[0].incoming_video1.rate()
         );
         assert_eq!(
@@ -4899,15 +4836,15 @@ mod call_tests {
                     demux_id: receiver1_demux_id,
                     padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(sender_demux_id)),
                     target_send_rate: DataRate::from_kbps(600),
-                    requested_base_rate: DataRate::from_bps(33797),
-                    ideal_send_rate: DataRate::from_bps(1017282),
+                    requested_base_rate: DataRate::from_bps(34546),
+                    ideal_send_rate: DataRate::from_bps(1043790),
                 },
                 SendRateAllocationInfo {
                     demux_id: receiver2_demux_id,
                     padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(sender_demux_id)),
                     target_send_rate: DataRate::from_kbps(600),
-                    requested_base_rate: DataRate::from_bps(33797),
-                    ideal_send_rate: DataRate::from_bps(33797),
+                    requested_base_rate: DataRate::from_bps(34546),
+                    ideal_send_rate: DataRate::from_bps(34546),
                 }
             ],
             call.get_send_rate_allocation_info().collect::<Vec<_>>()
@@ -5835,7 +5772,6 @@ mod call_tests {
             demux_id2,
             LayerId::Video0,
             101,
-            11,
             1,
             Some(PixelSize {
                 width: 320,
@@ -5887,7 +5823,6 @@ mod call_tests {
             demux_id1,
             LayerId::Video0,
             101,
-            11,
             1,
             Some(PixelSize {
                 width: 320,
@@ -5965,7 +5900,6 @@ mod call_tests {
                 demux_id2,
                 LayerId::Video0,
                 1,
-                1,
                 seqnum,
                 Some(PixelSize {
                     width: 640,
@@ -5994,7 +5928,6 @@ mod call_tests {
         let mut to_server = create_video_rtp(
             demux_id2,
             LayerId::Video0,
-            1,
             1,
             11,
             Some(PixelSize {
@@ -6101,7 +6034,6 @@ mod call_tests {
                 demux_id2,
                 LayerId::Video0,
                 1,
-                1,
                 seqnum * 2,
                 Some(PixelSize {
                     width: 320,
@@ -6115,7 +6047,6 @@ mod call_tests {
                 demux_id2,
                 LayerId::Video1,
                 2,
-                1,
                 (seqnum + 1) * 2,
                 Some(PixelSize {
                     width: 640,
@@ -6683,7 +6614,6 @@ mod call_tests {
                 demux_id2,
                 LayerId::Video0,
                 1,
-                1,
                 seqnum,
                 Some(PixelSize {
                     width: 640,
@@ -6696,7 +6626,6 @@ mod call_tests {
             let mut to_server = create_video_rtp(
                 demux_id3,
                 LayerId::Video0,
-                1,
                 1,
                 seqnum,
                 Some(PixelSize {
@@ -6760,7 +6689,6 @@ mod call_tests {
         let mut to_server = create_video_rtp(
             demux_id2,
             LayerId::Video0,
-            1,
             1,
             100,
             Some(PixelSize {
