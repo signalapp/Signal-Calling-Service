@@ -341,8 +341,15 @@ impl Sfu {
         let now = Instant::now();
 
         for (connection_id, connection) in &self.connection_by_id {
+            let Some(&call_size_bucket) = call_size_map.get(&connection_id.call_id) else {
+                warn!(
+                    "call_id not found in call_size_map: {}",
+                    LoggableCallId::from(&connection_id.call_id)
+                );
+                continue;
+            };
+
             let mut connection = connection.lock();
-            let call_size_bucket = call_size_map[&connection_id.call_id];
             let region_relation = connection.region_relation();
             let tags = CONNECTION_TAG_VALUES.get(&(call_size_bucket, region_relation));
 
