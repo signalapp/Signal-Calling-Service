@@ -68,8 +68,10 @@ pub struct JoinResponse {
     pub demux_id: u32,
     pub port: u16,
     pub port_tcp: u16,
+    pub port_tls: Option<u16>,
     pub ip: String,
     pub ips: Vec<String>,
+    pub hostname: Option<String>,
     pub ice_ufrag: String,
     pub ice_pwd: String,
     pub dhe_public_key: String,
@@ -360,12 +362,14 @@ async fn join_conference(
                 demux_id: demux_id.into(),
                 port: media_server.ports.udp,
                 port_tcp: media_server.ports.tcp,
+                port_tls: media_server.ports.tls,
                 ip: media_server.ip().to_string(),
                 ips: media_server
                     .addresses
                     .iter()
                     .map(|ip| ip.to_string())
                     .collect(),
+                hostname: media_server.hostname,
                 ice_ufrag: server_ice_ufrag,
                 ice_pwd: server_ice_pwd,
                 dhe_public_key: server_dhe_public_key.encode_hex(),

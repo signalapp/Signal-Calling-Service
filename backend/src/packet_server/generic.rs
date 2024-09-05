@@ -15,6 +15,7 @@ use anyhow::Result;
 use calling_common::{Duration, Instant};
 use log::*;
 use parking_lot::Mutex;
+use rustls::ServerConfig;
 
 use crate::{
     metrics::TimingOptions,
@@ -38,6 +39,8 @@ impl PacketServerState {
     pub fn new(
         local_addr_udp: SocketAddr,
         _local_addr_tcp: SocketAddr,
+        _local_addr_tls: Option<SocketAddr>,
+        _tls_config: Option<Arc<ServerConfig>>,
         num_threads: usize,
         _tick_interval: Duration,
     ) -> Result<Arc<Self>> {

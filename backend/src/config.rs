@@ -34,6 +34,11 @@ pub struct Config {
     #[arg(long, default_value = "10000")]
     pub ice_candidate_port_tcp: u16,
 
+    /// The port to use for ICE candidates when connected over TCP+TLS. Clients
+    /// will connect to the calling backend using this port.
+    #[arg(long)]
+    pub ice_candidate_port_tls: Option<u16>,
+
     /// The IP address to share for direct access to the signaling_server. If
     /// defined, then the signaling_server will be used, otherwise the
     /// http_server will be used for testing.
@@ -128,6 +133,18 @@ pub struct Config {
     #[arg(long)]
     pub persist_approval_for_all_users_who_join: bool,
 
+    /// The path to the certificate file for TLS
+    #[arg(long)]
+    pub certificate_file_path: Option<String>,
+
+    /// The path to the private key file for TLS
+    #[arg(long)]
+    pub key_file_path: Option<String>,
+
+    // The hostname to give the client to validate the certificate used for TLS
+    #[arg(long)]
+    pub hostname: Option<String>,
+
     #[clap(flatten)]
     pub metrics: MetricsOptions,
 }
@@ -151,14 +168,16 @@ pub struct MetricsOptions {
 pub struct MediaPorts {
     pub udp: u16,
     pub tcp: u16,
+    pub tls: Option<u16>,
 }
 
 pub struct ServerMediaAddress {
     pub addresses: Vec<IpAddr>,
     pub ports: MediaPorts,
+    pub hostname: Option<String>,
 }
 
-/// Public address of the server for media/UDP/TCP derived from the configuration.
+/// Public address of the server for media/UDP/TCP/TLS derived from the configuration.
 impl ServerMediaAddress {
     pub fn from(config: &'static Config) -> Self {
         let addresses = if config.ice_candidate_ip.is_empty() {
@@ -178,7 +197,9 @@ impl ServerMediaAddress {
             ports: MediaPorts {
                 udp: config.ice_candidate_port,
                 tcp: config.ice_candidate_port_tcp,
+                tls: config.ice_candidate_port_tls,
             },
+            hostname: config.hostname.clone(),
         }
     }
 
@@ -215,5 +236,9 @@ pub(crate) fn default_test_config() -> Config {
         persist_approval_for_all_users_who_join: false,
         metrics: Default::default(),
         frontend_operation_timeout_ms: 1000,
+        certificate_file_path: None,
+        key_file_path: None,
+        hostname: None,
+        ice_candidate_port_tls: None,
     }
 }

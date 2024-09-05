@@ -59,13 +59,14 @@ pub struct JoinRequestWrapper {
 pub struct JoinResponseWrapper {
     pub demux_id: u32,
     pub port: u16,
-    pub port_tcp: Option<u16>,
-    pub ip: String,
+    pub port_tcp: u16,
+    pub port_tls: Option<u16>,
+    pub hostname: Option<String>,
     pub ips: Vec<String>,
     pub ice_ufrag: String,
     pub ice_pwd: String,
     pub dhe_public_key: String,
-    pub client_status: Option<String>,
+    pub client_status: String,
 }
 
 pub struct ClientInfo {
@@ -289,25 +290,16 @@ impl Frontend {
                 FrontendError::InternalError
             })?;
 
-        let backend_dhe_public_key = backend_join_response.dhe_public_key.ok_or_else(|| {
-            error!("join_client_to_call: failed to receive dhe_public_key from the backend");
-            FrontendError::InternalError
-        })?;
-
-        let ips = match backend_join_response.ips {
-            Some(ips) => ips,
-            None => vec![backend_join_response.ip.clone()],
-        };
-
         Ok(JoinResponseWrapper {
             demux_id: demux_id.as_u32(),
             port: backend_join_response.port,
             port_tcp: backend_join_response.port_tcp,
-            ip: backend_join_response.ip,
-            ips,
+            port_tls: backend_join_response.port_tls,
+            ips: backend_join_response.ips,
+            hostname: backend_join_response.hostname,
             ice_ufrag: backend_join_response.ice_ufrag,
             ice_pwd: backend_join_response.ice_pwd,
-            dhe_public_key: backend_dhe_public_key,
+            dhe_public_key: backend_join_response.dhe_public_key,
             client_status: backend_join_response.client_status,
         })
     }

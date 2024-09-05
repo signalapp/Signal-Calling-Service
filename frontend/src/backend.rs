@@ -97,22 +97,24 @@ pub struct JoinRequest {
 
 #[derive(Deserialize, Debug)]
 pub struct JoinResponse {
-    #[serde(rename = "serverIp")]
-    pub ip: String,
     #[serde(rename = "serverIps")]
-    pub ips: Option<Vec<String>>,
+    pub ips: Vec<String>,
     #[serde(rename = "serverPort")]
     pub port: u16,
-    #[serde(rename = "serverPortTcp", default)]
-    pub port_tcp: Option<u16>,
+    #[serde(rename = "serverPortTcp")]
+    pub port_tcp: u16,
+    #[serde(rename = "serverPortTls", default)]
+    pub port_tls: Option<u16>,
+    #[serde(rename = "serverHostname", default)]
+    pub hostname: Option<String>,
     #[serde(rename = "serverIceUfrag")]
     pub ice_ufrag: String,
     #[serde(rename = "serverIcePwd")]
     pub ice_pwd: String,
     #[serde(rename = "serverDhePublicKey")]
-    pub dhe_public_key: Option<String>,
+    pub dhe_public_key: String,
     #[serde(rename = "clientStatus")]
-    pub client_status: Option<String>,
+    pub client_status: String,
 }
 
 #[derive(thiserror::Error, Debug)]

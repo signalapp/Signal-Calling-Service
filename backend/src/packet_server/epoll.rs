@@ -29,6 +29,7 @@ use nix::{
     sys::{epoll::*, timerfd::*},
 };
 use parking_lot::{Mutex, RwLock};
+use rustls::{ServerConfig, ServerConnection};
 use scopeguard::ScopeGuard;
 use unique_id::sequence::SequenceGenerator;
 use unique_id::Generator;
@@ -87,6 +88,8 @@ pub struct PacketServerState {
     local_addr_udp: SocketAddr,
     new_client_socket: Socket,
     new_tcp_socket: TcpListener,
+    new_tls_socket: Option<TcpListener>,
+    tls_config: Option<Arc<ServerConfig>>,
     all_epoll_fds: Vec<RawFd>,
     all_connections: RwLock<ConnectionMap>,
     tick_interval: Duration,
@@ -102,11 +105,20 @@ impl PacketServerState {
     pub fn new(
         local_addr_udp: SocketAddr,
         local_addr_tcp: SocketAddr,
+        local_addr_tls: Option<SocketAddr>,
+        tls_config: Option<Arc<ServerConfig>>,
         num_threads: usize,
         tick_interval: Duration,
     ) -> Result<Arc<Self>> {
         let new_client_socket = Socket::Udp(Self::open_socket_with_reusable_port(&local_addr_udp)?);
         let new_tcp_socket = Self::open_listen_socket(&local_addr_tcp)?;
+
+        let new_tls_socket = if let Some(local_addr_tls) = local_addr_tls {
+            Some(Self::open_listen_socket(&local_addr_tls)?)
+        } else {
+            None
+        };
+
         let all_epoll_fds = (0..num_threads)
             .map(|_| epoll_create1(EpollCreateFlags::empty()))
             .collect::<nix::Result<_>>()?;
@@ -116,6 +128,8 @@ impl PacketServerState {
             local_addr_udp,
             new_client_socket,
             new_tcp_socket,
+            new_tls_socket,
+            tls_config,
             all_epoll_fds,
             all_connections: RwLock::new(ConnectionMap::new()),
             tick_interval,
@@ -125,6 +139,9 @@ impl PacketServerState {
         };
         result.add_socket_to_poll_for_reads(&result.new_client_socket)?;
         result.add_socket_to_poll_for_reads(&result.new_tcp_socket)?;
+        if let Some(listen_socket) = &result.new_tls_socket {
+            result.add_socket_to_poll_for_reads(listen_socket)?;
+        }
         Ok(Arc::new(result))
     }
 
@@ -259,7 +276,8 @@ impl PacketServerState {
     fn run(self: Arc<Self>, epoll_fd: RawFd, sfu: &Arc<Mutex<Sfu>>) {
         let new_client_socket_fd = self.new_client_socket.as_raw_fd();
         let new_tcp_socket_fd = self.new_tcp_socket.as_raw_fd();
-        let mut buf = [0u8; MAX_RTP_LENGTH];
+        let new_tls_socket_fd = self.new_tls_socket.as_ref().map_or(-1, |s| s.as_raw_fd());
+        let mut bufs = vec![PacketBuffer::new()];
         let mut poll_timeout_ms = EPOLL_WAIT_TIMEOUT_MS;
 
         let (timer, timer_fd) = match TimerFd::new(ClockId::CLOCK_MONOTONIC, TimerFlags::empty()) {
@@ -304,10 +322,27 @@ impl PacketServerState {
                 let connections_lock = self.all_connections.read();
                 let socket = if socket_fd == new_client_socket_fd {
                     &self.new_client_socket
-                } else if socket_fd == new_tcp_socket_fd {
+                } else if socket_fd == new_tcp_socket_fd || socket_fd == new_tls_socket_fd {
                     drop(connections_lock);
 
-                    match self.new_tcp_socket.accept() {
+                    let (accepted, tls_config) = if socket_fd == new_tcp_socket_fd {
+                        (self.new_tcp_socket.accept(), None)
+                    } else {
+                        (
+                            self.new_tls_socket
+                                .as_ref()
+                                .expect("tls socket must exist if we got an event on it")
+                                .accept(),
+                            Some(
+                                self.tls_config
+                                    .as_ref()
+                                    .expect("tls config must exist if we got a tls accept")
+                                    .clone(),
+                            ),
+                        )
+                    };
+
+                    match accepted {
                         Ok((client_socket, addr)) => {
                             // TODO: explore TCP_CORK instead of/in addition to TCP_NODELAY
                             let _ = client_socket.set_nodelay(true); // fail quietly
@@ -320,16 +355,22 @@ impl PacketServerState {
                                 V6(addr) => addr.to_ipv4_mapped().is_none(),
                             };
                             let id = self.tcp_id_generator.next_id();
-                            let client_socket = Socket::new_tcp(client_socket, id, is_ipv6);
-
-                            let mut write_lock = self.all_connections.write();
-
-                            if self.add_socket_to_poll_for_reads(&client_socket).is_ok() {
-                                write_lock.get_or_insert_connected(
-                                    client_socket,
-                                    SocketLocator::Tcp { id, is_ipv6 },
-                                    Some(self.tick_number.load(AtomicOrdering::Relaxed)),
-                                );
+                            let is_tls = tls_config.is_some();
+                            if let Ok(client_socket) =
+                                Socket::new_tcp(client_socket, id, is_ipv6, tls_config)
+                            {
+                                let mut write_lock = self.all_connections.write();
+                                if self.add_socket_to_poll_for_reads(&client_socket).is_ok() {
+                                    write_lock.get_or_insert_connected(
+                                        client_socket,
+                                        SocketLocator::Tcp {
+                                            id,
+                                            is_ipv6,
+                                            is_tls,
+                                        },
+                                        Some(self.tick_number.load(AtomicOrdering::Relaxed)),
+                                    );
+                                }
                             }
                         }
                         Err(err) => match err.kind() {
@@ -427,54 +468,79 @@ impl PacketServerState {
                 //
                 // Note that this relies on using epoll in level-triggered mode rather than
                 // edge-triggered.
-                let (size, sender_addr) = match socket.recv_from(&mut buf) {
-                    Err(err) => {
-                        match err.kind() {
-                            io::ErrorKind::TimedOut
-                            | io::ErrorKind::WouldBlock
-                            | io::ErrorKind::Interrupted => {}
-                            io::ErrorKind::ConnectionRefused => {
-                                // This can happen when someone leaves a call
-                                // because e.g. their router stops forwarding packets.
-                                // This is normal with UDP; technically this error happened
-                                // with the previous *sent* packet and we're just finding out now.
-                                trace!("recv_from() failed: {}", err);
-                            }
-                            io::ErrorKind::InvalidData => {
-                                // got invalid data, so drop the connection
-                                if let Ok(peer_addr) = socket.peer_addr() {
-                                    // Drop the read lock...
-                                    drop(connections_lock);
-                                    // ...and connect with a write lock...
-                                    let mut write_lock = self.all_connections.write();
-                                    write_lock.mark_closed(&peer_addr, Instant::now());
+                //
+                // We loop here, to allow reading multiple RTP packets from TLS connections;
+                // it's possible that the TLS layer will have read all data from the socket and
+                // there are multiple RTP packets within that data. If we only read one RTP
+                // packet, the next packet will remain buffered in the TLS layer, but epoll will
+                // not find the socket ready for read, until a future packet arrives.
+
+                let mut index = 0;
+                let mut sender_addr = None;
+                loop {
+                    match bufs[index].recv_from(socket) {
+                        Err(err) => {
+                            match err.kind() {
+                                io::ErrorKind::TimedOut
+                                | io::ErrorKind::WouldBlock
+                                | io::ErrorKind::Interrupted => {}
+                                io::ErrorKind::ConnectionRefused => {
+                                    // This can happen when someone leaves a call
+                                    // because e.g. their router stops forwarding packets.
+                                    // This is normal with UDP; technically this error happened
+                                    // with the previous *sent* packet and we're just finding out now.
+                                    trace!("recv_from() failed: {}", err);
                                 }
-                                continue;
-                            }
-                            _ => {
-                                Self::socket_error(&err);
-                            }
+                                io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData => {
+                                    // got invalid data, so drop the connection
+                                    if let Ok(peer_addr) = socket.peer_addr() {
+                                        // Drop the read lock...
+                                        drop(connections_lock);
+                                        // ...and connect with a write lock...
+                                        let mut write_lock = self.all_connections.write();
+                                        write_lock.mark_closed(&peer_addr, Instant::now());
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    Self::socket_error(&err);
+                                }
+                            };
+                            drop(connections_lock);
+                            break;
                         }
-                        continue;
+                        Ok(s_a) => {
+                            sender_addr = Some(s_a);
+                        }
+                    };
+                    index += 1;
+                    if socket.has_pending_data() {
+                        if bufs.len() <= index {
+                            bufs.push(PacketBuffer::new());
+                        }
+                    } else {
+                        drop(connections_lock);
+                        break;
                     }
-
-                    Ok((size, sender_addr)) => (size, sender_addr),
-                };
-                drop(connections_lock);
-
-                let HandleOutput {
-                    packets_to_send,
-                    dequeues_to_schedule,
-                } = packet_server::handle_packet(sfu, sender_addr, &mut buf[..size]);
-
-                for (buf, addr) in packets_to_send {
-                    self.send_packet(&buf, addr)
                 }
 
-                if !dequeues_to_schedule.is_empty() {
-                    let mut timer_heap = self.timer_heap.lock();
-                    for (time, addr) in dequeues_to_schedule {
-                        timer_heap.schedule(time, addr);
+                if let Some(sender_addr) = sender_addr {
+                    for inbuf in bufs.iter_mut().take(index) {
+                        let HandleOutput {
+                            packets_to_send,
+                            dequeues_to_schedule,
+                        } = packet_server::handle_packet(sfu, sender_addr, inbuf.as_mut());
+
+                        for (buf, addr) in packets_to_send {
+                            self.send_packet(&buf, addr)
+                        }
+
+                        if !dequeues_to_schedule.is_empty() {
+                            let mut timer_heap = self.timer_heap.lock();
+                            for (time, addr) in dequeues_to_schedule {
+                                timer_heap.schedule(time, addr);
+                            }
+                        }
                     }
                 }
             }
@@ -813,14 +879,41 @@ impl PacketServerState {
     }
 }
 
+struct PacketBuffer {
+    buf: [u8; MAX_RTP_LENGTH],
+    size: usize,
+}
+
+impl PacketBuffer {
+    fn new() -> Self {
+        Self {
+            buf: [0; MAX_RTP_LENGTH],
+            size: 0,
+        }
+    }
+
+    fn recv_from(&mut self, socket: &Socket) -> io::Result<SocketLocator> {
+        self.size = 0;
+        socket.recv_from(&mut self.buf).map(|(size, sender_addr)| {
+            self.size = size;
+            sender_addr
+        })
+    }
+
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[0..self.size]
+    }
+}
+
 struct TcpState {
-    socket: TcpStream,
+    stream: SocketStream,
     size: usize,
     pos: usize,
     buf: [u8; MAX_RTP_LENGTH],
     outq: VecDeque<u8>,
     id: i64,
     is_ipv6: bool,
+    is_tls: bool,
 }
 
 impl TcpState {
@@ -830,7 +923,7 @@ impl TcpState {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         if self.size == 0 {
-            match self.socket.read(&mut self.buf[self.pos..2]) {
+            match self.stream.read(&mut self.buf[self.pos..2]) {
                 Ok(read) => {
                     if read == 0 {
                         return Err(io::Error::from(io::ErrorKind::InvalidData));
@@ -862,7 +955,7 @@ impl TcpState {
             event!("calling.udp.epoll.tcp_too_large");
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         } else if self.size != 0 {
-            match self.socket.read(&mut self.buf[self.pos..self.size]) {
+            match self.stream.read(&mut self.buf[self.pos..self.size]) {
                 Ok(read) => {
                     if read == 0 {
                         return Err(io::Error::from(io::ErrorKind::InvalidData));
@@ -878,6 +971,7 @@ impl TcpState {
                             SocketLocator::Tcp {
                                 id: self.id,
                                 is_ipv6: self.is_ipv6,
+                                is_tls: self.is_tls,
                             },
                         ));
                     }
@@ -901,7 +995,7 @@ impl TcpState {
         let mut dropped = false;
         if self.outq.is_empty() {
             let sent = match self
-                .socket
+                .stream
                 .write_vectored(&[IoSlice::new(&size), IoSlice::new(buf)])
             {
                 Ok(sent) => sent,
@@ -927,7 +1021,7 @@ impl TcpState {
             }
         } else {
             let (a, b) = self.outq.as_slices();
-            let mut sent = match self.socket.write_vectored(&[
+            let mut sent = match self.stream.write_vectored(&[
                 IoSlice::new(a),
                 IoSlice::new(b),
                 IoSlice::new(&size),
@@ -983,22 +1077,101 @@ impl AsRawFd for Socket {
     fn as_raw_fd(&self) -> RawFd {
         match self {
             Socket::Udp(s) => s.as_raw_fd(),
-            Socket::Tcp(m) => m.lock().socket.as_raw_fd(),
+            Socket::Tcp(m) => m.lock().stream.as_raw_fd(),
+        }
+    }
+}
+
+enum SocketStream {
+    Tcp(TcpStream),
+    Tls(Box<(ServerConnection, TcpStream)>),
+}
+
+impl SocketStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            SocketStream::Tcp(s) => s.read(buf),
+            SocketStream::Tls(b) => {
+                let (c, s) = b.as_mut();
+                let was_handshaking = c.is_handshaking();
+                if c.wants_read() {
+                    c.read_tls(s)?;
+                }
+                if let Err(e) = c.process_new_packets() {
+                    // try to write any alerts generated
+                    if c.wants_write() {
+                        _ = c.write_tls(s);
+                    }
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                }
+                if was_handshaking && c.wants_write() {
+                    // ignore any write errors during handshaking
+                    _ = c.write_tls(s);
+                }
+                c.reader().read(buf)
+            }
+        }
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice]) -> io::Result<usize> {
+        match self {
+            SocketStream::Tcp(s) => s.write_vectored(bufs),
+            SocketStream::Tls(b) => {
+                let (c, s) = b.as_mut();
+                let result = c.writer().write_vectored(bufs);
+                // ignore result from socket write
+                _ = c.write_tls(s);
+                result
+            }
+        }
+    }
+
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            SocketStream::Tcp(s) => s.as_raw_fd(),
+            SocketStream::Tls(b) => b.1.as_raw_fd(),
+        }
+    }
+
+    fn take_error(&self) -> io::Result<Option<io::Error>> {
+        match self {
+            SocketStream::Tcp(s) => s.take_error(),
+            SocketStream::Tls(b) => b.1.take_error(),
+        }
+    }
+
+    fn has_pending_data(&self) -> bool {
+        match self {
+            SocketStream::Tcp(_) => false,
+            // If the ServerConnection wants_read, it doesn't have any data for us to read
+            SocketStream::Tls(b) => !b.0.wants_read(),
         }
     }
 }
 
 impl Socket {
-    fn new_tcp(s: TcpStream, id: i64, is_ipv6: bool) -> Self {
-        Socket::Tcp(Box::new(Mutex::new(TcpState {
-            socket: s,
+    fn new_tcp(
+        s: TcpStream,
+        id: i64,
+        is_ipv6: bool,
+        tls_config: Option<Arc<ServerConfig>>,
+    ) -> Result<Self> {
+        let (stream, is_tls) = if let Some(tls_config) = tls_config {
+            let connection = rustls::ServerConnection::new(tls_config)?;
+            (SocketStream::Tls(Box::new((connection, s))), true)
+        } else {
+            (SocketStream::Tcp(s), false)
+        };
+        Ok(Socket::Tcp(Box::new(Mutex::new(TcpState {
+            stream,
             size: 0,
             pos: 0,
             buf: [0u8; MAX_RTP_LENGTH],
             outq: VecDeque::new(),
             id,
             is_ipv6,
-        })))
+            is_tls,
+        }))))
     }
 
     fn send(&self, buf: &[u8]) -> io::Result<()> {
@@ -1025,6 +1198,7 @@ impl Socket {
                 Ok(SocketLocator::Tcp {
                     id: state.id,
                     is_ipv6: state.is_ipv6,
+                    is_tls: state.is_tls,
                 })
             }
         }
@@ -1033,7 +1207,14 @@ impl Socket {
     fn take_error(&self) -> io::Result<Option<io::Error>> {
         match self {
             Socket::Udp(s) => s.take_error(),
-            Socket::Tcp(m) => m.lock().socket.take_error(),
+            Socket::Tcp(m) => m.lock().stream.take_error(),
+        }
+    }
+
+    fn has_pending_data(&self) -> bool {
+        match self {
+            Socket::Udp(_) => false,
+            Socket::Tcp(m) => m.lock().stream.has_pending_data(),
         }
     }
 }
@@ -1406,6 +1587,7 @@ mod tests {
         let addr = SocketLocator::Tcp {
             id: 1,
             is_ipv6: false,
+            is_tls: false,
         };
 
         // Insert
@@ -1439,6 +1621,7 @@ mod tests {
         let addr = SocketLocator::Tcp {
             id: 2,
             is_ipv6: false,
+            is_tls: false,
         };
 
         // Insert

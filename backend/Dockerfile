@@ -49,10 +49,17 @@ COPY --from=build-stage /usr/src/calling-service/target/release/calling_backend 
 # Update system packages.
 RUN apt-get update \
     && apt-get upgrade -y \
+    # Install ca certificates
+    && apt-get install -y --no-install-recommends --no-install-suggests \
+               ca-certificates \
+    && update-ca-certificates \
     # Install curl for ip detection.
     && apt-get install -y --no-install-recommends --no-install-suggests curl \
     # Install jq for parsing gcp metadata.
     && apt-get install -y --no-install-recommends --no-install-suggests jq \
+    # make a directory for certificate files
+    && mkdir /etc/calling_server \
+    && chown -R nobody:nogroup /etc/calling_server \
     # Allow non-root using privileged ports.
     && apt-get install -y --no-install-recommends --no-install-suggests libcap2-bin \
     && setcap CAP_NET_BIND_SERVICE=+ep /usr/local/bin/calling_backend \

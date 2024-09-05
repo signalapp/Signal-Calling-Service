@@ -54,6 +54,8 @@ pub enum AddressType {
     UdpV6,
     TcpV4,
     TcpV6,
+    TlsV4,
+    TlsV6,
 }
 
 /// The state of a connection to a client.
@@ -250,13 +252,14 @@ impl Connection {
                         AddressType::UdpV4
                     }
                 }
-                SocketLocator::Tcp { is_ipv6, .. } => {
-                    if is_ipv6 {
-                        AddressType::TcpV6
-                    } else {
-                        AddressType::TcpV4
-                    }
-                }
+                SocketLocator::Tcp {
+                    is_ipv6, is_tls, ..
+                } => match (is_ipv6, is_tls) {
+                    (false, false) => AddressType::TcpV4,
+                    (false, true) => AddressType::TlsV4,
+                    (true, false) => AddressType::TcpV6,
+                    (true, true) => AddressType::TlsV6,
+                },
             });
         }
         self.ice.binding_request_received = Some(now);

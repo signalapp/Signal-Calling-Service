@@ -66,17 +66,19 @@ pub struct JoinRequest {
 pub struct JoinResponse {
     pub demux_id: u32,
     pub port: u16,
+    pub port_tcp: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub port_tcp: Option<u16>,
-    pub ip: String, // TODO remove once all clients use 'ips' field instead
+    pub port_tls: Option<u16>,
     pub ips: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub ice_ufrag: String,
     pub ice_pwd: String,
     pub dhe_public_key: String,
     pub call_creator: String,
     #[serde(rename = "conferenceId")]
     pub era_id: String,
-    pub client_status: Option<String>,
+    pub client_status: String,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -352,8 +354,9 @@ pub async fn join(
         demux_id: response.demux_id,
         port: response.port,
         port_tcp: response.port_tcp,
-        ip: response.ip,
+        port_tls: response.port_tls,
         ips: response.ips,
+        hostname: response.hostname,
         ice_ufrag: response.ice_ufrag,
         ice_pwd: response.ice_pwd,
         dhe_public_key: response.dhe_public_key,
@@ -401,8 +404,7 @@ pub mod api_server_v2_tests {
     const AUTH_KEY: &str = "f00f0014fe091de31827e8d686969fad65013238aadd25ef8629eb8a9e5ef69b";
     const ZKPARAMS: &str = "AMJqvmQRYwEGlm0MSy6QFPIAvgOVsqRASNX1meQyCOYHJFqxO8lITPkow5kmhPrsNbu9JhVfKFwesVSKhdZaqQko3IZlJZMqP7DDw0DgTWpdnYzSt0XBWT50DM1cw1nCUXXBZUiijdaFs+JRlTKdh54M7sf43pFxyMHlS3URH50LOeR8jVQKaUHi1bDP2GR9ZXp3Ot9Fsp0pM4D/vjL5PwoOUuzNNdpIqUSFhKVrtazwuHNn9ecHMsFsN0QPzByiDA8nhKcGpdzyWUvGjEDBvpKkBtqjo8QuXWjyS3jSl2oJ/Z4Fh3o2N1YfD2aWV/K88o+TN2/j2/k+KbaIZgmiWwppLU+SYGwthxdDfZgnbaaGT/vMYX9P5JlUWSuP3xIxDzPzxBEFho67BP0Pvux+0a5nEOEVEpfRSs61MMvwNXEKZtzkO0QFbOrFYrPntyb7ToqNi66OQNyTfl/J7kqFZg2MTm3CKjHTAIvVMFAGCIamsrT9sWXOtuNeMS94xazxDA==";
 
-    pub static ACTIVE_CLIENT_STATUS: Lazy<Option<String>> =
-        Lazy::new(|| Some("active".to_string()));
+    pub static ACTIVE_CLIENT_STATUS: Lazy<String> = Lazy::new(|| "active".to_string());
 
     pub const USER_ID_1: &str = "1111111111111111";
     const USER_ID_2: &str = "2222222222222222";
@@ -888,14 +890,15 @@ pub mod api_server_v2_tests {
             // Result<JoinResponse, BackendError>
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    ips: vec!["127.0.0.1".to_string()],
                     port: 8080,
-                    port_tcp: Some(8080),
+                    port_tcp: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    dhe_public_key: BACKEND_DHE_PUBLIC_KEY.to_string(),
                     client_status: ACTIVE_CLIENT_STATUS.clone(),
+                    hostname: None,
+                    port_tls: None,
                 })
             });
 
@@ -929,7 +932,6 @@ pub mod api_server_v2_tests {
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_1);
         assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
         assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
         assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
         assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
@@ -995,14 +997,15 @@ pub mod api_server_v2_tests {
             // Result<JoinResponse, BackendError>
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    ips: vec!["127.0.0.1".to_string()],
                     port: 8080,
-                    port_tcp: Some(8080),
+                    port_tcp: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    dhe_public_key: BACKEND_DHE_PUBLIC_KEY.to_string(),
                     client_status: ACTIVE_CLIENT_STATUS.clone(),
+                    hostname: None,
+                    port_tls: None,
                 })
             });
 
@@ -1036,114 +1039,6 @@ pub mod api_server_v2_tests {
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
-        assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
-        assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
-        assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
-        assert_eq!(
-            join_response.dhe_public_key,
-            BACKEND_DHE_PUBLIC_KEY.to_string()
-        );
-        assert_eq!(&join_response.call_creator, USER_ID_1);
-        assert_eq!(&join_response.era_id, ERA_ID_1);
-    }
-
-    /// Invoke the "PUT /v2/conference/participants" to join in the case where there is a call and backend is older and does not return ips.
-    #[tokio::test]
-    async fn test_join_with_call_old_backend() {
-        let config = &CONFIG;
-
-        // Create mocked dependencies with expectations.
-        let storage = create_mocked_storage_for_join(&config.region, USER_ID_2);
-        let mut backend = Box::new(MockBackend::new());
-        let mut id_generator = Box::new(MockIdGenerator::new());
-
-        // Create additional expectations.
-        backend
-            .expect_select_ip()
-            .once()
-            // Result<String, BackendError>
-            .returning(|| Ok("127.0.0.1".to_string()));
-        id_generator
-            .expect_get_random_era_id()
-            .with(eq(16))
-            .once()
-            .returning(|_| ERA_ID_1.to_string());
-        id_generator
-            .expect_get_random_demux_id()
-            // user_id: &str
-            .with(eq(USER_ID_2))
-            .once()
-            // DemuxId
-            .returning(|_| DEMUX_ID_2.try_into().unwrap());
-
-        let expected_demux_id: DemuxId = DEMUX_ID_2.try_into().unwrap();
-
-        backend
-            .expect_join()
-            // backend_address: &BackendAddress, call_id: &str, demux_id: DemuxId, join_request: &JoinRequest,
-            .with(
-                eq(backend::Address::try_from("127.0.0.1").unwrap()),
-                eq(ERA_ID_1),
-                eq(expected_demux_id),
-                eq(backend::JoinRequest {
-                    user_id: USER_ID_2.to_string(),
-                    ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
-                    dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
-                    hkdf_extra_info: None,
-                    region: LOCAL_REGION.to_string(),
-                    new_clients_require_approval: false,
-                    is_admin: false,
-                    room_id: RoomId::from(GROUP_ID_1),
-                    approved_users: None,
-                }),
-            )
-            .once()
-            // Result<JoinResponse, BackendError>
-            .returning(|_, _, _, _| {
-                Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: None,
-                    port: 8080,
-                    port_tcp: None,
-                    ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
-                    ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
-                    client_status: ACTIVE_CLIENT_STATUS.clone(),
-                })
-            });
-
-        let frontend = create_frontend_with_id_generator(config, storage, backend, id_generator);
-
-        // Create an axum application.
-        let app = app(frontend);
-
-        // Create the request.
-        let join_request = create_join_request();
-
-        let request = Request::builder()
-            .method(http::Method::PUT)
-            .uri("/v2/conference/participants")
-            .header(header::USER_AGENT, "test/user/agent")
-            .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
-            .header(
-                header::AUTHORIZATION,
-                create_authorization_header_for_user(USER_ID_2),
-            )
-            .body(Body::from(serde_json::to_vec(&join_request).unwrap()))
-            .unwrap();
-
-        // Submit the request.
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(join_response.demux_id, DEMUX_ID_2);
-        assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
         assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
         assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
         assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
@@ -2315,14 +2210,15 @@ pub mod api_server_v2_tests {
             // Result<JoinResponse, BackendError>
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    ips: vec!["127.0.0.1".to_string()],
                     port: 8080,
-                    port_tcp: Some(8080),
+                    port_tcp: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    dhe_public_key: BACKEND_DHE_PUBLIC_KEY.to_string(),
                     client_status: ACTIVE_CLIENT_STATUS.clone(),
+                    hostname: None,
+                    port_tls: None,
                 })
             });
 
@@ -2356,7 +2252,6 @@ pub mod api_server_v2_tests {
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_1);
         assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
         assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
         assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
         assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
@@ -2447,14 +2342,15 @@ pub mod api_server_v2_tests {
             // Result<JoinResponse, BackendError>
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    ips: vec!["127.0.0.1".to_string()],
                     port: 8080,
-                    port_tcp: Some(8080),
+                    port_tcp: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    dhe_public_key: BACKEND_DHE_PUBLIC_KEY.to_string(),
                     client_status: ACTIVE_CLIENT_STATUS.clone(),
+                    hostname: None,
+                    port_tls: None,
                 })
             });
 
@@ -2488,7 +2384,6 @@ pub mod api_server_v2_tests {
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_1);
         assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
         assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
         assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
         assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
@@ -2580,14 +2475,15 @@ pub mod api_server_v2_tests {
             // Result<JoinResponse, BackendError>
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    ips: vec!["127.0.0.1".to_string()],
                     port: 8080,
-                    port_tcp: Some(8080),
+                    port_tcp: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    dhe_public_key: BACKEND_DHE_PUBLIC_KEY.to_string(),
                     client_status: ACTIVE_CLIENT_STATUS.clone(),
+                    hostname: None,
+                    port_tls: None,
                 })
             });
 
@@ -2621,7 +2517,6 @@ pub mod api_server_v2_tests {
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_1);
         assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
         assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
         assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
         assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
@@ -2686,14 +2581,15 @@ pub mod api_server_v2_tests {
             // Result<JoinResponse, BackendError>
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    ips: vec!["127.0.0.1".to_string()],
                     port: 8080,
-                    port_tcp: Some(8080),
+                    port_tcp: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    dhe_public_key: BACKEND_DHE_PUBLIC_KEY.to_string(),
                     client_status: ACTIVE_CLIENT_STATUS.clone(),
+                    hostname: None,
+                    port_tls: None,
                 })
             });
 
@@ -2728,7 +2624,6 @@ pub mod api_server_v2_tests {
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
         assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
         assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
         assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
@@ -2793,14 +2688,15 @@ pub mod api_server_v2_tests {
             // Result<JoinResponse, BackendError>
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    ips: vec!["127.0.0.1".to_string()],
                     port: 8080,
-                    port_tcp: Some(8080),
+                    port_tcp: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    dhe_public_key: BACKEND_DHE_PUBLIC_KEY.to_string(),
                     client_status: ACTIVE_CLIENT_STATUS.clone(),
+                    hostname: None,
+                    port_tls: None,
                 })
             });
 
@@ -2835,7 +2731,6 @@ pub mod api_server_v2_tests {
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
         assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
         assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
         assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
@@ -3004,14 +2899,15 @@ pub mod api_server_v2_tests {
             // Result<JoinResponse, BackendError>
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    ips: vec!["127.0.0.1".to_string()],
                     port: 8080,
-                    port_tcp: Some(8080),
+                    port_tcp: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    dhe_public_key: BACKEND_DHE_PUBLIC_KEY.to_string(),
                     client_status: ACTIVE_CLIENT_STATUS.clone(),
+                    hostname: None,
+                    port_tls: None,
                 })
             });
 
@@ -3046,7 +2942,6 @@ pub mod api_server_v2_tests {
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
         assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
         assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
         assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());
@@ -3112,14 +3007,15 @@ pub mod api_server_v2_tests {
             // Result<JoinResponse, BackendError>
             .returning(|_, _, _, _| {
                 Ok(backend::JoinResponse {
-                    ip: "127.0.0.1".to_string(),
-                    ips: Some(vec!["127.0.0.1".to_string()]),
+                    ips: vec!["127.0.0.1".to_string()],
                     port: 8080,
-                    port_tcp: Some(8080),
+                    port_tcp: 8080,
                     ice_ufrag: BACKEND_ICE_UFRAG.to_string(),
                     ice_pwd: BACKEND_ICE_PWD.to_string(),
-                    dhe_public_key: Some(BACKEND_DHE_PUBLIC_KEY.to_string()),
+                    dhe_public_key: BACKEND_DHE_PUBLIC_KEY.to_string(),
                     client_status: ACTIVE_CLIENT_STATUS.clone(),
+                    hostname: None,
+                    port_tls: None,
                 })
             });
 
@@ -3154,7 +3050,6 @@ pub mod api_server_v2_tests {
         let join_response: JoinResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(join_response.demux_id, DEMUX_ID_2);
         assert_eq!(join_response.port, 8080);
-        assert_eq!(join_response.ip, "127.0.0.1".to_string());
         assert_eq!(join_response.ips, vec!["127.0.0.1".to_string()]);
         assert_eq!(join_response.ice_ufrag, BACKEND_ICE_UFRAG.to_string());
         assert_eq!(join_response.ice_pwd, BACKEND_ICE_PWD.to_string());

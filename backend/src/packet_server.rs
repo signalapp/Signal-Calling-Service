@@ -18,6 +18,7 @@ use std::{
 use anyhow::Result;
 use log::*;
 use parking_lot::Mutex;
+use rustls::ServerConfig;
 use tokio::sync::oneshot::Receiver;
 
 #[cfg(all(feature = "epoll", target_os = "linux"))]
@@ -41,20 +42,29 @@ use crate::{
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum SocketLocator {
     Udp(SocketAddr),
-    Tcp { id: i64, is_ipv6: bool },
+    Tcp {
+        id: i64,
+        is_ipv6: bool,
+        is_tls: bool,
+    },
 }
 
 impl fmt::Display for SocketLocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SocketLocator::Udp(a) => write!(f, "U{}", a),
-            SocketLocator::Tcp { id, is_ipv6 } => write!(f, "T{}-{}", id, is_ipv6),
+            SocketLocator::Tcp {
+                id,
+                is_ipv6,
+                is_tls,
+            } => write!(f, "T{}-{}-{}", id, is_ipv6, is_tls),
         }
     }
 }
 
 pub async fn start(
     config: &'static config::Config,
+    tls_config: Option<Arc<ServerConfig>>,
     sfu: Arc<Mutex<Sfu>>,
     packet_ender_rx: Receiver<()>,
     is_healthy: Arc<AtomicBool>,
@@ -65,9 +75,18 @@ pub async fn start(
 
     let local_addr_udp = SocketAddr::new(config.binding_ip, config.ice_candidate_port);
     let local_addr_tcp = SocketAddr::new(config.binding_ip, config.ice_candidate_port_tcp);
+    let local_addr_tls = config
+        .ice_candidate_port_tls
+        .map(|tls_port| SocketAddr::new(config.binding_ip, tls_port));
 
-    let packet_handler_state =
-        PacketServerState::new(local_addr_udp, local_addr_tcp, num_threads, tick_interval)?;
+    let packet_handler_state = PacketServerState::new(
+        local_addr_udp,
+        local_addr_tcp,
+        local_addr_tls,
+        tls_config,
+        num_threads,
+        tick_interval,
+    )?;
     let packet_handler_state_for_tick = packet_handler_state.clone();
     let packet_handler_state_for_stats = packet_handler_state.clone();
 

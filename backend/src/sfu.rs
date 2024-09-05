@@ -336,6 +336,8 @@ impl Sfu {
         let mut udp_v6_connections = 0;
         let mut tcp_v4_connections = 0;
         let mut tcp_v6_connections = 0;
+        let mut tls_v4_connections = 0;
+        let mut tls_v6_connections = 0;
         let mut connections_with_video_available = 0;
 
         let now = Instant::now();
@@ -369,6 +371,8 @@ impl Sfu {
                     AddressType::UdpV6 => udp_v6_connections += 1,
                     AddressType::TcpV4 => tcp_v4_connections += 1,
                     AddressType::TcpV6 => tcp_v6_connections += 1,
+                    AddressType::TlsV4 => tls_v4_connections += 1,
+                    AddressType::TlsV6 => tls_v6_connections += 1,
                 }
             }
 
@@ -424,6 +428,14 @@ impl Sfu {
         values.insert(
             "calling.sfu.connections.tcp_v6_count",
             tcp_v6_connections as f32,
+        );
+        values.insert(
+            "calling.sfu.connections.tls_v4_count",
+            tls_v4_connections as f32,
+        );
+        values.insert(
+            "calling.sfu.connections.tls_v6_count",
+            tls_v6_connections as f32,
         );
         values.insert(
             "calling.sfu.connections.video_available",
