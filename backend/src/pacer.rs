@@ -219,6 +219,15 @@ impl Pacer {
         }
     }
 
+    pub fn force_enqueue(&mut self, media: rtp::Packet<Vec<u8>>) {
+        self.queued_size += media.size();
+        match media.is_rtx() {
+            false => self.video_queue.push_back(media),
+            true => self.rtx_queue.push_back(media),
+        }
+        event!("calling.pacer.enqueue.before_nomination");
+    }
+
     fn queue_is_empty(&self) -> bool {
         self.video_queue.is_empty() && self.rtx_queue.is_empty()
     }

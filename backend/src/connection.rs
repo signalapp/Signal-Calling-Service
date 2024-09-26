@@ -465,6 +465,9 @@ impl Connection {
                     rtp_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
                 }
             }
+        } else if outgoing_rtp.tcc_seqnum().is_some() && outgoing_rtp.is_video() {
+            // Queue outgoing video packets, even if there's no nominated connection.
+            self.congestion_control.pacer.force_enqueue(outgoing_rtp);
         }
     }
 
