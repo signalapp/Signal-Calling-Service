@@ -309,6 +309,12 @@ type RtpToSend = (DemuxId, rtp::Packet<Vec<u8>>);
 /// of the call, identified by DemuxId.
 type KeyFrameRequestToSend = (DemuxId, rtp::KeyFrameRequest);
 
+pub enum CallActivity {
+    Active,
+    Inactive,
+    Waiting,
+}
+
 /// A collection of clients between which media is forwarded.
 /// Each client sends and receives media (audio, video, or data).
 /// Media is forwarded from every client to every other client.
@@ -472,10 +478,6 @@ impl Call {
         &self.creator_id
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.clients.is_empty()
-    }
-
     pub fn size(&self) -> usize {
         self.clients.len()
     }
@@ -484,11 +486,22 @@ impl Call {
         CallSizeBucket::from(self.size())
     }
 
-    pub fn is_inactive(&mut self, now: &Instant, inactivity_timeout: &Duration) -> bool {
+    pub fn activity(&mut self, now: &Instant, inactivity_timeout: &Duration) -> CallActivity {
+        if !self.clients.is_empty()
+            || !self.pending_clients.is_empty()
+            || !self.removed_clients.is_empty()
+        {
+            return CallActivity::Active;
+        }
+
         self.approved_users.tick();
-        self.is_empty()
-            && !self.approved_users.is_busy()
+        if !self.approved_users.is_busy()
             && *now >= self.client_added_or_removed + *inactivity_timeout
+        {
+            CallActivity::Inactive
+        } else {
+            CallActivity::Waiting
+        }
     }
 
     pub fn is_approved_users_busy(&self) -> bool {

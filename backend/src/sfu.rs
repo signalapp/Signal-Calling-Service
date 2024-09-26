@@ -38,7 +38,7 @@ use crate::{
     rtp::{self, new_master_key_material},
 };
 pub use crate::{
-    call::{CallId, UserId},
+    call::{CallActivity, CallId, UserId},
     connection::DhePublicKey,
 };
 
@@ -1055,9 +1055,8 @@ impl Sfu {
                 }
             }
 
-            if call.is_empty() {
-                // If the call is empty there is nothing to send out.
-                if call.is_inactive(&now, &inactivity_timeout) {
+            match call.activity(&now, &inactivity_timeout) {
+                CallActivity::Inactive => {
                     // If the call hasn't had any activity recently, remove it.
                     let call_time = call.call_time();
                     info!(
@@ -1125,42 +1124,47 @@ impl Sfu {
                         let _ = call_ended_handler(call_id, &call);
                     }
                     false
-                } else {
+                }
+                CallActivity::Waiting => {
                     // Keep the call around for a while longer.
                     true
                 }
-            } else {
-                if let Some(outgoing_queue_sizes) = outgoing_queue_sizes_by_call_id.get(call_id) {
-                    for (demux_id, outgoing_queue_size) in outgoing_queue_sizes {
-                        // Note: this works even if the duration is zero.
-                        // Normally, we shouldn't ever be configured with 0 drain duration
-                        // But perhaps allowing it to mean "as fast as possible"?
-                        // would be an interesting thing to be able to do.
-                        let outgoing_queue_drain_rate =
-                            *outgoing_queue_size / outgoing_queue_drain_duration;
-                        // Ignore the error because it can only mean the client is gone, in which case it doesn't matter.
-                        let _ = call
-                            .set_outgoing_queue_drain_rate(*demux_id, outgoing_queue_drain_rate);
+                CallActivity::Active => {
+                    if let Some(outgoing_queue_sizes) = outgoing_queue_sizes_by_call_id.get(call_id)
+                    {
+                        for (demux_id, outgoing_queue_size) in outgoing_queue_sizes {
+                            // Note: this works even if the duration is zero.
+                            // Normally, we shouldn't ever be configured with 0 drain duration
+                            // But perhaps allowing it to mean "as fast as possible"?
+                            // would be an interesting thing to be able to do.
+                            let outgoing_queue_drain_rate =
+                                *outgoing_queue_size / outgoing_queue_drain_duration;
+                            // Ignore the error because it can only mean the client is gone, in which case it doesn't matter.
+                            let _ = call.set_outgoing_queue_drain_rate(
+                                *demux_id,
+                                outgoing_queue_drain_rate,
+                            );
+                        }
                     }
-                }
 
-                if let Some(connection_rates) = connection_rates_by_call_id.get(call_id) {
-                    for (demux_id, rates) in connection_rates {
-                        let _ = call.set_connection_rates(*demux_id, *rates);
+                    if let Some(connection_rates) = connection_rates_by_call_id.get(call_id) {
+                        for (demux_id, rates) in connection_rates {
+                            let _ = call.set_connection_rates(*demux_id, *rates);
+                        }
                     }
-                }
-                // Don't remove the call; there are still clients!
-                let (outgoing_rtp, outgoing_key_frame_requests) = call.tick(now);
-                let send_rate_allocation_infos =
-                    call.get_send_rate_allocation_info().collect::<Vec<_>>();
+                    // Don't remove the call; there are still clients!
+                    let (outgoing_rtp, outgoing_key_frame_requests) = call.tick(now);
+                    let send_rate_allocation_infos =
+                        call.get_send_rate_allocation_info().collect::<Vec<_>>();
 
-                call_tick_results.push((
-                    call_id.clone(),
-                    outgoing_rtp,
-                    outgoing_key_frame_requests,
-                    send_rate_allocation_infos,
-                ));
-                true
+                    call_tick_results.push((
+                        call_id.clone(),
+                        outgoing_rtp,
+                        outgoing_key_frame_requests,
+                        send_rate_allocation_infos,
+                    ));
+                    true
+                }
             }
         });
         remove_inactive_calls_timer.stop();
