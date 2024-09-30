@@ -161,6 +161,8 @@ services:
       - "10"
       - --approved-users-persistence-url
       - "http://calling-frontend:8100/v1/call-link-approvals"
+      - --remove-call-records-base-url
+      - "http://calling-frontend:8100/v2/conference"
 
   # Go here on the host to find out the ngrok tunnel URL: http://localhost:4040
   ngrok-frontend:

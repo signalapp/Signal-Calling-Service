@@ -34,6 +34,18 @@ use crate::{config, frontend::UserId, metrics::Timer};
 const ROOM_ID_KEY: &str = "roomId";
 const RECORD_TYPE_KEY: &str = "recordType";
 
+pub(super) fn call_link_room_key(room_id: &RoomId) -> String {
+    call_link_room_key_str(room_id.as_ref())
+}
+
+fn call_link_room_key_str(room_id: &str) -> String {
+    if !room_id.starts_with("adhoc:") {
+        format!("adhoc:{}", room_id)
+    } else {
+        room_id.to_string()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CallRecord {
@@ -589,7 +601,7 @@ impl Storage for DynamoDb {
             .client
             .get_item()
             .table_name(&self.table_name)
-            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(ROOM_ID_KEY, AttributeValue::S(call_link_room_key(room_id)))
             .key(
                 RECORD_TYPE_KEY,
                 AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
@@ -640,7 +652,7 @@ impl Storage for DynamoDb {
             .client
             .update_item()
             .table_name(&self.table_name)
-            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(ROOM_ID_KEY, AttributeValue::S(call_link_room_key(room_id)))
             .key(
                 RECORD_TYPE_KEY,
                 AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
@@ -689,9 +701,10 @@ impl Storage for DynamoDb {
         room_id: &RoomId,
         admin_passkey: &[u8],
     ) -> Result<(), CallLinkDeleteError> {
+        let room_id_key = call_link_room_key(room_id);
         let delete_link = Delete::builder()
             .table_name(&self.table_name)
-            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(ROOM_ID_KEY, AttributeValue::S(room_id_key.clone()))
             .key(
                 RECORD_TYPE_KEY,
                 AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
@@ -712,7 +725,7 @@ impl Storage for DynamoDb {
 
         let active_call_check = ConditionCheck::builder()
             .table_name(&self.table_name)
-            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(ROOM_ID_KEY, AttributeValue::S(room_id_key.clone()))
             .key(
                 RECORD_TYPE_KEY,
                 AttributeValue::S(CallRecord::RECORD_TYPE.to_string()),
@@ -792,7 +805,7 @@ impl Storage for DynamoDb {
             .client
             .update_item()
             .table_name(&self.table_name)
-            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(ROOM_ID_KEY, AttributeValue::S(call_link_room_key(room_id)))
             .key(
                 RECORD_TYPE_KEY,
                 AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
@@ -828,7 +841,7 @@ impl Storage for DynamoDb {
             .query()
             .table_name(&self.table_name)
             .key_condition_expression("roomId = :value")
-            .expression_attribute_values(":value", AttributeValue::S(room_id.as_ref().to_string()))
+            .expression_attribute_values(":value", AttributeValue::S(call_link_room_key(room_id)))
             .consistent_read(true);
         let query = if peek_info_only {
             query
@@ -885,7 +898,7 @@ impl Storage for DynamoDb {
             .client
             .update_item()
             .table_name(&self.table_name)
-            .key(ROOM_ID_KEY, AttributeValue::S(room_id.as_ref().to_string()))
+            .key(ROOM_ID_KEY, AttributeValue::S(call_link_room_key(room_id)))
             .key(
                 RECORD_TYPE_KEY,
                 AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
@@ -1132,6 +1145,10 @@ mod tests {
 
         const ERA_ID_KEY: &str = "eraId";
 
+        fn default_call_link_call_record_state(room_id: &str, era_id: &str) -> serde_json::Value {
+            default_call_record_state(&call_link_room_key_str(room_id), era_id)
+        }
+
         fn default_call_record_state(room_id: &str, era_id: &str) -> serde_json::Value {
             serde_json::json!({
             ROOM_ID_KEY: {"S": room_id},
@@ -1145,7 +1162,7 @@ mod tests {
 
         fn default_call_link_state_json(room_id: &str) -> serde_json::Value {
             serde_json::json!({
-            ROOM_ID_KEY: {"S": room_id},
+            ROOM_ID_KEY: {"S": call_link_room_key_str(room_id)},
             RECORD_TYPE_KEY: {"S": CallLinkState::RECORD_TYPE},
             "adminPasskey": {"B": STANDARD.encode([1, 2, 3])},
             "zkparams": {"B": ""},
@@ -1340,7 +1357,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_present_call_link() -> Result<()> {
-            let storage = DynamoDb::new(&default_test_config()).await?;
+            let storage = bootstrap_storage().await?;
             let room_id = format!("testing-room-{}", line!());
             with_db_items(
                 &storage,
@@ -1525,14 +1542,7 @@ mod tests {
                 &storage,
                 [
                     default_call_link_state_json(&room_id),
-                    serde_json::json!({
-                    ROOM_ID_KEY: {"S": room_id},
-                    RECORD_TYPE_KEY: {"S": CallRecord::RECORD_TYPE},
-                    "eraId": {"S": "mesozoic"},
-                    "backendIp": {"S": "127.0.0.1"},
-                    "region": {"S": "pangaea"},
-                    "creator": {"S": "Peter"},
-                    }),
+                    default_call_link_call_record_state(&room_id, "mesozoic"),
                 ],
                 [],
                 async {
@@ -1548,7 +1558,7 @@ mod tests {
                             approved_users: vec![],
                         }),
                         Some(CallRecord {
-                            room_id: RoomId::from(room_id.clone()),
+                            room_id: RoomId::from(call_link_room_key_str(&room_id)),
                             era_id: "mesozoic".to_string(),
                             backend_ip: "127.0.0.1".to_string(),
                             backend_region: "pangaea".to_string(),
@@ -1586,14 +1596,7 @@ mod tests {
                         "approvedUsers": {"SS": ["Moxie", "Brian", "Meredith"]},
                         }),
                     ),
-                    serde_json::json!({
-                    ROOM_ID_KEY: {"S": room_id},
-                    RECORD_TYPE_KEY: {"S": CallRecord::RECORD_TYPE},
-                    "eraId": {"S": "mesozoic"},
-                    "backendIp": {"S": "127.0.0.1"},
-                    "region": {"S": "pangaea"},
-                    "creator": {"S": "Peter"},
-                    }),
+                    default_call_link_call_record_state(&room_id, "mesozoic"),
                 ],
                 [],
                 async {
@@ -1613,7 +1616,7 @@ mod tests {
                             ],
                         }),
                         Some(CallRecord {
-                            room_id: RoomId::from(room_id.clone()),
+                            room_id: RoomId::from(call_link_room_key_str(&room_id)),
                             era_id: "mesozoic".to_string(),
                             backend_ip: "127.0.0.1".to_string(),
                             backend_region: "pangaea".to_string(),
@@ -1664,16 +1667,7 @@ mod tests {
                 ],
                 [],
                 async {
-                    let expected = (
-                        None,
-                        Some(CallRecord {
-                            room_id: RoomId::from(room_id.clone()),
-                            era_id: "mesozoic".to_string(),
-                            backend_ip: "127.0.0.1".to_string(),
-                            backend_region: "pangaea".to_string(),
-                            creator: "Peter".to_string(),
-                        }),
-                    );
+                    let expected = (None, None);
                     assert_eq!(
                         &storage
                             .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
@@ -1867,7 +1861,7 @@ mod tests {
                 &storage,
                 [
                     default_call_link_state_json(&room_id),
-                    default_call_record_state(&room_id, &era_id),
+                    default_call_link_call_record_state(&room_id, &era_id),
                 ],
                 [],
                 async {

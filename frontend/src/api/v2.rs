@@ -280,7 +280,9 @@ pub async fn join(
                         start_timer_us!("calling.frontend.api.v2.join_by_room_id.get_or_create_call_record.timed");
                                 let can_create = true;
                                 let call = frontend
-                                    .get_or_create_call_record(&room_id, can_create, &user_id)
+                                    .get_or_create_call_link_call_record(
+                                        &room_id, can_create, &user_id,
+                                    )
                                     .await?;
                                 get_or_create_timer.stop();
 
@@ -423,6 +425,7 @@ pub mod api_server_v2_tests {
     const BACKEND_DHE_PUBLIC_KEY: &str = "24c41251f82b1f3481cce4bdaab8976a";
 
     const ROOM_ID: &str = "ff0000dd";
+    const CALL_LINK_ROOM_ID: &str = "adhoc:ff0000dd";
 
     static CONFIG: Lazy<config::Config> = Lazy::new(|| {
         let mut config = config::default_test_config();
@@ -2143,9 +2146,9 @@ pub mod api_server_v2_tests {
         // Create mocked dependencies with expectations.
         let mut seq = Sequence::new();
         let mut storage = Box::new(MockStorage::new());
-        let mut expected_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
+        let mut expected_call_record = create_call_record(CALL_LINK_ROOM_ID, LOCAL_REGION);
         expected_call_record.creator = USER_ID_1_DOUBLE_ENCODED.to_string();
-        let resulting_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
+        let resulting_call_record = create_call_record(CALL_LINK_ROOM_ID, LOCAL_REGION);
 
         storage
             .expect_get_call_link_and_record()
@@ -2202,7 +2205,7 @@ pub mod api_server_v2_tests {
                     region: LOCAL_REGION.to_string(),
                     new_clients_require_approval: false,
                     is_admin: false,
-                    room_id: RoomId::from(ROOM_ID),
+                    room_id: RoomId::from(CALL_LINK_ROOM_ID),
                     approved_users: Some(vec![]),
                 }),
             )
@@ -2271,9 +2274,9 @@ pub mod api_server_v2_tests {
         // Create mocked dependencies with expectations.
         let mut seq = Sequence::new();
         let mut storage = Box::new(MockStorage::new());
-        let mut expected_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
+        let mut expected_call_record = create_call_record(CALL_LINK_ROOM_ID, LOCAL_REGION);
         expected_call_record.creator = USER_ID_1_DOUBLE_ENCODED.to_string();
-        let resulting_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
+        let resulting_call_record = create_call_record(CALL_LINK_ROOM_ID, LOCAL_REGION);
 
         storage
             .expect_get_call_link_and_record()
@@ -2334,7 +2337,7 @@ pub mod api_server_v2_tests {
                     region: LOCAL_REGION.to_string(),
                     new_clients_require_approval: true,
                     is_admin: false,
-                    room_id: RoomId::from(ROOM_ID),
+                    room_id: RoomId::from(CALL_LINK_ROOM_ID),
                     approved_users: Some(vec![]),
                 }),
             )
@@ -2403,9 +2406,9 @@ pub mod api_server_v2_tests {
         // Create mocked dependencies with expectations.
         let mut seq = Sequence::new();
         let mut storage = Box::new(MockStorage::new());
-        let mut expected_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
+        let mut expected_call_record = create_call_record(CALL_LINK_ROOM_ID, LOCAL_REGION);
         expected_call_record.creator = USER_ID_1_DOUBLE_ENCODED.to_string();
-        let resulting_call_record = create_call_record(ROOM_ID, LOCAL_REGION);
+        let resulting_call_record = create_call_record(CALL_LINK_ROOM_ID, LOCAL_REGION);
 
         storage
             .expect_get_call_link_and_record()
@@ -2467,7 +2470,7 @@ pub mod api_server_v2_tests {
                     region: LOCAL_REGION.to_string(),
                     new_clients_require_approval: true,
                     is_admin: false,
-                    room_id: RoomId::from(ROOM_ID),
+                    room_id: RoomId::from(CALL_LINK_ROOM_ID),
                     approved_users: Some(vec!["11223344".to_string(), "aabbccdd".to_string()]),
                 }),
             )

@@ -21,7 +21,7 @@ use crate::{
     authenticator::Authenticator,
     backend::{self, Backend, BackendError},
     config,
-    storage::{CallLinkRestrictions, CallRecord, Storage},
+    storage::{self, CallLinkRestrictions, CallRecord, Storage},
 };
 
 pub type UserId = String;
@@ -205,6 +205,20 @@ impl Frontend {
                 Err(FrontendError::InternalError)
             }
         }
+    }
+
+    pub async fn get_or_create_call_link_call_record(
+        &self,
+        room_id: &RoomId,
+        can_create: bool,
+        user_id: &UserId,
+    ) -> Result<CallRecord, FrontendError> {
+        self.get_or_create_call_record(
+            &storage::call_link_room_key(room_id).into(),
+            can_create,
+            user_id,
+        )
+        .await
     }
 
     pub async fn get_or_create_call_record(

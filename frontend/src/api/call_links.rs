@@ -56,7 +56,7 @@ impl TryFrom<String> for RoomId {
     type Error = StatusCode;
 
     fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
-        if value.is_empty() || value.len() > 128 {
+        if value.is_empty() || value.len() > 128 || value.contains(":") {
             return Err(StatusCode::BAD_REQUEST);
         }
         Ok(Self(value.into()))
@@ -79,7 +79,11 @@ impl Header for RoomId {
             return Err(headers::Error::invalid());
         }
         if let Ok(value) = value.to_str() {
-            Ok(Self(value.into()))
+            if value.contains(":") {
+                Err(headers::Error::invalid())
+            } else {
+                Ok(Self(value.into()))
+            }
         } else {
             Err(headers::Error::invalid())
         }
