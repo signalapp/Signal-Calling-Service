@@ -79,11 +79,7 @@ impl Header for RoomId {
             return Err(headers::Error::invalid());
         }
         if let Ok(value) = value.to_str() {
-            if value.contains(":") {
-                Err(headers::Error::invalid())
-            } else {
-                Ok(Self(value.into()))
-            }
+            Ok(Self(value.into()))
         } else {
             Err(headers::Error::invalid())
         }

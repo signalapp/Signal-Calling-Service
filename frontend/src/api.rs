@@ -21,6 +21,7 @@ use axum::{
     routing::get,
     Extension, Router,
 };
+use axum_extra::TypedHeader;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use http::{header, Method, StatusCode};
@@ -30,6 +31,7 @@ use tower::ServiceBuilder;
 use zkgroup::call_links::CreateCallLinkCredentialPresentation;
 
 use crate::{
+    api::call_links::RoomId,
     authenticator::{Authenticator, AuthenticatorError, GroupAuthToken, ParsedHeader::*},
     frontend::{Frontend, FrontendError},
     metrics::histogram::Histogram,
@@ -164,12 +166,19 @@ async fn metrics(
 /// Middleware to handle the authorization header.
 async fn authorize(
     State(frontend): State<Arc<Frontend>>,
+    room_id: Option<TypedHeader<RoomId>>,
     mut req: Request,
     next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
     trace!("authorize");
 
     let user_agent = get_user_agent(&req)?;
+
+    if let Some(room_id) = room_id {
+        if room_id.0.as_ref().contains(":") {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
 
     let authorization_header = req
         .headers()
