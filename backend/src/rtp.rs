@@ -31,9 +31,7 @@ pub use srtp::{key_from, new_srtp_keys, salt_from};
 
 use std::{collections::HashMap, convert::TryInto};
 
-use calling_common::{
-    expand_truncated_counter, read_u16, Bits, Duration, Instant, SystemTime, Writer,
-};
+use calling_common::{expand_truncated_counter, read_u16, Bits, Duration, Instant, Writer};
 use log::*;
 
 use crate::transportcc as tcc;
@@ -546,7 +544,7 @@ impl Endpoint {
     /// send (Header-1, SR-1, Header-2, RR-1, Header-3, SR-2) as a valid RTCP packet.
     /// https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/modules/rtp_rtcp/source/rtcp_receiver.cc;l=380;drc=2017cd8a8925f180257662f78eaf9eb93e8e394d
     /// Since this can only include SR and RRs, there is no padding.
-    pub fn send_rtcp_report(&mut self, now: Instant, sys_now: SystemTime) -> Option<Vec<u8>> {
+    pub fn send_rtcp_report(&mut self, now: Instant) -> Option<Vec<u8>> {
         let mut report_buffer = self.create_buffer_for_rtcp_reports()?;
         let mut is_first = true;
         let mut first_ssrc = 0u32;
@@ -555,7 +553,7 @@ impl Endpoint {
             block_buffer.clear();
             let Some((payload_type, block_count, report_length)) = state
                 .rtcp_report_sender
-                .write_report_block_in_place(*ssrc, now, sys_now, &mut block_buffer)
+                .write_report_block_in_place(*ssrc, now, &mut block_buffer)
             else {
                 continue;
             };

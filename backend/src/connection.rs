@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use calling_common::{DataRate, DataRateTracker, DataSize, Duration, Instant, SystemTime};
+use calling_common::{DataRate, DataRateTracker, DataSize, Duration, Instant};
 use log::*;
 use thiserror::Error;
 
@@ -392,15 +392,10 @@ impl Connection {
     // but that actually makes it more difficult for sfu.rs to aggregate the
     // results of calling this across many connections.
     // So we use (packet, addr) for convenience.
-    pub fn tick(
-        &mut self,
-        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
-        now: Instant,
-        sys_now: SystemTime,
-    ) {
+    pub fn tick(&mut self, packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>, now: Instant) {
         self.send_acks_if_its_been_too_long(packets_to_send, now);
         self.send_nacks_if_its_been_too_long(packets_to_send, now);
-        self.send_rtcp_report_if_its_been_too_long(packets_to_send, now, sys_now);
+        self.send_rtcp_report_if_its_been_too_long(packets_to_send, now);
     }
 
     /// If an ICE binding request has been received, a Connection is inactive if it's been more
@@ -602,7 +597,6 @@ impl Connection {
         &mut self,
         packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
         now: Instant,
-        sys_now: SystemTime,
     ) {
         if let Some(rtcp_report_sent) = self.rtp.rtcp_report_sent {
             if now < rtcp_report_sent + RTCP_REPORT_INTERVAL {
@@ -612,7 +606,7 @@ impl Connection {
         }
 
         if let Some(outgoing_addr) = self.outgoing_addr {
-            if let Some(rtcp_report_packet) = self.rtp.endpoint.send_rtcp_report(now, sys_now) {
+            if let Some(rtcp_report_packet) = self.rtp.endpoint.send_rtcp_report(now) {
                 self.push_outgoing_non_media_bytes(rtcp_report_packet.len(), now);
                 packets_to_send.push((rtcp_report_packet, outgoing_addr));
             }
@@ -1247,9 +1241,7 @@ mod connection_tests {
     #[test]
     fn test_send_acks_and_nacks() {
         let now = Instant::now();
-        let sys_now = SystemTime::now();
         let at = |ms| now + Duration::from_millis(ms);
-        let at_sys = |ms| sys_now + Duration::from_millis(ms);
 
         let mut connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
@@ -1274,7 +1266,7 @@ mod connection_tests {
         let mut packets_to_send = vec![];
 
         // Can't send yet because there is no outgoing address.
-        connection.tick(&mut packets_to_send, at(4), at_sys(4));
+        connection.tick(&mut packets_to_send, at(4));
         assert_eq!(0, packets_to_send.len());
 
         let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
@@ -1282,7 +1274,7 @@ mod connection_tests {
         assert_eq!(Some(client_addr), connection.outgoing_addr());
 
         // Now we can send ACKs, NACKs, and receiver reports.
-        connection.tick(&mut packets_to_send, at(6), at_sys(6));
+        connection.tick(&mut packets_to_send, at(6));
         assert_eq!(3, packets_to_send.len());
 
         let expected_acks = vec![
@@ -1306,7 +1298,7 @@ mod connection_tests {
         assert_eq!(0, actual_acks.len());
 
         // We resend NACKs but not acks or receiver reports.
-        connection.tick(&mut packets_to_send, at(1000), at_sys(1000));
+        connection.tick(&mut packets_to_send, at(1000));
         assert_eq!(4, packets_to_send.len());
         assert_eq!(client_addr, packets_to_send[3].1);
         let (actual_acks, actual_nacks) =
@@ -1322,7 +1314,7 @@ mod connection_tests {
             )
             .unwrap()
             .unwrap();
-        connection.tick(&mut packets_to_send, at(1000), at_sys(1000));
+        connection.tick(&mut packets_to_send, at(1000));
         assert_eq!(4, packets_to_send.len());
     }
 

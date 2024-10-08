@@ -14,10 +14,9 @@ use aes::cipher::{generic_array::GenericArray, KeyInit};
 use aes_gcm::{AeadInPlace, Aes128Gcm};
 use calling_common::{
     parse_u16, parse_u24, parse_u32, parse_u64, round_up_to_multiple_of, CheckedSplitAt, Duration,
-    Instant, SystemTime, Writable, Writer, U24,
+    Instant, Writable, Writer, U24,
 };
 use log::*;
-use once_cell::sync::Lazy;
 
 use crate::transportcc as tcc;
 
@@ -51,9 +50,6 @@ pub const RTCP_TYPE_SPECIFIC_FEEDBACK: u8 = 206;
 pub const RTCP_FORMAT_PLI: u8 = 1;
 pub const RTT_ESTIMATE_AGE_LIMIT: Duration = Duration::from_secs(15);
 const RTT_ESTIMATE_AGE_LIMIT_SECS_F64: f64 = 15.0;
-// 1900 Jan 1st 00:00:00 UTC, RTP's chosen EPOCH
-static NTP_EPOCH: Lazy<SystemTime> =
-    Lazy::new(|| (std::time::UNIX_EPOCH - std::time::Duration::from_secs(2_208_988_800)).into());
 
 #[derive(Default, Debug)]
 pub struct ControlPacket<'packet> {
@@ -362,7 +358,7 @@ pub(super) struct RtcpReportSender {
     last_receive_time: Instant,
     last_rtp_timestamp: u32,
     jitter_q4: u32,
-    last_sender_report_received_ntp_timestamp: u64,
+    last_received_sender_info: Option<SenderInfo>,
     last_sender_report_received_time: Instant,
     // sender report stats
     sent_since_last_report: bool,
@@ -392,7 +388,7 @@ impl RtcpReportSender {
             last_receive_time: now,
             last_rtp_timestamp: 0,
             jitter_q4: 0,
-            last_sender_report_received_ntp_timestamp: 0,
+            last_received_sender_info: None,
             last_sender_report_received_time: now,
 
             sent_since_last_report: false,
@@ -418,12 +414,18 @@ impl RtcpReportSender {
         receive_time: Instant,
     ) {
         // ignore older sender reports
-        if sender_report.sender_info.ntp_ts <= self.last_sender_report_received_ntp_timestamp {
+        if self
+            .last_received_sender_info
+            .as_ref()
+            .map_or(false, |info| {
+                sender_report.sender_info.ntp_ts <= info.ntp_ts
+            })
+        {
             return;
         }
 
         self.last_sender_report_received_time = receive_time;
-        self.last_sender_report_received_ntp_timestamp = sender_report.sender_info.ntp_ts;
+        self.last_received_sender_info = Some(sender_report.sender_info.clone());
     }
 
     pub(super) fn remember_report_block(&mut self, report_block: ReportBlock, now: Instant) {
@@ -618,12 +620,11 @@ impl RtcpReportSender {
         &mut self,
         ssrc: Ssrc,
         now: Instant,
-        sys_now: SystemTime,
         buffer: &mut dyn Writable,
     ) -> Option<(u8, u8, usize)> {
         match self.rtcp_report_payload_type()? {
             RTCP_TYPE_SENDER_REPORT => {
-                self.write_sender_report_block_in_place(ssrc, now, sys_now, buffer);
+                self.write_sender_report_block_in_place(ssrc, now, buffer);
                 Some((RTCP_TYPE_SENDER_REPORT, 0u8, SenderInfo::SENDER_INFO_LENGTH))
             }
             RTCP_TYPE_RECEIVER_REPORT => {
@@ -700,15 +701,15 @@ impl RtcpReportSender {
 
         let interarrival_jitter: u32 = self.jitter_q4 >> 4;
 
-        let (last_sender_report_timestamp, delay_since_last_sender_report) =
-            if self.last_sender_report_received_ntp_timestamp != 0 {
+        let (last_sender_report_timestamp, delay_since_last_sender_report) = self
+            .last_received_sender_info
+            .as_ref()
+            .map_or((0, 0), |info| {
                 (
-                    get_lsr(self.last_sender_report_received_ntp_timestamp),
+                    get_lsr(info.ntp_ts),
                     calculate_dlsr(self.last_sender_report_received_time, now),
                 )
-            } else {
-                (0, 0)
-            };
+            });
 
         (
             ssrc, // sender_ssrc - matches source ssrc since we send a separate report for every SSRC
@@ -729,21 +730,15 @@ impl RtcpReportSender {
         &mut self,
         ssrc: Ssrc,
         now: Instant,
-        sys_now: SystemTime,
         buffer: &mut dyn Writable,
     ) {
-        let ntp_ts = convert_to_ntp(sys_now);
+        let (ntp_ts, rtp_ts) = self
+            .last_received_sender_info
+            .as_ref()
+            .map_or((0, self.last_sent_rtp_timestamp), |info| {
+                (info.ntp_ts, info.rtp_ts)
+            });
         self.last_sender_report_sent_time_ntp = ntp_ts;
-        // we use sys time as our wall clock timestamp, Instants can only measure elapsed times
-        // interpolate based off last sent rtp timestamp, elapsed time, and sample freq
-        let rtp_ts_elapsed: u32 = (now
-            .saturating_duration_since(self.last_sent_time)
-            .as_micros() as u64
-            * self.sent_sample_freq
-            / 1_000_000)
-            .try_into()
-            .unwrap_or(0);
-        let rtp_ts = self.last_sent_rtp_timestamp.wrapping_add(rtp_ts_elapsed);
         let packet_count = self.packets_sent;
         let octet_count = self.total_payload_bytes_sent;
 
@@ -815,15 +810,6 @@ fn calculate_dlsr(sr_last_received_time: Instant, now: Instant) -> u32 {
 fn dlsr_to_duration(delay_since_sr: u32) -> Duration {
     const NANOS_TO_DELAY_UNIT: u64 = 15259;
     Duration::from_nanos(delay_since_sr as u64 * NANOS_TO_DELAY_UNIT)
-}
-
-/// Converts to NTP TS in seconds. Returns 0 if the SystemTime is before NTP epoch (Jan 01, 1900)
-/// Full length NTP timestamp is 32 bits for seconds since epoch, and 32 bits for fractions of a second
-/// Seconds roll over every u32::MAX seconds after NTP Epoch
-pub fn convert_to_ntp(ts: SystemTime) -> u64 {
-    const ROLLOVER_LIMIT: u64 = u32::MAX as u64 + 1;
-    let elapsed = ts.saturating_duration_since(*NTP_EPOCH);
-    ((elapsed.as_secs() % ROLLOVER_LIMIT) << 32) + elapsed.subsec_nanos() as u64
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1713,22 +1699,6 @@ mod test {
     }
 
     #[test]
-    fn test_convert_to_ntp() {
-        // NTP Epoch is Jan 01, 1900 00:00:00 UTC
-        // Unix Epoch is Jan 01, 1970 00:00:00 UTC
-        let unix_epoch = std::time::UNIX_EPOCH.into();
-        assert_eq!(
-            ((70 * 365 * 24 * 60 * 60) + (17 * 24 * 60 * 60)) << 32,
-            convert_to_ntp(unix_epoch),
-        );
-
-        assert_eq!(
-            (((70 * 365 * 24 * 60 * 60) + (17 * 24 * 60 * 60)) << 32) + 550_500,
-            convert_to_ntp(unix_epoch + Duration::from_nanos(550_500)),
-        );
-    }
-
-    #[test]
     fn test_sender_report_basic() {
         let mut report_sender = RtcpReportSender::new();
 
@@ -1739,11 +1709,8 @@ mod test {
         let packet_rate = 50;
         let rtp_interval = sample_rate / packet_rate;
         // rtp duration for 5 milliseconds
-        let rtp_elapsed = 5 * sample_rate / 1000;
         let now = Instant::now();
-        let sys_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
-        let sys_at = |millis| sys_now + Duration::from_millis(millis);
         let mut seqnum: FullSequenceNumber = 1;
         let mut sent = 0;
         let mut next_packet = |pt, packet_size| {
@@ -1768,7 +1735,7 @@ mod test {
         );
         assert_eq!(
             None,
-            report_sender.write_report_block_in_place(ssrc, now, sys_now, &mut vec![]),
+            report_sender.write_report_block_in_place(ssrc, now, &mut vec![]),
             "Nothing received or sent, should have no report"
         );
 
@@ -1778,12 +1745,12 @@ mod test {
             Some(RTCP_TYPE_SENDER_REPORT),
             report_sender.rtcp_report_payload_type()
         );
-        report_sender.write_report_block_in_place(ssrc, at(25), sys_at(25), &mut buffer);
+        report_sender.write_report_block_in_place(ssrc, at(25), &mut buffer);
         assert_eq!(
             SenderInfo {
                 ssrc,
-                ntp_ts: convert_to_ntp(sys_at(25)),
-                rtp_ts: rtp_elapsed,
+                ntp_ts: 0,
+                rtp_ts: 0,
                 packet_count: 1,
                 octet_count: 5
             },
@@ -1798,12 +1765,12 @@ mod test {
 
         let mut buffer = vec![];
         report_sender.remember_sent(&next_packet(OPUS_PAYLOAD_TYPE, 100), at(40));
-        report_sender.write_report_block_in_place(ssrc, at(45), sys_at(45), &mut buffer);
+        report_sender.write_report_block_in_place(ssrc, at(45), &mut buffer);
         assert_eq!(
             SenderInfo {
                 ssrc,
-                ntp_ts: convert_to_ntp(sys_at(45)),
-                rtp_ts: rtp_interval + rtp_elapsed,
+                ntp_ts: 0,
+                rtp_ts: rtp_interval,
                 packet_count: 2,
                 octet_count: 105
             },
