@@ -4,7 +4,7 @@
 //
 
 use anyhow::{anyhow, bail, Result};
-use calling_common::PixelSize;
+use calling_common::{DataRate, PixelSize};
 use std::{
     borrow::{Borrow, BorrowMut},
     convert::TryFrom,
@@ -39,6 +39,7 @@ const RTP_EXT_ID_TCC_SEQNUM: u8 = 1; // Really u4
 const RTP_EXT_ID_VIDEO_ORIENTATION: u8 = 4; // Really u4
 const RTP_EXT_ID_AUDIO_LEVEL: u8 = 5; // Really u4
 const RTP_EXT_ID_DEPENDENCY_DESCRIPTOR: u8 = 6;
+const RTP_EXT_ID_VIDEO_LAYERS_ALLOCATION: u8 = 14;
 const RTP_DEPENDENCY_DESCRIPTOR_MIN_LEN: usize = 3;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -95,6 +96,7 @@ pub struct Header {
     pub payload_range: Range<usize>,
     // We store the range as well in order to replace the frame number easily.
     dependency_descriptor: Option<(DependencyDescriptor, Range<usize>)>,
+    video_layers_allocation: Option<Vec<RtpStreamAllocation>>,
 }
 
 impl Header {
@@ -121,6 +123,7 @@ impl Header {
         let mut video_rotation = None;
         let mut audio_level = None;
         let mut dependency_descriptor = None;
+        let mut video_layers_allocation = None;
 
         let extensions_start = RTP_MIN_HEADER_LEN + csrcs_len;
         let mut payload_start = extensions_start;
@@ -218,8 +221,7 @@ impl Header {
                             return None;
                         }
 
-                        dependency_descriptor = DependencyDescriptorReader::new(val)
-                            .read()
+                        dependency_descriptor = read_dependency_descriptor(val)
                             .ok()
                             .or(Some(DependencyDescriptor {
                                 is_key_frame: false,
@@ -227,6 +229,9 @@ impl Header {
                                 truncated_frame_number: None,
                             }))
                             .map(|descriptor| (descriptor, extension_val_range));
+                    }
+                    (RTP_EXT_ID_VIDEO_LAYERS_ALLOCATION, val) => {
+                        video_layers_allocation = read_video_layers_allocation(val).ok();
                     }
                     _ => {}
                 }
@@ -271,21 +276,13 @@ impl Header {
             tcc_seqnum_range,
             payload_range,
             dependency_descriptor,
+            video_layers_allocation,
         })
     }
 }
 
-/// https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct DependencyDescriptor {
-    pub is_key_frame: bool,
-    pub resolution: Option<PixelSize>,
-    pub truncated_frame_number: Option<u16>,
-}
-
-/// Parser for DependencyDescriptor
 #[derive(Debug)]
-pub(super) struct DependencyDescriptorReader<'a> {
+struct BitBuffer<'a> {
     bytes: &'a [u8],
     /// The index into `bytes` of the next byte to read.
     byte_index: usize,
@@ -293,86 +290,13 @@ pub(super) struct DependencyDescriptorReader<'a> {
     bit_offset: u8,
 }
 
-impl<'a> DependencyDescriptorReader<'a> {
+impl<'a> BitBuffer<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
             byte_index: 0,
             bit_offset: 0,
         }
-    }
-
-    /// An implementation of the pseudocode from the following section of the spec:
-    /// https://aomediacodec.github.io/av1-rtp-spec/#a82-syntax
-    ///
-    /// The meaning of each parsed field is here:
-    /// https://aomediacodec.github.io/av1-rtp-spec/#a83-semantics
-    pub fn read(mut self) -> Result<DependencyDescriptor> {
-        // Ignore start_of_frame, end_of_frame, and frame_dependency_template_id.
-        self.byte_index = 1;
-
-        let truncated_frame_number = self.read_u16().ok();
-        if self.bytes.len() == 3 {
-            return Ok(DependencyDescriptor {
-                is_key_frame: false,
-                resolution: None,
-                truncated_frame_number,
-            });
-        }
-
-        let template_dependency_structure_present_flag = self.read_u8(1)? == 1;
-        let _active_decode_targets_present_flag = self.read_u8(1)?;
-        let _custom_dtis_flag = self.read_u8(1)?;
-        let _custom_fdiffs_flag = self.read_u8(1)?;
-        let _custom_chains_flag = self.read_u8(1)?;
-
-        if !template_dependency_structure_present_flag {
-            return Ok(DependencyDescriptor {
-                is_key_frame: false,
-                resolution: None,
-                truncated_frame_number,
-            });
-        }
-
-        let _template_id_offset = self.read_u8(6)?;
-        let dt_cnt = self.read_u8(5)? + 1;
-
-        // template_layers
-        let mut template_cnt = 1;
-        while self.read_u8(2)? != 3 {
-            template_cnt += 1;
-        }
-
-        // template_dtis
-        for _ in 0..template_cnt {
-            for _ in 0..dt_cnt {
-                let _template_dti = self.read_u8(2)?;
-            }
-        }
-
-        // template_fdiffs
-        for _ in 0..template_cnt {
-            while self.read_u8(1)? == 1 {
-                let _fdiff_minus_one = self.read_u8(4)?;
-            }
-        }
-
-        // Skip over template_chains since we don't use SVC, so num_chains is 0.
-        self.skip_non_symmetric(dt_cnt + 1)?;
-
-        let mut resolution = None;
-        let resolutions_present_flag = self.read_u8(1)?;
-        if resolutions_present_flag == 1 {
-            let width = self.read_u16()?.saturating_add(1);
-            let height = self.read_u16()?.saturating_add(1);
-            resolution = Some(PixelSize { width, height });
-        }
-
-        Ok(DependencyDescriptor {
-            is_key_frame: true,
-            resolution,
-            truncated_frame_number,
-        })
     }
 
     /// An implementation of the `f(n)` function in the spec, where 0 < n <= 8:
@@ -454,6 +378,186 @@ impl<'a> DependencyDescriptorReader<'a> {
         let _extra_bit = self.read_u8(1)?;
         Ok(())
     }
+
+    fn has_more(&mut self) -> bool {
+        let last_byte = self.bytes.len() - 1;
+        self.byte_index <= last_byte
+    }
+
+    fn zero_pad(&mut self) {
+        if self.bit_offset > 0 {
+            self.bit_offset = 0;
+            self.byte_index += 1;
+        }
+    }
+    /// An implementation of https://aomediacodec.github.io/av1-spec/#leb128
+    fn read_leb128(&mut self) -> Result<u128> {
+        let mut value = 0;
+        for i in 0..8 {
+            let byte = self.read_u8(8)? as u128;
+            value |= (byte & 0x7f) << (i * 7);
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        Ok(value)
+    }
+}
+
+/// https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DependencyDescriptor {
+    pub is_key_frame: bool,
+    pub resolution: Option<PixelSize>,
+    pub truncated_frame_number: Option<u16>,
+}
+
+/// An implementation of the pseudocode from the following section of the spec:
+/// https://aomediacodec.github.io/av1-rtp-spec/#a82-syntax
+///
+/// The meaning of each parsed field is here:
+/// https://aomediacodec.github.io/av1-rtp-spec/#a83-semantics
+fn read_dependency_descriptor(bytes: &[u8]) -> Result<DependencyDescriptor> {
+    let mut data = BitBuffer::new(bytes);
+
+    // Ignore start_of_frame, end_of_frame, and frame_dependency_template_id.
+    data.byte_index = 1;
+
+    let truncated_frame_number = data.read_u16().ok();
+    if data.bytes.len() == 3 {
+        return Ok(DependencyDescriptor {
+            is_key_frame: false,
+            resolution: None,
+            truncated_frame_number,
+        });
+    }
+
+    let template_dependency_structure_present_flag = data.read_u8(1)? == 1;
+    let _active_decode_targets_present_flag = data.read_u8(1)?;
+    let _custom_dtis_flag = data.read_u8(1)?;
+    let _custom_fdiffs_flag = data.read_u8(1)?;
+    let _custom_chains_flag = data.read_u8(1)?;
+
+    if !template_dependency_structure_present_flag {
+        return Ok(DependencyDescriptor {
+            is_key_frame: false,
+            resolution: None,
+            truncated_frame_number,
+        });
+    }
+
+    let _template_id_offset = data.read_u8(6)?;
+    let dt_cnt = data.read_u8(5)? + 1;
+
+    // template_layers
+    let mut template_cnt = 1;
+    while data.read_u8(2)? != 3 {
+        template_cnt += 1;
+    }
+
+    // template_dtis
+    for _ in 0..template_cnt {
+        for _ in 0..dt_cnt {
+            let _template_dti = data.read_u8(2)?;
+        }
+    }
+
+    // template_fdiffs
+    for _ in 0..template_cnt {
+        while data.read_u8(1)? == 1 {
+            let _fdiff_minus_one = data.read_u8(4)?;
+        }
+    }
+
+    // Skip over template_chains since we don't use SVC, so num_chains is 0.
+    data.skip_non_symmetric(dt_cnt + 1)?;
+
+    let mut resolution = None;
+    let resolutions_present_flag = data.read_u8(1)?;
+    if resolutions_present_flag == 1 {
+        let width = data.read_u16()?.saturating_add(1);
+        let height = data.read_u16()?.saturating_add(1);
+        resolution = Some(PixelSize { width, height });
+    }
+
+    Ok(DependencyDescriptor {
+        is_key_frame: true,
+        resolution,
+        truncated_frame_number,
+    })
+}
+
+type RtpStreamAllocation = Vec<SpatialLayer>;
+
+/// http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpatialLayer {
+    temporal_layer_rates: Vec<DataRate>,
+    pub size: Option<PixelSize>,
+}
+
+impl SpatialLayer {
+    fn default() -> Self {
+        Self {
+            temporal_layer_rates: vec![DataRate::ZERO],
+            size: None,
+        }
+    }
+
+    pub fn max_rate(&self) -> Option<DataRate> {
+        self.temporal_layer_rates.last().copied()
+    }
+}
+
+fn read_video_layers_allocation(bytes: &[u8]) -> Result<Vec<RtpStreamAllocation>> {
+    let mut data = BitBuffer::new(bytes);
+
+    let _rid = data.read_u8(2)?;
+    let ns = data.read_u8(2)? + 1;
+    let sl_bm = data.read_u8(4)?;
+    let mut allocations = Vec::with_capacity(ns.into());
+
+    for _ in 0..ns {
+        let spatial_layers = if sl_bm != 0 {
+            sl_bm.count_ones()
+        } else {
+            data.read_u8(4)?.count_ones()
+        };
+        allocations.push(vec![SpatialLayer::default(); spatial_layers as usize]);
+    }
+    data.zero_pad();
+
+    for allocation in allocations.iter_mut() {
+        for spatial_layer in allocation.iter_mut() {
+            spatial_layer
+                .temporal_layer_rates
+                .resize((data.read_u8(2)? + 1) as usize, DataRate::ZERO);
+        }
+    }
+    data.zero_pad();
+
+    for allocation in allocations.iter_mut() {
+        for spatial_layer in allocation.iter_mut() {
+            for temporal_layer in &mut spatial_layer.temporal_layer_rates {
+                *temporal_layer = DataRate::from_kbps(data.read_leb128()?.try_into()?);
+            }
+        }
+    }
+
+    if data.has_more() {
+        for allocation in allocations.iter_mut() {
+            for spatial_layer in allocation.iter_mut() {
+                spatial_layer.size = Some(PixelSize {
+                    width: data.read_u16()? + 1,
+                    height: data.read_u16()? + 1,
+                });
+                // Our server has no use for the framerate
+                let _framerate = Some(data.read_u8(8)?);
+            }
+        }
+    }
+
+    Ok(allocations)
 }
 
 // A combination of the parsed values of an RTP packet (mostly from the header)
@@ -482,6 +586,7 @@ pub struct Packet<T> {
     pub audio_level: Option<audio::Level>,
     // The range is relative to self.serialized.
     pub dependency_descriptor: Option<(DependencyDescriptor, Range<usize>)>,
+    pub video_layers_allocation: Option<Vec<RtpStreamAllocation>>,
     pub(super) tcc_seqnum: Option<tcc::FullSequenceNumber>,
 
     // These are relative to self.serialized.
@@ -522,6 +627,7 @@ impl<T: std::cmp::PartialEq> PartialEq for Packet<T> {
             && self.video_rotation == other.video_rotation
             && self.audio_level == other.audio_level
             && self.dependency_descriptor == other.dependency_descriptor
+            && self.video_layers_allocation == other.video_layers_allocation
             && self.tcc_seqnum == other.tcc_seqnum
             && self.payload_range_in_header == other.payload_range_in_header
             && self.encrypted == other.encrypted
@@ -555,6 +661,7 @@ impl<T> Packet<T> {
             video_rotation: header.video_rotation,
             audio_level: header.audio_level,
             dependency_descriptor: header.dependency_descriptor.clone(),
+            video_layers_allocation: header.video_layers_allocation.clone(),
             tcc_seqnum,
             tcc_seqnum_range: header.tcc_seqnum_range.clone(),
             payload_range_in_header: header.payload_range.clone(),
@@ -672,6 +779,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
             dependency_descriptor: self.dependency_descriptor.clone(),
+            video_layers_allocation: self.video_layers_allocation.clone(),
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
@@ -696,6 +804,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
             dependency_descriptor: self.dependency_descriptor.clone(),
+            video_layers_allocation: self.video_layers_allocation.clone(),
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
@@ -887,6 +996,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
             video_rotation: self.video_rotation,
             audio_level: self.audio_level,
             dependency_descriptor: self.dependency_descriptor.clone(),
+            video_layers_allocation: self.video_layers_allocation.clone(),
             tcc_seqnum: self.tcc_seqnum,
             tcc_seqnum_range: self.tcc_seqnum_range.clone(),
             payload_range_in_header: self.payload_range_in_header.clone(),
@@ -1067,6 +1177,7 @@ impl Packet<Vec<u8>> {
             video_rotation: None,
             audio_level: None,
             dependency_descriptor: None,
+            video_layers_allocation: None,
             tcc_seqnum,
             // This only matters for tests.
             tcc_seqnum_range: if tcc_seqnum.is_some() {
@@ -1119,6 +1230,7 @@ impl Packet<Vec<u8>> {
                 dependency_descriptor_val_offset
                     ..(dependency_descriptor_val_offset + extensions_len),
             )),
+            video_layers_allocation: None,
             tcc_seqnum: None,
             tcc_seqnum_range: None,
             payload_range_in_header: payload_range,
@@ -1150,6 +1262,7 @@ impl Packet<Vec<u8>> {
                 seqnum_in_header: rtx_seqnum,
                 seqnum_in_payload: Some(self.seqnum_in_header),
                 dependency_descriptor: self.dependency_descriptor.clone(),
+                video_layers_allocation: self.video_layers_allocation.clone(),
                 tcc_seqnum_range: self.tcc_seqnum_range.clone(),
                 payload_range_in_header: self.payload_range_in_header.start
                     ..(self.payload_range_in_header.end + 2),
@@ -1169,13 +1282,13 @@ impl Packet<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod dependency_descriptor_tests {
+mod bit_buffer_tests {
     use super::*;
 
     #[test]
     fn read_u8() -> Result<()> {
         let bytes = [0b0000_0010, 0b1010_0000];
-        let mut rdr = DependencyDescriptorReader::new(&bytes);
+        let mut rdr = BitBuffer::new(&bytes);
 
         assert_eq!(rdr.read_u8(1)?, 0);
 
@@ -1198,7 +1311,7 @@ mod dependency_descriptor_tests {
     #[test]
     fn read_u8_two_bytes() -> Result<()> {
         let bytes = [0b0000_0010, 0b1010_0011];
-        let mut rdr = DependencyDescriptorReader::new(&bytes);
+        let mut rdr = BitBuffer::new(&bytes);
 
         assert_eq!(rdr.read_u8(1)?, 0);
         assert_eq!(rdr.read_u8(1)?, 0);
@@ -1217,7 +1330,7 @@ mod dependency_descriptor_tests {
     #[test]
     fn read_u8_one_byte() -> Result<()> {
         let bytes = [0b0001_1011];
-        let mut rdr = DependencyDescriptorReader::new(&bytes);
+        let mut rdr = BitBuffer::new(&bytes);
 
         assert_eq!(rdr.read_u8(1)?, 0);
         assert_eq!(rdr.read_u8(1)?, 0);
@@ -1251,7 +1364,11 @@ mod dependency_descriptor_tests {
 
         Ok(())
     }
+}
 
+#[cfg(test)]
+mod dependency_descriptor_tests {
+    use super::*;
     #[test]
     fn read_camera_layer_0() -> Result<()> {
         let bytes = [
@@ -1286,9 +1403,7 @@ mod dependency_descriptor_tests {
             0b00_011101,
             0b11_000000,
         ];
-        let rdr = DependencyDescriptorReader::new(&bytes);
-
-        let descriptor = rdr.read()?;
+        let descriptor = read_dependency_descriptor(&bytes)?;
 
         assert!(descriptor.is_key_frame);
         assert_eq!(
@@ -1323,9 +1438,7 @@ mod dependency_descriptor_tests {
             0b0001_1001,
             0b0100_1100,
         ];
-        let rdr = DependencyDescriptorReader::new(&bytes);
-
-        let descriptor = rdr.read()?;
+        let descriptor = read_dependency_descriptor(&bytes)?;
 
         assert!(descriptor.is_key_frame);
         assert_eq!(
@@ -1342,9 +1455,7 @@ mod dependency_descriptor_tests {
     #[test]
     fn read_no_dependency_structure() -> Result<()> {
         let bytes = [0b10000011, 0b00000001, 0b01100101];
-        let rdr = DependencyDescriptorReader::new(&bytes);
-
-        let descriptor = rdr.read()?;
+        let descriptor = read_dependency_descriptor(&bytes)?;
 
         assert!(!descriptor.is_key_frame);
         assert_eq!(descriptor.resolution, None);
@@ -1363,13 +1474,250 @@ mod dependency_descriptor_tests {
             0b0001_0010,
             0b01000000,
         ];
-        let rdr = DependencyDescriptorReader::new(&bytes);
-
-        let descriptor = rdr.read()?;
+        let descriptor = read_dependency_descriptor(&bytes)?;
 
         assert!(!descriptor.is_key_frame);
         assert_eq!(descriptor.resolution, None);
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod video_layers_allocation_tests {
+    use super::*;
+
+    #[test]
+    fn read_screenshare_with_size() -> Result<()> {
+        let bytes = [
+            0b01010001, // (rid 1), two streams, one spatial layer per stream
+            0b00010000, // stream 0/0: 1 temporal layer, stream 1/0: 2 temporal layers
+            0x64,       // stream 0/0/0: 100 kbps
+            0xEE, 0x05, // stream 1/0/0: 750 kbps (0x6E + (0x5 << 7))
+            0xE2, 0x09, // stream 1/0/1: 1250 kbps (0x62 + (0x9 << 7))
+            0x04, 0xD3, // stream 0/0 width: 1236
+            0x03, 0x8F, // stream 0/0 height: 912
+            5,    // stream 0/0 fps: 5
+            0x04, 0xD3, // stream 1/0 width: 1236
+            0x03, 0x8F, // stream 1/0 height: 912
+            5,    // stream 1/0 fps: 5
+        ];
+        let layers = read_video_layers_allocation(&bytes)?;
+        assert_eq!(
+            layers,
+            vec![
+                vec![SpatialLayer {
+                    temporal_layer_rates: vec![DataRate::from_kbps(100)],
+                    size: Some(PixelSize {
+                        width: 1236,
+                        height: 912
+                    })
+                }],
+                vec![SpatialLayer {
+                    temporal_layer_rates: vec![DataRate::from_kbps(750), DataRate::from_kbps(1250)],
+                    size: Some(PixelSize {
+                        width: 1236,
+                        height: 912
+                    })
+                }]
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_screenshare_no_size() -> Result<()> {
+        let bytes = [
+            0b00010001, // (rid 0), two streams, one spatial layer per stream
+            0b00010000, // stream 0/0: 1 temporal layer, stream 1/0: 2 temporal layers
+            0x64,       // stream 0/0/0: 100 kbps
+            0xEE, 0x05, // stream 1/0/0: 750 kbps (0x6E + (0x5 << 7))
+            0xE2,
+            0x09, // stream 1/0/1: 1250 kbps (0x62 + (0x9 << 7))
+                  // No size information
+        ];
+        let layers = read_video_layers_allocation(&bytes)?;
+        assert_eq!(
+            layers,
+            vec![
+                vec![SpatialLayer {
+                    temporal_layer_rates: vec![DataRate::from_kbps(100)],
+                    size: None
+                }],
+                vec![SpatialLayer {
+                    temporal_layer_rates: vec![DataRate::from_kbps(750), DataRate::from_kbps(1250)],
+                    size: None
+                }]
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_video_one_layer_with_size() -> Result<()> {
+        let bytes = [
+            0b00000001, // (rid 0), one stream, one spatial layer
+            0b10000000, // stream 0/0: 3 temporal layers
+            0x23,       // stream 0/0/0: 35 kbps
+            0x35,       // stream 0/0/1: 53 kbps
+            0x58,       // stream 0/0/2: 88 kbps
+            0x00, 0x9F, // stream 0/0 width: 160
+            0x00, 0x77, // stream 0/0 height: 120
+            22,   // stream 0/0 fps: 22
+        ];
+        let layers = read_video_layers_allocation(&bytes)?;
+        assert_eq!(
+            layers,
+            vec![vec![SpatialLayer {
+                temporal_layer_rates: vec![
+                    DataRate::from_kbps(35),
+                    DataRate::from_kbps(53),
+                    DataRate::from_kbps(88)
+                ],
+                size: Some(PixelSize {
+                    width: 160,
+                    height: 120
+                })
+            }]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_video_one_layer_no_size() -> Result<()> {
+        let bytes = [
+            0b00000001, // (rid 0), one stream, one spatial layer
+            0b10000000, // stream 0/0: 3 temporal layers
+            0x23,       // stream 0/0/0: 35 kbps
+            0x35,       // stream 0/0/1: 53 kbps
+            0x58,       // stream 0/0/2: 88 kbps
+        ];
+        let layers = read_video_layers_allocation(&bytes)?;
+        assert_eq!(
+            layers,
+            vec![vec![SpatialLayer {
+                temporal_layer_rates: vec![
+                    DataRate::from_kbps(35),
+                    DataRate::from_kbps(53),
+                    DataRate::from_kbps(88)
+                ],
+                size: None
+            }]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_video_three_layers_with_size() -> Result<()> {
+        let bytes = [
+            0b10100001, // (rid 2), three streams, one spatial layer
+            0b10101000, // stream 0/0,1/0,2/0, 3 temporal layers
+            30,         // stream 0/0/0: 30 kbps
+            45,         // stream 0/0/1: 45 kbps
+            75,         // stream 0/0/2: 75 kbps
+            81,         // stream 1/0/0: 81 kbps
+            122,        // stream 1/0/1: 122 kbps
+            0xCB, 0x01, // stream 1/0/2: 203 kbps
+            0x89, 0x02, // stream 2/0/0: 265 kbps
+            0x8E, 0x03, // stream 2/0/1: 398 kbps
+            0x97, 0x05, // stream 2/0/2: 663 kbps
+            0, 159, // stream 0/0 width: 160
+            0, 119, // stream 0/0 height: 120
+            23,  // stream 0/0 fps 23
+            1, 63, // stream 1/0 width: 320
+            0, 239, // stream 1/0 height: 240
+            23,  // stream 1/0 fps 23
+            2, 127, // stream 2/0 width: 640
+            1, 223, // stream 2/0 height: 480
+            23,  // stream 2/0 fps 23
+        ];
+        let layers = read_video_layers_allocation(&bytes)?;
+        assert_eq!(
+            layers,
+            vec![
+                vec![SpatialLayer {
+                    temporal_layer_rates: vec![
+                        DataRate::from_kbps(30),
+                        DataRate::from_kbps(45),
+                        DataRate::from_kbps(75)
+                    ],
+                    size: Some(PixelSize {
+                        width: 160,
+                        height: 120
+                    })
+                }],
+                vec![SpatialLayer {
+                    temporal_layer_rates: vec![
+                        DataRate::from_kbps(81),
+                        DataRate::from_kbps(122),
+                        DataRate::from_kbps(203)
+                    ],
+                    size: Some(PixelSize {
+                        width: 320,
+                        height: 240
+                    })
+                }],
+                vec![SpatialLayer {
+                    temporal_layer_rates: vec![
+                        DataRate::from_kbps(265),
+                        DataRate::from_kbps(398),
+                        DataRate::from_kbps(663)
+                    ],
+                    size: Some(PixelSize {
+                        width: 640,
+                        height: 480
+                    })
+                }],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_video_three_layers_no_size() -> Result<()> {
+        let bytes = [
+            0b10100001, // (rid 2), three streams, one spatial layer
+            0b10101000, // stream 0/0,1/0,2/0, 3 temporal layers
+            30,         // stream 0/0/0: 30 kbps
+            45,         // stream 0/0/1: 45 kbps
+            75,         // stream 0/0/2: 75 kbps
+            81,         // stream 1/0/0: 81 kbps
+            122,        // stream 1/0/1: 122 kbps
+            0xCB, 0x01, // stream 1/0/2: 203 kbps
+            0x89, 0x02, // stream 2/0/0: 265 kbps
+            0x8E, 0x03, // stream 2/0/1: 398 kbps
+            0x97, 0x05, // stream 2/0/2: 663 kbps
+        ];
+        let layers = read_video_layers_allocation(&bytes)?;
+        assert_eq!(
+            layers,
+            vec![
+                vec![SpatialLayer {
+                    temporal_layer_rates: vec![
+                        DataRate::from_kbps(30),
+                        DataRate::from_kbps(45),
+                        DataRate::from_kbps(75)
+                    ],
+                    size: None
+                }],
+                vec![SpatialLayer {
+                    temporal_layer_rates: vec![
+                        DataRate::from_kbps(81),
+                        DataRate::from_kbps(122),
+                        DataRate::from_kbps(203)
+                    ],
+                    size: None
+                }],
+                vec![SpatialLayer {
+                    temporal_layer_rates: vec![
+                        DataRate::from_kbps(265),
+                        DataRate::from_kbps(398),
+                        DataRate::from_kbps(663)
+                    ],
+                    size: None
+                }],
+            ]
+        );
         Ok(())
     }
 }
@@ -1451,6 +1799,7 @@ mod test {
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range: RTP_MIN_HEADER_LEN..RTP_MIN_HEADER_LEN,
+                video_layers_allocation: None,
             }),
             Header::parse(&packet)
         );
@@ -1487,6 +1836,7 @@ mod test {
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(17..19),
                 payload_range: expected_payload_start..expected_payload_start,
+                video_layers_allocation: None,
             }),
             Header::parse(&packet)
         );
@@ -1567,6 +1917,7 @@ mod test {
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(17..19),
                 payload_range,
+                video_layers_allocation: None,
             }),
             Header::parse(&packet)
         );
@@ -1599,6 +1950,7 @@ mod test {
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(19..21),
                 payload_range,
+                video_layers_allocation: None,
             }),
             Header::parse(&packet)
         );
@@ -1633,6 +1985,7 @@ mod test {
                 tcc_seqnum: Some(0x5678),
                 tcc_seqnum_range: Some(19..21),
                 payload_range,
+                video_layers_allocation: None,
             }),
             Header::parse(&packet)
         );
@@ -1665,6 +2018,7 @@ mod test {
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,
+                video_layers_allocation: None,
             }),
             Header::parse(&packet)
         );
@@ -1694,6 +2048,7 @@ mod test {
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,
+                video_layers_allocation: None,
             }),
             Header::parse(&packet)
         );
@@ -1727,6 +2082,7 @@ mod test {
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,
+                video_layers_allocation: None,
             }),
             Header::parse(&packet)
         );
@@ -1764,6 +2120,7 @@ mod test {
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,
+                video_layers_allocation: None,
             }),
             Header::parse(&packet)
         );
@@ -1808,6 +2165,7 @@ mod test {
                 tcc_seqnum: None,
                 tcc_seqnum_range: None,
                 payload_range,
+                video_layers_allocation: None,
             }),
             Header::parse(&packet)
         );
@@ -1876,6 +2234,7 @@ mod test {
                 tcc_seqnum: Some(28),
                 tcc_seqnum_range: Some(18..20),
                 payload_range,
+                video_layers_allocation: None,
             }),
             Header::parse(&packet)
         );
