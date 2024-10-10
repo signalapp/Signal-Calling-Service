@@ -161,6 +161,10 @@ pub struct Endpoint {
 
     // For RTX
     rtx_sender: RtxSender,
+
+    // For Endpoint stats
+    last_stats_calculated_time: Instant,
+    last_stats: Option<EndpointStats>,
 }
 
 struct IncomingSsrcState {
@@ -178,6 +182,18 @@ pub struct EndpointStats {
     /// Average RTT across all SSRCs based on last 15 seconds
     /// returns None if stat is not currently available or recent
     pub rtt_estimate: Option<Duration>,
+}
+
+impl AsRef<EndpointStats> for EndpointStats {
+    fn as_ref(&self) -> &EndpointStats {
+        self
+    }
+}
+
+impl AsRef<Endpoint> for Endpoint {
+    fn as_ref(&self) -> &Endpoint {
+        self
+    }
 }
 
 impl Endpoint {
@@ -202,6 +218,9 @@ impl Endpoint {
             max_received_tcc_seqnum: 0,
 
             rtx_sender: RtxSender::new(PACKET_LIFETIME),
+
+            last_stats: None,
+            last_stats_calculated_time: now,
         }
     }
 
@@ -640,15 +659,30 @@ impl Endpoint {
         Some(encrypted)
     }
 
-    pub fn update_stats(&mut self, now: Instant) -> EndpointStats {
+    pub fn get_or_update_stats(&mut self, now: Instant) -> &EndpointStats {
+        // destructuring here causes wrong lifetimes (https://github.com/rust-lang/rust/issues/54663)
+        if self.last_stats.is_some()
+            && now.saturating_duration_since(self.last_stats_calculated_time)
+                < RTT_ESTIMATE_AGE_LIMIT
+        {
+            return self.last_stats.as_ref().unwrap();
+        }
+
+        self.update_stats(now)
+    }
+
+    pub fn update_stats(&mut self, now: Instant) -> &EndpointStats {
         let (remembered_packet_count, remembered_packet_bytes) =
             self.rtx_sender.remembered_packet_stats();
 
-        EndpointStats {
+        self.last_stats = Some(EndpointStats {
             remembered_packet_count,
             remembered_packet_bytes,
             rtt_estimate: self.calculate_rtt(now),
-        }
+        });
+        self.last_stats_calculated_time = now;
+
+        self.last_stats.as_ref().unwrap()
     }
 
     /// Average RTT estimates across all SSRCS that are not too old.

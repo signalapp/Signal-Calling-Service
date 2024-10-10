@@ -5,11 +5,7 @@
 
 use super::{Packet, OPUS_PAYLOAD_TYPE, VP8_PAYLOAD_TYPE};
 
-use std::{
-    convert::TryFrom,
-    ops::{Range, RangeInclusive},
-};
-
+use crate::transportcc as tcc;
 use aes::cipher::{generic_array::GenericArray, KeyInit};
 use aes_gcm::{AeadInPlace, Aes128Gcm};
 use calling_common::{
@@ -17,8 +13,10 @@ use calling_common::{
     Instant, Writable, Writer, U24,
 };
 use log::*;
-
-use crate::transportcc as tcc;
+use std::{
+    convert::TryFrom,
+    ops::{Range, RangeInclusive},
+};
 
 use super::{
     nack::{parse_nack, Nack},
@@ -48,8 +46,9 @@ pub const RTCP_FORMAT_NACK: u8 = 1;
 pub const RTCP_FORMAT_TRANSPORT_CC: u8 = 15;
 pub const RTCP_TYPE_SPECIFIC_FEEDBACK: u8 = 206;
 pub const RTCP_FORMAT_PLI: u8 = 1;
-pub const RTT_ESTIMATE_AGE_LIMIT: Duration = Duration::from_secs(15);
-const RTT_ESTIMATE_AGE_LIMIT_SECS_F64: f64 = 15.0;
+// 2 * RTCP_REPORT_INTERVAL + 1 second
+pub const RTT_ESTIMATE_AGE_LIMIT: Duration = Duration::from_secs(11);
+const RTT_ESTIMATE_AGE_LIMIT_SECS_F64: f64 = 11.0;
 
 #[derive(Default, Debug)]
 pub struct ControlPacket<'packet> {

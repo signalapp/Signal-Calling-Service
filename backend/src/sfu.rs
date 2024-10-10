@@ -356,7 +356,6 @@ impl Sfu {
             let tags = CONNECTION_TAG_VALUES.get(&(call_size_bucket, region_relation));
 
             let stats = connection.rtp_endpoint_stats(now);
-            let rates = connection.current_rates(now);
             if let Some(rtt_estimate) = stats.rtt_estimate {
                 client_rtt_ms
                     .entry(tags)
@@ -365,6 +364,7 @@ impl Sfu {
             }
             remembered_packet_count.push(stats.remembered_packet_count);
             remembered_packet_bytes.push(stats.remembered_packet_bytes);
+            let rates = connection.current_rates(now);
             if let Some(addr_type) = connection.outgoing_addr_type() {
                 match addr_type {
                     AddressType::UdpV4 => udp_v4_connections += 1,
@@ -940,7 +940,7 @@ impl Sfu {
                             let rtt = if let Some(connection) =
                                 self.get_connection_from_id(&connection_id)
                             {
-                                connection.lock().rtt().as_millis()
+                                connection.lock().rtt(now).as_millis()
                             } else {
                                 0
                             };

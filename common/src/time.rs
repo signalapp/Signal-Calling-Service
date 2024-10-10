@@ -209,6 +209,14 @@ impl Duration {
         self.0.as_nanos()
     }
 
+    pub fn mul_f64(&self, rhs: f64) -> Duration {
+        self.0.mul_f64(rhs).into()
+    }
+
+    pub fn abs_diff(&self, other: Duration) -> Duration {
+        self.0.abs_diff(other.0).into()
+    }
+
     pub const fn subsec_nanos(&self) -> u32 {
         self.0.subsec_nanos()
     }

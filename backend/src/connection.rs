@@ -32,7 +32,7 @@ const NACK_CALCULATION_INTERVAL: Duration = Duration::from_millis(20);
 // tick interval ever decreases.
 const ACK_CALCULATION_INTERVAL: Duration = Duration::from_millis(100);
 
-const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+pub const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub type PacketToSend = Vec<u8>;
 
@@ -571,6 +571,9 @@ impl Connection {
         packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
         now: Instant,
     ) {
+        // allow the client some time to queue/pace the RTX
+        const RTT_GRACE_MULTIPLIER: f64 = 1.1;
+
         if let Some(nacks_sent) = self.rtp.nacks_sent {
             if now < nacks_sent + NACK_CALCULATION_INTERVAL {
                 // We sent NACKs recently. Wait to resend/recalculate them.
@@ -579,7 +582,7 @@ impl Connection {
         }
 
         if let Some(outgoing_addr) = self.outgoing_addr {
-            let rtt = self.rtt();
+            let rtt = self.rtt(now).mul_f64(RTT_GRACE_MULTIPLIER);
             let rtp_endpoint = &mut self.rtp.endpoint;
 
             let mut bytes = 0;
@@ -623,7 +626,7 @@ impl Connection {
         self.congestion_control.pacer.queue_delay(now)
     }
 
-    pub fn rtp_endpoint_stats(&mut self, now: Instant) -> rtp::EndpointStats {
+    pub fn rtp_endpoint_stats(&mut self, now: Instant) -> &rtp::EndpointStats {
         self.rtp.endpoint.update_stats(now)
     }
 
@@ -642,8 +645,18 @@ impl Connection {
         }
     }
 
-    pub fn rtt(&self) -> Duration {
-        self.congestion_control.controller.rtt()
+    pub fn rtt(&mut self, now: Instant) -> Duration {
+        // Congestion Controller RTT tends to be higher and more reactive, switch when delta is large
+        const RTCP_RTT_LAG_THRESHOLD: Duration = Duration::from_millis(250);
+
+        let cc_rtt = self.congestion_control.controller.rtt();
+        if let Some(rtcp_rtt) = self.rtp.endpoint.get_or_update_stats(now).rtt_estimate {
+            if cc_rtt.abs_diff(rtcp_rtt) < RTCP_RTT_LAG_THRESHOLD {
+                return rtcp_rtt;
+            }
+        }
+
+        cc_rtt
     }
 
     pub fn region_relation(&self) -> RegionRelation {
