@@ -29,7 +29,7 @@ clap = { version = "4.5.9", features = ["derive"] }
 tokio = { version = "1.38.0", features = ["full"] }
 parking_lot = "0.12.3"
 once_cell = "1.19.0"
-futures = "0.3.30"
+futures = "0.3.31"
 num_cpus = "1.16.0"
 async-trait = "0.1.81"
 
