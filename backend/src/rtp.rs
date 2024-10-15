@@ -239,12 +239,11 @@ impl Endpoint {
         let tcc_seqnum = header
             .tcc_seqnum
             .map(|tcc_seqnum| tcc::expand_seqnum(tcc_seqnum, &mut self.max_received_tcc_seqnum));
-        let ssrc_state = self.get_incoming_ssrc_state_mut(header.ssrc);
-        let seqnum_in_header = expand_seqnum(header.seqnum, &mut ssrc_state.max_seqnum);
-        match ssrc_state
-            .seqnum_reuse_detector
-            .remember_used(seqnum_in_header)
-        {
+        let ssrc_state = self.get_incoming_ssrc_state(header.ssrc);
+        let mut max_seqnum = ssrc_state.max_seqnum;
+        let seqnum_in_header = expand_seqnum(header.seqnum, &mut max_seqnum);
+        let mut seqnum_reuse_detector = ssrc_state.seqnum_reuse_detector.clone();
+        match seqnum_reuse_detector.remember_used(seqnum_in_header) {
             SequenceNumberReuse::UsedBefore => {
                 trace!("Dropping SRTP packet because we've already seen this seqnum ({}) from this ssrc ({})", seqnum_in_header, header.ssrc);
                 event!("calling.srtp.seqnum_drop.reused");
@@ -292,6 +291,11 @@ impl Endpoint {
             return None;
         }
 
+        // Commit state changes
+        let ssrc_state = self.get_incoming_ssrc_state_mut(header.ssrc);
+        ssrc_state.max_seqnum = max_seqnum;
+        ssrc_state.seqnum_reuse_detector = seqnum_reuse_detector;
+
         if header.has_padding {
             incoming.padding_byte_count = incoming.payload()[incoming.payload().len() - 1];
         }
@@ -317,6 +321,39 @@ impl Endpoint {
                 expand_seqnum(original_seqnum, &mut original_ssrc_state.max_seqnum);
             // This makes the Packet appear to be an RTX packet for the rest of the processing.
             incoming.seqnum_in_payload = Some(original_seqnum);
+
+            let drop = match original_ssrc_state
+                .seqnum_reuse_detector
+                .remember_used(original_seqnum)
+            {
+                SequenceNumberReuse::UsedBefore => {
+                    trace!("Dropping SRTP packet because we've already seen this seqnum ({}) from this ssrc ({}) RTXed as {} {}", original_seqnum, original_ssrc, seqnum_in_header, header.ssrc);
+                    event!("calling.srtp.seqnum_drop.reused_rtx");
+                    true
+                }
+                SequenceNumberReuse::TooOldToKnow { delta } => {
+                    trace!(
+                        "Dropping SRTP packet because it's such an old seqnum ({}) from this ssrc ({}), delta: {} RTXed as {} {}",
+                        original_seqnum,
+                        original_ssrc,
+                        delta,
+                        seqnum_in_header,
+                        header.ssrc,
+                    );
+                    sampling_histogram!("calling.srtp.seqnum_drop.old_rtx", || delta
+                        .try_into()
+                        .unwrap());
+                    true
+                }
+                SequenceNumberReuse::NotUsedBefore => false,
+            };
+
+            if drop {
+                if let Some(tcc_seqnum) = incoming.tcc_seqnum {
+                    self.tcc_receiver.remember_received(tcc_seqnum, now);
+                }
+                return None;
+            }
         }
 
         // We have to do this after "unwrapping" the RTX packet
@@ -359,6 +396,10 @@ impl Endpoint {
                 nack_sender: NackSender::new(250),
                 rtcp_report_sender: RtcpReportSender::new(),
             })
+    }
+
+    fn get_incoming_ssrc_state(&mut self, ssrc: Ssrc) -> &IncomingSsrcState {
+        self.get_incoming_ssrc_state_mut(ssrc)
     }
 
     // Returns parsed and decrypted RTCP, and also processes transport-cc feedback based on
@@ -750,7 +791,7 @@ enum SequenceNumberReuse {
 // We keep a history of 128 sequence numbers.
 // That's what libsrtp/WebRTC uses, which means it's probably
 // enough.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 struct SequenceNumberReuseDetector {
     /// Everything before this seqnuence number is too old to
     /// know whether or not we have seen it.
@@ -1022,20 +1063,8 @@ mod test {
             .unwrap();
         assert_eq!(1, reforwarded2.seqnum_in_header);
         assert_eq!(Some(22), reforwarded2.seqnum_in_payload);
-        let reforwarded2 = sender
-            .receive_rtp(reforwarded2.serialized.borrow_mut(), at(90))
-            .unwrap();
-        let reforwarded2 = reforwarded2.to_owned();
-        assert_eq!(resent2.payload_type(), reforwarded2.payload_type());
-        assert_eq!(VP8_RTX_PAYLOAD_TYPE, reforwarded2.payload_type_in_header);
-        assert_eq!(33, reforwarded2.ssrc());
-        assert_eq!(34, reforwarded2.ssrc_in_header);
-        assert_eq!(1, reforwarded2.seqnum_in_header);
-        assert_eq!(Some(22), reforwarded2.seqnum_in_payload);
-        assert_eq!(22, reforwarded2.seqnum());
-        assert_eq!(44, reforwarded2.timestamp);
-        assert_eq!(resent2.payload(), reforwarded2.payload());
-        assert_eq!(Some(2), reforwarded2.tcc_seqnum);
+        let reforwarded2 = sender.receive_rtp(reforwarded2.serialized.borrow_mut(), at(90));
+        assert_eq!(reforwarded2, None);
 
         // Padding
         let mut padding = sender.send_padding(4, at(100)).unwrap();
