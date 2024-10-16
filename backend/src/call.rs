@@ -73,6 +73,8 @@ const MRP_SEND_TIMEOUT_INTERVAL: Duration = Duration::from_secs(1);
 const MIN_TARGET_SEND_RATE_GENERATION_INTERVAL: Duration = Duration::from_millis(2500);
 /// How much of the target send rate to allocate when the queue drain rate is high.
 const TARGET_RATE_MINIMUM_ALLOCATION_RATIO: f64 = 0.9;
+/// How much bitrate to assume clients will use to send layer 0 video.
+const ASSUMED_LAYER0_KBPS: u64 = 150;
 
 #[derive(Debug, EnumString, EnumIter, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum CallSizeBucket {
@@ -1104,14 +1106,22 @@ impl Call {
         }
 
         let incoming_rtp = incoming_rtp.borrow();
+        if let Some(audio_level) = incoming_rtp.audio_level {
+            time_scope_us!("calling.call.handle_rtp.audio_level");
+            sender.incoming_audio_levels.push(audio_level);
+            // Active speaker is recalculated in tick()
+        }
         let incoming_vp8 = if incoming_rtp.is_vp8() {
             time_scope_us!("calling.call.handle_rtp.vp8_header");
-            if let Some(incoming_vp8) = sender
+            if let Some((incoming_vp8, need_reallocation)) = sender
                 .parse_vp8_header_and_update_incoming_video_rate_and_resolution(
                     &incoming_rtp,
                     now,
                 )?
             {
+                if need_reallocation {
+                    self.reallocate_target_send_rates(now);
+                }
                 Some(incoming_vp8)
             } else {
                 return Ok(vec![]);
@@ -1121,11 +1131,6 @@ impl Call {
         };
 
         let mut rtp_to_send = vec![];
-        if let Some(audio_level) = incoming_rtp.audio_level {
-            time_scope_us!("calling.call.handle_rtp.audio_level");
-            sender.incoming_audio_levels.push(audio_level);
-            // Active speaker is recalculated in tick()
-        }
 
         let layer_id = LayerId::from_ssrc(incoming_rtp.ssrc()).ok_or(Error::InvalidRtpLayerId)?;
 
@@ -1166,9 +1171,9 @@ impl Call {
         self.approved_users.tick();
 
         for sender in &mut self.clients {
-            sender.incoming_video0.rate_tracker.update(now);
-            sender.incoming_video1.rate_tracker.update(now);
-            sender.incoming_video2.rate_tracker.update(now);
+            for v in sender.incoming_video.each_mut().iter_mut() {
+                v.rate_tracker.update(now);
+            }
         }
 
         let mut new_active_speaker: Option<DemuxId> = None;
@@ -1223,7 +1228,7 @@ impl Call {
                 .find_client(active_speaker_id)
                 .expect("active speaker is a client");
 
-            if let Some(active_speaker_layer0_height) = active_speaker.incoming_video0.height {
+            if let Some(active_speaker_layer0_height) = active_speaker.incoming_video[0].height {
                 if max_requested_active_speaker_height > active_speaker_layer0_height.as_u16() {
                     key_frame_requests_to_send.extend_from_slice(&[
                         (
@@ -1408,11 +1413,10 @@ impl Call {
 
                 Some(AllocatableVideo {
                     sender_demux_id: sender.demux_id,
-                    layers: [
-                        sender.incoming_video0.as_allocatable_layer(),
-                        sender.incoming_video1.as_allocatable_layer(),
-                        sender.incoming_video2.as_allocatable_layer(),
-                    ],
+                    layers: sender
+                        .incoming_video
+                        .each_ref()
+                        .map(|v| v.as_allocatable_layer()),
                     requested_height,
                     allocated_layer_index,
                     interesting: sender.became_active_speaker,
@@ -1826,11 +1830,25 @@ impl Call {
             return vec![];
         }
 
+        if self.clients.len() < 2 {
+            // We only need key frames if there are at least 2 clients.
+            return vec![];
+        }
+
         let mut desired_incoming_ssrcs: HashSet<rtp::Ssrc> = HashSet::new();
         for receiver in &mut self.clients {
             for video_forwarder in receiver.video_forwarder_by_sender_demux_id.values() {
                 if let Some(desired_incoming_ssrc) = video_forwarder.needs_key_frame() {
                     desired_incoming_ssrcs.insert(desired_incoming_ssrc);
+                }
+            }
+
+            for (i, incoming_video) in receiver.incoming_video.iter().enumerate() {
+                if incoming_video.needs_resolution && incoming_video.rate() > Some(DataRate::ZERO) {
+                    let ssrc = LayerId::from_video_layer_index(i)
+                        .unwrap()
+                        .to_ssrc(receiver.demux_id);
+                    desired_incoming_ssrcs.insert(ssrc);
                 }
             }
         }
@@ -1878,12 +1896,8 @@ impl Call {
 
     fn incoming_video_height(&self, ssrc: rtp::Ssrc) -> Option<VideoHeight> {
         let client = self.find_client(DemuxId::from_ssrc(ssrc))?;
-        match LayerId::from_ssrc(ssrc)? {
-            LayerId::Video0 => client.incoming_video0.height,
-            LayerId::Video1 => client.incoming_video1.height,
-            LayerId::Video2 => client.incoming_video2.height,
-            LayerId::Audio | LayerId::RtpData => None,
-        }
+        let index = LayerId::layer_index_from_ssrc(ssrc)?;
+        client.incoming_video[index].height
     }
 
     /// Get the DemuxIds and opaque user IDs for each client.  These are needed for signaling.
@@ -2025,9 +2039,7 @@ struct Client {
     region_relation: RegionRelation,
 
     // Updated by incoming video packets
-    incoming_video0: IncomingVideoState,
-    incoming_video1: IncomingVideoState,
-    incoming_video2: IncomingVideoState,
+    incoming_video: [IncomingVideoState; 3],
     video_rotation: VideoRotation,
 
     // Updated by incoming audio packets
@@ -2095,9 +2107,11 @@ impl Client {
             is_admin: pending_client_info.is_admin,
             region_relation: pending_client_info.region_relation,
 
-            incoming_video0: IncomingVideoState::default(),
-            incoming_video1: IncomingVideoState::default(),
-            incoming_video2: IncomingVideoState::default(),
+            incoming_video: [
+                IncomingVideoState::new(Some(DataRate::from_kbps(ASSUMED_LAYER0_KBPS))),
+                IncomingVideoState::new(None),
+                IncomingVideoState::new(None),
+            ],
             video_rotation: VideoRotation::None,
 
             incoming_audio_levels: audio::LevelsTracker::default(),
@@ -2139,7 +2153,7 @@ impl Client {
         &mut self,
         incoming_rtp: &rtp::Packet<&[u8]>,
         now: Instant,
-    ) -> Result<Option<VideoHeader>, Error> {
+    ) -> Result<Option<(VideoHeader, bool)>, Error> {
         let incoming_vp8 = if let Some((descriptor, _)) = incoming_rtp.dependency_descriptor {
             VideoHeader::from(descriptor)
         } else {
@@ -2148,35 +2162,18 @@ impl Client {
                     .map_err(|_| Error::InvalidVp8Header)?,
             )
         };
-        let incoming_layer_id = LayerId::from_ssrc(incoming_rtp.ssrc());
+        let incoming_layer_index =
+            LayerId::layer_index_from_ssrc(incoming_rtp.ssrc()).ok_or(Error::InvalidRtpLayerId)?;
+        let incoming_video = &mut self.incoming_video[incoming_layer_index];
+
         let size = incoming_rtp.size().as_bytes() as usize;
-
-        let incoming_video = match incoming_layer_id {
-            Some(LayerId::Video0) => {
-                event!("calling.bandwidth.incoming.video0_bytes", size);
-                &mut self.incoming_video0
-            }
-            Some(LayerId::Video1) => {
-                event!("calling.bandwidth.incoming.video1_bytes", size);
-                &mut self.incoming_video1
-            }
-            Some(LayerId::Video2) => {
-                event!("calling.bandwidth.incoming.video2_bytes", size);
-                &mut self.incoming_video2
-            }
-            _ => {
-                event!("calling.bandwidth.incoming.video_unknown_layer_bytes", size);
-                return Err(Error::InvalidRtpLayerId);
-            }
-        };
-
         incoming_video.rate_tracker.push_bytes(size, now);
-
-        let old_resolution = incoming_video.original_resolution;
-        if let Some(resolution) = incoming_vp8.resolution() {
-            incoming_video.original_resolution = Some(resolution);
-        }
-        let new_resolution = incoming_video.original_resolution;
+        match incoming_layer_index {
+            0 => event!("calling.bandwidth.incoming.video0_bytes", size),
+            1 => event!("calling.bandwidth.incoming.video1_bytes", size),
+            2 => event!("calling.bandwidth.incoming.video2_bytes", size),
+            _ => return Err(Error::InvalidRtpLayerId),
+        };
 
         // Note: Rotation may be sent in a separate packet than the resolution since it is sent in
         // the last packet for a key frame.
@@ -2185,27 +2182,97 @@ impl Client {
             self.video_rotation = rotation;
         }
 
-        if old_resolution != new_resolution || old_rotation != self.video_rotation {
-            self.incoming_video0.apply_rotation(self.video_rotation);
-            self.incoming_video1.apply_rotation(self.video_rotation);
-            self.incoming_video2.apply_rotation(self.video_rotation);
+        let old_resolution = incoming_video.original_resolution;
+        if let Some(resolution) = incoming_vp8.resolution() {
+            incoming_video.apply_resolution(resolution, self.video_rotation);
+        } else if old_resolution.is_none() && !incoming_video.needs_resolution {
+            // Record that we have data on the stream, when the resolution has been cleared.
+            // We can't allocate this stream for forwarding until we get a key frame.
+            incoming_video.needs_resolution = true;
+            event!("calling.rtcp.pli.need_resolution");
+        }
+        let new_resolution = incoming_video.original_resolution;
 
-            // Clear any higher resolutions.
-            // This will be a little inefficient if we get a resolution change for layer 1 before
-            // layer 0, but we can't really tell if resolutions between layers match or not.
-            match incoming_layer_id {
-                Some(LayerId::Video0) => {
-                    self.incoming_video1.clear_resolution();
-                    self.incoming_video2.clear_resolution();
+        let mut need_reallocation = false;
+
+        // If this is a key frame, and it was not allocatable before, update the bitrate and run
+        // allocation; this allows for switching to a new stream on the first key frame.
+        if incoming_vp8.is_key_frame()
+            && (old_resolution.is_none() || incoming_video.rate().unwrap_or_default().as_bps() == 0)
+        {
+            incoming_video.rate_tracker.update(now);
+            need_reallocation = true;
+        }
+
+        if let Some(allocations) = &incoming_rtp.video_layers_allocation {
+            for i in 0..self.incoming_video.len() {
+                if allocations.len() > i && !allocations[i].is_empty() {
+                    let layer = allocations[i].last().ok_or(Error::InvalidVp8Header)?;
+                    self.incoming_video[i]
+                        .rate_tracker
+                        .set_target(layer.max_rate());
+                    if let Some(size) = layer.size {
+                        if self.incoming_video[i].apply_resolution(size, self.video_rotation) {
+                            trace!(
+                                "ssrc {:?} layer {} available (resolution from header)",
+                                DemuxId::from_ssrc(incoming_rtp.ssrc()),
+                                i
+                            );
+                            need_reallocation = true;
+                        }
+                    }
+                } else {
+                    self.incoming_video[i].rate_tracker.set_target(None);
+                    if self.incoming_video[i].clear_resolution() {
+                        trace!(
+                            "ssrc {:?} layer {} no longer available (no spatial stream in header)",
+                            DemuxId::from_ssrc(incoming_rtp.ssrc()),
+                            i
+                        );
+                        need_reallocation = true;
+                    }
                 }
-                Some(LayerId::Video1) => {
-                    self.incoming_video2.clear_resolution();
+            }
+        } else if old_resolution != new_resolution {
+            // Clear any higher resolutions. This will be inefficient if we
+            // get a resolution change for layer 1 before layer 0. However,
+            // if we have the Video Layers Allocation header extension, all
+            // keyframes include resolution information for all streams.
+            for layer_index in incoming_layer_index + 1..self.incoming_video.len() {
+                if self.incoming_video[layer_index].clear_resolution() {
+                    trace!(
+                        "ssrc {:?} layer {} no longer available (layer {} change res)",
+                        DemuxId::from_ssrc(incoming_rtp.ssrc()),
+                        layer_index,
+                        incoming_layer_index
+                    );
+                    need_reallocation = true;
                 }
-                Some(LayerId::Video2) => {}
-                _ => unreachable!("checked above"),
             }
         }
-        Ok(Some(incoming_vp8))
+
+        if old_rotation != self.video_rotation {
+            // Clear any higher resolutions when we get a stream rotation
+            // indicator. This is inefficient unless we get the rotation
+            // indicator on the highest layer first.
+            for layer_index in incoming_layer_index + 1..self.incoming_video.len() {
+                if self.incoming_video[layer_index].clear_resolution() {
+                    trace!(
+                        "ssrc {:?} layer {} no longer available (layer {} change rotation)",
+                        DemuxId::from_ssrc(incoming_rtp.ssrc()),
+                        layer_index,
+                        incoming_layer_index
+                    );
+                    need_reallocation = true;
+                }
+            }
+
+            for v in self.incoming_video.each_mut().iter_mut() {
+                v.apply_rotation(self.video_rotation);
+            }
+        }
+
+        Ok(Some((incoming_vp8, need_reallocation)))
     }
 
     fn forward_audio_rtp(
@@ -2279,12 +2346,12 @@ impl Client {
         ClientStats {
             demux_id: self.demux_id,
             user_id: self.user_id.clone(),
-            video0_incoming_rate: self.incoming_video0.rate(),
-            video1_incoming_rate: self.incoming_video1.rate(),
-            video2_incoming_rate: self.incoming_video2.rate(),
-            video0_incoming_height: self.incoming_video0.height,
-            video1_incoming_height: self.incoming_video1.height,
-            video2_incoming_height: self.incoming_video2.height,
+            video0_incoming_rate: self.incoming_video[0].rate(),
+            video1_incoming_rate: self.incoming_video[1].rate(),
+            video2_incoming_rate: self.incoming_video[2].rate(),
+            video0_incoming_height: self.incoming_video[0].height,
+            video1_incoming_height: self.incoming_video[1].height,
+            video2_incoming_height: self.incoming_video[2].height,
             requested_base_rate: self.requested_base_rate,
             min_target_send_rate: self.min_target_send_rate(),
             target_send_rate: self.target_send_rate,
@@ -2311,9 +2378,18 @@ struct IncomingVideoState {
     original_resolution: Option<PixelSize>,
     /// The height of the video, taking rotation into account.
     height: Option<VideoHeight>,
+    /// If the video stream has no resolution, but has received data.
+    needs_resolution: bool,
 }
 
 impl IncomingVideoState {
+    fn new(default: Option<DataRate>) -> Self {
+        Self {
+            rate_tracker: DataRateTracker::new(default),
+            ..Default::default()
+        }
+    }
+
     pub fn rate(&self) -> Option<DataRate> {
         self.rate_tracker.stable_rate()
     }
@@ -2327,12 +2403,25 @@ impl IncomingVideoState {
                 }
             };
             self.height = Some(VideoHeight::from(height));
+        } else {
+            self.height = None;
         }
     }
 
-    fn clear_resolution(&mut self) {
+    fn apply_resolution(&mut self, resolution: PixelSize, rotation: VideoRotation) -> bool {
+        let ret = self.original_resolution.is_none();
+        self.original_resolution = Some(resolution);
+        self.needs_resolution = false;
+        self.apply_rotation(rotation);
+        ret
+    }
+
+    fn clear_resolution(&mut self) -> bool {
+        let ret = self.original_resolution.is_some();
         self.original_resolution = None;
         self.height = None;
+        self.needs_resolution = false;
+        ret
     }
 
     fn as_allocatable_layer(&self) -> AllocatableVideoLayer {
@@ -2815,9 +2904,10 @@ impl Vp8SimulcastRtpForwarder {
                 && self.switching_ssrc() != Some(desired_incoming_ssrc)
             {
                 trace!(
-                    "Begin forwarding from SSRC {} to SSRC {} once we receive a key frame.",
+                    "Begin forwarding from SSRC {} to SSRC {} once we receive a key frame, instead of {:?}",
                     desired_incoming_ssrc,
-                    self.outgoing_ssrc
+                    self.outgoing_ssrc,
+                    self.forwarding_ssrc(),
                 );
                 match self.forwarding_ssrc() {
                     Some(ssrc) if desired_incoming_ssrc > ssrc => {
@@ -4611,11 +4701,11 @@ mod call_tests {
         call.tick(at(501));
         assert_eq!(
             Some(DataRate::from_bps(40320)),
-            call.clients[0].incoming_video0.rate()
+            call.clients[0].incoming_video[0].rate()
         );
         assert_eq!(
             Some(VideoHeight::from(size.height)),
-            call.clients[0].incoming_video0.height
+            call.clients[0].incoming_video[0].height
         );
 
         let receiver1_demux_id = add_client(&mut call, "receiver1", 2, at(502));
@@ -4738,11 +4828,11 @@ mod call_tests {
         call.tick(at(2500));
         assert_eq!(
             Some(DataRate::from_bps(60480)),
-            call.clients[0].incoming_video1.rate()
+            call.clients[0].incoming_video[1].rate()
         );
         assert_eq!(
             Some(VideoHeight::from(size_layer1.height)),
-            call.clients[0].incoming_video1.height
+            call.clients[0].incoming_video[1].height
         );
 
         let mut resolution_request = create_resolution_request_rtp(1, 480);
@@ -4863,10 +4953,10 @@ mod call_tests {
         }
 
         let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(5100));
-        dbg!(call.clients[0].incoming_video1.rate().unwrap().as_bps());
+        dbg!(call.clients[0].incoming_video[1].rate().unwrap().as_bps());
         assert_eq!(
             Some(DataRate::from_bps(1043790)),
-            call.clients[0].incoming_video1.rate()
+            call.clients[0].incoming_video[1].rate()
         );
         assert_eq!(
             Some(expected_key_frame_request.1.ssrc),
@@ -6709,9 +6799,21 @@ mod call_tests {
             get_forwarding_video_demux_ids(&from_server, demux_id3)
         );
 
+        // Send PLI for demux id 2/3
         // Initial key frame requests
-        let mut outgoing_key_frame_requests =
-            call.send_key_frame_requests_if_its_been_too_long(at(2000));
+        let mut outgoing_key_frame_requests = call.handle_key_frame_requests(
+            demux_id1,
+            &[
+                rtp::KeyFrameRequest {
+                    ssrc: LayerId::Video0.to_ssrc(demux_id2),
+                },
+                rtp::KeyFrameRequest {
+                    ssrc: LayerId::Video0.to_ssrc(demux_id3),
+                },
+            ],
+            at(2000),
+        );
+
         outgoing_key_frame_requests.sort_unstable_by_key(|r| r.0);
 
         let expected_key_frame_requests = &[

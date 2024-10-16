@@ -385,19 +385,34 @@ pub struct DataRateTracker {
     accumulated_size: DataSize,
     rate: Option<DataRate>,
     stable_rate: Option<DataRate>,
-    last_stable_rate: Option<DataRate>,
+    target_rate: Option<DataRate>,
 }
 
 impl DataRateTracker {
     const MAX_DURATION: Duration = Duration::from_millis(5000);
     const MIN_DURATION: Duration = Duration::from_millis(500);
 
+    pub fn new(target: Option<DataRate>) -> Self {
+        Self {
+            target_rate: target,
+            ..Default::default()
+        }
+    }
+
     pub fn rate(&self) -> Option<DataRate> {
         self.rate
     }
 
     pub fn stable_rate(&self) -> Option<DataRate> {
-        self.stable_rate
+        if self.stable_rate.is_none() && !self.history.is_empty() {
+            self.target_rate
+        } else {
+            self.stable_rate
+        }
+    }
+
+    pub fn set_target(&mut self, target: Option<DataRate>) {
+        self.target_rate = target;
     }
 
     /// Old values don't get pushed off unless update() is called periodically.
@@ -434,10 +449,10 @@ impl DataRateTracker {
             None
         };
 
-        self.last_stable_rate = self.stable_rate;
+        let last_stable_rate = self.stable_rate;
         self.stable_rate = self.rate.map(|rate| {
             let alpha = 0.9;
-            match self.last_stable_rate {
+            match last_stable_rate {
                 Some(last) => (last * alpha) + (rate * (1.0 - alpha)),
                 None => rate,
             }
