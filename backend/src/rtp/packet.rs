@@ -465,7 +465,7 @@ impl<'a> DependencyDescriptorReader<'a> {
 // - RTX or non-RTX.
 // If it's RTX, many logical values are not what appear in the header
 // and the logical seqnum is stored in the first part of the payload.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Packet<T> {
     pub(super) marker: bool,
     // We use these _in_header values because of how the logical values
@@ -500,8 +500,34 @@ pub struct Packet<T> {
     pub(super) deadline: Option<Instant>,
 
     pub padding_byte_count: u8,
+    // If this packet is the maximum sequence number seen.
+    pub is_max_seqnum: bool,
 
     pub(super) serialized: T,
+}
+
+// check everything except for fields which are more observations of the
+// system and not actually properties of the packet.
+//
+// excluded fields: pending_retransmission, deadline, is_max_seqnum
+#[cfg(test)]
+impl<T: std::cmp::PartialEq> PartialEq for Packet<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.marker == other.marker
+            && self.payload_type_in_header == other.payload_type_in_header
+            && self.ssrc_in_header == other.ssrc_in_header
+            && self.seqnum_in_header == other.seqnum_in_header
+            && self.seqnum_in_payload == other.seqnum_in_payload
+            && self.timestamp == other.timestamp
+            && self.video_rotation == other.video_rotation
+            && self.audio_level == other.audio_level
+            && self.dependency_descriptor == other.dependency_descriptor
+            && self.tcc_seqnum == other.tcc_seqnum
+            && self.payload_range_in_header == other.payload_range_in_header
+            && self.encrypted == other.encrypted
+            && self.padding_byte_count == other.padding_byte_count
+            && self.serialized == other.serialized
+    }
 }
 
 impl<T> Packet<T> {
@@ -515,6 +541,7 @@ impl<T> Packet<T> {
         encrypted: bool,
         deadline: Option<Instant>,
         padding_byte_count: u8,
+        is_max_seqnum: bool,
         serialized: T,
     ) -> Self {
         Self {
@@ -534,6 +561,7 @@ impl<T> Packet<T> {
             encrypted,
             deadline,
             padding_byte_count,
+            is_max_seqnum,
             serialized,
         }
     }
@@ -650,6 +678,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             encrypted: self.encrypted,
             deadline: self.deadline,
             padding_byte_count: self.padding_byte_count,
+            is_max_seqnum: self.is_max_seqnum,
 
             serialized: self.serialized.borrow(),
         }
@@ -673,6 +702,7 @@ impl<T: Borrow<[u8]>> Packet<T> {
             encrypted: self.encrypted,
             deadline: self.deadline,
             padding_byte_count: self.padding_byte_count,
+            is_max_seqnum: self.is_max_seqnum,
 
             serialized: self.serialized.borrow().to_vec(),
         }
@@ -863,6 +893,7 @@ impl<T: BorrowMut<[u8]>> Packet<T> {
             encrypted: self.encrypted,
             deadline: self.deadline,
             padding_byte_count: self.padding_byte_count,
+            is_max_seqnum: self.is_max_seqnum,
 
             serialized: self.serialized.borrow_mut(),
         }
@@ -1047,6 +1078,7 @@ impl Packet<Vec<u8>> {
             encrypted: false,
             deadline: deadline_start.map(|deadline_start| deadline_start + PACKET_LIFETIME),
             padding_byte_count: 0,
+            is_max_seqnum: false,
             serialized,
         }
     }
@@ -1093,6 +1125,7 @@ impl Packet<Vec<u8>> {
             encrypted: false,
             deadline: None,
             padding_byte_count: 0,
+            is_max_seqnum: false,
             serialized,
         }
     }
@@ -1120,6 +1153,7 @@ impl Packet<Vec<u8>> {
                 tcc_seqnum_range: self.tcc_seqnum_range.clone(),
                 payload_range_in_header: self.payload_range_in_header.start
                     ..(self.payload_range_in_header.end + 2),
+                is_max_seqnum: self.is_max_seqnum,
                 serialized,
 
                 ..*self

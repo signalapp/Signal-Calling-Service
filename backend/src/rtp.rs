@@ -97,7 +97,7 @@ pub fn expand_seqnum(
 pub fn expand_timestamp(
     timestamp: TruncatedTimestamp,
     max_timestamp: &mut FullTimestamp,
-) -> FullSequenceNumber {
+) -> FullTimestamp {
     expand_truncated_counter(timestamp, max_timestamp, 32)
 }
 
@@ -273,6 +273,7 @@ impl Endpoint {
             true,
             Some(now + PACKET_LIFETIME),
             0,
+            max_seqnum == seqnum_in_header,
             encrypted,
         );
 
@@ -321,6 +322,7 @@ impl Endpoint {
                 expand_seqnum(original_seqnum, &mut original_ssrc_state.max_seqnum);
             // This makes the Packet appear to be an RTX packet for the rest of the processing.
             incoming.seqnum_in_payload = Some(original_seqnum);
+            incoming.is_max_seqnum = original_seqnum == original_ssrc_state.max_seqnum;
 
             let drop = match original_ssrc_state
                 .seqnum_reuse_detector
@@ -871,6 +873,7 @@ pub mod fuzz {
             true,
             None,
             0,
+            false,
             data,
         );
 

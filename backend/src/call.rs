@@ -2890,11 +2890,34 @@ impl Vp8SimulcastRtpForwarder {
             _ => {}
         }
 
-        if self.switching_ssrc() == Some(incoming_rtp.ssrc()) && incoming_vp8.is_key_frame() {
+        if self.switching_ssrc() == Some(incoming_rtp.ssrc())
+            && incoming_vp8.is_key_frame()
+            && (incoming_rtp.is_max_seqnum || self.forwarding_ssrc().is_none())
+        {
+            // When switching from forwarding one SSRC to another, we only
+            // switch when we receive the first packet of the key frame in
+            // order.  This prevents a delay in video decoding, at the
+            // expense of this receiver staying on the old stream until we
+            // receive a key frame where the first packet is received first.
+
+            // If we switch from not forwarding to forwarding, we start
+            // forwarding when we receive the first packet of the key frame,
+            // but if we have already received subsequent packets of the key
+            // frame, this receiver will need another key frame as we can't
+            // forward the other packets from the key frame that have
+            // already arrived out of order; when the next key frame
+            // arrives, all packets will be forwarded to this receiver, in
+            // the order they were received.  If that key frame also arrives
+            // out of order, WebRTC will be able to decode it using it is
+            // reorder buffer.
+
+            let needs_key_frame = !incoming_rtp.is_max_seqnum;
+
             trace!(
-                "Begin forwarding from SSRC {} to SSRC {} because we have a key frame.",
+                "Begin forwarding from SSRC {} to SSRC {} because we have a key frame; need additional keyframe {}",
                 incoming_rtp.ssrc(),
-                self.outgoing_ssrc
+                self.outgoing_ssrc,
+                needs_key_frame,
             );
 
             let first_incoming = Vp8RewrittenIds::new(
@@ -2914,8 +2937,8 @@ impl Vp8SimulcastRtpForwarder {
             );
             // We make two simplifying assumptions here:
             // 1. The first packet we received is the first packet of the key frame.
-            // If this is false (due to reordering), the receiving client will have to
-            // ask for a new key frame.  That should hopefully be infrequent.
+            // If this is false (due to reordering), we will wait to switch until we receive the first packet of a
+            // keyframe before subsequent packets (see above).
             // 2. The last packet we forwarded (of the previous layer) is the last packet we'd ever want to forward.
             // If this is false, the last frame of the previous layer will be dropped by the receiving client.
             // Which hopefully will not be noticeable.
@@ -2936,10 +2959,19 @@ impl Vp8SimulcastRtpForwarder {
                 first_incoming: first_incoming.clone(),
                 first_outgoing: first_outgoing.clone(),
                 max_incoming: first_incoming,
-                needs_key_frame: false,
+                needs_key_frame,
             };
             self.switching = Vp8SimulcastRtpSwitchingState::DoNotSwitch;
             self.max_outgoing = first_outgoing;
+        } else if self.switching_ssrc() == Some(incoming_rtp.ssrc()) && incoming_vp8.is_key_frame()
+        {
+            event!("calling.forwarding.layer_switch.wait_for_in_order_key_frame");
+            trace!(
+                "continue forwarding SSRC {:?} to SSRC {}, first packet of keyframe SSRC {} received out of order.",
+                self.forwarding_ssrc(),
+                incoming_rtp.ssrc(),
+                self.outgoing_ssrc
+            );
         }
 
         if let Vp8SimulcastRtpForwardingState::Forwarding {
@@ -3180,10 +3212,13 @@ mod call_tests {
                 let pt = 108;
                 let seqnum = ((ssrc * 10000) + index) as u64;
                 let timestamp = (ssrc * 100000) + (index * 30000); // 30 fps at 90khz clock
+                let mut rtp =
+                    rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, None, None, &[]);
+                rtp.is_max_seqnum = true;
                 Self {
                     ssrc,
                     index,
-                    rtp: rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, None, None, &[]),
+                    rtp,
                     dependency_descriptor: rtp::DependencyDescriptor {
                         truncated_frame_number: Some(((1000 * ssrc) + index) as u16),
                         is_key_frame,
@@ -4780,6 +4815,8 @@ mod call_tests {
             seqnum_layer1,
             Some(size_layer1),
         );
+        rtp_layer1.is_max_seqnum = true;
+
         let rtp_to_send = call
             .handle_rtp(sender_demux_id, rtp_layer1.borrow_mut(), at(2803))
             .unwrap();
