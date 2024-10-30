@@ -6,11 +6,21 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use strum_macros::{EnumIter, EnumString};
 
-#[derive(Clone, Debug, Eq, PartialEq, Copy, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, EnumString, EnumIter, PartialEq, Copy, Hash, Serialize, Deserialize)]
 pub enum CallType {
     Adhoc,
     GroupV2,
+}
+
+impl CallType {
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            CallType::Adhoc => "call-type:Adhoc",
+            CallType::GroupV2 => "call-type:GroupV2",
+        }
+    }
 }
 
 /// A wrapper around a u32 with the 4 LSBs set to 0.

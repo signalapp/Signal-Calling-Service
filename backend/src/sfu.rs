@@ -18,6 +18,7 @@ use calling_common::{
 };
 use hkdf::Hkdf;
 use log::*;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rand::rngs::OsRng;
 use sha2::Sha256;
@@ -115,6 +116,7 @@ impl std::fmt::Debug for ConnectionId {
     }
 }
 
+type ConnectionTags = (CallType, CallSizeBucket, RegionRelation);
 pub type CallEndHandler = dyn Fn(&CallId, &Call) -> Result<()> + Send + 'static;
 pub struct Sfu {
     /// Configuration structure originally from the command line or environment.
@@ -218,30 +220,36 @@ impl Sfu {
     /// Gives a snapshot of current metrics, such as call size.
     pub fn get_stats(&self) -> SfuStats {
         // Compute custom tags for Per-Call metrics to avoid allocating new tag vectors
-        // These tags contain the "call-size" tag
-        static CALL_TAG_VALUES: once_cell::sync::Lazy<HashMap<CallSizeBucket, Vec<&str>>> =
-            once_cell::sync::Lazy::new(|| {
+        // These tags contain the "call-type" and "call-size" tags
+        static CALL_TAG_VALUES: Lazy<HashMap<(CallType, CallSizeBucket), Vec<&str>>> =
+            Lazy::new(|| {
                 CallSizeBucket::iter()
-                    .map(|call_size| (call_size, vec![call_size.as_tag()]))
+                    .flat_map(|call_size| {
+                        CallType::iter().map(move |call_type| {
+                            (
+                                (call_type, call_size),
+                                vec![call_type.as_tag(), call_size.as_tag()],
+                            )
+                        })
+                    })
                     .collect()
             });
         // Compute custom tags for Per-Connection metrics to avoid allocating new tag vectors
         // These tags contain every combo of the "call-size" tag and "region-relation" tag
-        static CONNECTION_TAG_VALUES: once_cell::sync::Lazy<
-            HashMap<(CallSizeBucket, RegionRelation), Vec<&str>>,
-        > = once_cell::sync::Lazy::new(|| {
-            CALL_TAG_VALUES
-                .iter()
-                .flat_map(|(&call_size_key, call_size_tags)| {
-                    RegionRelation::iter().map(move |relation| {
-                        let key = (call_size_key, relation);
-                        let mut tags = call_size_tags.clone();
-                        tags.push(relation.as_tag());
-                        (key, tags)
+        static CONNECTION_TAG_VALUES: Lazy<HashMap<ConnectionTags, Vec<&str>>> =
+            once_cell::sync::Lazy::new(|| {
+                CALL_TAG_VALUES
+                    .iter()
+                    .flat_map(|(&(call_type, call_size_key), call_tags)| {
+                        RegionRelation::iter().map(move |relation| {
+                            let key = (call_type, call_size_key, relation);
+                            let mut tags = call_tags.clone();
+                            tags.push(relation.as_tag());
+                            (key, tags)
+                        })
                     })
-                })
-                .collect()
-        });
+                    .collect()
+            });
 
         let (mut histograms, mut values);
 
@@ -263,7 +271,7 @@ impl Sfu {
         let mut call_age_minutes_above_one: HashMap<Tags, Histogram<_>> = HashMap::new();
         let mut calls_persisting_approved_users = 0;
 
-        let mut call_size_map = HashMap::new();
+        let mut call_tags_map = HashMap::new();
         for (call_id, call) in &self.call_by_call_id {
             let call = call.lock();
             let clients = call.size();
@@ -271,9 +279,10 @@ impl Sfu {
             let call_duration =
                 (call.created().elapsed().unwrap_or_default().as_secs() / 60) as usize;
 
+            let call_type = call.call_type();
             let size_bucket = call.size_bucket();
-            let tags = CALL_TAG_VALUES.get(&size_bucket);
-            call_size_map.insert(call_id, size_bucket);
+            let tags = CALL_TAG_VALUES.get(&(call_type, size_bucket));
+            call_tags_map.insert(call_id, (call_type, size_bucket));
 
             all_clients += clients;
             call_size.push(clients);
@@ -343,7 +352,8 @@ impl Sfu {
         let now = Instant::now();
 
         for (connection_id, connection) in &self.connection_by_id {
-            let Some(&call_size_bucket) = call_size_map.get(&connection_id.call_id) else {
+            let Some(&(call_type, call_size_bucket)) = call_tags_map.get(&connection_id.call_id)
+            else {
                 warn!(
                     "call_id not found in call_size_map: {}",
                     LoggableCallId::from(&connection_id.call_id)
@@ -353,7 +363,7 @@ impl Sfu {
 
             let mut connection = connection.lock();
             let region_relation = connection.region_relation();
-            let tags = CONNECTION_TAG_VALUES.get(&(call_size_bucket, region_relation));
+            let tags = CONNECTION_TAG_VALUES.get(&(call_type, call_size_bucket, region_relation));
 
             let stats = connection.rtp_endpoint_stats(now);
             if let Some(rtt_estimate) = stats.rtt_estimate {

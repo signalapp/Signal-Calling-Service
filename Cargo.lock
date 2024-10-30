@@ -853,6 +853,8 @@ dependencies = [
  "rand",
  "serde",
  "sha2",
+ "strum",
+ "strum_macros",
  "thiserror",
 ]
 
