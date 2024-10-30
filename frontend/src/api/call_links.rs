@@ -510,6 +510,7 @@ pub mod tests {
     use zkgroup::call_links::CallLinkSecretParams;
     use zkgroup::call_links::CreateCallLinkCredentialRequestContext;
 
+    use crate::frontend::UserId;
     use crate::{
         api::app, api::v2::api_server_v2_tests::create_call_record, authenticator::Authenticator,
         backend::MockBackend, config, frontend::FrontendIdGenerator, storage::MockStorage,
@@ -520,6 +521,11 @@ pub mod tests {
 
     pub const USER_ID_1: &str = "11111111111111111111111111111111";
     pub const USER_ID_1_DOUBLE_ENCODED: &str = "00b033dec3c913aa7d087a49be7bbf4115cd441453778a73d5c705f3515d500841b867748697709fe3f587f796d6c9b20104a27cd1250af6b330fc0dd4eda07005";
+    pub const USER_ID_2: &str = "22222222222222222222222222222222";
+    pub const USER_ID_2_DOUBLE_ENCODED: &str = "0098d38ed257381ba5cd769275e505ae3d4d577a85c8393e787a818c18c9d0dc5196b8e46f96d4f2f1cbb32d79370e6b177c45be1a52a5f1a63ed656d6d4cb1b21";
+    pub const USER_ID_3: &str = "33333333333333333333333333333333";
+    pub const USER_ID_3_DOUBLE_ENCODED: &str = "005c623150bf34d1f5d569a6ac3e4ca9edf6938288971442c2cf8fc6ff0825fe09b6406e031db6c23d6df715a6198369899c6709b44f9f3fb1cb33ca174d384622";
+
     const ROOM_ID: &str = "ff0000dd";
     pub const ADMIN_PASSKEY: &[u8] = b"swordfish";
 
@@ -643,6 +649,10 @@ pub mod tests {
     }
 
     pub fn default_call_link_state() -> storage::CallLinkState {
+        call_link_state_with_approved(vec![])
+    }
+
+    pub fn call_link_state_with_approved(approved_users: Vec<UserId>) -> storage::CallLinkState {
         storage::CallLinkState {
             admin_passkey: ADMIN_PASSKEY.into(),
             zkparams: bincode::serialize(&CALL_LINK_SECRET_PARAMS.get_public_params())
@@ -652,7 +662,7 @@ pub mod tests {
             revoked: false,
             expiration: *DISTANT_FUTURE,
             delete_at: *DISTANT_FUTURE_DELETE_AT,
-            approved_users: vec![],
+            approved_users,
         }
     }
 

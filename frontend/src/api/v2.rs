@@ -28,7 +28,7 @@ use crate::{
     storage::{self, CallLinkRestrictions},
 };
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Participant {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,14 +36,14 @@ pub struct Participant {
     pub demux_id: u32,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ParticipantsResponse {
     #[serde(rename = "conferenceId")]
     pub era_id: String,
     pub max_devices: u32,
     pub participants: Vec<Participant>,
-    pub creator: String,
+    pub creator: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub pending_clients: Vec<Participant>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,7 +169,7 @@ pub async fn get_participants(
     }
 
     let clients_response = frontend.get_client_ids_in_call(&call, &user_id).await?;
-    let participants = clients_response
+    let mut participants: Vec<Participant> = clients_response
         .active_clients
         .into_iter()
         .map(|client| Participant {
@@ -177,6 +177,17 @@ pub async fn get_participants(
             demux_id: client.demux_id.as_u32(),
         })
         .collect();
+    let mut creator = Some(call.creator);
+
+    if let Some(link_state) = call_link_state.as_ref() {
+        if should_filter_userid(&participants, &user_id, link_state) {
+            participants.iter_mut().for_each(|participant| {
+                participant.opaque_user_id = None;
+            });
+            creator = None;
+        }
+    }
+
     let pending_clients = clients_response
         .pending_clients
         .into_iter()
@@ -192,11 +203,25 @@ pub async fn get_participants(
         era_id: call.era_id,
         max_devices: frontend.config.max_clients_per_call,
         participants,
-        creator: call.creator,
+        creator,
         pending_clients,
         call_link_state,
     })
     .into_response())
+}
+
+fn should_filter_userid(
+    participants: &[Participant],
+    user_id: &UserId,
+    call_link_state: &storage::CallLinkState,
+) -> bool {
+    call_link_state.restrictions == CallLinkRestrictions::AdminApproval
+        && !(call_link_state.approved_users.contains(user_id)
+            || participants.iter().any(|p| {
+                p.opaque_user_id
+                    .as_ref()
+                    .map_or(false, |uid| uid.as_str() == user_id)
+            }))
 }
 
 #[derive(Deserialize)]
@@ -388,13 +413,16 @@ pub mod api_server_v2_tests {
     use once_cell::sync::Lazy;
     use tower::ServiceExt;
 
+    use crate::api::call_links::tests::{
+        call_link_state_with_approved, USER_ID_3, USER_ID_3_DOUBLE_ENCODED,
+    };
     use crate::{
         api::app,
         api::call_links::tests::{
             create_authorization_header_for_creator,
             create_authorization_header_for_user as create_call_links_authorization_header_for_user,
             default_call_link_state, ADMIN_PASSKEY, USER_ID_1 as CALL_LINKS_USER_ID_1,
-            USER_ID_1_DOUBLE_ENCODED, X_ROOM_ID,
+            USER_ID_1_DOUBLE_ENCODED, USER_ID_2_DOUBLE_ENCODED, X_ROOM_ID,
         },
         authenticator::{Authenticator, HmacSha256, GV2_AUTH_MATCH_LIMIT},
         backend::{self, BackendError, MockBackend},
@@ -527,7 +555,10 @@ pub mod api_server_v2_tests {
     }
 
     fn create_clients_response_two_calls() -> backend::ClientsResponse {
-        let client_ids = vec![USER_ID_1.to_string(), USER_ID_2.to_string()];
+        let client_ids = vec![
+            USER_ID_1_DOUBLE_ENCODED.to_string(),
+            USER_ID_2_DOUBLE_ENCODED.to_string(),
+        ];
         let demux_ids = vec![DEMUX_ID_1, DEMUX_ID_2];
 
         backend::ClientsResponse {
@@ -706,21 +737,21 @@ pub mod api_server_v2_tests {
             participants_response.max_devices,
             config.max_clients_per_call
         );
-        assert_eq!(participants_response.creator, USER_ID_1);
+        assert_eq!(participants_response.creator, Some(USER_ID_1.into()));
         assert_eq!(participants_response.participants.len(), 2);
 
         assert_eq!(
             participants_response.participants[0]
                 .opaque_user_id
                 .as_deref(),
-            Some(USER_ID_1)
+            Some(USER_ID_1_DOUBLE_ENCODED)
         );
         assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
         assert_eq!(
             participants_response.participants[1]
                 .opaque_user_id
                 .as_deref(),
-            Some(USER_ID_2)
+            Some(USER_ID_2_DOUBLE_ENCODED)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
         assert!(participants_response.call_link_state.is_none());
@@ -1622,21 +1653,21 @@ pub mod api_server_v2_tests {
             participants_response.max_devices,
             config.max_clients_per_call
         );
-        assert_eq!(participants_response.creator, USER_ID_1);
+        assert_eq!(participants_response.creator, Some(USER_ID_1.into()));
         assert_eq!(participants_response.participants.len(), 2);
 
         assert_eq!(
             participants_response.participants[0]
                 .opaque_user_id
                 .as_deref(),
-            Some(USER_ID_1)
+            Some(USER_ID_1_DOUBLE_ENCODED),
         );
         assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
         assert_eq!(
             participants_response.participants[1]
                 .opaque_user_id
                 .as_deref(),
-            Some(USER_ID_2)
+            Some(USER_ID_2_DOUBLE_ENCODED),
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
         assert_eq!(
@@ -1722,7 +1753,7 @@ pub mod api_server_v2_tests {
             participants_response.max_devices,
             config.max_clients_per_call
         );
-        assert_eq!(participants_response.creator, USER_ID_1);
+        assert_eq!(participants_response.creator, Some(USER_ID_1.into()));
         assert_eq!(participants_response.participants.len(), 1);
 
         assert_eq!(
@@ -1827,7 +1858,7 @@ pub mod api_server_v2_tests {
             participants_response.max_devices,
             config.max_clients_per_call
         );
-        assert_eq!(participants_response.creator, USER_ID_1);
+        assert_eq!(participants_response.creator, Some(USER_ID_1.into()));
         assert_eq!(participants_response.participants.len(), 1);
 
         assert_eq!(
@@ -1850,6 +1881,122 @@ pub mod api_server_v2_tests {
             participants_response.call_link_state.unwrap(),
             expected_call_link_state_response
         );
+    }
+
+    // Tests filtering UserIds from get_participants. Filtering depends on three conditions
+    // 1. Restrictions == AdminApproval
+    // 2. User is currently in call
+    // 3. User has previously been approved
+    #[tokio::test]
+    async fn test_call_link_get_participants_userid_filtering() {
+        fn expected_response(
+            is_filtered: bool,
+            call_link_state: storage::CallLinkState,
+        ) -> ParticipantsResponse {
+            let mut response = ParticipantsResponse {
+                era_id: ERA_ID_1.into(),
+                max_devices: 8,
+                creator: Some(USER_ID_1.into()),
+                participants: vec![
+                    Participant {
+                        opaque_user_id: Some(USER_ID_1_DOUBLE_ENCODED.into()),
+                        demux_id: DEMUX_ID_1,
+                    },
+                    Participant {
+                        opaque_user_id: Some(USER_ID_2_DOUBLE_ENCODED.into()),
+                        demux_id: DEMUX_ID_2,
+                    },
+                ],
+                pending_clients: vec![],
+                call_link_state: Some(call_link_state.into()),
+            };
+            if is_filtered {
+                response.creator = None;
+                response.participants.iter_mut().for_each(|participant| {
+                    participant.opaque_user_id = None;
+                })
+            }
+            response
+        }
+
+        fn gen_call_link_state(
+            call_link_restrictions: CallLinkRestrictions,
+        ) -> storage::CallLinkState {
+            let mut call_link_state =
+                call_link_state_with_approved(vec![USER_ID_3_DOUBLE_ENCODED.into()]);
+            call_link_state.restrictions = call_link_restrictions;
+            call_link_state
+        }
+
+        async fn setup_call_and_get_participants(
+            api_user_id: UserId,
+            call_link_state: storage::CallLinkState,
+        ) -> ParticipantsResponse {
+            let config = &CONFIG;
+            let backend = create_mocked_backend_two_calls();
+            let mut storage = Box::new(MockStorage::new());
+            storage
+                .expect_get_call_link_and_record()
+                .with(eq(RoomId::from(ROOM_ID)), eq(true))
+                .once()
+                .return_once(|_, _| {
+                    Ok((
+                        Some(call_link_state),
+                        Some(create_call_record(ROOM_ID, LOCAL_REGION)),
+                    ))
+                });
+            let frontend = create_frontend(config, storage, backend);
+            let app = app(frontend.clone());
+
+            let request = Request::builder()
+                .method(http::Method::GET)
+                .uri("/v2/conference/participants".to_string())
+                .header(X_ROOM_ID, ROOM_ID)
+                .header(header::USER_AGENT, "test/user/agent")
+                .header(
+                    header::AUTHORIZATION,
+                    create_call_links_authorization_header_for_user(&frontend, &api_user_id),
+                )
+                .body(Body::empty())
+                .unwrap();
+
+            // Submit the request.
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let pre_approved_user = USER_ID_3;
+        let unknown_user = "44444444444444444444444444444444";
+        for restrictions in [
+            CallLinkRestrictions::None,
+            CallLinkRestrictions::AdminApproval,
+        ] {
+            let is_restricted = restrictions == CallLinkRestrictions::AdminApproval;
+
+            for api_user_id in [unknown_user, pre_approved_user, CALL_LINKS_USER_ID_1] {
+                let is_in_call = api_user_id == CALL_LINKS_USER_ID_1;
+                let is_preapproved = api_user_id == pre_approved_user;
+                let should_be_filtered = is_restricted && (!is_in_call && !is_preapproved);
+
+                let call_link_state = gen_call_link_state(restrictions.clone());
+                let response =
+                    setup_call_and_get_participants(api_user_id.into(), call_link_state.clone())
+                        .await;
+                let expected = expected_response(should_be_filtered, call_link_state);
+
+                assert_eq!(
+                    response, expected,
+                    "should_be_filtered: {}, is_restricted: {}, is_in_call: {}, is_preapproved: {}",
+                    should_be_filtered, is_restricted, is_in_call, is_preapproved
+                );
+            }
+        }
     }
 
     /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is a call
@@ -1908,21 +2055,21 @@ pub mod api_server_v2_tests {
             participants_response.max_devices,
             config.max_clients_per_call
         );
-        assert_eq!(participants_response.creator, USER_ID_1);
+        assert_eq!(participants_response.creator, Some(USER_ID_1.into()));
         assert_eq!(participants_response.participants.len(), 2);
 
         assert_eq!(
             participants_response.participants[0]
                 .opaque_user_id
                 .as_deref(),
-            Some(USER_ID_1)
+            Some(USER_ID_1_DOUBLE_ENCODED)
         );
         assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
         assert_eq!(
             participants_response.participants[1]
                 .opaque_user_id
                 .as_deref(),
-            Some(USER_ID_2)
+            Some(USER_ID_2_DOUBLE_ENCODED)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
         assert_eq!(
@@ -1987,21 +2134,21 @@ pub mod api_server_v2_tests {
             participants_response.max_devices,
             config.max_clients_per_call
         );
-        assert_eq!(participants_response.creator, USER_ID_1);
+        assert_eq!(participants_response.creator, Some(USER_ID_1.into()));
         assert_eq!(participants_response.participants.len(), 2);
 
         assert_eq!(
             participants_response.participants[0]
                 .opaque_user_id
                 .as_deref(),
-            Some(USER_ID_1)
+            Some(USER_ID_1_DOUBLE_ENCODED)
         );
         assert_eq!(participants_response.participants[0].demux_id, DEMUX_ID_1);
         assert_eq!(
             participants_response.participants[1]
                 .opaque_user_id
                 .as_deref(),
-            Some(USER_ID_2)
+            Some(USER_ID_2_DOUBLE_ENCODED)
         );
         assert_eq!(participants_response.participants[1].demux_id, DEMUX_ID_2);
         assert_eq!(

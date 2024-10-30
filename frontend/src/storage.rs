@@ -130,7 +130,7 @@ pub struct CallLinkState {
 impl CallLinkState {
     const RECORD_TYPE: &'static str = "CallLinkState";
     const PEEK_ATTRIBUTES: &'static str =
-        "adminPasskey,zkparams,restrictions,encryptedName,revoked,expiration,deleteAt";
+        "adminPasskey,zkparams,restrictions,encryptedName,approvedUsers,revoked,expiration,deleteAt";
 
     pub const EXPIRATION_TIMER: std::time::Duration =
         std::time::Duration::from_secs(60 * 60 * 24 * 90);
@@ -1100,8 +1100,7 @@ mod tests {
             revoked: true,
             expiration: *TESTING_EXPIRATION,
             delete_at: *TESTING_DELETE_AT,
-            // Deliberately empty to be left out of this serialization.
-            approved_users: vec![],
+            approved_users: vec!["user".to_owned()],
         });
         let record_as_json = serde_json::to_value(example_record).expect("can serialize");
         let mut serialized_keys: Vec<&str> = record_as_json
