@@ -7,6 +7,12 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Eq, PartialEq, Copy, Hash, Serialize, Deserialize)]
+pub enum CallType {
+    Adhoc,
+    GroupV2,
+}
+
 /// A wrapper around a u32 with the 4 LSBs set to 0.
 /// Uniquely identifies a client within a call (scoped to the call era).
 #[derive(Clone, Debug, Eq, PartialEq, Copy, Hash, PartialOrd, Ord)]

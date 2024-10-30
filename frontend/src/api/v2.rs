@@ -12,6 +12,7 @@ use axum::{
     Extension, Json,
 };
 use axum_extra::TypedHeader;
+use calling_common::CallType;
 use hex::ToHex;
 use http::StatusCode;
 use log::*;
@@ -254,7 +255,7 @@ pub async fn join(
         frontend.config.region.clone()
     };
 
-    let (call, user_id, restrictions, is_admin, approved_users) = match (
+    let (call, user_id, restrictions, is_admin, approved_users, call_type) = match (
         group_auth,
         call_links_auth,
         room_id,
@@ -276,6 +277,7 @@ pub async fn join(
                 CallLinkRestrictions::None,
                 false,
                 None,
+                CallType::GroupV2,
             )
         }
         (None, Some(Extension(auth_credential)), Some(TypedHeader(room_id))) => {
@@ -340,6 +342,7 @@ pub async fn join(
                             state.restrictions,
                             is_admin,
                             Some(state.approved_users),
+                            CallType::Adhoc,
                         )
                     }
                 }
@@ -372,6 +375,7 @@ pub async fn join(
                 restrictions,
                 is_admin,
                 approved_users,
+                call_type,
             },
         )
         .await?;
@@ -918,6 +922,7 @@ pub mod api_server_v2_tests {
                     is_admin: false,
                     room_id: RoomId::from(GROUP_ID_1),
                     approved_users: None,
+                    call_type: CallType::GroupV2,
                 }),
             )
             .once()
@@ -1025,6 +1030,7 @@ pub mod api_server_v2_tests {
                     is_admin: false,
                     room_id: RoomId::from(GROUP_ID_1),
                     approved_users: None,
+                    call_type: CallType::GroupV2,
                 }),
             )
             .once()
@@ -2354,6 +2360,7 @@ pub mod api_server_v2_tests {
                     is_admin: false,
                     room_id: RoomId::from(CALL_LINK_ROOM_ID),
                     approved_users: Some(vec![]),
+                    call_type: CallType::Adhoc,
                 }),
             )
             .once()
@@ -2486,6 +2493,7 @@ pub mod api_server_v2_tests {
                     is_admin: false,
                     room_id: RoomId::from(CALL_LINK_ROOM_ID),
                     approved_users: Some(vec![]),
+                    call_type: CallType::Adhoc,
                 }),
             )
             .once()
@@ -2619,6 +2627,7 @@ pub mod api_server_v2_tests {
                     is_admin: false,
                     room_id: RoomId::from(CALL_LINK_ROOM_ID),
                     approved_users: Some(vec!["11223344".to_string(), "aabbccdd".to_string()]),
+                    call_type: CallType::Adhoc,
                 }),
             )
             .once()
@@ -2725,6 +2734,7 @@ pub mod api_server_v2_tests {
                     is_admin: false,
                     room_id: RoomId::from(ROOM_ID),
                     approved_users: Some(vec![]),
+                    call_type: CallType::Adhoc,
                 }),
             )
             .once()
@@ -2832,6 +2842,7 @@ pub mod api_server_v2_tests {
                     is_admin: false,
                     room_id: RoomId::from(ROOM_ID),
                     approved_users: Some(vec!["11223344".to_string(), "aabbccdd".to_string()]),
+                    call_type: CallType::Adhoc,
                 }),
             )
             .once()
@@ -3043,6 +3054,7 @@ pub mod api_server_v2_tests {
                     is_admin: true,
                     room_id: RoomId::from(ROOM_ID),
                     approved_users: Some(vec![]),
+                    call_type: CallType::Adhoc,
                 }),
             )
             .once()
@@ -3151,6 +3163,7 @@ pub mod api_server_v2_tests {
                     is_admin: false,
                     room_id: RoomId::from(ROOM_ID),
                     approved_users: Some(vec![]),
+                    call_type: CallType::Adhoc,
                 }),
             )
             .once()

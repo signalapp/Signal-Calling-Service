@@ -34,7 +34,7 @@ use crate::{
     sfu::{self, Sfu},
 };
 
-use calling_common::DemuxId;
+use calling_common::{CallType, DemuxId};
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -336,6 +336,11 @@ async fn join_conference(
     let mut sfu = sfu.lock();
     // Make the first user to join an admin.
     let is_admin = sfu.get_call_signaling_info(call_id.clone(), None).is_none();
+    let call_type = if config.new_clients_require_approval {
+        CallType::Adhoc
+    } else {
+        CallType::GroupV2
+    };
     match sfu.get_or_create_call_and_add_client(
         call_id.clone(),
         None,
@@ -348,6 +353,7 @@ async fn join_conference(
         client_hkdf_extra_info,
         Region::Unset,
         config.new_clients_require_approval,
+        call_type,
         is_admin,
         None,
     ) {

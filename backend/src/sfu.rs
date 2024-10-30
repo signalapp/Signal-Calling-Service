@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::Result;
 use calling_common::{
-    ClientStatus, DataRate, DataSize, DemuxId, Duration, Instant, RoomId,
+    CallType, ClientStatus, DataRate, DataSize, DemuxId, Duration, Instant, RoomId,
     TwoGenerationCacheWithManualRemoveOld, DUMMY_DEMUX_ID,
 };
 use hkdf::Hkdf;
@@ -460,6 +460,7 @@ impl Sfu {
         client_hkdf_extra_info: Vec<u8>,
         region: Region,
         new_clients_require_approval: bool,
+        call_type: CallType,
         is_admin: bool,
         approved_users: Option<Vec<UserId>>,
     ) -> Result<(DhePublicKey, ClientStatus), SfuError> {
@@ -467,6 +468,7 @@ impl Sfu {
         trace!("get_or_create_call_and_add_client():");
 
         trace!("  {:25}{}", "call_id:", loggable_call_id);
+        trace!("  {:25}{:?}", "call_type:", call_type);
         trace!("  {:25}{}", "user_id:", user_id.as_str());
         trace!("  {:25}{}", "client_ice_ufrag:", client_ice_ufrag);
         trace!(
@@ -511,6 +513,7 @@ impl Sfu {
                 room_id.clone(),
                 user_id.clone(),
                 new_clients_require_approval,
+                call_type,
                 self.config.persist_approval_for_all_users_who_join,
                 Duration::from_millis(active_speaker_message_interval_ms),
                 initial_target_send_rate,
@@ -1326,6 +1329,7 @@ mod sfu_tests {
             vec![],
             Region::Unset,
             false,
+            CallType::GroupV2,
             false,
             None,
         )?;

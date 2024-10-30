@@ -33,7 +33,7 @@ use axum_extra::{
     headers::{self, Header},
     TypedHeader,
 };
-use calling_common::{DemuxId, RoomId};
+use calling_common::{CallType, DemuxId, RoomId};
 use hex::{FromHex, ToHex};
 use hyper::http::{HeaderName, HeaderValue};
 use log::*;
@@ -98,6 +98,7 @@ pub struct JoinRequest {
     pub region: Option<String>,
     #[serde(default)]
     pub new_clients_require_approval: bool,
+    pub call_type: CallType,
     pub is_admin: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_id: Option<RoomId>,
@@ -342,6 +343,7 @@ async fn join(
         client_hkdf_extra_info,
         region,
         request.new_clients_require_approval,
+        request.call_type,
         request.is_admin,
         request.approved_users,
     ) {
@@ -547,6 +549,7 @@ mod signaling_server_tests {
                 vec![],
                 Region::Unset,
                 false,
+                CallType::GroupV2,
                 false,
                 None,
             )
@@ -578,6 +581,7 @@ mod signaling_server_tests {
                 vec![],
                 Region::Unset,
                 true,
+                CallType::Adhoc,
                 true,
                 None,
             )
@@ -1025,6 +1029,7 @@ mod signaling_server_tests {
                             hkdf_extra_info: None,
                             region: None,
                             new_clients_require_approval: false,
+                            call_type: CallType::GroupV2,
                             is_admin: false,
                             room_id: Some(ROOM_ID.into()),
                             approved_users: None,
@@ -1052,6 +1057,7 @@ mod signaling_server_tests {
                             hkdf_extra_info: None,
                             region: None,
                             new_clients_require_approval: false,
+                            call_type: CallType::GroupV2,
                             is_admin: false,
                             room_id: Some(ROOM_ID.into()),
                             approved_users: None,
@@ -1079,6 +1085,7 @@ mod signaling_server_tests {
                             hkdf_extra_info: None,
                             region: None,
                             new_clients_require_approval: false,
+                            call_type: CallType::GroupV2,
                             is_admin: false,
                             room_id: None,
                             approved_users: None,
@@ -1106,6 +1113,7 @@ mod signaling_server_tests {
                             hkdf_extra_info: None,
                             region: None,
                             new_clients_require_approval: false,
+                            call_type: CallType::GroupV2,
                             is_admin: false,
                             room_id: None,
                             approved_users: None,
@@ -1133,6 +1141,7 @@ mod signaling_server_tests {
                             hkdf_extra_info: Some("G".to_string()),
                             region: None,
                             new_clients_require_approval: false,
+                            call_type: CallType::GroupV2,
                             is_admin: false,
                             room_id: None,
                             approved_users: None,
@@ -1160,6 +1169,7 @@ mod signaling_server_tests {
                             hkdf_extra_info: None,
                             region: None,
                             new_clients_require_approval: false,
+                            call_type: CallType::GroupV2,
                             is_admin: false,
                             room_id: None,
                             approved_users: None,
@@ -1206,6 +1216,7 @@ mod signaling_server_tests {
                             hkdf_extra_info: None,
                             region: None,
                             new_clients_require_approval: false,
+                            call_type: CallType::GroupV2,
                             is_admin: false,
                             room_id: None,
                             approved_users: None,
@@ -1231,6 +1242,7 @@ mod signaling_server_tests {
                 "hkdfExtraInfo": null,
                 "region": "pangaea",
                 "newClientsRequireApproval": false,
+                "callType": "GroupV2",
                 "isAdmin": false,
                 "roomId": ROOM_ID,
                 "approvedUsers": ["A", "B"],
@@ -1242,6 +1254,7 @@ mod signaling_server_tests {
                 hkdf_extra_info: None,
                 region: Some("pangaea".to_string()),
                 new_clients_require_approval: false,
+                call_type: CallType::GroupV2,
                 is_admin: false,
                 room_id: Some(RoomId::from(ROOM_ID)),
                 approved_users: Some(vec![

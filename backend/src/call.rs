@@ -13,8 +13,8 @@ use std::{
 };
 
 use calling_common::{
-    ClientStatus, DataRate, DataRateTracker, DemuxId, Duration, Instant, PixelSize, RoomId,
-    VideoHeight,
+    CallType, ClientStatus, DataRate, DataRateTracker, DemuxId, Duration, Instant, PixelSize,
+    RoomId, VideoHeight,
 };
 use hex::ToHex;
 use log::*;
@@ -328,6 +328,7 @@ pub struct Call {
     loggable_call_id: LoggableCallId,
     creator_id: UserId, // AKA the first user to join
     new_clients_require_approval: bool,
+    call_type: CallType,
     persist_approval_for_all_users_who_join: bool,
     created: SystemTime, // For knowing how old the call is
     active_speaker_message_interval: Duration,
@@ -415,6 +416,7 @@ impl Call {
         room_id: Option<RoomId>,
         creator_id: UserId,
         new_clients_require_approval: bool,
+        call_type: CallType,
         persist_approval_for_all_users_who_join: bool,
         active_speaker_message_interval: Duration,
         initial_target_send_rate: DataRate,
@@ -430,6 +432,7 @@ impl Call {
             loggable_call_id,
             creator_id,
             new_clients_require_approval,
+            call_type,
             persist_approval_for_all_users_who_join,
             created: system_now,
             active_speaker_message_interval,
@@ -468,6 +471,10 @@ impl Call {
 
     pub fn room_id(&self) -> Option<&RoomId> {
         self.room_id.as_ref()
+    }
+
+    pub fn call_type(&self) -> CallType {
+        self.call_type
     }
 
     pub fn loggable_call_id(&self) -> &LoggableCallId {
@@ -4132,6 +4139,7 @@ mod call_tests {
             None,
             creator_id,
             false,
+            CallType::GroupV2,
             false,
             active_speaker_message_interval,
             initial_target_send_rate,
