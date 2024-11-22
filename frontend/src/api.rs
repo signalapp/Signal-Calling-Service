@@ -89,6 +89,8 @@ fn user_agent_event_string(user_agent: &str) -> &str {
         } else {
             "desktop.unknown"
         }
+    } else if user_agent.starts_with("Signal-Internal") {
+        "internal"
     } else {
         "unknown"
     }
