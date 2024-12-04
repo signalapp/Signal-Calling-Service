@@ -15,7 +15,7 @@ use anyhow::Result;
 use log::*;
 use metrics::{
     metric_config::{
-        Client as DatadogClient, Histogram, HistogramReport, PipelineSink, Precision, Tags,
+        Client as DatadogClient, Histogram, HistogramReport, PipelineSink, Precision, TagsRef,
         UdpEventSink,
     },
     metrics, time_scope_us,
@@ -65,7 +65,7 @@ pub async fn start(
                     let mut datadog = datadog.open_pipeline();
 
                     for (metric_name, value) in get_value_metrics() {
-                        datadog.gauge(metric_name, value as f64, &None);
+                        datadog.gauge(metric_name, value as f64, None);
                     }
 
                     {
@@ -79,7 +79,7 @@ pub async fn start(
                             }
                         }
                         for (name, value) in stats.values {
-                            datadog.gauge(name, value as f64, &None);
+                            datadog.gauge(name, value as f64, None);
                         }
                     }
 
@@ -88,7 +88,7 @@ pub async fn start(
                         datadog.send_timer_histogram(&report, None);
                     }
                     for report in report.events {
-                        datadog.count(report.name(), report.event_count() as f64, &None);
+                        datadog.count(report.name(), report.event_count() as f64, report.tags());
                     }
 
                     #[cfg(target_os = "linux")]
@@ -100,12 +100,12 @@ pub async fn start(
                         datadog.count(
                             "calling.system.memory.new_alloc_bytes",
                             (alloc - last_alloc) as f64,
-                            &None,
+                            None,
                         );
                         datadog.gauge(
                             "calling.system.memory.net_alloc_bytes",
                             (alloc - dealloc) as f64,
-                            &None,
+                            None,
                         );
                         last_alloc = alloc;
                     }
@@ -179,7 +179,7 @@ impl<'a> DerefMut for DatadogPipeline<'a> {
 }
 
 impl<'a> DatadogPipeline<'a> {
-    fn send_timer_histogram(&mut self, histogram_report: &HistogramReport, tags: Tags) {
+    fn send_timer_histogram(&mut self, histogram_report: &HistogramReport, tags: TagsRef) {
         let name = histogram_report.name();
 
         let precision = histogram_report.sample_precision();
@@ -211,7 +211,7 @@ impl<'a> DatadogPipeline<'a> {
         &mut self,
         metric_name: &str,
         histogram: &Histogram<usize>,
-        tags: Tags,
+        tags: TagsRef,
     ) {
         for (value, frequency) in histogram.iter() {
             self.histogram_at_rate(metric_name, *value as f64, 1f64 / (*frequency as f64), tags);

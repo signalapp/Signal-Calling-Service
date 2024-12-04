@@ -30,6 +30,7 @@ use tokio::{
 
 // Load the config and treat it as a read-only static value.
 static CONFIG: Lazy<config::Config> = Lazy::new(config::Config::parse);
+const MONITOR_DEADLOCK_INTERVAL: Duration = Duration::from_secs(5);
 
 #[rustfmt::skip]
 fn print_config(config: &'static config::Config) {
@@ -163,6 +164,10 @@ fn main() -> Result<()> {
         None
     };
 
+    let (deadlock_monitor_ender_tx, deadlock_monitor_ender_rx) = std::sync::mpsc::channel();
+    let deadlock_monitor_handle =
+        metrics::monitor_deadlocks(MONITOR_DEADLOCK_INTERVAL.into(), deadlock_monitor_ender_rx);
+
     // Create the shared SFU context.
     let sfu: Arc<Mutex<Sfu>> = Arc::new(Mutex::new(Sfu::new(Instant::now(), config)?));
 
@@ -243,6 +248,7 @@ fn main() -> Result<()> {
         let _ = packet_ender_tx.send(());
         let _ = metrics_ender_tx.send(());
         let _ = call_lifecycle_ender_tx.send(());
+        let _ = deadlock_monitor_ender_tx.send(());
 
         // Wait for the servers to exit.
         let _ = tokio::join!(
@@ -251,6 +257,7 @@ fn main() -> Result<()> {
             metrics_server_handle,
             call_lifecycle_handle,
         );
+        let _ = deadlock_monitor_handle.join();
     });
 
     info!("shutting down the runtime");

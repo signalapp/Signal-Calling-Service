@@ -6,6 +6,7 @@
 #[cfg(not(test))]
 use std::time::Instant;
 use std::{
+    collections::HashMap,
     mem,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
@@ -16,6 +17,7 @@ use mock_instant::Instant;
 use parking_lot::Mutex;
 
 use crate::{
+    datadog_statsd::TagsRef,
     histogram::Histogram,
     timing_options::{Precision, TimingOptions},
 };
@@ -139,33 +141,52 @@ impl NumericValueReporter {
 
 pub struct EventCountReporter {
     name: &'static str,
-    event_counter: AtomicUsize,
+    event_counters: parking_lot::RwLock<HashMap<TagsRef<'static>, AtomicUsize>>,
 }
 
 impl EventCountReporter {
     pub fn new(name: &'static str) -> EventCountReporter {
         EventCountReporter {
             name,
-            event_counter: AtomicUsize::new(0),
+            event_counters: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
     /// This will count n events.
     pub fn count_n(&self, n: usize) {
-        self.event_counter.fetch_add(n, Ordering::Relaxed);
+        self.count_n_tagged(n, None)
+    }
+
+    pub fn count_n_tagged(&self, n: usize, tags: TagsRef<'static>) {
+        if let Some(counter) = self.event_counters.read().get(&tags) {
+            counter.fetch_add(n, Ordering::Relaxed);
+            return;
+        }
+
+        // Must recheck entry in case it was made while waiting for write lock
+        self.event_counters
+            .write()
+            .entry(tags.to_owned())
+            .or_insert_with(|| AtomicUsize::new(0))
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     /// This will count an event.
     pub fn count(&self) {
-        self.count_n(1);
+        self.count_n_tagged(1, None);
     }
 
     /// Grab the event count and reset to zero.
-    pub fn report(&self) -> EventReport {
-        EventReport {
-            name: self.name,
-            event_count: self.event_counter.swap(0, Ordering::Relaxed),
-        }
+    pub fn report(&self) -> Vec<EventReport> {
+        self.event_counters
+            .read()
+            .iter()
+            .map(|(tags, counter)| EventReport {
+                name: self.name,
+                event_count: counter.swap(0, Ordering::Relaxed),
+                tags: tags.to_owned(),
+            })
+            .collect()
     }
 }
 
@@ -250,9 +271,11 @@ impl HistogramReport {
     }
 }
 
+#[derive(PartialEq, Eq, Debug)]
 pub struct EventReport {
     name: &'static str,
     event_count: usize,
+    tags: TagsRef<'static>,
 }
 
 impl EventReport {
@@ -262,6 +285,10 @@ impl EventReport {
 
     pub fn event_count(&self) -> usize {
         self.event_count
+    }
+
+    pub fn tags(&self) -> TagsRef<'static> {
+        self.tags
     }
 }
 
@@ -288,6 +315,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use mock_instant::MockClock;
+    use once_cell::sync::Lazy;
 
     use super::*;
     use crate::{test_utils::assert_histogram_eq, timing_options::Precision};
@@ -728,15 +756,75 @@ mod tests {
 
         event_reporter.count();
 
-        let report = event_reporter.report();
+        let reports = event_reporter.report();
+        assert_eq!(1, reports.len());
+
+        let report = reports.first().unwrap();
         assert_eq!("event", report.name());
         assert_eq!(1, report.event_count());
 
         event_reporter.count();
         event_reporter.count_n(3);
 
-        let report = event_reporter.report();
+        let reports = event_reporter.report();
+        assert_eq!(1, reports.len());
+        let report = reports.first().unwrap();
         assert_eq!("event", report.name());
         assert_eq!(4, report.event_count());
+
+        static TAGS_SET: Lazy<Vec<Vec<&'static str>>> = Lazy::new(|| {
+            vec![
+                vec!["size:big", "color:red"],
+                vec!["size:medium", "color:blue"],
+                vec!["size:small", "color:green"],
+            ]
+        });
+
+        event_reporter.count_n_tagged(1, TAGS_SET.first());
+        let reports = event_reporter.report();
+        assert_eq!(2, reports.len(), "expect 1 tagged and 1 no-tag report");
+        assert!(reports.contains(&EventReport {
+            name: "event",
+            event_count: 1,
+            tags: TAGS_SET.first(),
+        }));
+
+        assert!(reports.contains(&EventReport {
+            name: "event",
+            event_count: 0,
+            tags: None,
+        }));
+
+        event_reporter.count_n_tagged(1, TAGS_SET.first());
+        event_reporter.count_n_tagged(1, TAGS_SET.get(1));
+        event_reporter.count_n_tagged(1, TAGS_SET.get(2));
+        event_reporter.count_n_tagged(1, None);
+        event_reporter.count_n_tagged(1, TAGS_SET.first());
+        event_reporter.count_n_tagged(2, TAGS_SET.get(1));
+        event_reporter.count_n_tagged(3, TAGS_SET.get(2));
+        event_reporter.count_n(4);
+
+        let reports = event_reporter.report();
+        assert_eq!(4, reports.len(), "expect 3 tagged and 1 no-tag report");
+        assert!(reports.contains(&EventReport {
+            name: "event",
+            event_count: 2,
+            tags: TAGS_SET.first(),
+        }));
+        assert!(reports.contains(&EventReport {
+            name: "event",
+            event_count: 3,
+            tags: TAGS_SET.get(1),
+        }));
+        assert!(reports.contains(&EventReport {
+            name: "event",
+            event_count: 4,
+            tags: TAGS_SET.get(2),
+        }));
+        assert!(reports.contains(&EventReport {
+            name: "event",
+            event_count: 5,
+            tags: None,
+        }));
     }
 }

@@ -33,6 +33,7 @@ use tokio::{
 
 // Load the config and treat it as a read-only static value.
 static CONFIG: Lazy<config::Config> = Lazy::new(config::Config::parse);
+const MONITOR_DEADLOCK_INTERVAL: Duration = Duration::from_secs(5);
 
 #[rustfmt::skip]
 fn print_config(config: &'static config::Config) {
@@ -113,6 +114,10 @@ fn main() -> Result<()> {
     // Parse the command line arguments.
     let config = &CONFIG;
     print_config(config);
+
+    let (deadlock_monitor_ender_tx, deadlock_monitor_ender_rx) = std::sync::mpsc::channel();
+    let deadlock_monitor_handle =
+        metrics::monitor_deadlocks(MONITOR_DEADLOCK_INTERVAL.into(), deadlock_monitor_ender_rx);
 
     // Create a threaded tokio runtime. By default, starts a worker thread
     // for each core on the system.
@@ -215,6 +220,7 @@ fn main() -> Result<()> {
         let _ = cleaner_ender_tx.send(());
         let _ = metrics_ender_tx.send(());
         let _ = identity_fetcher_ender_tx.send(());
+        let _ = deadlock_monitor_ender_tx.send(());
 
         // Wait for the servers to exit.
         let _ = tokio::join!(
@@ -224,6 +230,7 @@ fn main() -> Result<()> {
             metrics_handle,
             fetcher_handle
         );
+        let _ = deadlock_monitor_handle.join();
     });
 
     info!("shutting down the runtime");

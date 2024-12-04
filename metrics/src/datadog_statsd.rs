@@ -15,7 +15,8 @@ use std::{
 
 use log::*;
 
-pub type Tags<'a> = Option<&'a Vec<&'a str>>;
+pub type TagsRef<'a> = Option<&'a Vec<&'a str>>;
+pub type Tags<'a> = Option<Vec<&'a str>>;
 
 #[derive(Debug)]
 pub enum StatsdError {
@@ -178,39 +179,39 @@ impl<E: EventSink> Client<E> {
     /// Increment a metric by 1
     ///
     /// This modifies a counter with an effective sampling rate of 1.0.
-    pub fn incr(&mut self, metric: &str, tags: &Option<Vec<&str>>) {
+    pub fn incr(&mut self, metric: &str, tags: TagsRef) {
         self.count(metric, 1.0, tags);
     }
 
     /// Decrement a metric by 1
     ///
     /// This modifies a counter with an effective sampling rate of 1.0.
-    pub fn decr(&mut self, metric: &str, tags: &Option<Vec<&str>>) {
+    pub fn decr(&mut self, metric: &str, tags: TagsRef) {
         self.count(metric, -1.0, tags);
     }
 
     /// Modify a counter by `value`.
     ///
     /// Will increment or decrement a counter by `value` with a sampling rate of 1.0.
-    pub fn count(&mut self, metric: &str, value: f64, tags: &Option<Vec<&str>>) {
+    pub fn count(&mut self, metric: &str, value: f64, tags: TagsRef) {
         let data = self.prepare_with_tags(format!("{}:{}|c", metric, value), tags);
         self.send(data);
     }
 
     /// Set a gauge value.
-    pub fn gauge(&mut self, metric: &str, value: f64, tags: &Option<Vec<&str>>) {
+    pub fn gauge(&mut self, metric: &str, value: f64, tags: TagsRef) {
         let data = self.prepare_with_tags(format!("{}:{}|g", metric, value), tags);
         self.send(data);
     }
 
     /// Send a timer value.
-    pub fn timer(&mut self, metric: &str, milliseconds: f64, tags: &Option<Vec<&str>>) {
+    pub fn timer(&mut self, metric: &str, milliseconds: f64, tags: TagsRef) {
         let data = self.prepare_with_tags(format!("{}:{}|ms", metric, milliseconds), tags);
         self.send(data);
     }
 
     /// Send a timer value at a specified sample rate in 0..1 range.
-    pub fn timer_at_rate(&mut self, metric: &str, milliseconds: f64, rate: f64, tags: Tags) {
+    pub fn timer_at_rate(&mut self, metric: &str, milliseconds: f64, rate: f64, tags: TagsRef) {
         let data =
             self.prepare_with_tags_ref(format!("{}:{}|ms|@{}", metric, milliseconds, rate), tags);
         self.send(data);
@@ -224,15 +225,15 @@ impl<E: EventSink> Client<E> {
         }
     }
 
-    fn prepare_with_tags<T: AsRef<str>>(&self, data: T, tags: &Option<Vec<&str>>) -> String {
+    fn prepare_with_tags<T: AsRef<str>>(&self, data: T, tags: TagsRef) -> String {
         self.append_tags(self.prepare(data), tags)
     }
 
-    fn prepare_with_tags_ref<T: AsRef<str>>(&self, data: T, tags: Tags) -> String {
+    fn prepare_with_tags_ref<T: AsRef<str>>(&self, data: T, tags: TagsRef) -> String {
         self.append_tags_ref(self.prepare(data), tags)
     }
 
-    fn append_tags_ref<T: AsRef<str>>(&self, data: T, tags: Tags) -> String {
+    fn append_tags_ref<T: AsRef<str>>(&self, data: T, tags: TagsRef) -> String {
         if self.constant_tags.is_empty() && tags.is_none() {
             data.as_ref().to_string()
         } else {
@@ -247,7 +248,7 @@ impl<E: EventSink> Client<E> {
         }
     }
 
-    fn append_tags<T: AsRef<str>>(&self, data: T, tags: &Option<Vec<&str>>) -> String {
+    fn append_tags<T: AsRef<str>>(&self, data: T, tags: TagsRef) -> String {
         if self.constant_tags.is_empty() && tags.is_none() {
             data.as_ref().to_string()
         } else {
@@ -290,37 +291,31 @@ impl<E: EventSink> Client<E> {
     }
 
     /// Send a histogram value.
-    pub fn histogram(&mut self, metric: &str, value: f64, tags: &Option<Vec<&str>>) {
+    pub fn histogram(&mut self, metric: &str, value: f64, tags: TagsRef) {
         let data = self.prepare_with_tags(format!("{}:{}|h", metric, value), tags);
         self.send(data);
     }
 
     /// Send a histogram value at a specified sample rate in 0..1 range.
-    pub fn histogram_at_rate(&mut self, metric: &str, value: f64, rate: f64, tags: Tags) {
+    pub fn histogram_at_rate(&mut self, metric: &str, value: f64, rate: f64, tags: TagsRef) {
         let data = self.prepare_with_tags_ref(format!("{}:{}|h|@{}", metric, value, rate), tags);
         self.send(data);
     }
 
     /// Send a distribution value.
-    pub fn distribution(&mut self, metric: &str, value: f64, tags: &Option<Vec<&str>>) {
+    pub fn distribution(&mut self, metric: &str, value: f64, tags: TagsRef) {
         let data = self.prepare_with_tags(format!("{}.d:{}|d", metric, value), tags);
         self.send(data);
     }
 
     /// Send a distribution value at a specified sample rate in 0..1 range.
-    pub fn distribution_at_rate(&mut self, metric: &str, value: f64, rate: f64, tags: Tags) {
+    pub fn distribution_at_rate(&mut self, metric: &str, value: f64, rate: f64, tags: TagsRef) {
         let data = self.prepare_with_tags_ref(format!("{}.d:{}|d|@{}", metric, value, rate), tags);
         self.send(data);
     }
 
     /// Send a event.
-    pub fn event(
-        &mut self,
-        title: &str,
-        text: &str,
-        alert_type: AlertType,
-        tags: &Option<Vec<&str>>,
-    ) {
+    pub fn event(&mut self, title: &str, text: &str, alert_type: AlertType, tags: TagsRef) {
         let mut d = vec![];
         d.push(format!("_e{{{},{}}}:{}", title.len(), text.len(), title));
         d.push(text.to_string());
@@ -336,7 +331,7 @@ impl<E: EventSink> Client<E> {
         &mut self,
         service_check_name: &str,
         status: ServiceCheckStatus,
-        tags: &Option<Vec<&str>>,
+        tags: TagsRef,
     ) {
         let mut d = vec![];
         let status_code = (status as u32).to_string();
@@ -422,7 +417,7 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", None);
 
-        client.gauge("metric", 9.1, &None);
+        client.gauge("metric", 9.1, None);
 
         assert_eq!("myapp.metric:9.1|g", server.read_packet());
         server.expect_no_more_packets();
@@ -433,7 +428,7 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", Some(vec!["tag1", "tag2:value"]));
 
-        client.gauge("metric", 9.1, &Some(vec!["tag3", "tag4:value"]));
+        client.gauge("metric", 9.1, Some(vec!["tag3", "tag4:value"]).as_ref());
 
         assert_eq!(
             "myapp.metric:9.1|g|#tag1,tag2:value,tag3,tag4:value",
@@ -447,7 +442,7 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "", None);
 
-        client.gauge("metric", 9.1, &None);
+        client.gauge("metric", 9.1, None);
 
         assert_eq!("metric:9.1|g", server.read_packet());
         server.expect_no_more_packets();
@@ -458,7 +453,7 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", None);
 
-        client.incr("metric", &None);
+        client.incr("metric", None);
 
         assert_eq!("myapp.metric:1|c", server.read_packet());
         server.expect_no_more_packets();
@@ -469,7 +464,7 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", None);
 
-        client.decr("metric", &None);
+        client.decr("metric", None);
 
         assert_eq!("myapp.metric:-1|c", server.read_packet());
         server.expect_no_more_packets();
@@ -480,7 +475,7 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", None);
 
-        client.count("metric", 12.2, &None);
+        client.count("metric", 12.2, None);
 
         assert_eq!("myapp.metric:12.2|c", server.read_packet());
         server.expect_no_more_packets();
@@ -491,7 +486,7 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", Some(vec!["tag1", "tag2:value"]));
 
-        client.count("metric", 12.2, &Some(vec!["tag3", "tag4:value"]));
+        client.count("metric", 12.2, Some(vec!["tag3", "tag4:value"]).as_ref());
 
         assert_eq!(
             "myapp.metric:12.2|c|#tag1,tag2:value,tag3,tag4:value",
@@ -505,7 +500,7 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", None);
 
-        client.timer("metric", 21.39, &None);
+        client.timer("metric", 21.39, None);
 
         assert_eq!("myapp.metric:21.39|ms", server.read_packet());
         server.expect_no_more_packets();
@@ -528,7 +523,7 @@ mod test {
         let mut client = Client::new(server.new_port(), "myapp", None);
 
         // without tags
-        client.histogram("metric", 9.1, &None);
+        client.histogram("metric", 9.1, None);
         assert_eq!("myapp.metric:9.1|h", server.read_packet());
         server.expect_no_more_packets();
 
@@ -551,7 +546,7 @@ mod test {
         );
 
         // without tags
-        client.histogram("metric", 9.1, &None);
+        client.histogram("metric", 9.1, None);
         assert_eq!(
             "myapp.metric:9.1|h|#tag1common,tag2common:test",
             server.read_packet()
@@ -559,8 +554,8 @@ mod test {
         server.expect_no_more_packets();
 
         // with tags
-        let tags = &Some(vec!["tag1", "tag2:test"]);
-        client.histogram("metric", 9.1, tags);
+        let tags = Some(vec!["tag1", "tag2:test"]);
+        client.histogram("metric", 9.1, tags.as_ref());
         assert_eq!(
             "myapp.metric:9.1|h|#tag1common,tag2common:test,tag1,tag2:test",
             server.read_packet()
@@ -582,7 +577,7 @@ mod test {
         let mut client = Client::new(server.new_port(), "myapp", None);
 
         // without tags
-        client.distribution("metric", 9.1, &None);
+        client.distribution("metric", 9.1, None);
         assert_eq!("myapp.metric.d:9.1|d", server.read_packet());
         server.expect_no_more_packets();
 
@@ -604,7 +599,7 @@ mod test {
             "Title Test",
             "Text ABC",
             AlertType::Error,
-            &Some(vec!["tag1", "tag2:test"]),
+            Some(vec!["tag1", "tag2:test"]).as_ref(),
         );
 
         assert_eq!(
@@ -622,7 +617,7 @@ mod test {
         client.service_check(
             "Service.check.name",
             ServiceCheckStatus::Critical,
-            &Some(vec!["tag1", "tag2:test"]),
+            Some(vec!["tag1", "tag2:test"]).as_ref(),
         );
 
         assert_eq!(
@@ -637,7 +632,7 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", None);
         let mut pipeline = client.pipeline();
-        pipeline.gauge("metric", 9.1, &None);
+        pipeline.gauge("metric", 9.1, None);
         drop(pipeline);
 
         assert_eq!("myapp.metric:9.1|g", server.read_packet());
@@ -649,7 +644,7 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", None);
         let mut pipeline = client.pipeline();
-        pipeline.histogram("metric", 9.1, &None);
+        pipeline.histogram("metric", 9.1, None);
         drop(pipeline);
 
         assert_eq!("myapp.metric:9.1|h", server.read_packet());
@@ -661,8 +656,8 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", None);
         let mut pipeline = client.pipeline();
-        pipeline.gauge("metric", 9.1, &None);
-        pipeline.count("metric", 12.2, &None);
+        pipeline.gauge("metric", 9.1, None);
+        pipeline.count("metric", 12.2, None);
         drop(pipeline);
 
         assert_eq!(
@@ -677,8 +672,8 @@ mod test {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", None);
         let mut pipeline = client.pipeline_client_of_size(20);
-        pipeline.gauge("metric", 9.1, &None);
-        pipeline.count("metric", 12.2, &None);
+        pipeline.gauge("metric", 9.1, None);
+        pipeline.count("metric", 12.2, None);
         drop(pipeline);
 
         assert_eq!("myapp.metric:9.1|g", server.read_packet());
@@ -692,13 +687,13 @@ mod test {
         let mut client = Client::new(server.new_port(), "myapp", None);
         let mut pipeline = client.pipeline();
 
-        pipeline.gauge("load", 9.0, &None);
-        pipeline.count("customers", 7.0, &None);
+        pipeline.gauge("load", 9.0, None);
+        pipeline.count("customers", 7.0, None);
         drop(pipeline);
 
         // Should still be able to send metrics
         // with the client.
-        client.count("customers", 6.0, &None);
+        client.count("customers", 6.0, None);
 
         assert_eq!("myapp.load:9|g\nmyapp.customers:7|c", server.read_packet());
         assert_eq!("myapp.customers:6|c", server.read_packet());

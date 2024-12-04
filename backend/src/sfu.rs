@@ -19,7 +19,7 @@ use calling_common::{
 use hkdf::Hkdf;
 use log::*;
 use metrics::{
-    metric_config::{Histogram, Tags, Timer},
+    metric_config::{Histogram, TagsRef, Timer},
     *,
 };
 use once_cell::sync::Lazy;
@@ -164,7 +164,7 @@ pub struct HandleOutput {
 }
 
 pub struct SfuStats {
-    pub histograms: HashMap<&'static str, HashMap<Tags<'static>, Histogram<usize>>>,
+    pub histograms: HashMap<&'static str, HashMap<TagsRef<'static>, Histogram<usize>>>,
     pub values: HashMap<&'static str, f32>,
 }
 
@@ -268,10 +268,10 @@ impl Sfu {
         let mut clients_in_calls_above_one = 0;
         let mut call_size = Histogram::default();
         let mut call_size_squared = Histogram::default();
-        let mut call_age_minutes: HashMap<Tags, Histogram<_>> = HashMap::new();
+        let mut call_age_minutes: HashMap<TagsRef, Histogram<_>> = HashMap::new();
         let mut call_size_above_one = Histogram::default();
         let mut call_size_squared_above_one = Histogram::default();
-        let mut call_age_minutes_above_one: HashMap<Tags, Histogram<_>> = HashMap::new();
+        let mut call_age_minutes_above_one: HashMap<TagsRef, Histogram<_>> = HashMap::new();
         let mut calls_persisting_approved_users = 0;
 
         let mut call_tags_map = HashMap::new();
@@ -340,10 +340,10 @@ impl Sfu {
 
         let mut remembered_packet_count = Histogram::default();
         let mut remembered_packet_bytes = Histogram::default();
-        let mut outgoing_queue_size: HashMap<Tags, Histogram<_>> = HashMap::new();
-        let mut outgoing_queue_delay_ms: HashMap<Tags, Histogram<_>> = HashMap::new();
-        let mut client_rtt_ms: HashMap<Tags, Histogram<_>> = HashMap::new();
-        let mut connection_outgoing_data_rate: HashMap<Tags, Histogram<_>> = HashMap::new();
+        let mut outgoing_queue_size: HashMap<TagsRef, Histogram<_>> = HashMap::new();
+        let mut outgoing_queue_delay_ms: HashMap<TagsRef, Histogram<_>> = HashMap::new();
+        let mut client_rtt_ms: HashMap<TagsRef, Histogram<_>> = HashMap::new();
+        let mut connection_outgoing_data_rate: HashMap<TagsRef, Histogram<_>> = HashMap::new();
         let mut udp_v4_connections = 0;
         let mut udp_v6_connections = 0;
         let mut tcp_v4_connections = 0;

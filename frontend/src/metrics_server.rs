@@ -67,7 +67,7 @@ pub async fn start(frontend: Arc<Frontend>, shutdown_signal_rx: Receiver<()>) ->
                     let mut datadog = datadog.open_pipeline();
 
                     for (metric_name, value) in get_value_metrics() {
-                        datadog.gauge(metric_name, value as f64, &None);
+                        datadog.gauge(metric_name, value as f64, None);
                     }
 
                     let report = metrics!().report();
@@ -75,7 +75,7 @@ pub async fn start(frontend: Arc<Frontend>, shutdown_signal_rx: Receiver<()>) ->
                         datadog.send_timer_histogram(&report, &None);
                     }
                     for report in report.events {
-                        datadog.count(report.name(), report.event_count() as f64, &None);
+                        datadog.count(report.name(), report.event_count() as f64, None);
                     }
 
                     let mut api_metrics = frontend.api_metrics.lock();
@@ -86,7 +86,7 @@ pub async fn start(frontend: Arc<Frontend>, shutdown_signal_rx: Receiver<()>) ->
                     }
 
                     for (name, value) in &mut api_metrics.counts {
-                        datadog.count(name, *value as f64, &None);
+                        datadog.count(name, *value as f64, None);
                         *value = 0;
                     }
                 }

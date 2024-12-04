@@ -111,7 +111,7 @@ impl Metrics {
         let mut events = registry
             .event_reporters
             .iter()
-            .map(|reporter| reporter.report())
+            .flat_map(|reporter| reporter.report())
             .collect::<Vec<_>>();
         events.sort_unstable_by_key(|report| report.name());
 
@@ -203,6 +203,9 @@ macro_rules! event {
     };
     ($name:expr, $count:expr) => {
         $crate::event_reporter!($name).count_n($count)
+    };
+    ($name:expr, $count:expr, $tags:expr) => {
+        $crate::event_reporter!($name).count_n_tagged($count, &tags)
     };
 }
 
