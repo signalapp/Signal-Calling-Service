@@ -7,6 +7,7 @@ use anyhow::Result;
 use calling_common::Duration;
 use futures::future::join_all;
 use log::*;
+use metrics::{event, metric_config::Timer, start_timer_us};
 use parking_lot::Mutex;
 use rand::{thread_rng, Rng};
 use std::sync::Arc;
@@ -16,7 +17,6 @@ use crate::storage::CallRecordKey;
 use crate::{
     backend::{self, Backend, BackendError, BackendHttpClient},
     config,
-    metrics::Timer,
     storage::{CallRecord, DynamoDb, Storage},
 };
 

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 use log::*;
+use metrics::event;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::{sync::mpsc, sync::oneshot::Receiver};

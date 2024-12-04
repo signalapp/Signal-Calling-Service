@@ -9,6 +9,7 @@ use std::time::Duration;
 use calling_common::RoomId;
 use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 use log::*;
+use metrics::*;
 use reqwest::{StatusCode, Url};
 use serde::Serialize;
 use tokio::{runtime::Handle, task::JoinHandle};

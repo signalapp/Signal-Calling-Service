@@ -15,6 +15,7 @@ use base64::Engine;
 use calling_common::RoomId;
 use hex::FromHex;
 use hmac::{Hmac, Mac};
+use metrics::event;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 

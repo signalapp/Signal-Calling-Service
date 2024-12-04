@@ -14,6 +14,7 @@ use axum_extra::{
 use bincode::Options;
 use http::StatusCode;
 use log::*;
+use metrics::event;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use zkgroup::call_links::{

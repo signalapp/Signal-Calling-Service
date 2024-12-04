@@ -16,6 +16,7 @@ use calling_common::CallType;
 use hex::ToHex;
 use http::StatusCode;
 use log::*;
+use metrics::{metric_config::Timer, start_timer_us, time_scope_us};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use subtle::ConstantTimeEq;
@@ -25,7 +26,6 @@ use crate::{
     api::call_links::{self, verify_auth_credential_against_zkparams, CallLinkState, RoomId},
     authenticator::UserAuthorization,
     frontend::{Frontend, JoinRequestWrapper, UserId},
-    metrics::Timer,
     storage::{self, CallLinkRestrictions},
 };
 

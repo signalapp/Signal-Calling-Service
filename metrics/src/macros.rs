@@ -11,17 +11,17 @@ use std::{
     },
 };
 
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
-use crate::metrics::{
-    EventCountReporter, EventReport, HistogramReport, NumericValueReporter, TimingOptions,
+use crate::{
+    reporter::{EventCountReporter, EventReport, HistogramReport, NumericValueReporter},
+    timing_options::TimingOptions,
 };
 
 /// A global structure that contains a map to each of the registered Timing Reporters.
 ///
 /// The mutex lock is only used once to register a new reporter, and then once by the report
-/// generation.  
+/// generation.
 pub struct Metrics {
     enabled: AtomicBool,
     registry: Mutex<Registry>,
@@ -39,10 +39,8 @@ pub struct Report {
     pub events: Vec<EventReport>,
 }
 
-pub static __METRICS: Lazy<Metrics> = Lazy::new(Metrics::new_enabled);
-
 impl Metrics {
-    fn new_enabled() -> Metrics {
+    pub(crate) fn new_enabled() -> Metrics {
         Metrics {
             enabled: AtomicBool::new(true),
             registry: Default::default(),
@@ -134,9 +132,9 @@ impl Metrics {
 macro_rules! reporter {
     ($name:expr, $options:expr) => {{
         static __REPORTER: once_cell::sync::Lazy<
-            std::sync::Arc<$crate::metrics::NumericValueReporter>,
+            std::sync::Arc<$crate::metric_config::NumericValueReporter>,
         > = once_cell::sync::Lazy::new(|| {
-            $crate::metrics::__METRICS.create_and_register_timer($name, $options)
+            $crate::__METRICS.create_and_register_timer($name, $options)
         });
 
         &__REPORTER
@@ -147,10 +145,8 @@ macro_rules! reporter {
 macro_rules! event_reporter {
     ($name:expr) => {{
         static __REPORTER: once_cell::sync::Lazy<
-            std::sync::Arc<$crate::metrics::EventCountReporter>,
-        > = once_cell::sync::Lazy::new(|| {
-            $crate::metrics::__METRICS.create_and_register_event($name)
-        });
+            std::sync::Arc<$crate::metric_config::EventCountReporter>,
+        > = once_cell::sync::Lazy::new(|| $crate::__METRICS.create_and_register_event($name));
 
         &__REPORTER
     }};
@@ -160,10 +156,10 @@ macro_rules! event_reporter {
 #[macro_export]
 macro_rules! start_timer {
     ($name:expr) => {
-        reporter!($name, Default::default()).start_timer()
+        $crate::reporter!($name, Default::default()).start_timer()
     };
     ($name:expr, $options:expr) => {
-        reporter!($name, $options).start_timer()
+        $crate::reporter!($name, $options).start_timer()
     };
 }
 
@@ -171,10 +167,10 @@ macro_rules! start_timer {
 #[macro_export]
 macro_rules! time_scope {
     ($name:expr) => {
-        let _t = reporter!($name, Default::default()).start_timer();
+        let _t = $crate::reporter!($name, Default::default()).start_timer();
     };
     ($name:expr, $options:expr) => {
-        let _t = reporter!($name, $options).start_timer();
+        let _t = $crate::reporter!($name, $options).start_timer();
     };
 }
 
@@ -182,9 +178,9 @@ macro_rules! time_scope {
 #[macro_export]
 macro_rules! time_scope_us {
     ($name:expr) => {
-        time_scope!(
+        $crate::time_scope!(
             $name,
-            $crate::metrics::TimingOptions::microsecond_1000_per_minute()
+            $crate::metric_config::TimingOptions::microsecond_1000_per_minute()
         );
     };
 }
@@ -193,9 +189,9 @@ macro_rules! time_scope_us {
 #[macro_export]
 macro_rules! start_timer_us {
     ($name:expr) => {{
-        start_timer!(
+        $crate::start_timer!(
             $name,
-            $crate::metrics::TimingOptions::microsecond_1000_per_minute()
+            $crate::metric_config::TimingOptions::microsecond_1000_per_minute()
         )
     }};
 }
@@ -203,17 +199,17 @@ macro_rules! start_timer_us {
 #[macro_export]
 macro_rules! event {
     ($name:expr) => {
-        event_reporter!($name).count()
+        $crate::event_reporter!($name).count()
     };
     ($name:expr, $count:expr) => {
-        event_reporter!($name).count_n($count)
+        $crate::event_reporter!($name).count_n($count)
     };
 }
 
 #[macro_export]
 macro_rules! metrics {
     () => {{
-        &$crate::metrics::__METRICS
+        &$crate::__METRICS
     }};
 }
 
@@ -221,10 +217,10 @@ macro_rules! metrics {
 #[macro_export]
 macro_rules! sampling_histogram {
     ($name:expr, $sampler:expr) => {
-        reporter!($name, Default::default()).push($sampler)
+        $crate::reporter!($name, Default::default()).push($sampler)
     };
     ($name:expr, $options:expr, $sampler:expr) => {
-        reporter!($name, $options).push($sampler)
+        $crate::reporter!($name, $options).push($sampler)
     };
 }
 
@@ -234,10 +230,7 @@ mod tests {
 
     use mock_instant::MockClock;
 
-    use crate::{
-        metrics::{test_utils::assert_histogram_eq, Metrics, Timer},
-        *,
-    };
+    use crate::{reporter::Timer, test_utils::assert_histogram_eq, *};
 
     #[test]
     #[should_panic(expected = "The metric name \"A\" has been used elsewhere.")]

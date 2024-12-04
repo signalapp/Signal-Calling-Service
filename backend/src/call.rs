@@ -35,6 +35,7 @@ use crate::{
 
 mod approval_persistence;
 use approval_persistence::ApprovedUsers;
+use metrics::*;
 
 pub const CLIENT_SERVER_DATA_SSRC: rtp::Ssrc = 1;
 pub const CLIENT_SERVER_DATA_PAYLOAD_TYPE: rtp::PayloadType = 101;

@@ -26,6 +26,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use http::{header, Method, StatusCode};
 use log::*;
+use metrics::{event, metric_config::Histogram};
 use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
 use zkgroup::call_links::CreateCallLinkCredentialPresentation;
@@ -34,7 +35,6 @@ use crate::{
     api::call_links::RoomId,
     authenticator::{Authenticator, AuthenticatorError, GroupAuthToken, ParsedHeader::*},
     frontend::{Frontend, FrontendError},
-    metrics::histogram::Histogram,
 };
 
 #[derive(Default)]

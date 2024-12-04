@@ -10,6 +10,7 @@ members = [
     "common",
     "docker/bootstrap",
     "frontend",
+    "metrics",
 ]
 
 [workspace.package]

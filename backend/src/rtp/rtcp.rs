@@ -13,6 +13,7 @@ use calling_common::{
     Instant, Writable, Writer, U24,
 };
 use log::*;
+use metrics::event;
 use std::{
     convert::TryFrom,
     ops::{Range, RangeInclusive},

@@ -18,6 +18,10 @@ use calling_common::{
 };
 use hkdf::Hkdf;
 use log::*;
+use metrics::{
+    metric_config::{Histogram, Tags, Timer},
+    *,
+};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rand::rngs::OsRng;
@@ -32,7 +36,6 @@ use crate::{
     connection::{self, AddressType, Connection, ConnectionRates, HandleRtcpResult, PacketToSend},
     googcc,
     ice::{self, BindingRequest},
-    metrics::{Histogram, Tags, Timer},
     pacer,
     packet_server::{PacketServerState, SocketLocator},
     region::{Region, RegionRelation},

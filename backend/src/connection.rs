@@ -5,6 +5,7 @@
 
 use calling_common::{DataRate, DataRateTracker, DataSize, Duration, Instant};
 use log::*;
+use metrics::event;
 use thiserror::Error;
 
 use crate::{

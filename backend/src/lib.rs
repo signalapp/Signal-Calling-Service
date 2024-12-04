@@ -3,9 +3,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-#[macro_use]
-pub mod metrics;
-
 pub mod audio;
 pub mod call;
 pub mod call_lifecycle;

@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-#[macro_use]
-pub mod metrics;
+pub mod metrics_server;
 
 pub mod api;
 pub mod authenticator;

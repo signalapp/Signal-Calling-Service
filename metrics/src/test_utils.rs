@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Signal Messenger, LLC
+// Copyright 2021 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
@@ -7,7 +7,7 @@
 
 use std::fmt::Debug;
 
-use crate::metrics::Histogram;
+use crate::histogram::Histogram;
 
 /// Compares the contents of a hash map with an expected vector of Key-Value pairs.
 pub fn assert_map_eq<K, V>(actual: impl Iterator<Item = (K, V)>, mut expected: Vec<(K, V)>)

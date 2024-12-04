@@ -17,7 +17,7 @@ use calling_frontend::{
     cleaner, config,
     frontend::Frontend,
     frontend::FrontendIdGenerator,
-    internal_api, metrics,
+    internal_api, metrics_server,
     storage::{DynamoDb, IdentityFetcher},
 };
 use clap::Parser;
@@ -193,7 +193,7 @@ fn main() -> Result<()> {
 
         // Start the metrics server.
         let metrics_handle = tokio::spawn(async move {
-            let _ = metrics::start(frontend_clone_for_metrics, metrics_ender_rx).await;
+            let _ = metrics_server::start(frontend_clone_for_metrics, metrics_ender_rx).await;
             let _ = signal_canceller_tx_clone_for_metrics.send(()).await;
         });
 

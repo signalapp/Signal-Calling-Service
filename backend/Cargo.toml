@@ -14,6 +14,7 @@ license = "AGPL-3.0-only"
 [dependencies]
 mrp = { git = "https://github.com/signalapp/ringrtc", tag = "v2.43.0" }
 calling_common = { path = "../common" }
+metrics = { path = "../metrics" }
 
 # For error handling
 anyhow = "1.0.86"
@@ -59,11 +60,9 @@ crc = "3.2.1"
 hmac = "0.12.1"
 sha-1 = "0.10.1"
 
-# For metrics
-rand = "0.8.5"
-
 # For SRTP key derivation using DHE
 hkdf = "0.12.4"
+rand = "0.8.5"
 rand_core = { version = "0.6.4", features = [] }
 x25519-dalek = { version = "2.0.1" }
 
@@ -100,8 +99,6 @@ http = "1.1.0"
 hex-literal = "0.4.1"
 unzip3 = "1.0.0"
 
-# For simulating passage of time in timing tests
-mock_instant = { version = "0.3.2" }
 tokio = { version = "1.38.0", features = ["test-util"] }
 
 # For matching WebRTC's randomness

@@ -44,6 +44,10 @@ impl<T> Histogram<T> {
     pub fn iter(&self) -> impl Iterator<Item = (&T, &usize)> {
         self.counts_by_value.iter()
     }
+
+    pub fn clear(&mut self) {
+        self.counts_by_value.clear();
+    }
 }
 
 impl<T> Default for Histogram<T> {
@@ -65,7 +69,7 @@ impl<A: Hash + Eq + Copy> FromIterator<A> for Histogram<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::test_utils::assert_histogram_eq;
+    use crate::test_utils::assert_histogram_eq;
 
     #[test]
     fn collect_i32_values_into_histogram() {

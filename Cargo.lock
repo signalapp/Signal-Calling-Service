@@ -807,7 +807,7 @@ dependencies = [
  "http 1.1.0",
  "hyper 1.4.1",
  "log",
- "mock_instant",
+ "metrics",
  "mrp",
  "nix 0.26.4",
  "num_cpus",
@@ -885,8 +885,8 @@ dependencies = [
  "lazy_static",
  "libsignal-core",
  "log",
+ "metrics",
  "mime",
- "mock_instant",
  "mockall",
  "once_cell",
  "parking_lot",
@@ -1993,6 +1993,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5de893c32cde5f383baa4c04c5d6dbdd735cfd4a794b0debdb2bb1b421da5ff4"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "metrics"
+version = "100.0.0"
+dependencies = [
+ "log",
+ "mock_instant",
+ "once_cell",
+ "parking_lot",
+ "rand",
 ]
 
 [[package]]

@@ -24,6 +24,7 @@ use anyhow::Result;
 use byteorder::{BigEndian, ByteOrder};
 use calling_common::{try_scoped, Duration, Instant};
 use log::*;
+use metrics::{metric_config::TimingOptions, *};
 use nix::{
     errno::Errno,
     sys::{epoll::*, timerfd::*},
@@ -35,7 +36,6 @@ use unique_id::sequence::SequenceGenerator;
 use unique_id::Generator;
 
 use crate::{
-    metrics::TimingOptions,
     packet_server::{self, SocketLocator, TimerHeap, TimerHeapNextResult},
     sfu::{self, HandleOutput, Sfu, SfuStats},
 };

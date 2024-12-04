@@ -17,6 +17,7 @@ use aws_smithy_types::{retry::RetryConfigBuilder, timeout::TimeoutConfig, Blob};
 use aws_types::region::Region;
 use calling_common::{Duration, RoomId};
 use log::*;
+use metrics::{metric_config::Timer, *};
 use serde::{Deserialize, Serialize};
 use serde_dynamo::{from_item, to_item, Item};
 use serde_with::{ser::SerializeAsWrap, serde_as, Bytes};
@@ -29,7 +30,7 @@ use std::{collections::HashMap, path::PathBuf, time::SystemTime};
 #[cfg(test)]
 use mockall::{automock, predicate::*};
 
-use crate::{config, frontend::UserId, metrics::Timer};
+use crate::{config, frontend::UserId};
 
 const ROOM_ID_KEY: &str = "roomId";
 const RECORD_TYPE_KEY: &str = "recordType";

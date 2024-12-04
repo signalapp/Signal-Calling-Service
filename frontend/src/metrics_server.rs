@@ -3,21 +3,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-pub use datadog_statsd::*;
-pub use histogram::*;
-pub use macros::*;
-pub use reporter::*;
-pub use timing_options::*;
-
-#[macro_use]
-mod macros;
-
-mod datadog_statsd;
-pub mod histogram;
-mod reporter;
-mod test_utils;
-mod timing_options;
-
 use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -26,16 +11,16 @@ use std::{
 
 use anyhow::Result;
 use log::*;
+use metrics::{
+    metric_config::{Client as DatadogClient, *},
+    *,
+};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use psutil::process::Process;
 use tokio::sync::oneshot::Receiver;
 
-use crate::{
-    config::Config,
-    frontend::Frontend,
-    metrics::{Client as DatadogClient, Histogram},
-};
+use crate::{config::Config, frontend::Frontend};
 
 pub async fn start(frontend: Arc<Frontend>, shutdown_signal_rx: Receiver<()>) -> Result<()> {
     match Datadog::new(frontend.config) {
@@ -191,13 +176,13 @@ impl<'a> DatadogPipeline<'a> {
                 name,
                 *value as f64 * factor,
                 1f64 / (*frequency as f64),
-                tags,
+                tags.as_ref(),
             );
             self.distribution_at_rate(
                 name,
                 *value as f64 * factor,
                 1f64 / (*frequency as f64),
-                tags,
+                tags.as_ref(),
             );
         }
     }
@@ -210,8 +195,18 @@ impl<'a> DatadogPipeline<'a> {
     ) {
         for (value, frequency) in histogram.iter() {
             let value_seconds = *value as f64 / 1000000.0;
-            self.histogram_at_rate(metric_name, value_seconds, 1f64 / (*frequency as f64), tags);
-            self.distribution_at_rate(metric_name, value_seconds, 1f64 / (*frequency as f64), tags);
+            self.histogram_at_rate(
+                metric_name,
+                value_seconds,
+                1f64 / (*frequency as f64),
+                tags.as_ref(),
+            );
+            self.distribution_at_rate(
+                metric_name,
+                value_seconds,
+                1f64 / (*frequency as f64),
+                tags.as_ref(),
+            );
         }
     }
 }

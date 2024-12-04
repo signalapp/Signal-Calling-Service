@@ -1,0 +1,13 @@
+[package]
+name = "metrics"
+edition = "2021"
+version.workspace = true
+
+[dependencies]
+log = "0.4.22"
+once_cell = "1.19.0"
+parking_lot = "0.12.3"
+rand = "0.8.5"
+
+[dev-dependencies]
+mock_instant = { version = "0.3.2" }

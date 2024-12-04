@@ -16,6 +16,7 @@ use axum::{
 use axum_extra::TypedHeader;
 use http::StatusCode;
 use log::*;
+use metrics::{event, metric_config::Histogram};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
@@ -23,7 +24,6 @@ use tower::ServiceBuilder;
 use crate::{
     api::call_links::RoomId,
     frontend::Frontend,
-    metrics::histogram::Histogram,
     storage::{CallLinkUpdateError, CallRecordKey},
 };
 

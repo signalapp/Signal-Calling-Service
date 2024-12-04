@@ -13,6 +13,13 @@ use std::{
 use accounting_allocator::AccountingAlloc;
 use anyhow::Result;
 use log::*;
+use metrics::{
+    metric_config::{
+        Client as DatadogClient, Histogram, HistogramReport, PipelineSink, Precision, Tags,
+        UdpEventSink,
+    },
+    metrics, time_scope_us,
+};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use psutil::process::Process;
@@ -20,10 +27,6 @@ use tokio::sync::oneshot::Receiver;
 
 use crate::{
     config::{self, Config},
-    metrics::{
-        Client as DatadogClient, Histogram, HistogramReport, PipelineSink, Precision, Tags,
-        UdpEventSink,
-    },
     sfu::Sfu,
 };
 

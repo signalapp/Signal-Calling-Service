@@ -15,7 +15,10 @@ use std::{
 use mock_instant::Instant;
 use parking_lot::Mutex;
 
-use crate::metrics::{Histogram, Precision, TimingOptions};
+use crate::{
+    histogram::Histogram,
+    timing_options::{Precision, TimingOptions},
+};
 
 /// Represents a sampler for collecting histograms of values of any unit.
 /// e.g. they might be times, or packets sizes.
@@ -287,7 +290,7 @@ mod tests {
     use mock_instant::MockClock;
 
     use super::*;
-    use crate::metrics::{test_utils::assert_histogram_eq, Precision};
+    use crate::{test_utils::assert_histogram_eq, timing_options::Precision};
 
     #[test]
     fn push_a_value_sample() {
