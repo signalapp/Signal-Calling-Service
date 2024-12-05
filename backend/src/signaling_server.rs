@@ -47,7 +47,7 @@ use crate::{
     call, config, ice,
     middleware::log_response,
     region::Region,
-    sfu::{self, Sfu, UserId},
+    sfu::{self, Sfu, SfuError, UserId},
 };
 
 const SYSTEM_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
@@ -372,14 +372,18 @@ async fn join(
         }
         Err(err) => {
             error!("client failed to join call {}", err);
-            if err == sfu::SfuError::DuplicateDemuxIdDetected {
-                // Invalid argument because the demux_id is a duplicate.
-                Err((StatusCode::BAD_REQUEST, err.to_string()))
-            } else {
-                Err((
+            match err {
+                SfuError::DuplicateDemuxIdDetected => {
+                    Err((StatusCode::BAD_REQUEST, err.to_string()))
+                }
+                SfuError::TooManyClients => Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Too many clients".to_string(),
+                )),
+                _ => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("failed to add client to call {}", err),
-                ))
+                )),
             }
         }
     }

@@ -31,7 +31,7 @@ use crate::{
     config, ice,
     middleware::log_response,
     region::Region,
-    sfu::{self, Sfu},
+    sfu::{self, Sfu, SfuError},
 };
 
 use calling_common::{CallType, DemuxId};
@@ -387,7 +387,11 @@ async fn join_conference(
         }
         Err(err) => {
             error!("client failed to join call {}", err.to_string());
-            Ok((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response())
+            let status_code = match err {
+                SfuError::TooManyClients => StatusCode::PAYLOAD_TOO_LARGE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            Ok((status_code, err.to_string()).into_response())
         }
     }
 }

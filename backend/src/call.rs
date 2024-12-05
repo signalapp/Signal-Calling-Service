@@ -493,6 +493,10 @@ impl Call {
         self.clients.len()
     }
 
+    pub fn size_including_pending_calls(&self) -> usize {
+        self.clients.len() + self.pending_clients.len()
+    }
+
     pub fn size_bucket(&self) -> CallSizeBucket {
         CallSizeBucket::from(self.size())
     }

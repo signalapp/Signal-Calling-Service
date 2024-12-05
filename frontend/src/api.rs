@@ -48,6 +48,7 @@ impl From<FrontendError> for StatusCode {
     fn from(err: FrontendError) -> Self {
         match err {
             FrontendError::CallNotFound => StatusCode::NOT_FOUND,
+            FrontendError::TooManyClients => StatusCode::PAYLOAD_TOO_LARGE,
             FrontendError::NoPermissionToCreateCall => StatusCode::FORBIDDEN,
             FrontendError::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }

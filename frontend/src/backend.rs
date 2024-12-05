@@ -122,6 +122,8 @@ pub struct JoinResponse {
 pub enum BackendError {
     #[error("No such call exists")]
     CallNotFound,
+    #[error("Too many clients")]
+    TooManyClients,
     #[error(transparent)]
     UnexpectedError(#[from] anyhow::Error),
     #[error(transparent)]
@@ -324,6 +326,7 @@ impl Backend for BackendHttpClient {
             })?;
 
         match response.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => Err(BackendError::TooManyClients),
             StatusCode::OK => {
                 let join_response = response
                     .json()

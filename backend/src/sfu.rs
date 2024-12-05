@@ -70,6 +70,8 @@ pub enum SfuError {
     ConnectionError(connection::Error),
     #[error("call error: {0}")]
     CallError(call::Error),
+    #[error("too many clients")]
+    TooManyClients,
 }
 
 impl std::fmt::Debug for SfuError {
@@ -522,6 +524,7 @@ impl Sfu {
         let region_relation = self.get_region_relation(region);
 
         let active_speaker_message_interval_ms = self.config.active_speaker_message_interval_ms;
+
         let call = self.call_by_call_id.entry(call_id).or_insert_with(|| {
             Arc::new(Mutex::new(Call::new(
                 loggable_call_id.clone(),
@@ -539,10 +542,16 @@ impl Sfu {
                 self.config.approved_users_persistence_url.as_ref(),
             )))
         });
+
         let client_status = {
             let mut call = call.lock();
+
             if call.has_client(demux_id) {
                 return Err(SfuError::DuplicateDemuxIdDetected);
+            }
+
+            if call.size_including_pending_calls() == self.config.max_clients_per_call as usize {
+                return Err(SfuError::TooManyClients);
             }
 
             info!(
@@ -1536,6 +1545,50 @@ mod sfu_tests {
             user_count,
             end.saturating_duration_since(start).as_nanos()
         );
+    }
+
+    #[tokio::test]
+    async fn test_maximum_client_limit() {
+        let initial_now = Instant::now();
+        let sfu = new_sfu(initial_now, &DEFAULT_CONFIG);
+
+        let n_overflow = 5;
+        let user_count = DEFAULT_CONFIG.max_clients_per_call as usize + n_overflow;
+
+        let user_ids = random_user_ids(user_count);
+        let call_id = random_call_id();
+
+        let mut sfu = sfu.lock();
+
+        let mut failure_count = 0;
+
+        for (index, user_id) in user_ids.iter().enumerate() {
+            let demux_id = ((index as u32) << 4).try_into().unwrap();
+            match add_test_client(
+                &mut sfu,
+                &call_id,
+                user_id,
+                demux_id,
+                "1".to_string(),
+                [0; 32],
+            ) {
+                Ok(_) => {
+                    // Unused
+                }
+                Err(SfuError::TooManyClients) => {
+                    failure_count += 1;
+                }
+                Err(err) => {
+                    panic!("get_or_create_call_and_add_client() failed with: {}", err);
+                }
+            }
+        }
+
+        assert_eq!(
+            DEFAULT_CONFIG.max_clients_per_call as usize,
+            sfu.get_call_signaling_info(call_id, None).unwrap().size
+        );
+        assert_eq!(n_overflow, failure_count);
     }
 
     // As we create calls and add clients, keep a verbose record of them so that

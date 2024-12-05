@@ -84,6 +84,8 @@ pub struct ClientsResponseWrapper {
 pub enum FrontendError {
     #[error("CallNotFound")]
     CallNotFound,
+    #[error("TooManyClients")]
+    TooManyClients,
     #[error("NoPermissionToCreateCall")]
     NoPermissionToCreateCall,
     #[error("InternalError")]
@@ -197,6 +199,7 @@ impl Frontend {
                 }
                 Err(FrontendError::CallNotFound)
             }
+            Err(BackendError::TooManyClients) => panic!("Unexpected"),
             Err(BackendError::UnexpectedError(err)) => {
                 Frontend::log_error("get_client_ids_in_call", err);
                 Err(FrontendError::InternalError)
@@ -301,9 +304,15 @@ impl Frontend {
                 },
             )
             .await
-            .map_err(|err| {
-                Frontend::log_error("join_client_to_call", err.into());
-                FrontendError::InternalError
+            .map_err(|err| match err {
+                BackendError::TooManyClients => {
+                    Frontend::log_error("join_client_to_call", err.into());
+                    FrontendError::TooManyClients
+                }
+                _ => {
+                    Frontend::log_error("join_client_to_call", err.into());
+                    FrontendError::InternalError
+                }
             })?;
 
         Ok(JoinResponseWrapper {
