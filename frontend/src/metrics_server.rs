@@ -37,12 +37,12 @@ pub async fn start(frontend: Arc<Frontend>, shutdown_signal_rx: Receiver<()>) ->
                     // accumulated metrics.
                     let mut api_metrics = frontend.api_metrics.lock();
 
-                    for histogram in api_metrics.latencies.values_mut() {
-                        histogram.clear();
+                    for histogram_map in api_metrics.latencies.values_mut() {
+                        histogram_map.clear();
                     }
 
-                    for value in api_metrics.counts.values_mut() {
-                        *value = 0;
+                    for value_map in api_metrics.counts.values_mut() {
+                        value_map.clear();
                     }
                 }
             });
@@ -67,7 +67,7 @@ pub async fn start(frontend: Arc<Frontend>, shutdown_signal_rx: Receiver<()>) ->
                     let mut datadog = datadog.open_pipeline();
 
                     for (metric_name, value) in get_value_metrics() {
-                        datadog.gauge(metric_name, value as f64, None);
+                        datadog.gauge(metric_name, value as f64);
                     }
 
                     let report = metrics!().report();
@@ -75,19 +75,27 @@ pub async fn start(frontend: Arc<Frontend>, shutdown_signal_rx: Receiver<()>) ->
                         datadog.send_timer_histogram(&report, &None);
                     }
                     for report in report.events {
-                        datadog.count(report.name(), report.event_count() as f64, None);
+                        datadog.count_with_tags(
+                            report.name(),
+                            report.event_count() as f64,
+                            report.tags(),
+                        );
                     }
 
                     let mut api_metrics = frontend.api_metrics.lock();
 
-                    for (name, histogram) in &mut api_metrics.latencies {
-                        datadog.send_latency_histogram(name, histogram, &None);
-                        histogram.clear();
+                    for (name, histogram_map) in &mut api_metrics.latencies {
+                        for (tags, histogram) in histogram_map {
+                            datadog.send_latency_histogram(name, histogram, tags.as_ref());
+                            histogram.clear();
+                        }
                     }
 
-                    for (name, value) in &mut api_metrics.counts {
-                        datadog.count(name, *value as f64, None);
-                        *value = 0;
+                    for (name, value_map) in &mut api_metrics.counts {
+                        for (tags, value) in value_map {
+                            datadog.count_with_tags(name, *value as f64, tags.as_ref());
+                            *value = 0;
+                        }
                     }
                 }
             });
@@ -172,7 +180,7 @@ impl<'a> DatadogPipeline<'a> {
         };
 
         for (value, frequency) in histogram_report.histogram.iter() {
-            self.timer_at_rate(
+            self.timer_at_rate_with_tags(
                 name,
                 *value as f64 * factor,
                 1f64 / (*frequency as f64),
@@ -187,26 +195,16 @@ impl<'a> DatadogPipeline<'a> {
         }
     }
 
-    fn send_latency_histogram(
+    fn send_latency_histogram<T: AsRef<str>>(
         &mut self,
         metric_name: &str,
         histogram: &Histogram<u64>,
-        tags: &Option<Vec<&str>>,
+        tags: TagsRef<T>,
     ) {
         for (value, frequency) in histogram.iter() {
             let value_seconds = *value as f64 / 1000000.0;
-            self.histogram_at_rate(
-                metric_name,
-                value_seconds,
-                1f64 / (*frequency as f64),
-                tags.as_ref(),
-            );
-            self.distribution_at_rate(
-                metric_name,
-                value_seconds,
-                1f64 / (*frequency as f64),
-                tags.as_ref(),
-            );
+            self.histogram_at_rate(metric_name, value_seconds, 1f64 / (*frequency as f64), tags);
+            self.distribution_at_rate(metric_name, value_seconds, 1f64 / (*frequency as f64), tags);
         }
     }
 }

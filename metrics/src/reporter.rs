@@ -16,8 +16,8 @@ use std::{
 use mock_instant::Instant;
 use parking_lot::Mutex;
 
+use crate::metric_config::StaticStrTagsRef;
 use crate::{
-    datadog_statsd::TagsRef,
     histogram::Histogram,
     timing_options::{Precision, TimingOptions},
 };
@@ -141,7 +141,7 @@ impl NumericValueReporter {
 
 pub struct EventCountReporter {
     name: &'static str,
-    event_counters: parking_lot::RwLock<HashMap<TagsRef<'static>, AtomicUsize>>,
+    event_counters: parking_lot::RwLock<HashMap<StaticStrTagsRef, AtomicUsize>>,
 }
 
 impl EventCountReporter {
@@ -157,7 +157,7 @@ impl EventCountReporter {
         self.count_n_tagged(n, None)
     }
 
-    pub fn count_n_tagged(&self, n: usize, tags: TagsRef<'static>) {
+    pub fn count_n_tagged(&self, n: usize, tags: StaticStrTagsRef) {
         if let Some(counter) = self.event_counters.read().get(&tags) {
             counter.fetch_add(n, Ordering::Relaxed);
             return;
@@ -275,7 +275,7 @@ impl HistogramReport {
 pub struct EventReport {
     name: &'static str,
     event_count: usize,
-    tags: TagsRef<'static>,
+    tags: StaticStrTagsRef,
 }
 
 impl EventReport {
@@ -287,7 +287,7 @@ impl EventReport {
         self.event_count
     }
 
-    pub fn tags(&self) -> TagsRef<'static> {
+    pub fn tags(&self) -> StaticStrTagsRef {
         self.tags
     }
 }

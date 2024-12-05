@@ -26,6 +26,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use http::{header, Method, StatusCode};
 use log::*;
+use metrics::metric_config::Tags;
 use metrics::{event, metric_config::Histogram};
 use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
@@ -39,8 +40,8 @@ use crate::{
 
 #[derive(Default)]
 pub struct ApiMetrics {
-    pub latencies: HashMap<String, Histogram<u64>>,
-    pub counts: HashMap<String, u64>,
+    pub latencies: HashMap<String, HashMap<Tags<String>, Histogram<u64>>>,
+    pub counts: HashMap<String, HashMap<Tags<String>, u64>>,
 }
 
 impl From<FrontendError> for StatusCode {
@@ -108,7 +109,7 @@ async fn metrics(
     // Get the method, path, user_agent, and frontend here to avoid cloning the whole
     // request before next.run() consumes it.
     let method = req.method().as_str().to_lowercase();
-    let path = get_request_path(&req);
+    let path = get_request_path(&req).to_owned();
     let user_agent = get_user_agent(&req)?.to_string();
 
     let tag = if path == "/v1/call-link" || path.starts_with("/v1/call-link/") {
@@ -128,6 +129,8 @@ async fn metrics(
     let _ = api_metrics
         .counts
         .entry(format!("calling.frontend.api.{}.{}", tag, method))
+        .or_default()
+        .entry(None)
         .and_modify(|value| *value = value.saturating_add(1))
         .or_insert(1);
 
@@ -139,6 +142,8 @@ async fn metrics(
             method,
             response.status().as_str()
         ))
+        .or_default()
+        .entry(None)
         .and_modify(|value| *value = value.saturating_add(1))
         .or_insert(1);
 
@@ -152,15 +157,19 @@ async fn metrics(
                 method,
                 user_agent_event_string(&user_agent)
             ))
+            .or_default()
+            .entry(None)
             .and_modify(|value| *value = value.saturating_add(1))
             .or_insert(1);
     }
 
-    let latencies = api_metrics
+    api_metrics
         .latencies
         .entry(format!("calling.frontend.api.{}.{}.latency", tag, method))
-        .or_insert_with(Histogram::default);
-    latencies.push(latency.as_micros() as u64);
+        .or_default()
+        .entry(None)
+        .or_default()
+        .push(latency.as_micros() as u64);
 
     Ok(response)
 }
@@ -330,6 +339,8 @@ async fn extra_call_link_metrics(
             tag,
             response.status().as_str()
         ))
+        .or_default()
+        .entry(None)
         .and_modify(|value| *value = value.saturating_add(1))
         .or_insert(1);
     let _ = api_metrics
@@ -339,6 +350,8 @@ async fn extra_call_link_metrics(
             tag,
             user_agent_event_string(&user_agent)
         ))
+        .or_default()
+        .entry(None)
         .and_modify(|value| *value = value.saturating_add(1))
         .or_insert(1);
 

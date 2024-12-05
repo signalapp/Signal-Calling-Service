@@ -74,6 +74,8 @@ async fn metrics(
     let _ = api_metrics
         .counts
         .entry(format!("calling.frontend.internal_api.{}.{}", tag, method))
+        .or_default()
+        .entry(None)
         .and_modify(|value| *value = value.saturating_add(1))
         .or_insert(1);
 
@@ -85,17 +87,21 @@ async fn metrics(
             method,
             response.status().as_str()
         ))
+        .or_default()
+        .entry(None)
         .and_modify(|value| *value = value.saturating_add(1))
         .or_insert(1);
 
-    let latencies = api_metrics
+    api_metrics
         .latencies
         .entry(format!(
             "calling.frontend.internal_api.{}.{}.latency",
             tag, method
         ))
-        .or_insert_with(Histogram::default);
-    latencies.push(latency.as_micros() as u64);
+        .or_default()
+        .entry(None)
+        .or_default()
+        .push(latency.as_micros() as u64);
 
     Ok(response)
 }
