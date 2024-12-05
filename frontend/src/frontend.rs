@@ -6,7 +6,7 @@
 use std::{convert::TryFrom, fmt::Write};
 
 use anyhow::{anyhow, Error, Result};
-use calling_common::{random_hex_string, CallType, DemuxId, RoomId};
+use calling_common::{random_hex_string, CallType, DemuxId, RoomId, SignalUserAgent};
 use http::Uri;
 use log::*;
 use parking_lot::Mutex;
@@ -55,6 +55,7 @@ pub struct JoinRequestWrapper {
     pub is_admin: bool,
     pub approved_users: Option<Vec<UserId>>,
     pub call_type: CallType,
+    pub user_agent: SignalUserAgent,
 }
 
 pub struct JoinResponseWrapper {
@@ -301,6 +302,7 @@ impl Frontend {
                     room_id: call.room_id.clone(),
                     approved_users: join_request.approved_users,
                     call_type: join_request.call_type,
+                    user_agent: join_request.user_agent,
                 },
             )
             .await

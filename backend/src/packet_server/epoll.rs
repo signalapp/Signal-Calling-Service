@@ -864,15 +864,15 @@ impl PacketServerState {
             let connections_lock = self.all_connections.read();
             values.insert(
                 "calling.packet_server.connection_map.by_fd.count",
-                connections_lock.by_fd.len() as f32,
+                HashMap::from([(None, connections_lock.by_fd.len() as f32)]),
             );
             values.insert(
                 "calling.packet_server.connection_map.by_peer_addr.count",
-                connections_lock.by_peer_addr.len() as f32,
+                HashMap::from([(None, connections_lock.by_peer_addr.len() as f32)]),
             );
             values.insert(
                 "calling.packet_server.connection_map.inactive_ttls.count",
-                connections_lock.inactive_ttls.len() as f32,
+                HashMap::from([(None, connections_lock.inactive_ttls.len() as f32)]),
             );
         }
         SfuStats { histograms, values }

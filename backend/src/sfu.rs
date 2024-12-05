@@ -7,14 +7,14 @@
 
 use core::ops::DerefMut;
 use std::{
-    cmp::min, collections::HashMap, convert::TryInto, fmt::Write, str::FromStr, sync::Arc,
-    time::SystemTime,
+    cmp::min, collections::HashMap, convert::TryInto, fmt::Write, ops::AddAssign, str::FromStr,
+    sync::Arc, time::SystemTime,
 };
 
 use anyhow::Result;
 use calling_common::{
     CallType, ClientStatus, DataRate, DataSize, DemuxId, Duration, Instant, RoomId,
-    TwoGenerationCacheWithManualRemoveOld, DUMMY_DEMUX_ID,
+    SignalUserAgent, TwoGenerationCacheWithManualRemoveOld, DUMMY_DEMUX_ID,
 };
 use hkdf::Hkdf;
 use log::*;
@@ -121,7 +121,7 @@ impl std::fmt::Debug for ConnectionId {
     }
 }
 
-type ConnectionTags = (CallType, CallSizeBucket, RegionRelation);
+type ConnectionTags = (CallType, CallSizeBucket, RegionRelation, SignalUserAgent);
 pub type CallEndHandler = dyn Fn(&CallId, &Call) -> Result<()> + Send + 'static;
 pub struct Sfu {
     /// Configuration structure originally from the command line or environment.
@@ -167,7 +167,7 @@ pub struct HandleOutput {
 
 pub struct SfuStats {
     pub histograms: HashMap<&'static str, HashMap<StaticStrTagsRef, Histogram<usize>>>,
-    pub values: HashMap<&'static str, f32>,
+    pub values: HashMap<&'static str, HashMap<StaticStrTagsRef, f32>>,
 }
 
 impl Sfu {
@@ -224,6 +224,8 @@ impl Sfu {
 
     /// Gives a snapshot of current metrics, such as call size.
     pub fn get_stats(&self) -> SfuStats {
+        type HistogramMap<T> = HashMap<StaticStrTagsRef, Histogram<T>>;
+        type ValueMap = HashMap<StaticStrTagsRef, f32>;
         // Compute custom tags for Per-Call metrics to avoid allocating new tag vectors
         // These tags contain the "call-type" and "call-size" tags
         static CALL_TAG_VALUES: Lazy<HashMap<(CallType, CallSizeBucket), Vec<&str>>> =
@@ -240,21 +242,23 @@ impl Sfu {
                     .collect()
             });
         // Compute custom tags for Per-Connection metrics to avoid allocating new tag vectors
-        // These tags contain every combo of the "call-size" tag and "region-relation" tag
-        static CONNECTION_TAG_VALUES: Lazy<HashMap<ConnectionTags, Vec<&str>>> =
-            once_cell::sync::Lazy::new(|| {
-                CALL_TAG_VALUES
-                    .iter()
-                    .flat_map(|(&(call_type, call_size_key), call_tags)| {
-                        RegionRelation::iter().map(move |relation| {
-                            let key = (call_type, call_size_key, relation);
+        // These tags contain every combo of the "call-size", "region-relation", and "user-agent" tag
+        static CONNECTION_TAG_VALUES: Lazy<HashMap<ConnectionTags, Vec<&str>>> = Lazy::new(|| {
+            CALL_TAG_VALUES
+                .iter()
+                .flat_map(|(&(call_type, call_size_key), call_tags)| {
+                    RegionRelation::iter().flat_map(move |relation| {
+                        SignalUserAgent::iter().map(move |user_agent| {
+                            let key = (call_type, call_size_key, relation, user_agent);
                             let mut tags = call_tags.clone();
                             tags.push(relation.as_tag());
+                            tags.push(user_agent.as_tag());
                             (key, tags)
                         })
                     })
-                    .collect()
-            });
+                })
+                .collect()
+        });
 
         let (mut histograms, mut values);
 
@@ -265,18 +269,20 @@ impl Sfu {
             values = HashMap::new();
         }
 
-        let mut all_clients = 0;
-        let mut calls_above_one = 0;
-        let mut clients_in_calls_above_one = 0;
-        let mut call_size = Histogram::default();
-        let mut call_size_squared = Histogram::default();
-        let mut call_age_minutes: HashMap<StaticStrTagsRef, Histogram<_>> = HashMap::new();
-        let mut call_size_above_one = Histogram::default();
-        let mut call_size_squared_above_one = Histogram::default();
-        let mut call_age_minutes_above_one: HashMap<StaticStrTagsRef, Histogram<_>> =
-            HashMap::new();
-        let mut calls_persisting_approved_users = 0;
+        let mut calls_count = ValueMap::with_capacity(CALL_TAG_VALUES.len());
+        let mut calls_above_one_count = ValueMap::with_capacity(CALL_TAG_VALUES.len());
+        let mut clients_in_call_count = ValueMap::with_capacity(CALL_TAG_VALUES.len());
+        let mut clients_in_calls_above_one = ValueMap::with_capacity(CALL_TAG_VALUES.len());
+        let mut calls_persisting_approved_users = ValueMap::with_capacity(CALL_TAG_VALUES.len());
 
+        let mut call_size = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
+        let mut call_size_squared = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
+        let mut call_age_minutes = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
+        let mut call_size_above_one = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
+        let mut call_size_squared_above_one = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
+        let mut call_age_minutes_above_one = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
+
+        // track tags to use in connection metrics
         let mut call_tags_map = HashMap::new();
         for (call_id, call) in &self.call_by_call_id {
             let call = call.lock();
@@ -290,71 +296,87 @@ impl Sfu {
             let tags = CALL_TAG_VALUES.get(&(call_type, size_bucket));
             call_tags_map.insert(call_id, (call_type, size_bucket));
 
-            all_clients += clients;
-            call_size.push(clients);
-            call_size_squared.push(clients_squared);
+            calls_count.entry(tags).or_default().add_assign(1f32);
+            clients_in_call_count
+                .entry(tags)
+                .or_default()
+                .add_assign(clients as f32);
+            call_size.entry(tags).or_default().push(clients);
+            call_size_squared
+                .entry(tags)
+                .or_default()
+                .push(clients_squared);
             call_age_minutes
                 .entry(tags)
                 .or_default()
                 .push(call_duration);
+
             if clients > 1 {
-                call_size_above_one.push(clients);
-                call_size_squared_above_one.push(clients_squared);
+                calls_above_one_count
+                    .entry(tags)
+                    .or_default()
+                    .add_assign(1f32);
+                call_size_above_one.entry(tags).or_default().push(clients);
+                call_size_squared_above_one
+                    .entry(tags)
+                    .or_default()
+                    .push(clients_squared);
                 call_age_minutes_above_one
                     .entry(tags)
                     .or_default()
                     .push(call_duration);
-                calls_above_one += 1;
-                clients_in_calls_above_one += clients;
+                clients_in_calls_above_one
+                    .entry(tags)
+                    .or_default()
+                    .add_assign(1f32);
             }
             if call.is_approved_users_busy() {
-                calls_persisting_approved_users += 1;
+                calls_persisting_approved_users
+                    .entry(tags)
+                    .or_default()
+                    .add_assign(1f32);
             }
         }
-        histograms.insert("calling.sfu.call_size", HashMap::from([(None, call_size)]));
-        histograms.insert(
-            "calling.sfu.call_size.squared",
-            HashMap::from([(None, call_size_squared)]),
-        );
+        histograms.insert("calling.sfu.call_size", call_size);
+        histograms.insert("calling.sfu.call_size.squared", call_size_squared);
         histograms.insert("calling.sfu.call_age_minutes", call_age_minutes);
-        histograms.insert(
-            "calling.sfu.call_size.above_one",
-            HashMap::from([(None, call_size_above_one)]),
-        );
+        histograms.insert("calling.sfu.call_size.above_one", call_size_above_one);
         histograms.insert(
             "calling.sfu.call_size.squared.above_one",
-            HashMap::from([(None, call_size_squared_above_one)]),
+            call_size_squared_above_one,
         );
         histograms.insert(
             "calling.sfu.call_age_minutes.above_one",
             call_age_minutes_above_one,
         );
-        values.insert("calling.sfu.calls.count", self.call_by_call_id.len() as f32);
-        values.insert("calling.sfu.calls.clients.count", all_clients as f32);
-        values.insert("calling.sfu.calls.above_one.count", calls_above_one as f32);
+        values.insert("calling.sfu.calls.count", calls_count);
+        values.insert("calling.sfu.calls.clients.count", clients_in_call_count);
+        values.insert("calling.sfu.calls.above_one.count", calls_above_one_count);
         values.insert(
             "calling.sfu.calls.above_one.clients.count",
-            clients_in_calls_above_one as f32,
+            clients_in_calls_above_one,
         );
         values.insert(
             "calling.sfu.calls.persisiting_approved_users.count",
-            calls_persisting_approved_users as f32,
+            calls_persisting_approved_users,
         );
 
-        let mut remembered_packet_count = Histogram::default();
-        let mut remembered_packet_bytes = Histogram::default();
-        let mut outgoing_queue_size: HashMap<StaticStrTagsRef, Histogram<_>> = HashMap::new();
-        let mut outgoing_queue_delay_ms: HashMap<StaticStrTagsRef, Histogram<_>> = HashMap::new();
-        let mut client_rtt_ms: HashMap<StaticStrTagsRef, Histogram<_>> = HashMap::new();
-        let mut connection_outgoing_data_rate: HashMap<StaticStrTagsRef, Histogram<_>> =
-            HashMap::new();
-        let mut udp_v4_connections = 0;
-        let mut udp_v6_connections = 0;
-        let mut tcp_v4_connections = 0;
-        let mut tcp_v6_connections = 0;
-        let mut tls_v4_connections = 0;
-        let mut tls_v6_connections = 0;
-        let mut connections_with_video_available = 0;
+        let mut remembered_packet_count = HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut remembered_packet_bytes = HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut outgoing_queue_size = HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut outgoing_queue_delay_ms = HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut client_rtt_ms = HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut connection_outgoing_data_rate =
+            HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
+
+        let mut udp_v4_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut udp_v6_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut tcp_v4_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut tcp_v6_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut tls_v4_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut tls_v6_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut connections_with_video_available =
+            ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
 
         let now = Instant::now();
 
@@ -370,7 +392,13 @@ impl Sfu {
 
             let mut connection = connection.lock();
             let region_relation = connection.region_relation();
-            let tags = CONNECTION_TAG_VALUES.get(&(call_type, call_size_bucket, region_relation));
+            let user_agent = connection.user_agent();
+            let tags = CONNECTION_TAG_VALUES.get(&(
+                call_type,
+                call_size_bucket,
+                region_relation,
+                user_agent,
+            ));
 
             let stats = connection.rtp_endpoint_stats(now);
             if let Some(rtt_estimate) = stats.rtt_estimate {
@@ -379,18 +407,27 @@ impl Sfu {
                     .or_default()
                     .push(rtt_estimate.as_millis() as usize);
             }
-            remembered_packet_count.push(stats.remembered_packet_count);
-            remembered_packet_bytes.push(stats.remembered_packet_bytes);
+            remembered_packet_count
+                .entry(tags)
+                .or_default()
+                .push(stats.remembered_packet_count);
+            remembered_packet_bytes
+                .entry(tags)
+                .or_default()
+                .push(stats.remembered_packet_bytes);
             let rates = connection.current_rates(now);
             if let Some(addr_type) = connection.outgoing_addr_type() {
                 match addr_type {
-                    AddressType::UdpV4 => udp_v4_connections += 1,
-                    AddressType::UdpV6 => udp_v6_connections += 1,
-                    AddressType::TcpV4 => tcp_v4_connections += 1,
-                    AddressType::TcpV6 => tcp_v6_connections += 1,
-                    AddressType::TlsV4 => tls_v4_connections += 1,
-                    AddressType::TlsV6 => tls_v6_connections += 1,
+                    AddressType::UdpV4 => &mut udp_v4_connections,
+                    AddressType::UdpV6 => &mut udp_v6_connections,
+                    AddressType::TcpV4 => &mut tcp_v4_connections,
+                    AddressType::TcpV6 => &mut tcp_v6_connections,
+                    AddressType::TlsV4 => &mut tls_v4_connections,
+                    AddressType::TlsV6 => &mut tls_v6_connections,
                 }
+                .entry(tags)
+                .or_default()
+                .add_assign(1f32);
             }
 
             connection_outgoing_data_rate
@@ -406,16 +443,19 @@ impl Sfu {
                     .entry(tags)
                     .or_default()
                     .push(delay.as_millis() as usize);
-                connections_with_video_available += 1;
+                connections_with_video_available
+                    .entry(tags)
+                    .or_default()
+                    .add_assign(1f32);
             }
         }
         histograms.insert(
             "calling.sfu.connections.remembered_packets.count",
-            HashMap::from([(None, remembered_packet_count)]),
+            remembered_packet_count,
         );
         histograms.insert(
             "calling.sfu.connections.remembered_packets.size_bytes",
-            HashMap::from([(None, remembered_packet_bytes)]),
+            remembered_packet_bytes,
         );
         histograms.insert(
             "calling.sfu.connections.outgoing_queue_size_bytes",
@@ -430,33 +470,15 @@ impl Sfu {
             connection_outgoing_data_rate,
         );
         histograms.insert("calling.sfu.connections.rtt_ms", client_rtt_ms);
-        values.insert(
-            "calling.sfu.connections.udp_v4_count",
-            udp_v4_connections as f32,
-        );
-        values.insert(
-            "calling.sfu.connections.udp_v6_count",
-            udp_v6_connections as f32,
-        );
-        values.insert(
-            "calling.sfu.connections.tcp_v4_count",
-            tcp_v4_connections as f32,
-        );
-        values.insert(
-            "calling.sfu.connections.tcp_v6_count",
-            tcp_v6_connections as f32,
-        );
-        values.insert(
-            "calling.sfu.connections.tls_v4_count",
-            tls_v4_connections as f32,
-        );
-        values.insert(
-            "calling.sfu.connections.tls_v6_count",
-            tls_v6_connections as f32,
-        );
+        values.insert("calling.sfu.connections.udp_v4_count", udp_v4_connections);
+        values.insert("calling.sfu.connections.udp_v6_count", udp_v6_connections);
+        values.insert("calling.sfu.connections.tcp_v4_count", tcp_v4_connections);
+        values.insert("calling.sfu.connections.tcp_v6_count", tcp_v6_connections);
+        values.insert("calling.sfu.connections.tls_v4_count", tls_v4_connections);
+        values.insert("calling.sfu.connections.tls_v6_count", tls_v6_connections);
         values.insert(
             "calling.sfu.connections.video_available",
-            connections_with_video_available as f32,
+            connections_with_video_available,
         );
 
         SfuStats { histograms, values }
@@ -478,6 +500,7 @@ impl Sfu {
         region: Region,
         new_clients_require_approval: bool,
         call_type: CallType,
+        user_agent: SignalUserAgent,
         is_admin: bool,
         approved_users: Option<Vec<UserId>>,
     ) -> Result<(DhePublicKey, ClientStatus), SfuError> {
@@ -578,6 +601,7 @@ impl Sfu {
                 user_id.clone(),
                 is_admin,
                 region_relation,
+                user_agent,
                 Instant::now(), // Now after taking the lock
             )
         };
@@ -615,6 +639,7 @@ impl Sfu {
             },
             inactivity_timeout,
             region_relation,
+            user_agent,
             now,
         )));
         self.connection_by_id
@@ -1354,6 +1379,7 @@ mod sfu_tests {
             Region::Unset,
             false,
             CallType::GroupV2,
+            SignalUserAgent::Unknown,
             false,
             None,
         )?;

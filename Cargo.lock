@@ -1999,7 +1999,7 @@ dependencies = [
 name = "metrics"
 version = "100.0.0"
 dependencies = [
- "backtrace",
+ "http 1.1.0",
  "log",
  "mock_instant",
  "once_cell",

@@ -4,10 +4,10 @@ edition = "2021"
 version.workspace = true
 
 [dependencies]
+http = "1.1.0"
 log = "0.4.22"
 once_cell = "1.19.0"
 parking_lot = "0.12.3"
-backtrace = "0.3.74"
 rand = "0.8.5"
 
 [dev-dependencies]

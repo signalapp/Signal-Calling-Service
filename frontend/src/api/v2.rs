@@ -11,8 +11,9 @@ use axum::{
     response::{IntoResponse, Redirect},
     Extension, Json,
 };
+use axum_extra::headers::UserAgent;
 use axum_extra::TypedHeader;
-use calling_common::CallType;
+use calling_common::{CallType, SignalUserAgent};
 use hex::ToHex;
 use http::StatusCode;
 use log::*;
@@ -223,11 +224,13 @@ pub struct Region {
 }
 
 /// Handler for the PUT /conference/participants route.
+#[allow(clippy::too_many_arguments)]
 pub async fn join(
     State(frontend): State<Arc<Frontend>>,
     group_auth: Option<Extension<UserAuthorization>>,
     call_links_auth: Option<Extension<Arc<CallLinkAuthCredentialPresentation>>>,
     room_id: Option<TypedHeader<RoomId>>,
+    user_agent: Option<TypedHeader<UserAgent>>,
     OriginalUri(original_uri): OriginalUri,
     Query(region): Query<Region>,
     Json(request): Json<JoinRequest>,
@@ -352,6 +355,7 @@ pub async fn join(
     if let Some(redirect_uri) = frontend.get_redirect_uri(&call.backend_region, &original_uri) {
         return temporary_redirect(&redirect_uri);
     }
+    let user_agent = user_agent.map_or(SignalUserAgent::Unknown, |header| header.0.as_str().into());
 
     let join_client_timer =
         start_timer_us!("calling.frontend.api.v2.join.join_client_to_call.timed");
@@ -368,6 +372,7 @@ pub async fn join(
                 is_admin,
                 approved_users,
                 call_type,
+                user_agent,
             },
         )
         .await?;
@@ -439,6 +444,7 @@ pub mod api_server_v2_tests {
     pub const DEMUX_ID_1: u32 = 1070920496;
     const DEMUX_ID_2: u32 = 1778901216;
     pub const LOCAL_REGION: &str = "us-west1";
+    pub const TEST_USER_AGENT: SignalUserAgent = SignalUserAgent::Unknown;
     const ALT_REGION: &str = "asia-northeast3";
     const REDIRECTED_URL: &str =
         "https://asia-northeast3.test.com/v2/conference/participants?region=us-west1";
@@ -910,6 +916,7 @@ pub mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    user_agent: TEST_USER_AGENT,
                     new_clients_require_approval: false,
                     is_admin: false,
                     room_id: RoomId::from(GROUP_ID_1),
@@ -1018,6 +1025,7 @@ pub mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    user_agent: TEST_USER_AGENT,
                     new_clients_require_approval: false,
                     is_admin: false,
                     room_id: RoomId::from(GROUP_ID_1),
@@ -2349,6 +2357,7 @@ pub mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    user_agent: TEST_USER_AGENT,
                     new_clients_require_approval: false,
                     is_admin: false,
                     room_id: RoomId::from(CALL_LINK_ROOM_ID),
@@ -2482,6 +2491,7 @@ pub mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    user_agent: TEST_USER_AGENT,
                     new_clients_require_approval: true,
                     is_admin: false,
                     room_id: RoomId::from(CALL_LINK_ROOM_ID),
@@ -2616,6 +2626,7 @@ pub mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    user_agent: TEST_USER_AGENT,
                     new_clients_require_approval: true,
                     is_admin: false,
                     room_id: RoomId::from(CALL_LINK_ROOM_ID),
@@ -2723,6 +2734,7 @@ pub mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    user_agent: TEST_USER_AGENT,
                     new_clients_require_approval: false,
                     is_admin: false,
                     room_id: RoomId::from(ROOM_ID),
@@ -2831,6 +2843,7 @@ pub mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    user_agent: TEST_USER_AGENT,
                     new_clients_require_approval: true,
                     is_admin: false,
                     room_id: RoomId::from(ROOM_ID),
@@ -3043,6 +3056,7 @@ pub mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    user_agent: TEST_USER_AGENT,
                     new_clients_require_approval: false,
                     is_admin: true,
                     room_id: RoomId::from(ROOM_ID),
@@ -3152,6 +3166,7 @@ pub mod api_server_v2_tests {
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
+                    user_agent: TEST_USER_AGENT,
                     new_clients_require_approval: false,
                     is_admin: false,
                     room_id: RoomId::from(ROOM_ID),

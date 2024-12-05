@@ -34,7 +34,7 @@ use crate::{
     sfu::{self, Sfu, SfuError},
 };
 
-use calling_common::{CallType, DemuxId};
+use calling_common::{CallType, DemuxId, SignalUserAgent};
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -354,6 +354,7 @@ async fn join_conference(
         Region::Unset,
         config.new_clients_require_approval,
         call_type,
+        SignalUserAgent::Unknown,
         is_admin,
         None,
     ) {

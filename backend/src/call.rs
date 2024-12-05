@@ -14,7 +14,7 @@ use std::{
 
 use calling_common::{
     CallType, ClientStatus, DataRate, DataRateTracker, DemuxId, Duration, Instant, PixelSize,
-    RoomId, VideoHeight,
+    RoomId, SignalUserAgent, VideoHeight,
 };
 use hex::ToHex;
 use log::*;
@@ -557,6 +557,7 @@ impl Call {
         user_id: UserId,
         is_admin: bool,
         region_relation: RegionRelation,
+        user_agent: SignalUserAgent,
         now: Instant,
     ) -> ClientStatus {
         let pending_client = NonParticipantClient {
@@ -564,6 +565,7 @@ impl Call {
             user_id,
             is_admin,
             region_relation,
+            user_agent,
             next_server_to_client_data_rtp_seqnum: 1,
         };
         if self.blocked_users.contains(&pending_client.user_id) {
@@ -1943,6 +1945,7 @@ struct NonParticipantClient {
     user_id: UserId,
     is_admin: bool,
     region_relation: RegionRelation,
+    user_agent: SignalUserAgent,
 
     // Update with each proto send from server to client
     next_server_to_client_data_rtp_seqnum: rtp::FullSequenceNumber,
@@ -1955,6 +1958,7 @@ impl From<Client> for NonParticipantClient {
             user_id: client.user_id,
             is_admin: client.is_admin,
             region_relation: client.region_relation,
+            user_agent: client.user_agent,
 
             next_server_to_client_data_rtp_seqnum: client.next_server_to_client_data_rtp_seqnum,
         }
@@ -1986,6 +1990,7 @@ struct Client {
     user_id: UserId,
     is_admin: bool,
     region_relation: RegionRelation,
+    user_agent: SignalUserAgent,
 
     // Updated by incoming video packets
     incoming_video: [IncomingVideoState; 3],
@@ -2055,6 +2060,7 @@ impl Client {
             user_id: pending_client_info.user_id,
             is_admin: pending_client_info.is_admin,
             region_relation: pending_client_info.region_relation,
+            user_agent: pending_client_info.user_agent,
 
             incoming_video: [
                 IncomingVideoState::new(Some(DataRate::from_kbps(ASSUMED_LAYER0_KBPS))),
@@ -4138,7 +4144,14 @@ mod call_tests {
     ) -> DemuxId {
         let demux_id = demux_id_from_unshifted(demux_id_without_shifting);
         let user_id = UserId::from(user_id.to_string());
-        call.add_client(demux_id, user_id, false, RegionRelation::Unknown, now);
+        call.add_client(
+            demux_id,
+            user_id,
+            false,
+            RegionRelation::Unknown,
+            SignalUserAgent::Unknown,
+            now,
+        );
         demux_id
     }
 
@@ -4150,7 +4163,14 @@ mod call_tests {
     ) -> DemuxId {
         let demux_id = demux_id_from_unshifted(demux_id_without_shifting);
         let user_id = UserId::from(user_id.to_string());
-        call.add_client(demux_id, user_id, true, RegionRelation::Unknown, now);
+        call.add_client(
+            demux_id,
+            user_id,
+            true,
+            RegionRelation::Unknown,
+            SignalUserAgent::Unknown,
+            now,
+        );
         demux_id
     }
 

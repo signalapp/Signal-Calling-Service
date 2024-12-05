@@ -7,7 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{anyhow, Context, Error};
 use async_trait::async_trait;
-use calling_common::{CallType, DemuxId, RoomId};
+use calling_common::{CallType, DemuxId, RoomId, SignalUserAgent};
 use log::*;
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,7 @@ pub struct JoinRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approved_users: Option<Vec<String>>,
     pub call_type: CallType,
+    pub user_agent: SignalUserAgent,
 }
 
 #[derive(Deserialize, Debug)]
@@ -365,6 +366,7 @@ mod tests {
                 "roomId": GROUP_ID_1,
                 "approvedUsers": ["A", "B"],
                 "callType": "GroupV2",
+                "userAgent": "Unknown"
             }),
             serde_json::to_value(JoinRequest {
                 user_id: USER_ID_1.to_string(),
@@ -377,6 +379,7 @@ mod tests {
                 room_id: RoomId::from(GROUP_ID_1),
                 approved_users: Some(vec!["A".to_string(), "B".to_string()]),
                 call_type: CallType::GroupV2,
+                user_agent: SignalUserAgent::Unknown
             })
             .unwrap()
         )

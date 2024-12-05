@@ -10,7 +10,8 @@ mod v2;
 pub use v2::api_server_v2_tests as v2_tests;
 
 use std::{
-    collections::HashMap, fmt::Display, net::SocketAddr, str::FromStr, sync::Arc, time::Instant,
+    collections::HashMap, fmt::Display, net::SocketAddr, ops::AddAssign, str::FromStr, sync::Arc,
+    time::Instant,
 };
 
 use anyhow::Result;
@@ -24,10 +25,11 @@ use axum::{
 use axum_extra::TypedHeader;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use calling_common::{CallType, SignalUserAgent};
 use http::{header, Method, StatusCode};
 use log::*;
 use metrics::metric_config::Tags;
-use metrics::{event, metric_config::Histogram};
+use metrics::{event, metric_config::Histogram, tags::KnownTags};
 use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
 use zkgroup::call_links::CreateCallLinkCredentialPresentation;
@@ -98,6 +100,21 @@ fn user_agent_event_string(user_agent: &str) -> &str {
     }
 }
 
+fn guess_call_type(req: &Request) -> Option<CallType> {
+    let authorization_header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())?;
+
+    let authorization_header =
+        Authenticator::parse_authorization_header(authorization_header).ok()?;
+
+    match authorization_header {
+        Basic(..) => Some(CallType::GroupV2),
+        Bearer(..) => Some(CallType::Adhoc),
+    }
+}
+
 /// Middleware to process metrics after a response is sent.
 async fn metrics(
     State(frontend): State<Arc<Frontend>>,
@@ -109,9 +126,11 @@ async fn metrics(
     let start = Instant::now();
     // Get the method, path, user_agent, and frontend here to avoid cloning the whole
     // request before next.run() consumes it.
-    let method = req.method().as_str().to_lowercase();
+    let method = req.method().clone();
+    let method_str = req.method().as_str().to_lowercase();
     let path = get_request_path(&req).to_owned();
     let user_agent = get_user_agent(&req)?.to_string();
+    let call_type = guess_call_type(&req);
 
     let tag = if path == "/v1/call-link" || path.starts_with("/v1/call-link/") {
         "call_links.v1"
@@ -129,7 +148,7 @@ async fn metrics(
 
     let _ = api_metrics
         .counts
-        .entry(format!("calling.frontend.api.{}.{}", tag, method))
+        .entry(format!("calling.frontend.api.{}.{}", tag, method_str))
         .or_default()
         .entry(None)
         .and_modify(|value| *value = value.saturating_add(1))
@@ -140,7 +159,7 @@ async fn metrics(
         .entry(format!(
             "calling.frontend.api.{}.{}.{}",
             tag,
-            method,
+            method_str,
             response.status().as_str()
         ))
         .or_default()
@@ -148,14 +167,14 @@ async fn metrics(
         .and_modify(|value| *value = value.saturating_add(1))
         .or_insert(1);
 
-    if method == "put" {
+    if method_str == "put" {
         // We only collect user_agent metrics for PUT (i.e. join).
         let _ = api_metrics
             .counts
             .entry(format!(
                 "calling.frontend.api.{}.{}.user_agent.{}",
                 tag,
-                method,
+                method_str,
                 user_agent_event_string(&user_agent)
             ))
             .or_default()
@@ -166,11 +185,41 @@ async fn metrics(
 
     api_metrics
         .latencies
-        .entry(format!("calling.frontend.api.{}.{}.latency", tag, method))
+        .entry(format!(
+            "calling.frontend.api.{}.{}.latency",
+            tag, method_str
+        ))
         .or_default()
         .entry(None)
         .or_default()
         .push(latency.as_micros() as u64);
+
+    let mut tags = vec![
+        format!("http_path:{path}"),
+        KnownTags::<Method>::tag_from(&method),
+        SignalUserAgent::from(user_agent).as_tag().to_string(),
+        KnownTags::<StatusCode>::tag_from(&response.status()),
+    ];
+    if let Some(call_type) = call_type {
+        tags.push(call_type.as_tag().to_string());
+    }
+    let tags = Some(tags);
+
+    api_metrics
+        .latencies
+        .entry("calling.frontend.api.latency".to_owned())
+        .or_default()
+        .entry(tags.clone())
+        .or_default()
+        .push(latency.as_micros() as u64);
+
+    api_metrics
+        .counts
+        .entry("calling.frontend.api".to_owned())
+        .or_default()
+        .entry(tags)
+        .or_default()
+        .add_assign(1u64);
 
     Ok(response)
 }

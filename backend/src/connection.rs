@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use calling_common::{DataRate, DataRateTracker, DataSize, Duration, Instant};
+use calling_common::{DataRate, DataRateTracker, DataSize, Duration, Instant, SignalUserAgent};
 use log::*;
 use metrics::event;
 use thiserror::Error;
@@ -66,6 +66,7 @@ pub enum AddressType {
 pub struct Connection {
     created: Instant,
     region_relation: RegionRelation,
+    user_agent: SignalUserAgent,
 
     /// How long we should wait without an incoming ICE binding request
     /// before we treat the client as "inactive".  Once "inactive", the SFU
@@ -145,6 +146,7 @@ impl Connection {
         googcc_config: googcc::Config,
         inactivity_timeout: Duration,
         region_relation: RegionRelation,
+        user_agent: SignalUserAgent,
         now: Instant,
     ) -> Self {
         let (decrypt, encrypt) =
@@ -155,6 +157,7 @@ impl Connection {
         Self {
             created: now,
             region_relation,
+            user_agent,
 
             inactivity_timeout,
 
@@ -664,6 +667,10 @@ impl Connection {
         self.region_relation
     }
 
+    pub fn user_agent(&self) -> SignalUserAgent {
+        self.user_agent
+    }
+
     pub fn current_rates(&mut self, now: Instant) -> ConnectionRates {
         self.video_rate.update(now);
         self.audio_rate.update(now);
@@ -779,6 +786,7 @@ mod connection_tests {
             googcc_config,
             inactivity_timeout,
             RegionRelation::Unknown,
+            SignalUserAgent::Unknown,
             now,
         )
     }

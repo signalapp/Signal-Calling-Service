@@ -23,6 +23,7 @@ mod macros;
 mod datadog_statsd;
 mod histogram;
 mod reporter;
+pub mod tags;
 mod test_utils;
 mod timing_options;
 

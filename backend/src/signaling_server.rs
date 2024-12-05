@@ -33,7 +33,7 @@ use axum_extra::{
     headers::{self, Header},
     TypedHeader,
 };
-use calling_common::{CallType, DemuxId, RoomId};
+use calling_common::{CallType, DemuxId, RoomId, SignalUserAgent};
 use hex::{FromHex, ToHex};
 use hyper::http::{HeaderName, HeaderValue};
 use log::*;
@@ -99,6 +99,8 @@ pub struct JoinRequest {
     #[serde(default)]
     pub new_clients_require_approval: bool,
     pub call_type: CallType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<SignalUserAgent>,
     pub is_admin: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_id: Option<RoomId>,
@@ -303,6 +305,8 @@ async fn join(
         return Err((StatusCode::BAD_REQUEST, err.to_string()));
     }
 
+    let user_agent = request.user_agent.unwrap_or(SignalUserAgent::Unknown);
+
     let call_id =
         call_id_from_hex(&call_id).map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
@@ -344,6 +348,7 @@ async fn join(
         region,
         request.new_clients_require_approval,
         request.call_type,
+        user_agent,
         request.is_admin,
         request.approved_users,
     ) {
@@ -554,6 +559,7 @@ mod signaling_server_tests {
                 Region::Unset,
                 false,
                 CallType::GroupV2,
+                SignalUserAgent::Unknown,
                 false,
                 None,
             )
@@ -586,6 +592,7 @@ mod signaling_server_tests {
                 Region::Unset,
                 true,
                 CallType::Adhoc,
+                SignalUserAgent::Unknown,
                 true,
                 None,
             )
@@ -1034,6 +1041,7 @@ mod signaling_server_tests {
                             region: None,
                             new_clients_require_approval: false,
                             call_type: CallType::GroupV2,
+                            user_agent: None,
                             is_admin: false,
                             room_id: Some(ROOM_ID.into()),
                             approved_users: None,
@@ -1061,6 +1069,7 @@ mod signaling_server_tests {
                             hkdf_extra_info: None,
                             region: None,
                             new_clients_require_approval: false,
+                            user_agent: None,
                             call_type: CallType::GroupV2,
                             is_admin: false,
                             room_id: Some(ROOM_ID.into()),
@@ -1088,6 +1097,7 @@ mod signaling_server_tests {
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
+                            user_agent: None,
                             new_clients_require_approval: false,
                             call_type: CallType::GroupV2,
                             is_admin: false,
@@ -1116,6 +1126,7 @@ mod signaling_server_tests {
                             client_dhe_public_key: "INVALID".to_string(),
                             hkdf_extra_info: None,
                             region: None,
+                            user_agent: None,
                             new_clients_require_approval: false,
                             call_type: CallType::GroupV2,
                             is_admin: false,
@@ -1144,6 +1155,7 @@ mod signaling_server_tests {
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: Some("G".to_string()),
                             region: None,
+                            user_agent: None,
                             new_clients_require_approval: false,
                             call_type: CallType::GroupV2,
                             is_admin: false,
@@ -1172,6 +1184,7 @@ mod signaling_server_tests {
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
+                            user_agent: None,
                             new_clients_require_approval: false,
                             call_type: CallType::GroupV2,
                             is_admin: false,
@@ -1219,6 +1232,7 @@ mod signaling_server_tests {
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
+                            user_agent: None,
                             new_clients_require_approval: false,
                             call_type: CallType::GroupV2,
                             is_admin: false,
@@ -1249,6 +1263,7 @@ mod signaling_server_tests {
                 "callType": "GroupV2",
                 "isAdmin": false,
                 "roomId": ROOM_ID,
+                "userAgent": Some(SignalUserAgent::Internal),
                 "approvedUsers": ["A", "B"],
             }),
             serde_json::to_value(JoinRequest {
@@ -1257,6 +1272,7 @@ mod signaling_server_tests {
                 client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                 hkdf_extra_info: None,
                 region: Some("pangaea".to_string()),
+                user_agent: Some(SignalUserAgent::Internal),
                 new_clients_require_approval: false,
                 call_type: CallType::GroupV2,
                 is_admin: false,

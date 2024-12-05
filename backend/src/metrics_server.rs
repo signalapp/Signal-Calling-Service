@@ -78,8 +78,10 @@ pub async fn start(
                                 datadog.send_count_histogram(name, &histogram, tags);
                             }
                         }
-                        for (name, value) in stats.values {
-                            datadog.gauge(name, value as f64);
+                        for (name, subseries) in stats.values {
+                            for (tags, value) in subseries {
+                                datadog.gauge_with_tags(name, value as f64, tags);
+                            }
                         }
                     }
 
