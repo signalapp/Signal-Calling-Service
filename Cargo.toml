@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "100.0.0"
+version = "101.0.0"
 
 [profile.release]
 debug = 1
