@@ -356,11 +356,11 @@ impl Pacer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::{cmp::Reverse, collections::BinaryHeap};
 
     use calling_common::Duration;
+
+    use super::*;
 
     // Wrap the Pacer to make it easier to use for testing.
     struct TestPacer {

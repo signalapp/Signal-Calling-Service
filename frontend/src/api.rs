@@ -6,9 +6,6 @@
 pub mod call_links;
 mod v2;
 
-#[cfg(test)]
-pub use v2::api_server_v2_tests as v2_tests;
-
 use std::{
     collections::HashMap, fmt::Display, net::SocketAddr, ops::AddAssign, str::FromStr, sync::Arc,
     time::Instant,
@@ -23,15 +20,19 @@ use axum::{
     Extension, Router,
 };
 use axum_extra::TypedHeader;
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use calling_common::{CallType, SignalUserAgent};
 use http::{header, Method, StatusCode};
 use log::*;
-use metrics::metric_config::Tags;
-use metrics::{event, metric_config::Histogram, tags::KnownTags};
+use metrics::{
+    event,
+    metric_config::{Histogram, Tags},
+    tags::KnownTags,
+};
 use tokio::sync::oneshot::Receiver;
 use tower::ServiceBuilder;
+#[cfg(test)]
+pub use v2::api_server_v2_tests as v2_tests;
 use zkgroup::call_links::CreateCallLinkCredentialPresentation;
 
 use crate::{

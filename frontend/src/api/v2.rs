@@ -11,8 +11,7 @@ use axum::{
     response::{IntoResponse, Redirect},
     Extension, Json,
 };
-use axum_extra::headers::UserAgent;
-use axum_extra::TypedHeader;
+use axum_extra::{headers::UserAgent, TypedHeader};
 use calling_common::{CallType, SignalUserAgent};
 use hex::ToHex;
 use http::StatusCode;
@@ -397,33 +396,29 @@ pub async fn join(
 
 #[cfg(test)]
 pub mod api_server_v2_tests {
-    use super::*;
-
-    use std::str;
-    use std::time::SystemTime;
+    use std::{str, time::SystemTime};
 
     use axum::body::Body;
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
+    use base64::{engine::general_purpose::STANDARD, Engine};
     use calling_common::{DemuxId, RoomId};
     use hex::{FromHex, ToHex};
     use hmac::Mac;
     use http::{header, Request};
-    use mockall::predicate::*;
-    use mockall::Sequence;
+    use mockall::{predicate::*, Sequence};
     use once_cell::sync::Lazy;
     use tower::ServiceExt;
 
-    use crate::api::call_links::tests::{
-        call_link_state_with_approved, USER_ID_3, USER_ID_3_DOUBLE_ENCODED,
-    };
+    use super::*;
     use crate::{
-        api::app,
-        api::call_links::tests::{
-            create_authorization_header_for_creator,
-            create_authorization_header_for_user as create_call_links_authorization_header_for_user,
-            default_call_link_state, ADMIN_PASSKEY, USER_ID_1 as CALL_LINKS_USER_ID_1,
-            USER_ID_1_DOUBLE_ENCODED, USER_ID_2_DOUBLE_ENCODED, X_ROOM_ID,
+        api::{
+            app,
+            call_links::tests::{
+                call_link_state_with_approved, create_authorization_header_for_creator,
+                create_authorization_header_for_user as create_call_links_authorization_header_for_user,
+                default_call_link_state, ADMIN_PASSKEY, USER_ID_1 as CALL_LINKS_USER_ID_1,
+                USER_ID_1_DOUBLE_ENCODED, USER_ID_2_DOUBLE_ENCODED, USER_ID_3,
+                USER_ID_3_DOUBLE_ENCODED, X_ROOM_ID,
+            },
         },
         authenticator::{Authenticator, HmacSha256, GV2_AUTH_MATCH_LIMIT},
         backend::{self, BackendError, MockBackend},

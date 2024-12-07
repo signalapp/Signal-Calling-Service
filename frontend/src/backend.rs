@@ -9,12 +9,11 @@ use anyhow::{anyhow, Context, Error};
 use async_trait::async_trait;
 use calling_common::{CallType, DemuxId, RoomId, SignalUserAgent};
 use log::*;
+#[cfg(test)]
+use mockall::{automock, predicate::*};
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use tokio::time::{error::Elapsed, Duration};
-
-#[cfg(test)]
-use mockall::{automock, predicate::*};
 
 use crate::{config, frontend, load_balancer::LoadBalancer};
 
@@ -347,7 +346,6 @@ impl Backend for BackendHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::api::v2_tests::{
         CLIENT_DHE_PUBLIC_KEY, CLIENT_ICE_UFRAG, GROUP_ID_1, LOCAL_REGION, USER_ID_1,
     };

@@ -32,8 +32,7 @@ use nix::{
 use parking_lot::{Mutex, RwLock};
 use rustls::{ServerConfig, ServerConnection};
 use scopeguard::ScopeGuard;
-use unique_id::sequence::SequenceGenerator;
-use unique_id::Generator;
+use unique_id::{sequence::SequenceGenerator, Generator};
 
 use crate::{
     packet_server::{self, SocketLocator, TimerHeap, TimerHeapNextResult},
@@ -1439,8 +1438,9 @@ impl<T: AsRawFd> ConnectionMap<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
+
+    use super::*;
 
     #[derive(Debug)]
     struct FakeSocket {

@@ -177,9 +177,9 @@ pub fn new_srtp_keys(seed: u8) -> (KeysAndSalts, KeysAndSalts) {
 
 #[cfg(test)]
 mod test {
-    use super::super::types::*;
-    use super::*;
     use rand::{thread_rng, Rng};
+
+    use super::{super::types::*, *};
 
     #[test]
     fn test_rtp_iv() {

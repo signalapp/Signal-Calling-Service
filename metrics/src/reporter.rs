@@ -16,9 +16,9 @@ use std::{
 use mock_instant::Instant;
 use parking_lot::Mutex;
 
-use crate::metric_config::StaticStrTagsRef;
 use crate::{
     histogram::Histogram,
+    metric_config::StaticStrTagsRef,
     timing_options::{Precision, TimingOptions},
 };
 

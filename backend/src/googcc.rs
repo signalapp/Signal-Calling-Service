@@ -373,8 +373,7 @@ impl TargetCalculator {
 #[cfg(test)]
 mod calculate_target_send_rates_tests {
     use async_stream::stream;
-    use futures::future::ready;
-    use futures::pin_mut;
+    use futures::{future::ready, pin_mut};
     use unzip3::Unzip3;
 
     use super::*;

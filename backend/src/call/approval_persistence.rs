@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use calling_common::RoomId;
 use futures::{future::BoxFuture, FutureExt, TryFutureExt};

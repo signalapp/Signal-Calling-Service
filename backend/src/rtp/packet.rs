@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use anyhow::{anyhow, bail, Result};
-use calling_common::{DataRate, PixelSize};
 use std::{
     borrow::{Borrow, BorrowMut},
     convert::TryFrom,
@@ -13,20 +11,20 @@ use std::{
 
 use aes::cipher::{generic_array::GenericArray, KeyInit};
 use aes_gcm::{AeadInPlace, Aes128Gcm};
+use anyhow::{anyhow, bail, Result};
 use calling_common::{
-    parse_u16, parse_u32, round_up_to_multiple_of, CheckedSplitAt, DataSize, Instant, Writer,
+    parse_u16, parse_u32, round_up_to_multiple_of, CheckedSplitAt, DataRate, DataSize, Instant,
+    PixelSize, Writer,
 };
 use log::*;
 use metrics::event;
-
-use crate::audio;
-use crate::rtp::tcc;
 
 use super::{
     from_rtx_payload_type, from_rtx_ssrc, is_audio_payload_type, is_padding_payload_type,
     is_video_payload_type, srtp::*, to_rtx_payload_type, to_rtx_ssrc, types::*, VideoRotation,
     CLIENT_SERVER_DATA_PAYLOAD_TYPE, PACKET_LIFETIME, VERSION, VP8_PAYLOAD_TYPE,
 };
+use crate::{audio, rtp::tcc};
 
 const RTP_MIN_HEADER_LEN: usize = 12;
 pub const RTP_PAYLOAD_TYPE_OFFSET: usize = 1;
@@ -1717,9 +1715,8 @@ mod video_layers_allocation_tests {
 
 #[cfg(test)]
 mod test {
-    use crate::rtp::{looks_like_rtcp, looks_like_rtp, RTCP_PAYLOAD_TYPE_OFFSET, RTCP_TYPE_BYE};
-
     use super::*;
+    use crate::rtp::{looks_like_rtcp, looks_like_rtp, RTCP_PAYLOAD_TYPE_OFFSET, RTCP_TYPE_BYE};
 
     #[test]
     fn test_packet_classification_rtp() {

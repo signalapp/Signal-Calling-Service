@@ -6,13 +6,14 @@
 //
 extern crate rand;
 
-use log::*;
 use std::{
     error, fmt,
     io::Error,
     mem,
     net::{AddrParseError, SocketAddr, ToSocketAddrs, UdpSocket},
 };
+
+use log::*;
 
 pub type TagsRef<'a, T> = Option<&'a Vec<T>>;
 pub type StaticStrTagsRef = TagsRef<'static, &'static str>;

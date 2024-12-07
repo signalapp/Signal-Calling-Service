@@ -13,27 +13,24 @@ mod rtx;
 mod srtp;
 mod types;
 
-use nack::*;
-use packet::*;
-use rtcp::*;
-use rtx::*;
-use srtp::*;
-
-pub use nack::{write_nack, Nack};
-pub use packet::{DependencyDescriptor, Header, Packet};
-pub use rtcp::{ControlPacket, KeyFrameRequest};
-pub use rtx::to_rtx_ssrc;
-pub use srtp::{new_master_key_material, KeyAndSalt, KeysAndSalts, MasterKeyMaterial};
-pub use types::*;
-
-#[cfg(test)]
-pub use srtp::{key_from, new_srtp_keys, salt_from};
-
 use std::{collections::HashMap, convert::TryInto};
 
 use calling_common::{expand_truncated_counter, read_u16, Bits, Duration, Instant, Writer};
 use log::*;
 use metrics::*;
+use nack::*;
+pub use nack::{write_nack, Nack};
+use packet::*;
+pub use packet::{DependencyDescriptor, Header, Packet};
+use rtcp::*;
+pub use rtcp::{ControlPacket, KeyFrameRequest};
+pub use rtx::to_rtx_ssrc;
+use rtx::*;
+use srtp::*;
+#[cfg(test)]
+pub use srtp::{key_from, new_srtp_keys, salt_from};
+pub use srtp::{new_master_key_material, KeyAndSalt, KeysAndSalts, MasterKeyMaterial};
+pub use types::*;
 
 use crate::transportcc as tcc;
 
@@ -917,9 +914,9 @@ pub mod fuzz {
 mod test {
     use std::borrow::BorrowMut;
 
-    use super::*;
-
     use calling_common::DataSize;
+
+    use super::*;
 
     const VP8_RTX_PAYLOAD_TYPE: PayloadType = 118;
 

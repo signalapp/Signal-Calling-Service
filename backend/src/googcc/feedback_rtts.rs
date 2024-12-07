@@ -38,11 +38,11 @@ pub fn estimate_feedback_rtts(
 
 #[cfg(test)]
 mod tests {
+    use calling_common::Instant;
     use futures::FutureExt;
 
     use super::*;
     use crate::transportcc::RemoteInstant;
-    use calling_common::Instant;
 
     /// Creates an `Ack` for each RTT, setting the departure and feedback-arrival times.
     ///

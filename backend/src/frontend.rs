@@ -3,14 +3,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use crate::{config, sfu::CallId};
+use std::time::Duration;
+
 use async_trait::async_trait;
 use calling_common::RoomId;
 use hex::ToHex;
 use log::*;
 use reqwest::Url;
 use serde::Serialize;
-use std::time::Duration;
+
+use crate::{config, sfu::CallId};
 
 /// Used to send call key into removal queue
 #[derive(Serialize, PartialEq, Eq)]

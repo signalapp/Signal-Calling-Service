@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use http::{Method, StatusCode};
 use std::marker::PhantomData;
+
+use http::{Method, StatusCode};
 
 pub struct KnownTags<T> {
     phantom: PhantomData<T>,

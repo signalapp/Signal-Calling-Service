@@ -220,8 +220,9 @@ impl<T: Writer + ?Sized> Writer for &T {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::convert::TryFrom;
+
+    use super::*;
 
     #[test]
     fn u16() {

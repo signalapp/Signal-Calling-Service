@@ -762,10 +762,11 @@ impl ConnectionRates {
 mod connection_tests {
     use std::borrow::Borrow;
 
-    use super::*;
-    use crate::transportcc as tcc;
     use calling_common::Writer;
     use rtp::new_srtp_keys;
+
+    use super::*;
+    use crate::transportcc as tcc;
 
     fn new_connection(now: Instant) -> Connection {
         let ice_request_username = b"server:client";

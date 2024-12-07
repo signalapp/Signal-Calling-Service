@@ -10,8 +10,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use calling_common::RoomId;
 use hex::FromHex;
 use hmac::{Hmac, Mac};
@@ -225,10 +224,11 @@ impl Authenticator {
 
 #[cfg(test)]
 mod authenticator_tests {
-    use super::*;
     use base64::DecodeError::{InvalidLength, InvalidPadding};
     use env_logger::Env;
     use hex::ToHex;
+
+    use super::*;
 
     const AUTH_KEY_1: &str = "f00f0014fe091de31827e8d686969fad65013238aadd25ef8629eb8a9e5ef69b";
     const AUTH_KEY_2: &str = "f00f0072f8ee256b9ba24255897230342cc83b76a3964d6288a7ac8ae4e8e9ca";

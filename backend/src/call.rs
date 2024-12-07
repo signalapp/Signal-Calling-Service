@@ -3081,8 +3081,9 @@ mod loggable_call_id_tests {
 
 #[cfg(test)]
 mod call_tests {
-    use super::*;
     use calling_common::PixelSize;
+
+    use super::*;
 
     #[test]
     fn test_forward_audio() {

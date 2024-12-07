@@ -3,19 +3,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use crate::macros::Metrics;
+use std::{thread::JoinHandle, time::Duration};
+
 use log::{error, info};
 use once_cell::sync::Lazy;
-use std::thread::JoinHandle;
-use std::time::Duration;
+
+use crate::macros::Metrics;
 
 pub static __METRICS: Lazy<Metrics> = Lazy::new(Metrics::new_enabled);
 
 pub mod metric_config {
-    pub use crate::datadog_statsd::*;
-    pub use crate::histogram::*;
-    pub use crate::reporter::*;
-    pub use crate::timing_options::*;
+    pub use crate::{datadog_statsd::*, histogram::*, reporter::*, timing_options::*};
 }
 
 #[macro_use]

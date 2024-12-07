@@ -17,22 +17,20 @@ use std::{
 
 use anyhow::Result;
 use log::*;
+#[cfg(all(feature = "epoll", target_os = "linux"))]
+use nix::sys::{time::TimeSpec, timer::Expiration::OneShot, timerfd::*};
 use parking_lot::Mutex;
 use rustls::ServerConfig;
 use tokio::sync::oneshot::Receiver;
-
-#[cfg(all(feature = "epoll", target_os = "linux"))]
-use nix::sys::{time::TimeSpec, timer::Expiration::OneShot, timerfd::*};
 #[cfg(all(feature = "epoll", target_os = "linux"))]
 mod epoll;
 #[cfg(all(feature = "epoll", target_os = "linux"))]
 pub use epoll::PacketServerState;
 #[cfg(not(all(feature = "epoll", target_os = "linux")))]
 mod generic;
+use calling_common::{Duration, Instant};
 #[cfg(not(all(feature = "epoll", target_os = "linux")))]
 pub use generic::PacketServerState;
-
-use calling_common::{Duration, Instant};
 use metrics::*;
 
 use crate::{
@@ -284,8 +282,9 @@ impl<T> TimerHeap<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use calling_common::{Duration, Instant};
+
+    use super::*;
 
     #[test]
     fn test_basics() {

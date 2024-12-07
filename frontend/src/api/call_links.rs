@@ -496,25 +496,27 @@ pub async fn reset_call_link_approvals(
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
-
     use axum::body::Body;
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
+    use base64::{engine::general_purpose::STANDARD, Engine};
     use calling_common::Duration;
     use hex::FromHex;
     use http::{header, Request};
     use mockall::predicate::*;
     use once_cell::sync::Lazy;
     use tower::ServiceExt;
-    use zkgroup::call_links::CallLinkAuthCredentialResponse;
-    use zkgroup::call_links::CallLinkSecretParams;
-    use zkgroup::call_links::CreateCallLinkCredentialRequestContext;
+    use zkgroup::call_links::{
+        CallLinkAuthCredentialResponse, CallLinkSecretParams,
+        CreateCallLinkCredentialRequestContext,
+    };
 
-    use crate::frontend::UserId;
+    use super::*;
     use crate::{
-        api::app, api::v2::api_server_v2_tests::create_call_record, authenticator::Authenticator,
-        backend::MockBackend, config, frontend::FrontendIdGenerator, storage::MockStorage,
+        api::{app, v2::api_server_v2_tests::create_call_record},
+        authenticator::Authenticator,
+        backend::MockBackend,
+        config,
+        frontend::{FrontendIdGenerator, UserId},
+        storage::MockStorage,
     };
 
     const AUTH_KEY: &str = "f00f0014fe091de31827e8d686969fad65013238aadd25ef8629eb8a9e5ef69b";

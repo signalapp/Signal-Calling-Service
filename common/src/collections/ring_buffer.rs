@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::collections::VecDeque;
-use std::fmt::Debug;
+use std::{collections::VecDeque, fmt::Debug};
 
 /// A fixed size RingBuffer. On insert drops the oldest inserted item iff full.
 pub struct RingBuffer<T> {

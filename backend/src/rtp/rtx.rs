@@ -8,9 +8,8 @@ use std::collections::HashMap;
 use calling_common::{Duration, Instant, TwoGenerationCache};
 use metrics::event;
 
-use crate::rtp::tcc;
-
 use super::{types::*, Packet};
+use crate::rtp::tcc;
 
 const RTX_PAYLOAD_TYPE_OFFSET: PayloadType = 10;
 const RTX_SSRC_OFFSET: Ssrc = 1;
@@ -157,9 +156,8 @@ pub(super) fn from_rtx_ssrc(rtx_ssrc: Ssrc) -> Ssrc {
 
 #[cfg(test)]
 mod test {
-    use crate::rtp::VP8_PAYLOAD_TYPE;
-
     use super::*;
+    use crate::rtp::VP8_PAYLOAD_TYPE;
 
     const VP8_RTX_PAYLOAD_TYPE: PayloadType = 118;
 

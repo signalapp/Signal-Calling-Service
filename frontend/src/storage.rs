@@ -3,13 +3,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use std::{collections::HashMap, path::PathBuf, time::SystemTime};
+
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::{
-    operation::{delete_item::DeleteItemError, update_item::UpdateItemError},
-    types::{AttributeValue, ConditionCheck, Delete, ReturnValue, Select, TransactWriteItem},
+    operation::{
+        delete_item::DeleteItemError, transact_write_items::TransactWriteItemsError,
+        update_item::UpdateItemError,
+    },
+    types::{
+        AttributeValue, BatchStatementErrorCodeEnum, ConditionCheck, Delete, ReturnValue, Select,
+        TransactWriteItem,
+    },
     Client, Config,
 };
 use aws_smithy_async::rt::sleep::default_async_sleep;
@@ -18,17 +26,12 @@ use aws_types::region::Region;
 use calling_common::{Duration, RoomId};
 use log::*;
 use metrics::{metric_config::Timer, *};
+#[cfg(test)]
+use mockall::{automock, predicate::*};
 use serde::{Deserialize, Serialize};
 use serde_dynamo::{from_item, to_item, Item};
 use serde_with::{ser::SerializeAsWrap, serde_as, Bytes};
 use tokio::{io::AsyncWriteExt, sync::oneshot::Receiver};
-
-use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
-use aws_sdk_dynamodb::types::BatchStatementErrorCodeEnum;
-use std::{collections::HashMap, path::PathBuf, time::SystemTime};
-
-#[cfg(test)]
-use mockall::{automock, predicate::*};
 
 use crate::{config, frontend::UserId};
 
@@ -1127,17 +1130,18 @@ mod tests {
 
     #[cfg(feature = "storage-tests")]
     mod test_operations {
-        use super::*;
-        use crate::config::default_test_config;
-        use aws_sdk_dynamodb::error::SdkError;
-        use aws_sdk_dynamodb::types::{DeleteRequest, PutRequest, WriteRequest};
-        use base64::engine::general_purpose::STANDARD;
-        use base64::Engine;
+        use std::{collections::HashSet, future::Future, process::Command};
+
+        use aws_sdk_dynamodb::{
+            error::SdkError,
+            types::{DeleteRequest, PutRequest, WriteRequest},
+        };
+        use base64::{engine::general_purpose::STANDARD, Engine};
         use futures::FutureExt;
         use lazy_static::lazy_static;
-        use std::collections::HashSet;
-        use std::future::Future;
-        use std::process::Command;
+
+        use super::*;
+        use crate::config::default_test_config;
 
         lazy_static! {
             static ref DYNAMODB_STATUS: std::process::ExitStatus = start_dynamodb();

@@ -3,12 +3,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use std::{collections::HashMap, net::Ipv4Addr};
+
 use anyhow::{anyhow, Result};
 use log::*;
 use rand::{thread_rng, Rng};
 use reqwest::StatusCode;
 use serde::Deserialize;
-use std::{collections::HashMap, net::Ipv4Addr};
 use tokio::{
     sync::{mpsc, oneshot},
     time::{self, Duration},
@@ -369,8 +370,9 @@ impl Drop for LoadBalancer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
+
+    use super::*;
 
     #[tokio::test]
     async fn zero_up() -> Result<()> {

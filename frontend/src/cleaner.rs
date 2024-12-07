@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use calling_common::Duration;
 use futures::future::join_all;
@@ -10,14 +12,12 @@ use log::*;
 use metrics::{event, metric_config::Timer, start_timer_us};
 use parking_lot::Mutex;
 use rand::{thread_rng, Rng};
-use std::sync::Arc;
 use tokio::sync::{oneshot::Receiver, Semaphore};
 
-use crate::storage::CallRecordKey;
 use crate::{
     backend::{self, Backend, BackendError, BackendHttpClient},
     config,
-    storage::{CallRecord, DynamoDb, Storage},
+    storage::{CallRecord, CallRecordKey, DynamoDb, Storage},
 };
 
 /// Returns true if the call is currently being handled by the associated Calling Backend.
@@ -164,9 +164,8 @@ pub async fn start(config: &'static config::Config, ender_rx: Receiver<()>) -> R
 mod tests {
     use calling_common::{random_hex_string, RoomId};
 
-    use crate::config::default_test_config;
-
     use super::*;
+    use crate::config::default_test_config;
 
     // Run this test manually to load several call records into local storage.
     // 1. Run the docker compose environment

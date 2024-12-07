@@ -13,14 +13,15 @@ jobs:
     - name: Install protoc
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
     - uses: actions/checkout@v4
-    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal --component rustfmt,clippy
+    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal --component clippy
+    - run: rustup toolchain install nightly --profile minimal --component rustfmt
     - run: shellcheck **/*.sh
     - name: Environment
       run: rustup --version && cargo --version
     - name: Build
       run: cargo build
     - name: Format
-      run: cargo fmt -- --check
+      run: cargo +nightly fmt -- --check
     - name: Clippy
       run: cargo clippy --all-targets -- -D warnings
     - name: Clippy (generic UDP)

@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use clap::ArgGroup;
 use std::net::{IpAddr, Ipv4Addr};
+
+use clap::ArgGroup;
 
 /// Configuration options from command line arguments.
 #[derive(clap::Parser, Debug, Clone)]

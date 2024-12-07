@@ -19,6 +19,7 @@ use axum_extra::{
     headers::{self, authorization::Basic, Authorization},
     TypedHeader,
 };
+use calling_common::{CallType, DemuxId, SignalUserAgent};
 use hex::{FromHex, ToHex};
 use log::*;
 use parking_lot::Mutex;
@@ -33,8 +34,6 @@ use crate::{
     region::Region,
     sfu::{self, Sfu, SfuError},
 };
-
-use calling_common::{CallType, DemuxId, SignalUserAgent};
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -447,11 +446,10 @@ pub async fn start(
 mod http_server_tests {
     use std::time::Instant;
 
+    use calling_common::random_hex_string;
     use hex::{FromHex, ToHex};
     use once_cell::sync::Lazy;
     use rand::{thread_rng, Rng};
-
-    use calling_common::random_hex_string;
 
     static CONFIG: Lazy<config::Config> = Lazy::new(config::default_test_config);
 

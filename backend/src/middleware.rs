@@ -3,9 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use axum::extract::Request;
-use axum::middleware::Next;
-use axum::response::Response;
+use axum::{extract::Request, middleware::Next, response::Response};
 use calling_common::Instant;
 use hyper::header;
 use log::*;

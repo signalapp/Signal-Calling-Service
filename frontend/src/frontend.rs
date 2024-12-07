@@ -9,12 +9,11 @@ use anyhow::{anyhow, Error, Result};
 use calling_common::{random_hex_string, CallType, DemuxId, RoomId, SignalUserAgent};
 use http::Uri;
 use log::*;
+#[cfg(test)]
+use mockall::{automock, predicate::*};
 use parking_lot::Mutex;
 use rand::Rng;
 use urlencoding::encode;
-
-#[cfg(test)]
-use mockall::{automock, predicate::*};
 
 use crate::{
     api::ApiMetrics,

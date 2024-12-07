@@ -60,11 +60,11 @@ fn accumulate_acked_sizes(
 
 #[cfg(test)]
 mod accumulate_acked_sizes_tests {
+    use calling_common::Instant;
     use futures::FutureExt;
 
     use super::*;
     use crate::transportcc::RemoteInstant;
-    use calling_common::Instant;
 
     /// Creates an `Ack` for each duration with a size of 10.
     ///

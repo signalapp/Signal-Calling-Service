@@ -494,8 +494,10 @@ fn start_monitor(mut ender_rx: Receiver<()>, cpu_idle_pct: Arc<AtomicU8>) {
 
 #[cfg(test)]
 mod signaling_server_tests {
-    use axum::body::Body;
-    use axum::http::{self, Request};
+    use axum::{
+        body::Body,
+        http::{self, Request},
+    };
     use calling_common::{ClientStatus, DemuxId, Instant};
     use once_cell::sync::Lazy;
     use tokio::sync::oneshot;

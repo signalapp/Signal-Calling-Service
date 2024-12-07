@@ -6,17 +6,17 @@
 #[macro_use]
 extern crate log;
 
+use std::{env, sync::Arc};
+
 use anyhow::Result;
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use calling_common::Duration;
 use calling_frontend::{
     api,
     authenticator::Authenticator,
     backend::BackendHttpClient,
     cleaner, config,
-    frontend::Frontend,
-    frontend::FrontendIdGenerator,
+    frontend::{Frontend, FrontendIdGenerator},
     internal_api, metrics_server,
     storage::{DynamoDb, IdentityFetcher},
 };
@@ -24,7 +24,6 @@ use clap::Parser;
 use env_logger::Env;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use std::{env, sync::Arc};
 use tokio::{
     runtime,
     signal::unix::{signal, SignalKind},

@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use std::{collections::HashMap, net::Ipv4Addr, str::FromStr};
+
 use anyhow::{anyhow, Context, Result};
 use log::*;
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
-use std::{collections::HashMap, net::Ipv4Addr, str::FromStr};
 use tokio::{
     sync::oneshot,
     time::{self, Duration, Instant},

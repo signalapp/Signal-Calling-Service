@@ -2,11 +2,12 @@
 // Copyright 2023 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 //
+use std::sync::Arc;
+
 use log::*;
 use metrics::event;
 use parking_lot::Mutex;
-use std::sync::Arc;
-use tokio::{sync::mpsc, sync::oneshot::Receiver};
+use tokio::sync::{mpsc, oneshot::Receiver};
 
 use crate::{
     call::LoggableCallId,

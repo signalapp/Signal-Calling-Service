@@ -17,10 +17,9 @@ mod serialize;
 mod slice;
 mod time;
 
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use std::{cmp::PartialEq, convert::TryInto, io::Write};
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 pub use bits::*;
 pub use call_ids::*;
 pub use client_status::*;
