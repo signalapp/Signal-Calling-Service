@@ -237,6 +237,7 @@ impl<T: Timer> Timer for Option<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct HistogramReport {
     name: &'static str,
     sample_interval: usize,

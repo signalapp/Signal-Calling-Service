@@ -3,10 +3,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::{collections::HashMap, hash::Hash, iter::FromIterator};
+use std::{
+    collections::HashMap,
+    fmt::{Debug, Formatter},
+    hash::Hash,
+    iter::FromIterator,
+};
 
 pub struct Histogram<T> {
     counts_by_value: HashMap<T, usize>,
+}
+
+impl<T: Debug> Debug for Histogram<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Histogram")
+            .field("counts_by_value", &self.counts_by_value)
+            .finish()
+    }
 }
 
 impl<T> Histogram<T> {

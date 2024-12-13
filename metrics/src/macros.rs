@@ -34,6 +34,7 @@ struct Registry {
     event_reporters: Vec<Arc<EventCountReporter>>,
 }
 
+#[derive(Debug)]
 pub struct Report {
     pub histograms: Vec<HistogramReport>,
     pub events: Vec<EventReport>,
@@ -205,7 +206,7 @@ macro_rules! event {
         $crate::event_reporter!($name).count_n($count)
     };
     ($name:expr, $count:expr, $tags:expr) => {
-        $crate::event_reporter!($name).count_n_tagged($count, &tags)
+        $crate::event_reporter!($name).count_n_tagged($count, $tags)
     };
 }
 
@@ -229,11 +230,22 @@ macro_rules! sampling_histogram {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        collections::HashMap,
+        ops::AddAssign,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, LazyLock,
+        },
+        time::{Duration, Instant},
+    };
 
     use mock_instant::MockClock;
+    use rand::Rng;
 
-    use crate::{reporter::Timer, test_utils::assert_histogram_eq, *};
+    use crate::{
+        metric_config::StaticStrTagsRef, reporter::Timer, test_utils::assert_histogram_eq, *,
+    };
 
     #[test]
     #[should_panic(expected = "The metric name \"A\" has been used elsewhere.")]
@@ -341,6 +353,8 @@ mod tests {
 
         event!("event3");
         event!("event4", 10);
+        static TAGS: LazyLock<Vec<&'static str>> = LazyLock::new(|| vec!["tag_name:tag_value"]);
+        event!("event5", 10, Some(&TAGS));
 
         let reports = metrics!().report();
         let histograms = reports.histograms;
@@ -373,5 +387,78 @@ mod tests {
         assert_eq!("event4", event4.name());
         assert_eq!(1, event3.event_count());
         assert_eq!(10, event4.event_count());
+    }
+
+    #[test]
+    fn correctly_clear_counters() {
+        static TAG_SET: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|| {
+            vec![
+                vec!["tag_name:0"],
+                vec!["tag_name:1"],
+                vec!["tag_name:2"],
+                vec!["tag_name:3"],
+                vec!["tag_name:4"],
+            ]
+        });
+
+        fn random_tags() -> StaticStrTagsRef {
+            TAG_SET.get(rand::thread_rng().gen_range(0..(TAG_SET.len() + 1)))
+        }
+
+        let expected_count = 10_000_000usize;
+        let parallelism = std::thread::available_parallelism().unwrap().into();
+        let finished = Arc::new(AtomicUsize::new(0));
+        let handles = (0..parallelism)
+            .map(|i| {
+                let finished = finished.clone();
+                std::thread::spawn(move || {
+                    for _ in (i..expected_count).step_by(parallelism) {
+                        event!("event", 1, random_tags());
+                    }
+                    finished.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let start = Instant::now();
+        let interval_millis = 1000;
+        // save reports so it's easier to debug!
+        let mut reports = vec![];
+        while finished.load(Ordering::Relaxed) < parallelism {
+            std::thread::sleep(Duration::from_millis(interval_millis));
+            reports.push(__METRICS.report());
+        }
+
+        // get any leftover values
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        reports.push(__METRICS.report());
+        println!(
+            "Finished emitting metrics in {} seconds",
+            start.elapsed().as_secs()
+        );
+        println!("Total reports: {}\n{:?}", reports.len(), reports);
+        let sum_by_tag = reports.iter().fold(HashMap::new(), |mut acc, report| {
+            for event_report in &report.events {
+                acc.entry(event_report.tags())
+                    .or_insert(0)
+                    .add_assign(event_report.event_count());
+            }
+            acc
+        });
+
+        println!("Sum by tag:");
+        sum_by_tag.iter().for_each(|(tags, count)| {
+            println!("\t{:?}={count}", tags);
+        });
+        let total_events = sum_by_tag.iter().fold(0, |acc, (_, count)| acc + count);
+        println!("Total Events={:?}", total_events);
+
+        assert_eq!(expected_count, total_events);
+        let last_report = __METRICS.report();
+        for event_report in &last_report.events {
+            assert_eq!(0, event_report.event_count());
+        }
     }
 }
