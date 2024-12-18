@@ -131,7 +131,9 @@ impl LoadBalancerTask {
 
             if weight == 0 {
                 // just remove our remaining weight
-                self.total_weight_left -= server_health.weight_left as u16;
+                self.total_weight_left = self
+                    .total_weight_left
+                    .saturating_sub(server_health.weight_left as u16);
             } else {
                 // restart selection with our new weight
                 self.total_weight_left = 0;
@@ -139,7 +141,7 @@ impl LoadBalancerTask {
             server_health.weight_left = weight;
 
             if let Some(old_weight) = server_health.weight.replace(weight) {
-                self.total_weight -= old_weight as u16;
+                self.total_weight = self.total_weight.saturating_sub(old_weight as u16);
             } else {
                 self.unchecked_servers -= 1;
                 self.maybe_send_host_list_reply();
