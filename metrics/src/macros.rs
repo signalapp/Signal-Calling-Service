@@ -14,7 +14,10 @@ use std::{
 use parking_lot::Mutex;
 
 use crate::{
-    reporter::{EventCountReporter, EventReport, HistogramReport, NumericValueReporter},
+    reporter::{
+        EventCountReporter, EventReport, NumericValueReporter, SamplingHistogramReport,
+        ValueHistogramReport, ValueHistogramReporter,
+    },
     timing_options::TimingOptions,
 };
 
@@ -32,11 +35,13 @@ struct Registry {
     registered_names: HashSet<&'static str>,
     numeric_reporters: Vec<Arc<NumericValueReporter>>,
     event_reporters: Vec<Arc<EventCountReporter>>,
+    value_histogram_reporters: Vec<Arc<ValueHistogramReporter>>,
 }
 
 #[derive(Debug)]
 pub struct Report {
-    pub histograms: Vec<HistogramReport>,
+    pub sampling_histograms: Vec<SamplingHistogramReport>,
+    pub value_histograms: Vec<ValueHistogramReport>,
     pub events: Vec<EventReport>,
 }
 
@@ -78,6 +83,22 @@ impl Metrics {
         numeric_reporter
     }
 
+    pub fn create_and_register_value_histogram(
+        &self,
+        name: &'static str,
+    ) -> Arc<ValueHistogramReporter> {
+        let reporter = Arc::new(ValueHistogramReporter::new(name));
+
+        let mut registry = self.registry.lock();
+
+        if !registry.registered_names.insert(name) {
+            panic!("The histogram name \"{}\" has been used elsewhere.", name);
+        }
+
+        registry.value_histogram_reporters.push(reporter.clone());
+        reporter
+    }
+
     /// Locks the internal structure and adds a new event.
     pub fn create_and_register_event(&self, name: &'static str) -> Arc<EventCountReporter> {
         let event_reporter = Arc::new(EventCountReporter::new(name));
@@ -102,12 +123,19 @@ impl Metrics {
     pub fn report(&self) -> Report {
         let registry = self.registry.lock();
 
-        let mut histograms = registry
+        let mut sampling_histograms = registry
             .numeric_reporters
             .iter()
             .map(|reporter| reporter.report())
             .collect::<Vec<_>>();
-        histograms.sort_unstable_by_key(|report| report.name());
+        sampling_histograms.sort_unstable_by_key(|report| report.name());
+
+        let mut value_histograms = registry
+            .value_histogram_reporters
+            .iter()
+            .flat_map(|reporter| reporter.report())
+            .collect::<Vec<_>>();
+        value_histograms.sort_unstable_by_key(|report| report.name);
 
         let mut events = registry
             .event_reporters
@@ -116,7 +144,11 @@ impl Metrics {
             .collect::<Vec<_>>();
         events.sort_unstable_by_key(|report| report.name());
 
-        Report { histograms, events }
+        Report {
+            sampling_histograms,
+            value_histograms,
+            events,
+        }
     }
 
     pub fn disable(&self) {
@@ -140,6 +172,29 @@ macro_rules! reporter {
 
         &__REPORTER
     }};
+}
+
+#[macro_export]
+macro_rules! value_histogram_reporter {
+    ($name:expr) => {{
+        static __VALUE_HISTOGRAM: once_cell::sync::Lazy<
+            std::sync::Arc<$crate::metric_config::ValueHistogramReporter>,
+        > = once_cell::sync::Lazy::new(|| {
+            $crate::__METRICS.create_and_register_value_histogram($name)
+        });
+
+        &__VALUE_HISTOGRAM
+    }};
+}
+
+#[macro_export]
+macro_rules! value_histogram {
+    ($name:expr, $value:expr) => {
+        $crate::value_histogram_reporter!($name).push($value)
+    };
+    ($name:expr, $value:expr, $tags:expr) => {
+        $crate::value_histogram_reporter!($name).push_tagged($value, $tags)
+    };
 }
 
 #[macro_export]
@@ -244,7 +299,10 @@ mod tests {
     use rand::Rng;
 
     use crate::{
-        metric_config::StaticStrTagsRef, reporter::Timer, test_utils::assert_histogram_eq, *,
+        metric_config::StaticStrTagsRef,
+        reporter::{EventCountReporter, Timer, ValueHistogramReporter},
+        test_utils::assert_histogram_eq,
+        *,
     };
 
     #[test]
@@ -357,7 +415,7 @@ mod tests {
         event!("event5", 10, Some(&TAGS));
 
         let reports = metrics!().report();
-        let histograms = reports.histograms;
+        let histograms = reports.sampling_histograms;
 
         let mut iter = histograms.iter();
         let report1 = iter.next().unwrap();
@@ -389,31 +447,33 @@ mod tests {
         assert_eq!(10, event4.event_count());
     }
 
+    static TAG_SET: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|| {
+        vec![
+            vec!["tag_name:0"],
+            vec!["tag_name:1"],
+            vec!["tag_name:2"],
+            vec!["tag_name:3"],
+            vec!["tag_name:4"],
+        ]
+    });
+
+    fn random_tags() -> StaticStrTagsRef {
+        TAG_SET.get(rand::thread_rng().gen_range(0..(TAG_SET.len() + 1)))
+    }
+
     #[test]
-    fn correctly_clear_counters() {
-        static TAG_SET: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|| {
-            vec![
-                vec!["tag_name:0"],
-                vec!["tag_name:1"],
-                vec!["tag_name:2"],
-                vec!["tag_name:3"],
-                vec!["tag_name:4"],
-            ]
-        });
-
-        fn random_tags() -> StaticStrTagsRef {
-            TAG_SET.get(rand::thread_rng().gen_range(0..(TAG_SET.len() + 1)))
-        }
-
-        let expected_count = 10_000_000usize;
+    fn correctly_clear_event_counters() {
+        static REPORTER: LazyLock<EventCountReporter> =
+            LazyLock::new(|| EventCountReporter::new("event"));
         let parallelism = std::thread::available_parallelism().unwrap().into();
+        let expected_count = parallelism * 50_000;
         let finished = Arc::new(AtomicUsize::new(0));
         let handles = (0..parallelism)
             .map(|i| {
                 let finished = finished.clone();
                 std::thread::spawn(move || {
                     for _ in (i..expected_count).step_by(parallelism) {
-                        event!("event", 1, random_tags());
+                        REPORTER.count_n_tagged(1, random_tags());
                     }
                     finished.fetch_add(1, Ordering::Relaxed);
                 })
@@ -426,21 +486,22 @@ mod tests {
         let mut reports = vec![];
         while finished.load(Ordering::Relaxed) < parallelism {
             std::thread::sleep(Duration::from_millis(interval_millis));
-            reports.push(__METRICS.report());
+            reports.push(REPORTER.report());
         }
 
         // get any leftover values
         for handle in handles {
             handle.join().unwrap();
         }
-        reports.push(__METRICS.report());
+        reports.push(REPORTER.report());
         println!(
-            "Finished emitting metrics in {} seconds",
-            start.elapsed().as_secs()
+            "Finished emitting metrics in {} seconds with parallelism={}",
+            start.elapsed().as_secs(),
+            parallelism,
         );
         println!("Total reports: {}\n{:?}", reports.len(), reports);
         let sum_by_tag = reports.iter().fold(HashMap::new(), |mut acc, report| {
-            for event_report in &report.events {
+            for event_report in report {
                 acc.entry(event_report.tags())
                     .or_insert(0)
                     .add_assign(event_report.event_count());
@@ -451,6 +512,70 @@ mod tests {
         println!("Sum by tag:");
         sum_by_tag.iter().for_each(|(tags, count)| {
             println!("\t{:?}={count}", tags);
+        });
+        let total_events = sum_by_tag.iter().fold(0, |acc, (_, count)| acc + count);
+        println!("Total Events={:?}", total_events);
+
+        assert_eq!(expected_count, total_events);
+        let last_report = __METRICS.report();
+        for event_report in &last_report.events {
+            assert_eq!(0, event_report.event_count());
+        }
+    }
+
+    #[test]
+    fn correctly_clear_histograms() {
+        static REPORTER: LazyLock<ValueHistogramReporter> =
+            LazyLock::new(|| ValueHistogramReporter::new("value_histogram"));
+        let parallelism = std::thread::available_parallelism().unwrap().into();
+        let expected_count = parallelism * 50_000;
+        let finished = Arc::new(AtomicUsize::new(0));
+        let handles = (0..parallelism)
+            .map(|i| {
+                let finished = finished.clone();
+                std::thread::spawn(move || {
+                    for _ in (i..expected_count).step_by(parallelism) {
+                        REPORTER.push_tagged(1, random_tags());
+                    }
+                    finished.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let start = Instant::now();
+        let interval_millis = 1000;
+        // save reports so it's easier to debug!
+        let mut reports = vec![];
+        while finished.load(Ordering::Relaxed) < parallelism {
+            std::thread::sleep(Duration::from_millis(interval_millis));
+            reports.push(REPORTER.report());
+        }
+
+        // get any leftover values
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        reports.push(REPORTER.report());
+        println!(
+            "Finished emitting metrics in {} seconds with parallelism={}",
+            start.elapsed().as_secs(),
+            parallelism,
+        );
+        println!("Total reports: {}\n{:?}", reports.len(), reports);
+        let sum_by_tag = reports.iter().fold(HashMap::new(), |mut acc, report| {
+            for histogram_report in report {
+                for (value, count) in histogram_report.histogram.iter() {
+                    acc.entry((value, histogram_report.tags))
+                        .or_insert(0)
+                        .add_assign(count);
+                }
+            }
+            acc
+        });
+
+        println!("Sum by tag:");
+        sum_by_tag.iter().for_each(|((value, tags), count)| {
+            println!("\t{}|{:?}={count}", value, tags);
         });
         let total_events = sum_by_tag.iter().fold(0, |acc, (_, count)| acc + count);
         println!("Total Events={:?}", total_events);

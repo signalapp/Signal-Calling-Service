@@ -15,8 +15,8 @@ use anyhow::Result;
 use log::*;
 use metrics::{
     metric_config::{
-        Client as DatadogClient, Histogram, HistogramReport, PipelineSink, Precision, TagsRef,
-        UdpEventSink,
+        Client as DatadogClient, Histogram, PipelineSink, Precision, SamplingHistogramReport,
+        TagsRef, UdpEventSink,
     },
     metrics, time_scope_us,
 };
@@ -86,8 +86,11 @@ pub async fn start(
                     }
 
                     let report = metrics!().report();
-                    for report in report.histograms {
+                    for report in report.sampling_histograms {
                         datadog.send_timer_histogram(&report);
+                    }
+                    for report in report.value_histograms {
+                        datadog.send_count_histogram(report.name, &report.histogram, report.tags);
                     }
                     for report in report.events {
                         datadog.count_with_tags(
@@ -183,13 +186,13 @@ impl<'a> DerefMut for DatadogPipeline<'a> {
 }
 
 impl<'a> DatadogPipeline<'a> {
-    fn send_timer_histogram(&mut self, histogram_report: &HistogramReport) {
+    fn send_timer_histogram(&mut self, histogram_report: &SamplingHistogramReport) {
         self.send_timer_histogram_with_tags::<&str>(histogram_report, None);
     }
 
     fn send_timer_histogram_with_tags<T: AsRef<str>>(
         &mut self,
-        histogram_report: &HistogramReport,
+        histogram_report: &SamplingHistogramReport,
         tags: TagsRef<T>,
     ) {
         let name = histogram_report.name();

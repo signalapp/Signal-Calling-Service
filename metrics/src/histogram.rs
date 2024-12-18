@@ -22,6 +22,18 @@ impl<T: Debug> Debug for Histogram<T> {
     }
 }
 
+impl<T: Clone> Clone for Histogram<T> {
+    fn clone(&self) -> Self {
+        Self {
+            counts_by_value: self.counts_by_value.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.counts_by_value = source.counts_by_value.clone();
+    }
+}
+
 impl<T> Histogram<T> {
     pub fn push_n(&mut self, value: T, n: usize)
     where

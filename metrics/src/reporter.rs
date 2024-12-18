@@ -99,7 +99,7 @@ impl NumericValueReporter {
     }
 
     /// Creates a report of timings and resets the reporter.
-    pub fn report(&self) -> HistogramReport {
+    pub fn report(&self) -> SamplingHistogramReport {
         let event_count = self.event_counter.load(Ordering::Relaxed);
         let last_sample_interval = self.sample_interval.load(Ordering::Relaxed);
 
@@ -124,7 +124,7 @@ impl NumericValueReporter {
             );
         }
 
-        HistogramReport {
+        SamplingHistogramReport {
             name: self.name,
             sample_interval: last_sample_interval,
             histogram: since_last_report.histogram,
@@ -139,14 +139,72 @@ impl NumericValueReporter {
     }
 }
 
+#[derive(Debug)]
+pub struct ValueHistogramReport {
+    pub name: &'static str,
+    pub histogram: Histogram<usize>,
+    pub tags: StaticStrTagsRef,
+}
+
+pub struct ValueHistogramReporter {
+    name: &'static str,
+    histograms: parking_lot::RwLock<HashMap<StaticStrTagsRef, Mutex<Histogram<usize>>>>,
+}
+
+impl ValueHistogramReporter {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            histograms: parking_lot::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// This will count n events.
+    pub fn push(&self, value: usize) {
+        self.push_tagged(value, None)
+    }
+
+    pub fn push_tagged(&self, value: usize, tags: StaticStrTagsRef) {
+        if let Some(histogram) = self.histograms.read().get(&tags) {
+            histogram.lock().push(value);
+            return;
+        }
+
+        // Must recheck entry in case it was made while waiting for write lock
+        self.histograms
+            .write()
+            .entry(tags.to_owned())
+            .or_insert_with(|| Mutex::new(Histogram::default()))
+            .lock()
+            .push(value);
+    }
+
+    pub fn report(&self) -> Vec<ValueHistogramReport> {
+        self.histograms
+            .read()
+            .iter()
+            .map(|(tags, histogram)| {
+                let mut histogram = histogram.lock();
+                let report = ValueHistogramReport {
+                    name: self.name,
+                    histogram: histogram.clone(),
+                    tags: tags.to_owned(),
+                };
+                histogram.clear();
+                report
+            })
+            .collect()
+    }
+}
+
 pub struct EventCountReporter {
     name: &'static str,
     event_counters: parking_lot::RwLock<HashMap<StaticStrTagsRef, AtomicUsize>>,
 }
 
 impl EventCountReporter {
-    pub fn new(name: &'static str) -> EventCountReporter {
-        EventCountReporter {
+    pub fn new(name: &'static str) -> Self {
+        Self {
             name,
             event_counters: parking_lot::RwLock::new(HashMap::new()),
         }
@@ -238,7 +296,7 @@ impl<T: Timer> Timer for Option<T> {
 }
 
 #[derive(Debug)]
-pub struct HistogramReport {
+pub struct SamplingHistogramReport {
     name: &'static str,
     sample_interval: usize,
     event_count: usize,
@@ -247,7 +305,7 @@ pub struct HistogramReport {
     sample_precision: Precision,
 }
 
-impl HistogramReport {
+impl SamplingHistogramReport {
     pub fn name(&self) -> &'static str {
         self.name
     }

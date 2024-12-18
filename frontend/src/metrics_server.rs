@@ -71,7 +71,7 @@ pub async fn start(frontend: Arc<Frontend>, shutdown_signal_rx: Receiver<()>) ->
                     }
 
                     let report = metrics!().report();
-                    for report in report.histograms {
+                    for report in report.sampling_histograms {
                         datadog.send_timer_histogram(&report, &None);
                     }
                     for report in report.events {
@@ -165,7 +165,7 @@ impl<'a> DerefMut for DatadogPipeline<'a> {
 impl<'a> DatadogPipeline<'a> {
     fn send_timer_histogram(
         &mut self,
-        histogram_report: &HistogramReport,
+        histogram_report: &SamplingHistogramReport,
         tags: &Option<Vec<&str>>,
     ) {
         let name = histogram_report.name();
