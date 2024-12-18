@@ -12,43 +12,42 @@ description = "Media forwarding server for group calls."
 license = "AGPL-3.0-only"
 
 [dependencies]
-mrp = { git = "https://github.com/signalapp/ringrtc", tag = "v2.43.0" }
+mrp = { git = "https://github.com/signalapp/ringrtc", tag = "v2.49.1" }
 calling_common = { path = "../common" }
 metrics = { path = "../metrics" }
 
 # For error handling
-anyhow = "1.0.86"
-thiserror = "1.0.62"
+anyhow = "1.0.94"
+thiserror = "2.0.6"
 scopeguard = "1.2.0"
 
 # For logging and command line operations
 log = "0.4.22"
-env_logger = "0.11.3"
-clap = { version = "4.5.9", features = ["derive"] }
+env_logger = "0.11.5"
+clap = { version = "4.5.23", features = ["derive"] }
 
 # For runtime and threading
-tokio = { version = "1.38.0", features = ["full"] }
+tokio = { version = "1.42.0", features = ["full"] }
 parking_lot = {  version = "0.12.3", features = ["deadlock_detection"] }
-once_cell = "1.19.0"
+once_cell = "1.20.2"
 futures = "0.3.31"
 num_cpus = "1.16.0"
-async-trait = "0.1.81"
+async-trait = "0.1.83"
 
 # For http
 axum = { version = "0.7.5" }
 axum-extra = { version = "0.9.3", default-features = false, features = ["typed-header", "tracing"] }
-hyper = { version = "1.4.1", features = ["full"] }
-reqwest = { version = "0.12.6", default-features = false, features = ["json"] }
-tower = "0.4.13"
+hyper = { version = "1.5.1", features = ["full"] }
+reqwest = { version = "0.12.9", default-features = false, features = ["json"] }
+tower = "0.5.1"
 
 # For general conversions
-base64 = "0.22.1"
 byteorder = "1.5.0"
 hex = { version = "0.4.3", features = ["serde"] }
-serde = { version = "1.0.204", features = ["derive"] }
-serde_json = "1.0.120"
-serde_with = { version = "3.9.0", features = ["base64"] }
-prost = "0.12.6"
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.133"
+serde_with = { version = "3.11.0", features = ["base64"] }
+prost = "0.13.4"
 strum = "0.26.3"
 strum_macros = "0.26.4"
 
@@ -63,7 +62,6 @@ sha-1 = "0.10.1"
 # For SRTP key derivation using DHE
 hkdf = "0.12.4"
 rand = "0.8.5"
-rand_core = { version = "0.6.4", features = [] }
 x25519-dalek = { version = "2.0.1" }
 
 # For (S)RTP
@@ -72,9 +70,9 @@ aes-gcm = "0.10.3"
 zeroize = "1.8.1"
 
 # For congestion control
-async-stream = "0.3.5"
+async-stream = "0.3.6"
 # For congestion-control-specific helpers
-pin-project = "1.1.5"
+pin-project = "1.1.7"
 
 # For low-level UDP sockets and tracking TCP sockets
 nix = { version = "0.26.4", optional = true }
@@ -84,22 +82,22 @@ unique_id = "0.1.5"
 psutil = { version = "3.3.0", default-features = false, features = ["cpu", "process"] }
 
 # For TLS sockets in epoll backend
-rustls = "0.23.12"
-rustls-pemfile = "2.1.3"
+rustls = "0.23.19"
+rustls-pemfile = "2.2.0"
 
 [target.'cfg(target_os="linux")'.dependencies]
 # Only currently needed for metrics (won't build on mac, see https://github.com/rust-lang/rust/issues/115149).
 accounting-allocator = "0.2.0"
 
 [build-dependencies]
-prost-build = "0.12.6"
+prost-build = "0.13.4"
 
 [dev-dependencies]
-http = "1.1.0"
+http = "1.2.0"
 hex-literal = "0.4.1"
 unzip3 = "1.0.0"
 
-tokio = { version = "1.38.0", features = ["test-util"] }
+tokio = { version = "1.42.0", features = ["test-util"] }
 
 # For matching WebRTC's randomness
 rand_distr = "0.4.3"

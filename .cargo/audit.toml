@@ -8,4 +8,6 @@ ignore = [
     "RUSTSEC-2021-0145",
     # Ignore advisory for mach (only used by psutil on macOS)
     "RUSTSEC-2020-0168",
+    # pqcrypto-kyber is our Kyber implementation
+    "RUSTSEC-2024-0381",
 ]

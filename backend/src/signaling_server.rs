@@ -725,7 +725,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                Request::get(format!("/v1/call/{}/clients", CALL_ID))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -748,7 +748,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                Request::get(format!("/v1/call/{}/clients", CALL_ID))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -786,7 +786,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                Request::get(format!("/v1/call/{}/clients", CALL_ID))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -814,7 +814,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                Request::get(format!("/v1/call/{}/clients", CALL_ID))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -840,7 +840,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                Request::get(format!("/v1/call/{}/clients", CALL_ID))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -870,7 +870,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                Request::get(format!("/v1/call/{}/clients", CALL_ID))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -893,7 +893,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                Request::get(format!("/v1/call/{}/clients", CALL_ID))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -931,7 +931,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                Request::get(format!("/v1/call/{}/clients", CALL_ID))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -957,7 +957,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                Request::get(format!("/v1/call/{}/clients", CALL_ID))
                     .header(
                         sfu::UserId::name(),
                         validate_user_id(USER_ID_2).unwrap().as_str(),
@@ -987,7 +987,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::get(&format!("/v1/call/{}/clients", CALL_ID))
+                Request::get(format!("/v1/call/{}/clients", CALL_ID))
                     .header(
                         sfu::UserId::name(),
                         validate_user_id(USER_ID_1).unwrap().as_str(),
@@ -1032,7 +1032,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 1))
+                Request::post(format!("/v1/call/{}/client/{}", CALL_ID, 1))
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
@@ -1061,7 +1061,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::post(&format!("/v1/call/{}/client/{}", "INVALIDNOTHEX", 16))
+                Request::post(format!("/v1/call/{}/client/{}", "INVALIDNOTHEX", 16))
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
@@ -1090,7 +1090,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+                Request::post(format!("/v1/call/{}/client/{}", CALL_ID, 16))
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
@@ -1119,7 +1119,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+                Request::post(format!("/v1/call/{}/client/{}", CALL_ID, 16))
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
@@ -1148,7 +1148,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+                Request::post(format!("/v1/call/{}/client/{}", CALL_ID, 16))
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
@@ -1177,7 +1177,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+                Request::post(format!("/v1/call/{}/client/{}", CALL_ID, 16))
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
@@ -1225,7 +1225,7 @@ mod signaling_server_tests {
         let response = api
             .clone()
             .oneshot(
-                Request::post(&format!("/v1/call/{}/client/{}", CALL_ID, 16))
+                Request::post(format!("/v1/call/{}/client/{}", CALL_ID, 16))
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&JoinRequest {
