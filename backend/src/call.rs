@@ -19,9 +19,11 @@ use calling_common::{
 use hex::ToHex;
 use log::*;
 use mrp::{self, MrpReceiveError, MrpStream};
+use once_cell::sync::Lazy;
 use prost::Message;
 use reqwest::Url;
 use serde::Serialize;
+use strum::IntoEnumIterator;
 use strum_macros::{EnumIter, EnumString};
 use thiserror::Error;
 
@@ -35,7 +37,7 @@ use crate::{
 
 mod approval_persistence;
 use approval_persistence::ApprovedUsers;
-use metrics::*;
+use metrics::{metric_config::StaticStrTagsRef, *};
 
 pub const CLIENT_SERVER_DATA_SSRC: rtp::Ssrc = 1;
 pub const CLIENT_SERVER_DATA_PAYLOAD_TYPE: rtp::PayloadType = 101;
@@ -123,6 +125,22 @@ impl From<usize> for CallSizeBucket {
         }
     }
 }
+
+// Compute custom tags for Per-Call metrics to avoid allocating new tag vectors
+// These tags contain the "call-type" and "call-size" tags
+pub static CALL_TAG_VALUES: Lazy<HashMap<(CallType, CallSizeBucket), Vec<&str>>> =
+    Lazy::new(|| {
+        CallSizeBucket::iter()
+            .flat_map(|call_size| {
+                CallType::iter().map(move |call_type| {
+                    (
+                        (call_type, call_size),
+                        vec![call_type.as_tag(), call_size.as_tag()],
+                    )
+                })
+            })
+            .collect()
+    });
 
 /// A wrapper around Vec<u8> to identify a Call.
 /// It comes from signaling, but isn't known by the clients.
@@ -384,11 +402,18 @@ pub struct Call {
     /// The last time key frame requests were sent, in general and specifically for certain SSRCs
     key_frame_requests_sent: Instant,
     key_frame_request_sent_by_ssrc: HashMap<rtp::Ssrc, Instant>,
-    call_time: CallTimeStats,
+    call_stats: CallStats,
 }
 
-#[derive(Default)]
-pub struct CallTimeStats {
+#[derive(Debug, Default)]
+pub struct CallStats {
+    /// The greatest call size seen during this call
+    pub peak_call_size: usize,
+    pub call_duration: CallDurationStats,
+}
+
+#[derive(Debug, Default)]
+pub struct CallDurationStats {
     pub empty: Duration,
     pub solo: Duration,
     pub pair: Duration,
@@ -469,7 +494,7 @@ impl Call {
 
             key_frame_requests_sent: now - KEY_FRAME_REQUEST_CALCULATION_INTERVAL, // easier than using None :)
             key_frame_request_sent_by_ssrc: HashMap::new(),
-            call_time: CallTimeStats::default(),
+            call_stats: CallStats::default(),
         }
     }
 
@@ -493,7 +518,7 @@ impl Call {
         self.clients.len()
     }
 
-    pub fn size_including_pending_calls(&self) -> usize {
+    pub fn size_including_pending_clients(&self) -> usize {
         self.clients.len() + self.pending_clients.len()
     }
 
@@ -527,8 +552,16 @@ impl Call {
         self.created
     }
 
-    pub fn call_time(&self) -> &CallTimeStats {
-        &self.call_time
+    pub fn peak_call_size(&self) -> usize {
+        self.call_stats.peak_call_size
+    }
+
+    pub fn call_duration(&self) -> &CallDurationStats {
+        &self.call_stats.call_duration
+    }
+
+    pub fn call_duration_mut(&mut self) -> &mut CallDurationStats {
+        &mut self.call_stats.call_duration
     }
 
     pub fn has_client(&self, demux_id: DemuxId) -> bool {
@@ -607,10 +640,10 @@ impl Call {
         // An update message to clients about clients will be sent at the next tick().
         let increment = now.saturating_duration_since(self.client_added_or_removed);
         match self.clients.len() {
-            0 => self.call_time.empty += increment,
-            1 => self.call_time.solo += increment,
-            2 => self.call_time.pair += increment,
-            _ => self.call_time.many += increment,
+            0 => self.call_duration_mut().empty += increment,
+            1 => self.call_duration_mut().solo += increment,
+            2 => self.call_duration_mut().pair += increment,
+            _ => self.call_duration_mut().many += increment,
         }
         self.client_added_or_removed = now;
     }
@@ -635,6 +668,7 @@ impl Call {
         );
         // We may have to update the padding SSRCs because there can't be any padding SSRCs until two people join
         self.update_padding_ssrcs();
+        self.call_stats.peak_call_size = max(self.call_stats.peak_call_size, self.size());
     }
 
     fn approve_pending_client(&mut self, demux_id: DemuxId, now: Instant) {
@@ -1930,11 +1964,19 @@ impl Call {
             .collect()
     }
 
-    pub fn get_stats(&self) -> CallStats {
-        CallStats {
+    pub fn get_stats(&self) -> CallStatsReport {
+        CallStatsReport {
             loggable_call_id: self.loggable_call_id.clone(),
             clients: self.clients.iter().map(Client::get_stats).collect(),
         }
+    }
+
+    pub fn call_tags(&self) -> StaticStrTagsRef {
+        Self::call_tags_from(self.call_type, self.size())
+    }
+
+    pub fn call_tags_from(call_type: CallType, client_count: usize) -> StaticStrTagsRef {
+        CALL_TAG_VALUES.get(&(call_type, client_count.into()))
     }
 }
 
@@ -2990,7 +3032,7 @@ impl Vp8SimulcastRtpForwarder {
     }
 }
 
-pub struct CallStats {
+pub struct CallStatsReport {
     pub loggable_call_id: LoggableCallId,
     pub clients: Vec<ClientStats>,
 }

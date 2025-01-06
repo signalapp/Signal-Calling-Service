@@ -31,7 +31,7 @@ use thiserror::Error;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::{
-    call::{self, Call, CallSizeBucket, LoggableCallId},
+    call::{self, Call, CallSizeBucket, LoggableCallId, CALL_TAG_VALUES},
     config,
     connection::{self, AddressType, Connection, ConnectionRates, HandleRtcpResult, PacketToSend},
     googcc,
@@ -226,21 +226,6 @@ impl Sfu {
     pub fn get_stats(&self) -> SfuStats {
         type HistogramMap<T> = HashMap<StaticStrTagsRef, Histogram<T>>;
         type ValueMap = HashMap<StaticStrTagsRef, f32>;
-        // Compute custom tags for Per-Call metrics to avoid allocating new tag vectors
-        // These tags contain the "call-type" and "call-size" tags
-        static CALL_TAG_VALUES: Lazy<HashMap<(CallType, CallSizeBucket), Vec<&str>>> =
-            Lazy::new(|| {
-                CallSizeBucket::iter()
-                    .flat_map(|call_size| {
-                        CallType::iter().map(move |call_type| {
-                            (
-                                (call_type, call_size),
-                                vec![call_type.as_tag(), call_size.as_tag()],
-                            )
-                        })
-                    })
-                    .collect()
-            });
         // Compute custom tags for Per-Connection metrics to avoid allocating new tag vectors
         // These tags contain every combo of the "call-size", "region-relation", and "user-agent" tag
         static CONNECTION_TAG_VALUES: Lazy<HashMap<ConnectionTags, Vec<&str>>> = Lazy::new(|| {
@@ -293,7 +278,7 @@ impl Sfu {
 
             let call_type = call.call_type();
             let size_bucket = call.size_bucket();
-            let tags = CALL_TAG_VALUES.get(&(call_type, size_bucket));
+            let tags = call.call_tags();
             call_tags_map.insert(call_id, (call_type, size_bucket));
 
             calls_count.entry(tags).or_default().add_assign(1f32);
@@ -573,7 +558,7 @@ impl Sfu {
                 return Err(SfuError::DuplicateDemuxIdDetected);
             }
 
-            if call.size_including_pending_calls() == self.config.max_clients_per_call as usize {
+            if call.size_including_pending_clients() == self.config.max_clients_per_call as usize {
                 return Err(SfuError::TooManyClients);
             }
 
@@ -1110,29 +1095,34 @@ impl Sfu {
             match call.activity(&now, &inactivity_timeout) {
                 CallActivity::Inactive => {
                     // If the call hasn't had any activity recently, remove it.
-                    let call_time = call.call_time();
+                    let call_tags = Call::call_tags_from(call.call_type(), call.peak_call_size());
+                    let call_duration = call.call_duration();
+                    let active_time = (call_duration.pair + call_duration.many).as_secs() as usize;
+                    let inactive_time =
+                        (call_duration.empty + call_duration.solo).as_secs() as usize;
                     info!(
                         "call_id: {} removed; seconds empty: {}, solo: {}, pair: {}, many: {}",
                         call.loggable_call_id(),
-                        call_time.empty.as_secs(),
-                        call_time.solo.as_secs(),
-                        call_time.pair.as_secs(),
-                        call_time.many.as_secs()
+                        call_duration.empty.as_secs(),
+                        call_duration.solo.as_secs(),
+                        call_duration.pair.as_secs(),
+                        call_duration.many.as_secs()
                     );
 
-                    event!("calling.sfu.call_complete");
-                    if !call_time.many.is_zero() {
+                    event!("calling.sfu.call_complete.count", 1, call_tags);
+                    value_histogram!("calling.sfu.call_length.active", active_time, call_tags);
+                    value_histogram!("calling.sfu.call_length.inactive", inactive_time, call_tags);
+
+                    // deprecate some of following events
+                    if !call_duration.many.is_zero() {
                         event!("calling.sfu.call_complete.many");
-                    } else if !call_time.pair.is_zero() {
+                    } else if !call_duration.pair.is_zero() {
                         event!("calling.sfu.call_complete.pair");
-                    } else if !call_time.solo.is_zero() {
+                    } else if !call_duration.solo.is_zero() {
                         event!("calling.sfu.call_complete.solo");
                     } else {
                         event!("calling.sfu.call_complete.empty");
                     }
-
-                    let active_time = (call_time.pair + call_time.many).as_secs();
-                    let inactive_time = (call_time.empty + call_time.solo).as_secs();
 
                     if active_time == 0 {
                     } else if active_time < 60 {
@@ -1157,18 +1147,18 @@ impl Sfu {
                     }
 
                     if active_time > 60 {
-                        if let Ok(seconds) = call_time.pair.as_secs().try_into() {
+                        if let Ok(seconds) = call_duration.pair.as_secs().try_into() {
                             event!("calling.sfu.call_seconds_over_1m.pair", seconds);
                         }
-                        if let Ok(seconds) = call_time.many.as_secs().try_into() {
+                        if let Ok(seconds) = call_duration.many.as_secs().try_into() {
                             event!("calling.sfu.call_seconds_over_1m.many", seconds);
                         }
                     }
 
-                    if let Ok(seconds) = call_time.pair.as_secs().try_into() {
+                    if let Ok(seconds) = call_duration.pair.as_secs().try_into() {
                         event!("calling.sfu.all_call_seconds.pair", seconds);
                     }
-                    if let Ok(seconds) = call_time.many.as_secs().try_into() {
+                    if let Ok(seconds) = call_duration.many.as_secs().try_into() {
                         event!("calling.sfu.all_call_seconds.many", seconds);
                     }
 
