@@ -11,6 +11,8 @@ mod client_status;
 mod collections;
 mod counters;
 mod data_rate;
+#[cfg(feature = "dynamic_config")]
+pub mod dynamic_config;
 mod integers;
 mod math;
 mod serialize;

@@ -33,5 +33,7 @@ jobs:
       working-directory: backend/fuzz
       env:
         RUSTFLAGS: --cfg fuzzing
-    - name: Test
+    - name: Quick tests
       run: cargo test
+    - name: Dynamic Config tests
+      run: cargo test -p calling_common dynamic_config --features=dynamic_config
