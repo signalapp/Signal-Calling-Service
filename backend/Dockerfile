@@ -28,7 +28,7 @@ RUN cargo new common --lib
 RUN cargo new metrics --lib
 RUN cargo new backend
 RUN cargo new docker/bootstrap
-RUN cargo new frontend
+RUN cargo new frontend --edition 2021
 
 COPY Cargo.toml Cargo.lock rust-toolchain ./
 COPY common/Cargo.toml ./common/

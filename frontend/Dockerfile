@@ -26,7 +26,7 @@ WORKDIR /usr/src/calling-service
 # Create a stub version of the project to cache dependencies.
 RUN cargo new common --lib
 RUN cargo new metrics --lib
-RUN cargo new backend
+RUN cargo new backend --edition 2021
 RUN cargo new docker/bootstrap
 RUN cargo new frontend
 
