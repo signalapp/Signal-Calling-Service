@@ -23,14 +23,15 @@ ENV RUSTFLAGS=$rust_flags
 
 WORKDIR /usr/src/calling-service
 
+COPY Cargo.toml Cargo.lock rust-toolchain ./
+
 # Create a stub version of the project to cache dependencies.
 RUN cargo new common --lib
 RUN cargo new metrics --lib
 RUN cargo new backend
 RUN cargo new docker/bootstrap
-RUN cargo new frontend --edition 2021
+RUN cargo new frontend
 
-COPY Cargo.toml Cargo.lock rust-toolchain ./
 COPY common/Cargo.toml ./common/
 # copy entire module because module is not properly recompiled when stubbed
 COPY metrics ./metrics
