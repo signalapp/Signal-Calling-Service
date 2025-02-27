@@ -1152,6 +1152,9 @@ impl Call {
             time_scope_us!("calling.call.handle_rtp.audio_level");
             sender.incoming_audio_levels.push(audio_level);
             // Active speaker is recalculated in tick()
+            if audio_level == 0 {
+                return Ok(vec![]);
+            }
         }
         let dependency_descriptor = if incoming_rtp.is_vp8() {
             time_scope_us!("calling.call.handle_rtp.vp8_header");
@@ -1181,14 +1184,7 @@ impl Call {
                 continue;
             }
             if let Some(rtp_to_forward) = match layer_id {
-                LayerId::Audio => {
-                    let is_silence = incoming_rtp.audio_level == Some(0);
-                    if is_silence {
-                        None
-                    } else {
-                        receiver.forward_audio_rtp(&incoming_rtp)
-                    }
-                }
+                LayerId::Audio => receiver.forward_audio_rtp(&incoming_rtp),
                 LayerId::RtpData => receiver.forward_data_rtp(&incoming_rtp),
                 LayerId::Video0 | LayerId::Video1 | LayerId::Video2 => {
                     receiver.forward_video_rtp(&incoming_rtp, dependency_descriptor.as_ref())
