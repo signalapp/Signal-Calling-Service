@@ -147,6 +147,9 @@ pub struct Config {
 
     #[clap(flatten)]
     pub metrics: MetricsOptions,
+
+    #[clap(flatten)]
+    pub candidate_selector_options: CandidateSelectorOptions,
 }
 
 #[derive(clap::Parser, Clone, Debug, Default)]
@@ -162,6 +165,65 @@ pub struct MetricsOptions {
     /// Deployment version appears as a tag in metrics and in logging if specified.
     #[arg(long = "metrics-version")]
     pub version: Option<String>,
+}
+
+#[derive(clap::Parser, Clone, Debug, Default)]
+pub struct CandidateSelectorOptions {
+    /// Candidate selector: connection ping period in milliseconds.
+    /// This value must be in the [500, 1500] range.
+    #[arg(long = "csel-ping-period", default_value = "1000", value_parser = clap::value_parser!(u64).range(500..=1500))]
+    pub ping_period: u64,
+
+    // Candidate selector: how many points to award to remotely nominated candidates.
+    // This value must be in the [0, 1000] range.
+    #[arg(long = "csel-score-nominated", default_value = "1000", value_parser = clap::value_parser!(u32).range(0..=1000))]
+    pub score_nominated: u32,
+
+    /// Candidate selector: UDPv4 connection score.
+    /// This value must be in the [0..1000] range.
+    #[arg(long = "csel-score-udpv4", default_value = "500", value_parser = clap::value_parser!(u32).range(0..=1000))]
+    pub score_udpv4: u32,
+
+    /// Candidate selector: UDPv6 connection score.
+    /// This value must be in the [0..1000] range.
+    #[arg(long = "csel-score-udpv6", default_value = "600", value_parser = clap::value_parser!(u32).range(0..=1000))]
+    pub score_udpv6: u32,
+
+    /// Candidate selector: TCPv4 connection score.
+    /// This value must be in the [0..1000] range.
+    #[arg(long = "csel-score-tcpv4", default_value = "250", value_parser = clap::value_parser!(u32).range(0..=1000))]
+    pub score_tcpv4: u32,
+
+    /// Candidate selector: TCPv6 connection score.
+    /// This value must be in the [0..1000] range.
+    #[arg(long = "csel-score-tcpv6", default_value = "350", value_parser = clap::value_parser!(u32).range(0..=1000))]
+    pub score_tcpv6: u32,
+
+    /// Candidate selector: TLSv4 connection score.
+    /// This value must be in the [0..1000] range.
+    #[arg(long = "csel-score-tlsv4", default_value = "100", value_parser = clap::value_parser!(u32).range(0..=1000))]
+    pub score_tlsv4: u32,
+
+    /// Candidate selector: TLSv6 connection score.
+    /// This value must be in the [0..1000] range.
+    #[arg(long = "csel-score-tlsv6", default_value = "150", value_parser = clap::value_parser!(u32).range(0..=1000))]
+    pub score_tlsv6: u32,
+
+    /// Candidate selector: maximum ICE ping RTT penalty.
+    /// This value must be greater than or equal to 0.
+    #[arg(long = "csel-rtt-max-penalty", default_value = "2000")]
+    pub rtt_max_penalty: f32,
+
+    /// Candidate selector: any remote candidate whose ICE ping RTT exceeds this value will
+    /// receive the maximum penalty. This value must be greater than or equal to 0.
+    #[arg(long = "csel-rtt-limit", default_value = "300")]
+    pub rtt_limit: f32,
+
+    /// Candidate selector: ICE ping RTT estimator sensitivity.
+    /// This value must be in the [0, 1] range where 0 will yield the least sensitive RTT
+    /// estimator, and, conversely, 1 will yield the most sensitive RTT estimator.
+    #[arg(long = "csel-rtt-sensitivity", default_value = "0.1")]
+    pub rtt_sensitivity: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -240,5 +302,6 @@ pub(crate) fn default_test_config() -> Config {
         key_file_path: None,
         hostname: None,
         ice_candidate_port_tls: None,
+        candidate_selector_options: Default::default(),
     }
 }

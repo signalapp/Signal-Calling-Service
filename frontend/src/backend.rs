@@ -83,6 +83,8 @@ pub struct JoinRequest {
     pub user_id: String,
     #[serde(rename = "clientIceUfrag")]
     pub ice_ufrag: String,
+    #[serde(rename = "clientIcePwd")]
+    pub ice_pwd: Option<String>,
     #[serde(rename = "clientDhePublicKey")]
     pub dhe_public_key: Option<String>,
     pub hkdf_extra_info: Option<String>,
@@ -347,7 +349,8 @@ impl Backend for BackendHttpClient {
 mod tests {
     use super::*;
     use crate::api::v2_tests::{
-        CLIENT_DHE_PUBLIC_KEY, CLIENT_ICE_UFRAG, GROUP_ID_1, LOCAL_REGION, USER_ID_1,
+        CLIENT_DHE_PUBLIC_KEY, CLIENT_ICE_PWD, CLIENT_ICE_UFRAG, GROUP_ID_1, LOCAL_REGION,
+        USER_ID_1,
     };
 
     #[test]
@@ -356,6 +359,7 @@ mod tests {
             serde_json::json!({
                 "endpointId": USER_ID_1,
                 "clientIceUfrag": CLIENT_ICE_UFRAG,
+                "clientIcePwd": CLIENT_ICE_PWD,
                 "clientDhePublicKey": CLIENT_DHE_PUBLIC_KEY,
                 "hkdfExtraInfo": null,
                 "region": LOCAL_REGION,
@@ -369,6 +373,7 @@ mod tests {
             serde_json::to_value(JoinRequest {
                 user_id: USER_ID_1.to_string(),
                 ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                 dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                 hkdf_extra_info: None,
                 region: LOCAL_REGION.to_string(),

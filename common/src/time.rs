@@ -270,9 +270,23 @@ impl Add<Duration> for Duration {
     }
 }
 
+impl Sub<Duration> for Duration {
+    type Output = Duration;
+
+    fn sub(self, rhs: Duration) -> Self::Output {
+        Duration(self.0 - rhs.0)
+    }
+}
+
 impl AddAssign<Duration> for Duration {
     fn add_assign(&mut self, rhs: Duration) {
         self.0 += rhs.0
+    }
+}
+
+impl SubAssign<Duration> for Duration {
+    fn sub_assign(&mut self, rhs: Duration) {
+        self.0 -= rhs.0
     }
 }
 

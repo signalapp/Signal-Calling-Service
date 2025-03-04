@@ -58,6 +58,7 @@ pub struct JoinRequest {
     #[serde_as(as = "Option<serde_with::base64::Base64>")]
     pub admin_passkey: Option<Vec<u8>>,
     pub ice_ufrag: String,
+    pub ice_pwd: Option<String>,
     pub dhe_public_key: String,
     pub hkdf_extra_info: Option<String>,
 }
@@ -364,6 +365,7 @@ pub async fn join(
             &call,
             JoinRequestWrapper {
                 ice_ufrag: request.ice_ufrag,
+                ice_pwd: request.ice_pwd,
                 dhe_public_key: request.dhe_public_key,
                 hkdf_extra_info: request.hkdf_extra_info,
                 region,
@@ -444,6 +446,7 @@ pub mod api_server_v2_tests {
     const REDIRECTED_URL: &str =
         "https://asia-northeast3.test.com/v2/conference/participants?region=us-west1";
     pub const CLIENT_ICE_UFRAG: &str = "client-ufrag";
+    pub const CLIENT_ICE_PWD: &str = "client-pwd";
     pub const CLIENT_DHE_PUBLIC_KEY: &str = "f924028e9b8021b77eb97b36f1d43e63";
     const BACKEND_ICE_UFRAG: &str = "backend-ufrag";
     const BACKEND_ICE_PWD: &str = "backend-password";
@@ -526,6 +529,7 @@ pub mod api_server_v2_tests {
         JoinRequest {
             admin_passkey: None,
             ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+            ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
             dhe_public_key: CLIENT_DHE_PUBLIC_KEY.to_string(),
             hkdf_extra_info: None,
         }
@@ -535,6 +539,7 @@ pub mod api_server_v2_tests {
         if let Some(passkey) = passkey {
             serde_json::to_vec(&JoinRequest {
                 ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                 dhe_public_key: CLIENT_DHE_PUBLIC_KEY.to_string(),
                 hkdf_extra_info: None,
                 admin_passkey: Some(passkey.into()),
@@ -544,6 +549,7 @@ pub mod api_server_v2_tests {
             serde_json::to_vec(&JoinRequest {
                 admin_passkey: None,
                 ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                 dhe_public_key: CLIENT_DHE_PUBLIC_KEY.to_string(),
                 hkdf_extra_info: None,
             })
@@ -908,6 +914,7 @@ pub mod api_server_v2_tests {
                 eq(backend::JoinRequest {
                     user_id: USER_ID_1.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
@@ -1017,6 +1024,7 @@ pub mod api_server_v2_tests {
                 eq(backend::JoinRequest {
                     user_id: USER_ID_2.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
@@ -1169,6 +1177,7 @@ pub mod api_server_v2_tests {
         let join_request = JoinRequest {
             admin_passkey: None,
             ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+            ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
             dhe_public_key: "".to_string(),
             hkdf_extra_info: None,
         };
@@ -2349,6 +2358,7 @@ pub mod api_server_v2_tests {
                 eq(backend::JoinRequest {
                     user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
@@ -2483,6 +2493,7 @@ pub mod api_server_v2_tests {
                 eq(backend::JoinRequest {
                     user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
@@ -2618,6 +2629,7 @@ pub mod api_server_v2_tests {
                 eq(backend::JoinRequest {
                     user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
@@ -2726,6 +2738,7 @@ pub mod api_server_v2_tests {
                 eq(backend::JoinRequest {
                     user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
@@ -2835,6 +2848,7 @@ pub mod api_server_v2_tests {
                 eq(backend::JoinRequest {
                     user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
@@ -3048,6 +3062,7 @@ pub mod api_server_v2_tests {
                 eq(backend::JoinRequest {
                     user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
@@ -3158,6 +3173,7 @@ pub mod api_server_v2_tests {
                 eq(backend::JoinRequest {
                     user_id: USER_ID_1_DOUBLE_ENCODED.to_string(),
                     ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+                    ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
                     dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                     hkdf_extra_info: None,
                     region: LOCAL_REGION.to_string(),
@@ -3487,6 +3503,7 @@ pub mod api_server_v2_tests {
         let join_request = JoinRequest {
             admin_passkey: None,
             ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
+            ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
             dhe_public_key: "".to_string(),
             hkdf_extra_info: None,
         };
@@ -3751,7 +3768,7 @@ pub mod api_server_v2_tests {
     #[tokio::test]
     async fn test_room_id_request_deserialize() {
         let serialized =
-            "{\"iceUfrag\":\"client-ufrag\",\"dhePublicKey\":\"f924028e9b8021b77eb97b36f1d43e63\"}";
+            "{\"iceUfrag\":\"client-ufrag\",\"icePwd\":\"client-pwd\",\"dhePublicKey\":\"f924028e9b8021b77eb97b36f1d43e63\"}";
         println!("serialized {:?}", serialized);
         let deserialized: Result<JoinRequest, serde_json::Error> = serde_json::from_str(serialized);
         println!("deserialized {:?}", deserialized);

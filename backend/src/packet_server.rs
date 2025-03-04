@@ -38,6 +38,16 @@ use crate::{
     sfu::{HandleOutput, Sfu, SfuError},
 };
 
+#[derive(Debug, Clone, Copy)]
+pub enum AddressType {
+    UdpV4,
+    UdpV6,
+    TcpV4,
+    TcpV6,
+    TlsV4,
+    TlsV6,
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum SocketLocator {
     Udp(SocketAddr),
@@ -46,6 +56,28 @@ pub enum SocketLocator {
         is_ipv6: bool,
         is_tls: bool,
     },
+}
+
+impl SocketLocator {
+    pub fn get_address_type(&self) -> AddressType {
+        match self {
+            SocketLocator::Udp(addr) => {
+                if addr.ip().to_canonical().is_ipv6() {
+                    AddressType::UdpV6
+                } else {
+                    AddressType::UdpV4
+                }
+            }
+            SocketLocator::Tcp {
+                is_ipv6, is_tls, ..
+            } => match (is_ipv6, is_tls) {
+                (false, false) => AddressType::TcpV4,
+                (false, true) => AddressType::TlsV4,
+                (true, false) => AddressType::TcpV6,
+                (true, true) => AddressType::TlsV6,
+            },
+        }
+    }
 }
 
 impl fmt::Display for SocketLocator {

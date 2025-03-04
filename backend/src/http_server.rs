@@ -57,6 +57,7 @@ pub struct ParticipantsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct JoinRequest {
     pub ice_ufrag: String,
+    pub ice_pwd: Option<String>,
     pub dhe_public_key: String,
     pub hkdf_extra_info: Option<String>,
 }
@@ -348,6 +349,7 @@ async fn join_conference(
         server_ice_ufrag.clone(),
         server_ice_pwd.clone(),
         join_request.ice_ufrag,
+        join_request.ice_pwd,
         client_dhe_public_key,
         client_hkdf_extra_info,
         Region::Unset,

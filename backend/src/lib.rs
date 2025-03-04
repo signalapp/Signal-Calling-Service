@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod call;
 pub mod call_lifecycle;
+pub mod candidate_selector;
 pub mod config;
 pub mod connection;
 pub mod frontend;

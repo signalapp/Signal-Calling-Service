@@ -164,6 +164,14 @@ fn main() -> Result<()> {
         None
     };
 
+    let csel_opts = &config.candidate_selector_options;
+    if csel_opts.rtt_limit < 0.0
+        || csel_opts.rtt_max_penalty < 0.0
+        || csel_opts.rtt_sensitivity < 0.0
+    {
+        panic!("rtt-limit, rtt-max-penalty, and rtt-sensitivity must be greater than 0");
+    }
+
     let (deadlock_monitor_ender_tx, deadlock_monitor_ender_rx) = std::sync::mpsc::channel();
     let deadlock_monitor_handle =
         metrics::monitor_deadlocks(MONITOR_DEADLOCK_INTERVAL.into(), deadlock_monitor_ender_rx);

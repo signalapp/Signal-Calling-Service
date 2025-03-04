@@ -33,11 +33,11 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 use crate::{
     call::{self, Call, CallSizeBucket, LoggableCallId, CALL_TAG_VALUES},
     config,
-    connection::{self, AddressType, Connection, ConnectionRates, HandleRtcpResult, PacketToSend},
+    connection::{self, Connection, ConnectionRates, HandleRtcpResult, PacketToSend},
     googcc,
-    ice::{self, BindingRequest},
+    ice::{self, BindingRequest, BindingResponse, IceTransactionTable},
     pacer,
-    packet_server::{PacketServerState, SocketLocator},
+    packet_server::{AddressType, PacketServerState, SocketLocator},
     region::{Region, RegionRelation},
     rtp::{self, new_master_key_material},
 };
@@ -64,8 +64,14 @@ pub enum SfuError {
     MissingCall(CallId),
     #[error("parsing ICE binding request failed: {0}")]
     ParseIceBindingRequest(ice::ParseError),
+    #[error("parsing ICE binding response failed: {0}")]
+    ParseIceBindingResponse(ice::ParseError),
     #[error("ICE binding request with unknown username: {0:?}")]
     IceBindingRequestUnknownUsername(Vec<u8>),
+    #[error("ICE binding request has no username")]
+    IceBindingRequestHasNoUsername,
+    #[error("ICE binding response has an invalid transaction ID")]
+    IceBindingInvalidTransactionId,
     #[error("connection error: {0}")]
     ConnectionError(connection::Error),
     #[error("call error: {0}")]
@@ -84,7 +90,7 @@ impl std::fmt::Debug for SfuError {
 /// Uniquely identifies a Connection across calls using a combination
 /// of CallId and DemuxId.
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct ConnectionId {
+pub struct ConnectionId {
     call_id: CallId,
     demux_id: DemuxId,
 }
@@ -93,10 +99,19 @@ impl ConnectionId {
     fn from_call_id_and_demux_id(call_id: CallId, demux_id: DemuxId) -> ConnectionId {
         Self { call_id, demux_id }
     }
+
     fn from_call_id(call_id: CallId) -> ConnectionId {
         Self {
             call_id,
             demux_id: DUMMY_DEMUX_ID,
+        }
+    }
+
+    /// For testing
+    pub fn null() -> Self {
+        Self {
+            call_id: CallId::from(vec![0u8; 8]),
+            demux_id: DemuxId::from_const(0u32),
         }
     }
 }
@@ -480,6 +495,7 @@ impl Sfu {
         server_ice_ufrag: String,
         server_ice_pwd: String,
         client_ice_ufrag: String,
+        client_ice_pwd: Option<String>,
         client_dhe_public_key: DhePublicKey,
         client_hkdf_extra_info: Vec<u8>,
         region: Region,
@@ -518,11 +534,12 @@ impl Sfu {
         trace!("  {:25}{}", "server_ice_ufrag:", server_ice_ufrag);
         trace!("  {:25}{}", "server_ice_pwd:", server_ice_pwd);
 
-        let ice_pwd = server_ice_pwd.as_bytes().to_vec();
+        let ice_server_pwd = server_ice_pwd.as_bytes().to_vec();
+        let ice_client_pwd = client_ice_pwd.map(|pwd| pwd.as_bytes().to_vec());
 
-        let ice_request_username =
+        let ice_server_username =
             ice::join_username(client_ice_ufrag.as_bytes(), server_ice_ufrag.as_bytes());
-        let ice_response_username =
+        let ice_client_username =
             ice::join_username(server_ice_ufrag.as_bytes(), client_ice_ufrag.as_bytes());
 
         let now = Instant::now();
@@ -609,12 +626,13 @@ impl Sfu {
             )
             .expect("Expand SRTP master key material");
 
-        let inactivity_timeout = Duration::from_secs(self.config.inactivity_timeout_secs);
-
         let connection = Arc::new(Mutex::new(Connection::new(
-            ice_request_username.clone(),
-            ice_response_username,
-            ice_pwd,
+            self.config,
+            &connection_id,
+            ice_server_username.clone(),
+            ice_client_username.clone(),
+            ice_server_pwd,
+            ice_client_pwd,
             srtp_master_key_material,
             ack_ssrc,
             googcc::Config {
@@ -622,7 +640,6 @@ impl Sfu {
                 min_target_send_rate,
                 max_target_send_rate,
             },
-            inactivity_timeout,
             region_relation,
             user_agent,
             now,
@@ -630,7 +647,7 @@ impl Sfu {
         self.connection_by_id
             .insert(connection_id.clone(), connection.clone());
         self.connection_id_by_ice_request_username
-            .insert(ice_request_username, connection_id);
+            .insert(ice_server_username, connection_id.clone());
         // Entries are inserted into self.connection_id_by_address as we received ICE binding
 
         Ok((server_dhe_public_key, client_status))
@@ -895,25 +912,27 @@ impl Sfu {
             });
         }
 
-        // When we get a valid ICE check, send back a check response and update the
-        // outgoing address for the client.
-        if BindingRequest::looks_like_header(incoming_packet) {
+        // ICE request check
+        if let Some(ice_binding_request) = BindingRequest::try_from_buffer(incoming_packet)
+            .map_err(SfuError::ParseIceBindingRequest)?
+        {
             trace!("looks like ice binding request");
             time_scope_us!("calling.sfu.handle_packet.ice");
 
-            let ice_binding_request =
-                BindingRequest::parse(incoming_packet).map_err(SfuError::ParseIceBindingRequest)?;
+            let username = ice_binding_request
+                .username()
+                .ok_or(SfuError::IceBindingRequestHasNoUsername)?;
 
-            let (incoming_connection_id, outgoing_response) = {
+            let (incoming_connection_id, packets_to_send) = {
                 let (incoming_connection_id, incoming_connection) = sfu
                     .lock()
-                    .get_connection_from_ice_request_username(ice_binding_request.username())?;
+                    .get_connection_from_ice_request_username(username)?;
                 let mut incoming_connection = incoming_connection.lock();
                 time_scope_us!("calling.sfu.handle_packet.ice.in_locks");
-                let outgoing_response = incoming_connection
+                let packets_to_send = incoming_connection
                     .handle_ice_binding_request(sender_addr, ice_binding_request, Instant::now())
                     .map_err(SfuError::ConnectionError)?;
-                (incoming_connection_id, outgoing_response)
+                (incoming_connection_id, packets_to_send)
             };
 
             // Removal of old addresses is done in tick().
@@ -922,7 +941,37 @@ impl Sfu {
                 .insert_without_removing_old(sender_addr, incoming_connection_id);
 
             return Ok(HandleOutput {
-                packets_to_send: vec![(outgoing_response, sender_addr)],
+                packets_to_send,
+                dequeues_to_schedule: vec![],
+            });
+        }
+
+        // ICE response check
+        if let Some(ice_binding_response) = BindingResponse::try_from_buffer(incoming_packet)
+            .map_err(SfuError::ParseIceBindingResponse)?
+        {
+            trace!("looks like ice binding response");
+            time_scope_us!("calling.sfu.handle_packet.ice.response");
+
+            let incoming_connection_id =
+                IceTransactionTable::claim(sender_addr, &ice_binding_response.transaction_id())
+                    .ok_or(SfuError::IceBindingInvalidTransactionId)?;
+            let incoming_connection = sfu
+                .lock()
+                .get_connection_from_id(&incoming_connection_id)
+                .ok_or(SfuError::MissingConnection(
+                    incoming_connection_id.call_id.clone(),
+                    incoming_connection_id.demux_id,
+                ))?;
+
+            let mut incoming_connection = incoming_connection.lock();
+            time_scope_us!("calling.sfu.handle_packet.ice.response.in_locks");
+            incoming_connection
+                .handle_ice_binding_response(sender_addr, ice_binding_response, Instant::now())
+                .map_err(SfuError::ConnectionError)?;
+
+            return Ok(HandleOutput {
+                packets_to_send: vec![],
                 dequeues_to_schedule: vec![],
             });
         }
@@ -1350,6 +1399,7 @@ mod sfu_tests {
         user_id: &'a UserId,
         demux_id: DemuxId,
         client_ice_ufrag: String,
+        client_ice_pwd: String,
         client_dhe_public_key: DhePublicKey,
     ) -> Result<(), SfuError> {
         // Generate ids for the client.
@@ -1364,6 +1414,7 @@ mod sfu_tests {
             server_ice_ufrag,
             server_ice_pwd,
             client_ice_ufrag,
+            Some(client_ice_pwd),
             client_dhe_public_key,
             vec![],
             Region::Unset,
@@ -1422,6 +1473,7 @@ mod sfu_tests {
             &user_id,
             demux_id,
             "1".to_string(),
+            "1".to_string(),
             [0; 32],
         );
 
@@ -1453,6 +1505,7 @@ mod sfu_tests {
                 call_id,
                 &user_id,
                 demux_id,
+                "1".to_string(),
                 "1".to_string(),
                 [0u8; 32],
             );
@@ -1487,6 +1540,7 @@ mod sfu_tests {
             &call_id,
             &user_id,
             demux_id,
+            "1".to_string(),
             "1".to_string(),
             [0; 32],
         ) {
@@ -1532,6 +1586,7 @@ mod sfu_tests {
                     call_id,
                     user_id,
                     demux_id,
+                    "1".to_string(),
                     "1".to_string(),
                     [0; 32],
                 ) {
@@ -1586,6 +1641,7 @@ mod sfu_tests {
                 user_id,
                 demux_id,
                 "1".to_string(),
+                "1".to_string(),
                 [0; 32],
             ) {
                 Ok(_) => {
@@ -1636,6 +1692,7 @@ mod sfu_tests {
                     call_id,
                     user_id,
                     demux_id,
+                    "1".to_string(),
                     "1".to_string(),
                     [0; 32],
                 ) {
@@ -1727,6 +1784,7 @@ mod sfu_tests {
                     call_id,
                     user_id,
                     demux_id,
+                    "1".to_string(),
                     "1".to_string(),
                     [0; 32],
                 ) {

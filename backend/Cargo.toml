@@ -16,6 +16,8 @@ mrp = { git = "https://github.com/signalapp/ringrtc", tag = "v2.49.1" }
 calling_common = { path = "../common" }
 metrics = { path = "../metrics" }
 
+partial-default = { version = "0.1.0", features = ["derive"] }
+
 # For error handling
 anyhow = "1.0.94"
 thiserror = "2.0.6"

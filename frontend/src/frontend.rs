@@ -47,6 +47,7 @@ impl IdGenerator for FrontendIdGenerator {
 
 pub struct JoinRequestWrapper {
     pub ice_ufrag: String,
+    pub ice_pwd: Option<String>,
     pub dhe_public_key: String,
     pub hkdf_extra_info: Option<String>,
     pub region: String,
@@ -292,6 +293,7 @@ impl Frontend {
                 &backend::JoinRequest {
                     user_id: user_id.to_string(),
                     ice_ufrag: join_request.ice_ufrag,
+                    ice_pwd: join_request.ice_pwd,
                     dhe_public_key: Some(join_request.dhe_public_key),
                     hkdf_extra_info: join_request.hkdf_extra_info,
                     region: join_request.region,
