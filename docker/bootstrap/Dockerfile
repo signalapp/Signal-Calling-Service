@@ -13,11 +13,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends --no-install-suggests curl build-essential ca-certificates \
     && update-ca-certificates
 
-# Install Rust.
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
 WORKDIR /usr/src/bootstrap
+
+COPY rust-toolchain ./
+
+# Install Rust.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $(cat rust-toolchain)
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 COPY . .
 

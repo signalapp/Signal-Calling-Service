@@ -13,17 +13,17 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends --no-install-suggests curl build-essential ca-certificates protobuf-compiler \
     && update-ca-certificates
 
-# Install Rust.
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
 # Take in a build argument to specify RUSTFLAGS environment, usually a target-cpu.
 ARG rust_flags
 ENV RUSTFLAGS=$rust_flags
 
 WORKDIR /usr/src/calling-service
 
-COPY Cargo.toml Cargo.lock rust-toolchain ./
+COPY rust-toolchain ./
+
+# Install Rust.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $(cat rust-toolchain)
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Create a stub version of the project to cache dependencies.
 RUN cargo new common --lib
@@ -32,8 +32,9 @@ RUN cargo new backend
 RUN cargo new docker/bootstrap
 RUN cargo new frontend
 
+COPY Cargo.toml Cargo.lock ./
 COPY common/Cargo.toml ./common/
-# copy entire module because module is not properly recompiled when stubbed
+# Copy the entire module because module is not properly recompiled when stubbed.
 COPY metrics ./metrics
 COPY docker/bootstrap/Cargo.toml ./docker/bootstrap/
 COPY backend/Cargo.toml ./backend/
