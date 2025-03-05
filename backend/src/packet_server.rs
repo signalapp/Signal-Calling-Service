@@ -81,6 +81,25 @@ impl SocketLocator {
 }
 
 impl fmt::Display for SocketLocator {
+    #[cfg(not(debug_assertions))]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SocketLocator::Udp(SocketAddr::V4(a)) => {
+                let o = a.ip().octets();
+                write!(f, "Ux.x.{}.{}:{}", o[2], o[3], a.port())
+            }
+            SocketLocator::Udp(SocketAddr::V6(a)) => {
+                let s = a.ip().segments();
+                write!(f, "U::{:04x}:{:04x}:{}", s[0], s[7], a.port())
+            }
+            SocketLocator::Tcp {
+                id,
+                is_ipv6,
+                is_tls,
+            } => write!(f, "T{}-{}-{}", id, is_ipv6, is_tls),
+        }
+    }
+    #[cfg(debug_assertions)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SocketLocator::Udp(a) => write!(f, "U{}", a),

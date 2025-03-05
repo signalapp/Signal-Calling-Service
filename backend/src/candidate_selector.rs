@@ -46,6 +46,7 @@ pub struct Config {
     pub rtt_sensitivity: f32,
     pub rtt_max_penalty: f32,
     pub rtt_limit: f32,
+    pub inactivity_timeout: Duration,
     pub scoring_values: ScoringValues,
     pub ice_credentials: IceCredentials,
     pub connection_id: ConnectionId,
@@ -353,6 +354,21 @@ impl Candidate {
             self.ping_next_send_time = now + self.ping_period - rtt;
         }
     }
+
+    // Passive client support: update the activity timestamp. This is done
+    // in response to a ping request being received from the candidate.
+    fn update_activity_timestamp_passive(&mut self, now: Instant) {
+        self.last_update_time = now;
+    }
+
+    // Passive client support: if the inactivity timeout is exceeded the client
+    // will transition into the Dead state.
+    fn update_state_passive(&mut self, inactivity_timeout: Duration, now: Instant) {
+        let inactive_time = now.saturating_duration_since(self.last_update_time);
+        if inactive_time >= inactivity_timeout {
+            self.state = State::Dead;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -372,6 +388,8 @@ impl CandidateSelector {
         if config.ice_credentials.client_pwd.is_none() {
             event!("calling.sfu.candidate_selector.passive");
             candidates.push(Candidate::partial_default());
+        } else {
+            event!("calling.sfu.candidate_selector.active");
         }
 
         Self {
@@ -443,14 +461,14 @@ impl CandidateSelector {
                 });
 
         if self.selected_candidate != selected {
-            info!(
+            self.selected_candidate = selected;
+            trace!(
                 "candidate nominated/selected: {:?}/{:?} (score={}) out of {} candidates",
                 nominated.map(|i| self.candidates[i].address),
                 selected.map(|i| self.candidates[i].address),
                 score,
                 self.candidates.len(),
             );
-            self.selected_candidate = selected;
             if selected.is_none() {
                 event!("calling.sfu.candidate_selector.no_output_address");
             } else {
@@ -529,17 +547,26 @@ impl CandidateSelector {
         self.send_ping_response(packets_to_send, &request, source_addr);
 
         if self.is_passive() {
-            self.handle_ping_request_passive(request, source_addr);
+            self.handle_ping_request_passive(request, source_addr, now);
         } else {
             self.handle_ping_request_default(packets_to_send, request, source_addr, now);
         }
     }
 
-    fn handle_ping_request_passive(&mut self, request: BindingRequest, source_addr: SocketLocator) {
-        if request.nominated() && self.candidates[0].address != source_addr {
-            info!("candidate selected (passive): {}", source_addr);
-            self.candidates[0] = Candidate::for_passive_mode(source_addr);
-            self.selected_candidate = Some(0);
+    fn handle_ping_request_passive(
+        &mut self,
+        request: BindingRequest,
+        source_addr: SocketLocator,
+        now: Instant,
+    ) {
+        if source_addr != self.candidates[0].address {
+            if request.nominated() {
+                event!("calling.sfu.ice.passive.outgoing_addr_switch");
+                self.candidates[0] = Candidate::for_passive_mode(source_addr);
+                self.selected_candidate = Some(0);
+            }
+        } else {
+            self.candidates[0].update_activity_timestamp_passive(now);
         }
     }
 
@@ -615,8 +642,10 @@ impl CandidateSelector {
     }
 
     pub fn tick(&mut self, packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>, now: Instant) {
-        // Nothing to do if we're in the passive mode.
+        // For passive selectors we need to force a candidate state update since
+        // we don't probe them with pings.
         if self.is_passive() {
+            self.candidates[0].update_state_passive(self.config.inactivity_timeout, now);
             return;
         }
 
@@ -739,6 +768,7 @@ mod tests {
     fn create_candidate_selector(ping_period: Duration) -> CandidateSelector {
         let config = Config {
             ping_period,
+            inactivity_timeout: Duration::from_secs(30),
             rtt_sensitivity: 0.2,
             rtt_max_penalty: 2000.0,
             rtt_limit: 200.0,
@@ -765,6 +795,7 @@ mod tests {
     fn create_passive_candidate_selector() -> CandidateSelector {
         let config = Config {
             ping_period: Duration::ZERO,
+            inactivity_timeout: Duration::from_secs(30),
             rtt_sensitivity: 0.2,
             rtt_max_penalty: 2000.0,
             rtt_limit: 200.0,
@@ -1274,6 +1305,7 @@ mod tests {
         assert_eq!(selector.borrow().candidates[0].state, State::Active);
         assert_eq!(selector.borrow().candidates[0].address, client_addr1);
         assert_eq!(selector.borrow().selected_candidate, Some(0));
+        assert!(!selector.borrow().inactive(time));
 
         // Send another ping without a nomination, but with a different address. The current
         // selection should not change.
@@ -1282,14 +1314,23 @@ mod tests {
         assert_eq!(selector.borrow().candidates[0].state, State::Active);
         assert_eq!(selector.borrow().candidates[0].address, client_addr1);
         assert_eq!(selector.borrow().selected_candidate, Some(0));
+        assert!(!selector.borrow().inactive(time));
 
         // Send a ping with a nomination, but with the second address. The second address
         // should be selected.
         simulator.send_ping_request_with_nomination(client_addr2, time, 32, &mut packets);
-        let _ = simulator.run(Duration::from_secs(5), time);
+        let time = simulator.run(Duration::from_secs(5), time);
         assert_eq!(selector.borrow().candidates[0].state, State::Active);
         assert_eq!(selector.borrow().candidates[0].address, client_addr2);
         assert_eq!(selector.borrow().selected_candidate, Some(0));
+        assert!(!selector.borrow().inactive(time));
+
+        // Let the simulator run for 35 seconds. This will result in the candidate
+        // transitioning into the dead state. Consequently, the selector will become
+        // inactive.
+        let time = simulator.run(Duration::from_secs(35), time);
+        assert_eq!(selector.borrow().candidates[0].state, State::Dead);
+        assert!(selector.borrow().inactive(time));
     }
 
     #[test]

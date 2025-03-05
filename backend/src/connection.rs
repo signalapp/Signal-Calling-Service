@@ -178,6 +178,7 @@ impl Connection {
 
         let candidate_selector = CandidateSelector::new(candidate_selector::Config {
             connection_id: connection_id.clone(),
+            inactivity_timeout: Duration::from_secs(config.inactivity_timeout_secs),
             ping_period: Duration::from_millis(config.candidate_selector_options.ping_period),
             rtt_sensitivity: config.candidate_selector_options.rtt_sensitivity,
             rtt_max_penalty: config.candidate_selector_options.rtt_max_penalty,
@@ -849,6 +850,7 @@ mod connection_tests {
         };
         let candidate_selector_config = candidate_selector::Config {
             connection_id: ConnectionId::null(),
+            inactivity_timeout: Duration::from_secs(30),
             ping_period: Duration::from_millis(1000),
             rtt_sensitivity: 0.2,
             rtt_max_penalty: 2000.0,
@@ -891,6 +893,7 @@ mod connection_tests {
         };
         let candidate_selector_config = candidate_selector::Config {
             connection_id: ConnectionId::null(),
+            inactivity_timeout: Duration::from_secs(30),
             ping_period: Duration::from_millis(1000),
             rtt_sensitivity: 0.2,
             rtt_max_penalty: 2000.0,
