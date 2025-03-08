@@ -158,7 +158,7 @@ impl Header {
                         break;
                     }
 
-                    event!("calling.rtp.invalid.extension_too_short");
+                    event!("calling.rtp.invalid.two_byte_extension_too_short");
                     debug!(
                         "Invalid RTP: too short for extension ID / len, profile={extensions_profile:?}, next byte {}",
                         extensions[extension_start]
