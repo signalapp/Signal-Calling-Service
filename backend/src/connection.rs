@@ -139,7 +139,7 @@ impl Connection {
                 }),
                 controller: googcc::CongestionController::new(googcc_config, now),
             },
-            candidate_selector: CandidateSelector::new(candidate_selector_config),
+            candidate_selector: CandidateSelector::new(now, candidate_selector_config),
             video_rate: DataRateTracker::default(),
             audio_rate: DataRateTracker::default(),
             rtx_rate: DataRateTracker::default(),
@@ -176,29 +176,32 @@ impl Connection {
 
         let rtp_endpoint = rtp::Endpoint::new(decrypt, encrypt, now, RTCP_SENDER_SSRC, ack_ssrc);
 
-        let candidate_selector = CandidateSelector::new(candidate_selector::Config {
-            connection_id: connection_id.clone(),
-            inactivity_timeout: Duration::from_secs(config.inactivity_timeout_secs),
-            ping_period: Duration::from_millis(config.candidate_selector_options.ping_period),
-            rtt_sensitivity: config.candidate_selector_options.rtt_sensitivity,
-            rtt_max_penalty: config.candidate_selector_options.rtt_max_penalty,
-            rtt_limit: config.candidate_selector_options.rtt_limit,
-            scoring_values: candidate_selector::ScoringValues {
-                score_nominated: config.candidate_selector_options.score_nominated,
-                score_udpv4: config.candidate_selector_options.score_udpv4,
-                score_udpv6: config.candidate_selector_options.score_udpv6,
-                score_tcpv4: config.candidate_selector_options.score_tcpv4,
-                score_tcpv6: config.candidate_selector_options.score_tcpv6,
-                score_tlsv4: config.candidate_selector_options.score_tlsv4,
-                score_tlsv6: config.candidate_selector_options.score_tlsv6,
+        let candidate_selector = CandidateSelector::new(
+            now,
+            candidate_selector::Config {
+                connection_id: connection_id.clone(),
+                inactivity_timeout: Duration::from_secs(config.inactivity_timeout_secs),
+                ping_period: Duration::from_millis(config.candidate_selector_options.ping_period),
+                rtt_sensitivity: config.candidate_selector_options.rtt_sensitivity,
+                rtt_max_penalty: config.candidate_selector_options.rtt_max_penalty,
+                rtt_limit: config.candidate_selector_options.rtt_limit,
+                scoring_values: candidate_selector::ScoringValues {
+                    score_nominated: config.candidate_selector_options.score_nominated,
+                    score_udpv4: config.candidate_selector_options.score_udpv4,
+                    score_udpv6: config.candidate_selector_options.score_udpv6,
+                    score_tcpv4: config.candidate_selector_options.score_tcpv4,
+                    score_tcpv6: config.candidate_selector_options.score_tcpv6,
+                    score_tlsv4: config.candidate_selector_options.score_tlsv4,
+                    score_tlsv6: config.candidate_selector_options.score_tlsv6,
+                },
+                ice_credentials: candidate_selector::IceCredentials {
+                    server_username: ice_server_username.clone(),
+                    client_username: ice_client_username.clone(),
+                    server_pwd: ice_server_pwd.clone(),
+                    client_pwd: ice_client_pwd.clone(),
+                },
             },
-            ice_credentials: candidate_selector::IceCredentials {
-                server_username: ice_server_username.clone(),
-                client_username: ice_client_username.clone(),
-                server_pwd: ice_server_pwd.clone(),
-                client_pwd: ice_client_pwd.clone(),
-            },
-        });
+        );
 
         Self {
             region_relation,

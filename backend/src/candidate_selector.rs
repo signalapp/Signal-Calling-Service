@@ -373,6 +373,7 @@ impl Candidate {
 
 #[derive(Debug)]
 pub struct CandidateSelector {
+    initialization_timeout: Option<Instant>,
     candidates: Vec<Candidate>,
     selected_candidate: Option<usize>,
     nominated_candidate: Option<usize>,
@@ -380,19 +381,24 @@ pub struct CandidateSelector {
 }
 
 impl CandidateSelector {
-    pub fn new(config: Config) -> Self {
+    pub fn new(now: Instant, config: Config) -> Self {
         let mut candidates = vec![];
 
-        // Backward compatibility: the selector will operate in passive mode
-        // if no client ICE password is provided.
-        if config.ice_credentials.client_pwd.is_none() {
+        // Backward compatibility: the selector will operate in the passive mode
+        // if no client ICE password is provided. The intialization timeout is only
+        // applicable to the active candidates. Inactivity timing for the passive
+        // candidates is managed via the last_update_time Candidate field.
+        let initialization_timeout = if config.ice_credentials.client_pwd.is_none() {
             event!("calling.sfu.candidate_selector.passive");
             candidates.push(Candidate::partial_default());
+            None
         } else {
             event!("calling.sfu.candidate_selector.active");
-        }
+            Some(now + config.inactivity_timeout)
+        };
 
         Self {
+            initialization_timeout,
             candidates,
             config,
             selected_candidate: None,
@@ -487,14 +493,22 @@ impl CandidateSelector {
     }
 
     /// Returns `true` if the candidate selector is currently inactive. A candidate
-    /// selector is deemed *inactive* if all of its candidates are in the Dead state.
+    /// selector is deemed *inactive* if:
     ///
-    /// A candidate selector with no candidates is considered *active*.
-    pub fn inactive(&self, _now: Instant) -> bool {
-        !self
-            .candidates
-            .iter()
-            .any(|c| !matches!(c.state, State::Dead))
+    /// - The initialization timeout is set and has been reached
+    /// - The initialization timeout is not set, but all of the candidates
+    ///   are in the dead state.
+    ///
+    pub fn inactive(&self, now: Instant) -> bool {
+        self.initialization_timeout.map_or_else(
+            || {
+                !self
+                    .candidates
+                    .iter()
+                    .any(|c| !matches!(c.state, State::Dead))
+            },
+            |timeout| timeout < now,
+        )
     }
 
     fn selected_candidate(&self) -> Option<&Candidate> {
@@ -578,6 +592,12 @@ impl CandidateSelector {
         now: Instant,
     ) {
         let (action, candidate_index) = self.get_or_create_candidate(source_addr, now);
+
+        // We transition the selector out of the initialization state if the candidate
+        // has been accepted (the action is to send a ping) and the selector's
+        // initialization timeout is still set.
+        self.initialization_timeout
+            .take_if(|_| matches!(action, Action::SendPing(_)));
 
         let candidate = &mut self.candidates[candidate_index];
 
@@ -765,7 +785,7 @@ mod tests {
         sfu::ConnectionId,
     };
 
-    fn create_candidate_selector(ping_period: Duration) -> CandidateSelector {
+    fn create_candidate_selector(now: Instant, ping_period: Duration) -> CandidateSelector {
         let config = Config {
             ping_period,
             inactivity_timeout: Duration::from_secs(30),
@@ -789,10 +809,10 @@ mod tests {
             },
             connection_id: ConnectionId::null(),
         };
-        CandidateSelector::new(config)
+        CandidateSelector::new(now, config)
     }
 
-    fn create_passive_candidate_selector() -> CandidateSelector {
+    fn create_passive_candidate_selector(now: Instant) -> CandidateSelector {
         let config = Config {
             ping_period: Duration::ZERO,
             inactivity_timeout: Duration::from_secs(30),
@@ -816,7 +836,7 @@ mod tests {
             },
             connection_id: ConnectionId::null(),
         };
-        CandidateSelector::new(config)
+        CandidateSelector::new(now, config)
     }
 
     #[derive(Debug)]
@@ -1047,10 +1067,11 @@ mod tests {
             8000,
         ));
 
+        let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(
+            time,
             Duration::from_millis(1000),
         )));
-        let time = Instant::now();
         let mut packets = vec![];
 
         let mut endpoints = vec![SimulatedEndpoint::new(
@@ -1093,11 +1114,12 @@ mod tests {
             8000,
         ));
 
+        let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(
+            time,
             Duration::from_millis(1000),
         )));
 
-        let time = Instant::now();
         let mut packets = vec![];
 
         let mut endpoints = vec![
@@ -1153,11 +1175,12 @@ mod tests {
             8000,
         ));
 
+        let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(
+            time,
             Duration::from_millis(1000),
         )));
 
-        let time = Instant::now();
         let mut packets = vec![];
 
         let mut endpoints = vec![
@@ -1207,11 +1230,12 @@ mod tests {
             8000,
         ));
 
+        let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(
+            time,
             Duration::from_millis(1000),
         )));
 
-        let time = Instant::now();
         let mut packets = vec![];
 
         let mut endpoints = vec![SimulatedEndpoint::new(
@@ -1276,9 +1300,9 @@ mod tests {
             8001,
         ));
 
-        let selector = Rc::new(RefCell::new(create_passive_candidate_selector()));
-
         let time = Instant::now();
+        let selector = Rc::new(RefCell::new(create_passive_candidate_selector(time)));
+
         let mut packets = vec![];
 
         let mut endpoints = vec![
@@ -1334,6 +1358,31 @@ mod tests {
     }
 
     #[test]
+    fn test_initialization_timeout() {
+        let time = Instant::now();
+        let selector = Rc::new(RefCell::new(create_candidate_selector(
+            time,
+            Duration::from_millis(1000),
+        )));
+        let mut endpoints = vec![];
+        let mut simulator = Simulator::new(
+            Rc::clone(&selector),
+            &mut endpoints,
+            Duration::from_millis(100),
+        );
+
+        // At this point the selector is not inactive since the intialization
+        // timeout has not been reached.
+        assert!(!selector.borrow().inactive(time));
+
+        // Run the simulator for 35 seconds. We will never send any pings. Therefore,
+        // the initialization timeout will be reached and the selector will become
+        // inactive.
+        let time = simulator.run(Duration::from_secs(35), time);
+        assert!(selector.borrow().inactive(time));
+    }
+
+    #[test]
     fn test_candidate_list() {
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
@@ -1344,11 +1393,12 @@ mod tests {
             8001,
         ));
 
+        let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(
+            time,
             Duration::from_millis(1000),
         )));
 
-        let time = Instant::now();
         let mut packets = vec![];
 
         let mut endpoints = vec![
@@ -1403,11 +1453,12 @@ mod tests {
             is_tls: true,
         };
 
+        let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(
+            time,
             Duration::from_millis(1000),
         )));
 
-        let time = Instant::now();
         let mut packets = vec![];
 
         let mut endpoints = vec![
