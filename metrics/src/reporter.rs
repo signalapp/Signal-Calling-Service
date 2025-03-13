@@ -277,13 +277,13 @@ impl<'a> RunningTimer<'a> {
     }
 }
 
-impl<'a> Drop for RunningTimer<'a> {
+impl Drop for RunningTimer<'_> {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-impl<'a> Timer for RunningTimer<'a> {
+impl Timer for RunningTimer<'_> {
     fn stop(self) {}
 }
 

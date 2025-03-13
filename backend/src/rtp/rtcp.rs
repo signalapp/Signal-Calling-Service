@@ -416,9 +416,7 @@ impl RtcpReportSender {
         if self
             .last_received_sender_info
             .as_ref()
-            .map_or(false, |info| {
-                sender_report.sender_info.ntp_ts <= info.ntp_ts
-            })
+            .is_some_and(|info| sender_report.sender_info.ntp_ts <= info.ntp_ts)
         {
             return;
         }

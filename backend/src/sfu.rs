@@ -222,8 +222,7 @@ impl Sfu {
     ) -> Option<CallSignalingInfo> {
         let call = self.call_by_call_id.get(&call_id)?;
         let call = call.lock();
-        let should_include_pending_user_ids =
-            user_id.map_or(false, |user_id| call.is_admin(user_id));
+        let should_include_pending_user_ids = user_id.is_some_and(|user_id| call.is_admin(user_id));
         Some(CallSignalingInfo {
             size: call.size(),
             created: call.created(),

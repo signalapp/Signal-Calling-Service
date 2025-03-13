@@ -214,7 +214,7 @@ fn should_filter_userid(
             || participants.iter().any(|p| {
                 p.opaque_user_id
                     .as_ref()
-                    .map_or(false, |uid| uid.as_str() == user_id)
+                    .is_some_and(|uid| uid.as_str() == user_id)
             }))
 }
 

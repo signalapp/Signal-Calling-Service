@@ -6,7 +6,7 @@
 use std::ops::{Add, Mul, Sub};
 
 pub fn round_up_to_multiple_of<const M: usize>(n: usize) -> usize {
-    (n + (M - 1)) / M * M
+    n.div_ceil(M) * M
 }
 
 #[cfg(test)]

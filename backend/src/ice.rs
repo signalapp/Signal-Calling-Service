@@ -262,7 +262,7 @@ impl<'a> StunAttributeIterator<'a> {
     }
 }
 
-impl<'a> Iterator for StunAttributeIterator<'a> {
+impl Iterator for StunAttributeIterator<'_> {
     type Item = Result<(u16, Range<usize>), ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -304,7 +304,7 @@ impl<'a> UnsafeStunAttributeIterator<'a> {
     }
 }
 
-impl<'a> Iterator for UnsafeStunAttributeIterator<'a> {
+impl Iterator for UnsafeStunAttributeIterator<'_> {
     type Item = (u16, Range<usize>);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -830,7 +830,7 @@ impl<'a> TryFrom<StunPacket<'a>> for BindingRequest<'a> {
     }
 }
 
-impl<'a> Display for StunPacket<'a> {
+impl Display for StunPacket<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -966,7 +966,7 @@ impl<'a> Deref for BindingResponse<'a> {
     }
 }
 
-impl<'a> Display for BindingResponse<'a> {
+impl Display for BindingResponse<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "BindingResponse {}", self.packet)
     }
@@ -1026,7 +1026,7 @@ impl<'a> Deref for BindingRequest<'a> {
     }
 }
 
-impl<'a> Display for BindingRequest<'a> {
+impl Display for BindingRequest<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "BindingRequest {}", self.packet)
     }

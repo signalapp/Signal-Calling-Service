@@ -156,13 +156,13 @@ impl<'a> Deref for DatadogPipeline<'a> {
     }
 }
 
-impl<'a> DerefMut for DatadogPipeline<'a> {
+impl DerefMut for DatadogPipeline<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-impl<'a> DatadogPipeline<'a> {
+impl DatadogPipeline<'_> {
     fn send_timer_histogram(
         &mut self,
         histogram_report: &SamplingHistogramReport,

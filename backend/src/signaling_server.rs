@@ -192,7 +192,7 @@ pub fn validate_user_id(user_id_str: &str) -> Result<sfu::UserId> {
 ///
 /// Currently any non-empty string is considered a valid room_id
 pub fn validate_room_id(room_id: &Option<RoomId>) -> Result<()> {
-    if room_id.as_ref().map_or(false, |id| id.as_ref().is_empty()) {
+    if room_id.as_ref().is_some_and(|id| id.as_ref().is_empty()) {
         return Err(anyhow!("missing room_id"));
     }
     Ok(())

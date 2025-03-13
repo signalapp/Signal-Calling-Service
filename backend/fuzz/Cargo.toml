@@ -6,7 +6,7 @@
 [package]
 name = "calling_backend-fuzz"
 version = "0.0.0"
-authors = ["Automatically generated"]
+authors = ["Calling Team <callingteam@signal.org>"]
 publish = false
 edition = "2018"
 
@@ -14,10 +14,10 @@ edition = "2018"
 cargo-fuzz = true
 
 [dependencies]
-anyhow = "1.0.86"
-arbitrary = "1.3.2"
+anyhow = "1.0.97"
+arbitrary = "1.4.1"
 hex-literal = "0.4.1"
-libfuzzer-sys = "0.4.7"
+libfuzzer-sys = "0.4.9"
 rand = "0.8.5"
 
 [dependencies.calling_common]

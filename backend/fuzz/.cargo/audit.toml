@@ -1,0 +1,9 @@
+[output]
+deny = ["unmaintained", "unsound", "yanked"]
+quiet = false
+
+[advisories]
+ignore = [
+    # Ignore until fixed upstream (see https://github.com/aws/aws-lc-rs/issues/722)
+    "RUSTSEC-2024-0436",
+]
