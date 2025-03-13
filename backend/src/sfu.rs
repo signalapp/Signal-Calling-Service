@@ -328,7 +328,7 @@ impl Sfu {
                 clients_in_calls_above_one
                     .entry(tags)
                     .or_default()
-                    .add_assign(1f32);
+                    .add_assign(clients as f32);
             }
             if call.is_approved_users_busy() {
                 calls_persisting_approved_users
