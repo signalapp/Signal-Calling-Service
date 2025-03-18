@@ -296,7 +296,7 @@ impl Candidate {
     }
 
     fn tick(&mut self, now: Instant) -> Action {
-        if matches!(self.state, State::Dead) || self.ping_next_send_time >= now {
+        if matches!(self.state, State::Dead) || self.ping_next_send_time > now {
             return Action::None;
         }
 
@@ -767,7 +767,6 @@ impl Drop for CandidateSelector {
 mod tests {
     use std::{
         cell::RefCell,
-        collections::VecDeque,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         ops::Range,
         rc::Rc,
@@ -776,9 +775,9 @@ mod tests {
     use calling_common::{Duration, Instant};
     use rand::Rng;
 
-    use super::{CandidateSelector, Config, RttEstimator, ScoringValues};
+    use super::{CandidateSelector, Config, RttEstimator, ScoringValues, PING_MAX_RETRANSMITS};
     use crate::{
-        candidate_selector::{IceCredentials, State},
+        candidate_selector::{IceCredentials, State, PING_RTO, PING_RTO_RM},
         connection::PacketToSend,
         ice::{BindingRequest, BindingResponse, StunPacketBuilder, TransactionId},
         packet_server::SocketLocator,
@@ -839,13 +838,28 @@ mod tests {
         CandidateSelector::new(now, config)
     }
 
+    fn find_ping_request(packets: Vec<(PacketToSend, SocketLocator)>) -> Option<Vec<u8>> {
+        packets
+            .into_iter()
+            .find(|(p, _)| BindingRequest::looks_like_header(p))
+            .map(|(p, _)| p)
+    }
+
+    fn create_ping_response(req: BindingRequest, selector: &CandidateSelector) -> Vec<u8> {
+        let transaction_id = req.transaction_id();
+        StunPacketBuilder::new_binding_response(&transaction_id)
+            .set_xor_mapped_address(&"1.1.1.1:10".parse().unwrap())
+            .build(&selector.config.ice_credentials.server_pwd)
+    }
+
     #[derive(Debug)]
     struct SimulatedEndpoint {
         selector: Rc<RefCell<CandidateSelector>>,
         address: SocketLocator,
         rtt_range: Range<u64>,
         packet_loss_percentage: f64,
-        ping_queue: VecDeque<(PacketToSend, Instant)>,
+        current_ping: Option<PacketToSend>,
+        current_ping_response_time: Option<Instant>,
     }
 
     impl SimulatedEndpoint {
@@ -855,12 +869,16 @@ mod tests {
             rtt_range: Range<u64>,
             packet_loss_percentage: f64,
         ) -> Self {
+            // Keep RTT always smaller than RTO. We don't test responses to retransmits here.
+            assert!((rtt_range.end as u128) < PING_RTO.as_millis());
+
             Self {
                 selector,
                 address,
                 rtt_range,
                 packet_loss_percentage,
-                ping_queue: VecDeque::new(),
+                current_ping: None,
+                current_ping_response_time: None,
             }
         }
 
@@ -874,68 +892,63 @@ mod tests {
 
         fn push(&mut self, packet: PacketToSend, now: Instant) {
             assert!(BindingRequest::looks_like_header(&packet));
+            assert!(self.current_ping.is_none());
+            assert!(self.current_ping_response_time.is_none());
+
             if !self.should_drop_packet() {
                 let rtt = self.generate_rtt();
-                self.ping_queue.push_back((packet, now + rtt));
+                self.current_ping = Some(packet);
+                self.current_ping_response_time = Some(now + rtt);
             }
         }
 
-        fn send_ping_request(
-            &mut self,
-            packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
-            now: Instant,
-            priority: u32,
-        ) {
-            let mut selector = self.selector.borrow_mut();
-            let transaction_id = TransactionId::new();
-            let packet = StunPacketBuilder::new_binding_request(&transaction_id)
-                .set_priority(priority)
-                .set_username(&selector.config.ice_credentials.server_username)
-                .build(&selector.config.ice_credentials.server_pwd);
-            selector.handle_ping_request(
-                packets_to_send,
-                BindingRequest::from_buffer_without_sanity_check(&packet),
-                self.address,
-                now,
-            );
-        }
+        fn send_ping_request(&mut self, now: Instant, priority: u32, nominated: bool) {
+            assert_eq!(self.current_ping, None);
+            assert_eq!(self.current_ping_response_time, None);
 
-        fn send_ping_request_with_nomination(
-            &mut self,
-            packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
-            now: Instant,
-            priority: u32,
-        ) {
             let mut selector = self.selector.borrow_mut();
+
             let transaction_id = TransactionId::new();
-            let packet = StunPacketBuilder::new_binding_request(&transaction_id)
-                .set_nomination()
-                .set_priority(priority)
-                .set_username(&selector.config.ice_credentials.server_username)
-                .build(&selector.config.ice_credentials.server_pwd);
+            let packet = if nominated {
+                StunPacketBuilder::new_binding_request(&transaction_id)
+                    .set_nomination()
+                    .set_priority(priority)
+                    .set_username(&selector.config.ice_credentials.server_username)
+                    .build(&selector.config.ice_credentials.server_pwd)
+            } else {
+                StunPacketBuilder::new_binding_request(&transaction_id)
+                    .set_priority(priority)
+                    .set_username(&selector.config.ice_credentials.server_username)
+                    .build(&selector.config.ice_credentials.server_pwd)
+            };
+
+            let mut packets = vec![];
+
             selector.handle_ping_request(
-                packets_to_send,
+                &mut packets,
                 BindingRequest::from_buffer_without_sanity_check(&packet),
                 self.address,
                 now,
             );
+
+            // The selector may have sent a ping. Capture it here. We'll eventually
+            // respond to it in tick().
+            if let Some(req) = find_ping_request(packets) {
+                self.current_ping = Some(req);
+                self.current_ping_response_time = Some(now + self.generate_rtt());
+            }
         }
 
         fn tick(&mut self, now: Instant) {
-            if let Some((_, send_time)) = self.ping_queue.front() {
-                if *send_time < now {
-                    let mut selector = self.selector.borrow_mut();
-                    let (req, _) = self.ping_queue.pop_front().unwrap();
+            if let Some(current_ping_response_time) = self.current_ping_response_time {
+                if current_ping_response_time < now {
+                    self.current_ping_response_time = None;
+                    let req = self.current_ping.take().unwrap();
                     let req = BindingRequest::from_buffer_without_sanity_check(&req);
-                    let transaction_id = req.transaction_id();
-                    let packet = StunPacketBuilder::new_binding_response(&transaction_id)
-                        .set_xor_mapped_address(&"1.1.1.1:10".parse().unwrap())
-                        .build(&selector.config.ice_credentials.server_pwd);
-                    selector.handle_ping_response(
-                        self.address,
-                        BindingResponse::from_buffer_without_sanity_check(&packet),
-                        now,
-                    );
+                    let mut selector = self.selector.borrow_mut();
+                    let res = create_ping_response(req, &selector);
+                    let res = BindingResponse::from_buffer_without_sanity_check(&res);
+                    selector.handle_ping_response(self.address, res, now);
                 }
             }
         }
@@ -954,6 +967,12 @@ mod tests {
             endpoints: &'a mut Vec<SimulatedEndpoint>,
             tick_period: Duration,
         ) -> Self {
+            for endpoint in endpoints.iter() {
+                assert_eq!(
+                    &*endpoint.selector.borrow() as *const CandidateSelector,
+                    &*selector.borrow() as *const CandidateSelector
+                );
+            }
             Self {
                 selector,
                 endpoints,
@@ -979,16 +998,8 @@ mod tests {
             self.with_endpoint(address, |e| e.packet_loss_percentage = percentage);
         }
 
-        fn send_ping_request(
-            &mut self,
-            address: SocketLocator,
-            now: Instant,
-            priority: u32,
-            packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
-        ) {
-            self.with_endpoint(address, |e| {
-                e.send_ping_request(packets_to_send, now, priority)
-            });
+        fn send_ping_request(&mut self, address: SocketLocator, now: Instant, priority: u32) {
+            self.with_endpoint(address, |e| e.send_ping_request(now, priority, false));
         }
 
         fn send_ping_request_with_nomination(
@@ -996,11 +1007,8 @@ mod tests {
             address: SocketLocator,
             now: Instant,
             priority: u32,
-            packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
         ) {
-            self.with_endpoint(address, |e| {
-                e.send_ping_request_with_nomination(packets_to_send, now, priority)
-            });
+            self.with_endpoint(address, |e| e.send_ping_request(now, priority, true));
         }
 
         #[must_use]
@@ -1040,9 +1048,9 @@ mod tests {
 
         let mut rtt_estimator = RttEstimator::with_sensitivity(0.0);
 
-        // Generate some large number samples. We will push them all into the RTT estimator. The
-        // estimator is expected to take into account up to `sample_count` samples when generating
-        // the estimate (which is simply an average over those samples).
+        // Generate some large number of samples and push them into the RTT estimator.
+        // The estimator is expected to take into account up to `sample_count` samples
+        // when generating the estimate (which is simply an average over those samples).
         let rtts: Vec<u32> = (0..1000).map(|_| random_range(50..550)).collect();
 
         rtts.iter()
@@ -1061,18 +1069,120 @@ mod tests {
     }
 
     #[test]
-    fn test_selection() {
+    fn test_retransmits() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             8000,
         ));
 
         let time = Instant::now();
-        let selector = Rc::new(RefCell::new(create_candidate_selector(
-            time,
-            Duration::from_millis(1000),
-        )));
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
+
         let mut packets = vec![];
+        let mut n = 0;
+        let mut now = time;
+        let mut expected = Duration::ZERO;
+
+        SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0)
+            .send_ping_request(time, 32, true);
+
+        while n < PING_MAX_RETRANSMITS {
+            packets.clear();
+            selector.borrow_mut().tick(&mut packets, now);
+            if !packets.is_empty() {
+                expected += if n == 0 {
+                    PING_RTO
+                } else {
+                    PING_RTO * (2 << (n - 1))
+                };
+                assert_eq!(expected, now.saturating_duration_since(time));
+                n += 1;
+            }
+            now += TICK_PERIOD;
+        }
+
+        expected += PING_RTO * PING_RTO_RM;
+        selector.borrow_mut().tick(&mut packets, time + expected);
+        assert!(selector.borrow().inactive(time + expected));
+    }
+
+    #[test]
+    fn test_pings() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
+        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            8000,
+        ));
+
+        let time = Instant::now();
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
+
+        let mut packets = vec![];
+        let mut now = time;
+        let mut last_ping_time = now;
+        let mut total_delta = Duration::ZERO;
+        let mut total_pings = 0;
+        let mut endpoint = SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0);
+
+        // Send the first ping to register the endpoint
+        endpoint.send_ping_request(time, 32, true);
+
+        let mut selector = selector.borrow_mut();
+
+        // We'll receive the first ping immediately. We must handle that here in order to avoid
+        // retransmit, but cannot include it in the delta calculation.
+        let req = endpoint.current_ping.take().unwrap();
+        let req = BindingRequest::from_buffer_without_sanity_check(&req);
+        let res = create_ping_response(req, &selector);
+        let res = BindingResponse::from_buffer_without_sanity_check(&res);
+        selector.handle_ping_response(client_addr1, res, now);
+
+        // Perform 1000 ticks, during which we'll receive pings every 1000ms.
+        // Since there is only one candidate, the only packet that will ever be
+        // deposited in the packet array will be a ping from the selector.
+        for _ in 0..1000 {
+            packets.clear();
+            selector.tick(&mut packets, now);
+            if !packets.is_empty() {
+                // We have a ping. Send a response to avoid possible retransmits.
+                let req = packets.pop().map(|(p, _)| p).unwrap();
+                let req = BindingRequest::from_buffer_without_sanity_check(&req);
+                let res = create_ping_response(req, &selector);
+                let res = BindingResponse::from_buffer_without_sanity_check(&res);
+                selector.handle_ping_response(client_addr1, res, now);
+                // Update stats.
+                let delta = now.saturating_duration_since(last_ping_time);
+                total_delta += delta;
+                total_pings += 1;
+                last_ping_time = now;
+            }
+            packets.clear();
+            selector.tick(&mut packets, now);
+            now += TICK_PERIOD;
+        }
+
+        let avg_delta = total_delta.as_millis() as f32 / total_pings as f32;
+
+        assert!((avg_delta - 1000.0).abs() <= 0.1);
+    }
+
+    #[test]
+    fn test_selection() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
+        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            8000,
+        ));
+
+        let time = Instant::now();
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
 
         let mut endpoints = vec![SimulatedEndpoint::new(
             Rc::clone(&selector),
@@ -1081,15 +1191,11 @@ mod tests {
             0.0,
         )];
 
-        let mut simulator = Simulator::new(
-            Rc::clone(&selector),
-            &mut endpoints,
-            Duration::from_millis(100),
-        );
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
 
         // Send the initial ping with nomination. After this, the candidate should be
         // in the New state, but not yet selected.
-        simulator.send_ping_request_with_nomination(client_addr1, time, 32, &mut packets);
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
         assert_eq!(selector.borrow().candidates.len(), 1);
         assert_eq!(selector.borrow().candidates[0].state, State::New);
         assert_eq!(selector.borrow().selected_candidate, None);
@@ -1105,6 +1211,9 @@ mod tests {
 
     #[test]
     fn test_rtt_based_switchover() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             8000,
@@ -1115,29 +1224,20 @@ mod tests {
         ));
 
         let time = Instant::now();
-        let selector = Rc::new(RefCell::new(create_candidate_selector(
-            time,
-            Duration::from_millis(1000),
-        )));
-
-        let mut packets = vec![];
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
 
         let mut endpoints = vec![
             SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0),
             SimulatedEndpoint::new(Rc::clone(&selector), client_addr2, 50..90, 0.0),
         ];
 
-        let mut simulator = Simulator::new(
-            Rc::clone(&selector),
-            &mut endpoints,
-            Duration::from_millis(100),
-        );
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
 
         // Send a ping for each candidate. This first candidate gets the nomination.
         // After this, both candidates should be in the New state. No candidate
         // should be selected.
-        simulator.send_ping_request_with_nomination(client_addr1, time, 32, &mut packets);
-        simulator.send_ping_request(client_addr2, time, 32, &mut packets);
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
+        simulator.send_ping_request(client_addr2, time, 32);
         assert_eq!(selector.borrow().candidates.len(), 2);
         assert_eq!(selector.borrow().candidates[0].state, State::New);
         assert_eq!(selector.borrow().candidates[1].state, State::New);
@@ -1166,6 +1266,9 @@ mod tests {
 
     #[test]
     fn test_two_clients_with_packet_loss() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             8000,
@@ -1176,28 +1279,19 @@ mod tests {
         ));
 
         let time = Instant::now();
-        let selector = Rc::new(RefCell::new(create_candidate_selector(
-            time,
-            Duration::from_millis(1000),
-        )));
-
-        let mut packets = vec![];
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
 
         let mut endpoints = vec![
             SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0),
             SimulatedEndpoint::new(Rc::clone(&selector), client_addr2, 50..90, 0.0),
         ];
 
-        let mut simulator = Simulator::new(
-            Rc::clone(&selector),
-            &mut endpoints,
-            Duration::from_millis(100),
-        );
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
 
         // Send the initial pings. After this, both clients should be in the New
         // state, but neither of them should be the selected candidate.
-        simulator.send_ping_request_with_nomination(client_addr1, time, 32, &mut packets);
-        simulator.send_ping_request(client_addr2, time, 32, &mut packets);
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
+        simulator.send_ping_request(client_addr2, time, 32);
         assert_eq!(selector.borrow().candidates.len(), 2);
         assert_eq!(selector.borrow().candidates[0].state, State::New);
         assert_eq!(selector.borrow().candidates[1].state, State::New);
@@ -1225,18 +1319,16 @@ mod tests {
 
     #[test]
     fn test_resurrection() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             8000,
         ));
 
         let time = Instant::now();
-        let selector = Rc::new(RefCell::new(create_candidate_selector(
-            time,
-            Duration::from_millis(1000),
-        )));
-
-        let mut packets = vec![];
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
 
         let mut endpoints = vec![SimulatedEndpoint::new(
             Rc::clone(&selector),
@@ -1245,16 +1337,12 @@ mod tests {
             0.0,
         )];
 
-        let mut simulator = Simulator::new(
-            Rc::clone(&selector),
-            &mut endpoints,
-            Duration::from_millis(100),
-        );
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
 
         // Send the initial ping with nomination and run the simulator for some time.
         // We expect the candidate to transition from the New into the Active state
         // and be selected.
-        simulator.send_ping_request_with_nomination(client_addr1, time, 32, &mut packets);
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
         let time = simulator.run(Duration::from_secs(32), time);
         assert_eq!(selector.borrow().candidates.len(), 1);
         assert_eq!(selector.borrow().candidates[0].state, State::Active);
@@ -1274,7 +1362,7 @@ mod tests {
         // Now send another ping from the candidate. The candidate should be resurrected,
         // and, therefore, transition into the New state. No candidates should yet be
         // selected, but the selector should declare itself as "active".
-        simulator.send_ping_request_with_nomination(client_addr1, time, 32, &mut packets);
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
         assert_eq!(selector.borrow().candidates.len(), 1);
         assert_eq!(selector.borrow().candidates[0].state, State::New);
         assert!(selector.borrow().selected_candidate.is_none());
@@ -1291,6 +1379,8 @@ mod tests {
 
     #[test]
     fn test_passive_mode() {
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             8000,
@@ -1303,28 +1393,22 @@ mod tests {
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_passive_candidate_selector(time)));
 
-        let mut packets = vec![];
-
         let mut endpoints = vec![
             SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0),
             SimulatedEndpoint::new(Rc::clone(&selector), client_addr2, 50..90, 0.0),
         ];
 
-        let mut simulator = Simulator::new(
-            Rc::clone(&selector),
-            &mut endpoints,
-            Duration::from_millis(100),
-        );
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
 
         // Send a ping for the first candidate, but without a nomination. There should
         // be no selected candidate.
-        simulator.send_ping_request(client_addr1, time, 32, &mut packets);
+        simulator.send_ping_request(client_addr1, time, 32);
         let time = simulator.run(Duration::from_secs(5), time);
         assert!(selector.borrow().selected_candidate.is_none());
 
         // Send a ping for the first candidate, but this time with a nomination.
         // The candidate should be in the active state and selected.
-        simulator.send_ping_request_with_nomination(client_addr1, time, 32, &mut packets);
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
         let time = simulator.run(Duration::from_secs(5), time);
         assert_eq!(selector.borrow().candidates[0].state, State::Active);
         assert_eq!(selector.borrow().candidates[0].address, client_addr1);
@@ -1333,7 +1417,7 @@ mod tests {
 
         // Send another ping without a nomination, but with a different address. The current
         // selection should not change.
-        simulator.send_ping_request(client_addr2, time, 32, &mut packets);
+        simulator.send_ping_request(client_addr2, time, 32);
         let time = simulator.run(Duration::from_secs(5), time);
         assert_eq!(selector.borrow().candidates[0].state, State::Active);
         assert_eq!(selector.borrow().candidates[0].address, client_addr1);
@@ -1342,7 +1426,7 @@ mod tests {
 
         // Send a ping with a nomination, but with the second address. The second address
         // should be selected.
-        simulator.send_ping_request_with_nomination(client_addr2, time, 32, &mut packets);
+        simulator.send_ping_request_with_nomination(client_addr2, time, 32);
         let time = simulator.run(Duration::from_secs(5), time);
         assert_eq!(selector.borrow().candidates[0].state, State::Active);
         assert_eq!(selector.borrow().candidates[0].address, client_addr2);
@@ -1359,17 +1443,13 @@ mod tests {
 
     #[test]
     fn test_initialization_timeout() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
         let time = Instant::now();
-        let selector = Rc::new(RefCell::new(create_candidate_selector(
-            time,
-            Duration::from_millis(1000),
-        )));
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
         let mut endpoints = vec![];
-        let mut simulator = Simulator::new(
-            Rc::clone(&selector),
-            &mut endpoints,
-            Duration::from_millis(100),
-        );
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
 
         // At this point the selector is not inactive since the intialization
         // timeout has not been reached.
@@ -1384,6 +1464,9 @@ mod tests {
 
     #[test]
     fn test_candidate_list() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             8000,
@@ -1394,34 +1477,25 @@ mod tests {
         ));
 
         let time = Instant::now();
-        let selector = Rc::new(RefCell::new(create_candidate_selector(
-            time,
-            Duration::from_millis(1000),
-        )));
-
-        let mut packets = vec![];
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
 
         let mut endpoints = vec![
             SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0),
             SimulatedEndpoint::new(Rc::clone(&selector), client_addr2, 50..90, 0.0),
         ];
 
-        let mut simulator = Simulator::new(
-            Rc::clone(&selector),
-            &mut endpoints,
-            Duration::from_millis(100),
-        );
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
 
         // Send the initial ping for the first canddiate. We expect the candidate to
         // transition into the Active state and be selected.
-        simulator.send_ping_request_with_nomination(client_addr1, time, 32, &mut packets);
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
         let time = simulator.run(Duration::from_secs(10), time);
         assert_eq!(selector.borrow().candidates[0].state, State::Active);
         assert_eq!(selector.borrow().selected_candidate, Some(0));
 
         // Send the initial ping for the second canddiate. We expect the candidate to
         // transition into the Active state and be selected.
-        simulator.send_ping_request_with_nomination(client_addr2, time, 32, &mut packets);
+        simulator.send_ping_request_with_nomination(client_addr2, time, 32);
         let _ = simulator.run(Duration::from_secs(10), time);
         assert_eq!(selector.borrow().candidates[0].state, State::Active);
         assert_eq!(selector.borrow().candidates[1].state, State::Active);
@@ -1430,6 +1504,9 @@ mod tests {
 
     #[test]
     fn test_candidate_ordering() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
         let client_addr1 = SocketLocator::Udp("[::1]:8001".parse().unwrap());
         let client_addr2 = SocketLocator::Udp("10.0.0.1:8000".parse().unwrap());
         let client_addr3 = SocketLocator::Tcp {
@@ -1454,12 +1531,7 @@ mod tests {
         };
 
         let time = Instant::now();
-        let selector = Rc::new(RefCell::new(create_candidate_selector(
-            time,
-            Duration::from_millis(1000),
-        )));
-
-        let mut packets = vec![];
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
 
         let mut endpoints = vec![
             SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0),
@@ -1470,19 +1542,15 @@ mod tests {
             SimulatedEndpoint::new(Rc::clone(&selector), client_addr6, 50..90, 0.0),
         ];
 
-        let mut simulator = Simulator::new(
-            Rc::clone(&selector),
-            &mut endpoints,
-            Duration::from_millis(100),
-        );
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
 
         // Register all except UDP IPv6. The selected candidate should be the second
         // candidate, the candidate with an IPv4 address.
-        simulator.send_ping_request(client_addr2, time, 32, &mut packets);
-        simulator.send_ping_request(client_addr3, time, 32, &mut packets);
-        simulator.send_ping_request(client_addr4, time, 32, &mut packets);
-        simulator.send_ping_request(client_addr5, time, 32, &mut packets);
-        simulator.send_ping_request(client_addr6, time, 32, &mut packets);
+        simulator.send_ping_request(client_addr2, time, 32);
+        simulator.send_ping_request(client_addr3, time, 32);
+        simulator.send_ping_request(client_addr4, time, 32);
+        simulator.send_ping_request(client_addr5, time, 32);
+        simulator.send_ping_request(client_addr6, time, 32);
         let time = simulator.run(Duration::from_secs(10), time);
         assert_eq!(
             selector.borrow().selected_candidate().unwrap().address,
@@ -1491,7 +1559,7 @@ mod tests {
 
         // Now, register UDP IPv6. The selected candidate should be the first candidate,
         // the candidate with an IPv6 address.
-        simulator.send_ping_request(client_addr1, time, 32, &mut packets);
+        simulator.send_ping_request(client_addr1, time, 32);
         let time = simulator.run(Duration::from_secs(10), time);
         assert_eq!(
             selector.borrow().selected_candidate().unwrap().address,
