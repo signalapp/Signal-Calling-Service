@@ -115,24 +115,20 @@ impl PacketServerState {
                     }
                 }
             }
+            let mut packets_to_send = vec![];
+            let mut dequeues_to_schedule = vec![];
             let mut heap = self.timer_heap.lock();
             loop {
                 let now = Instant::now();
                 match heap.next(now) {
                     TimerHeapNextResult::Value(addr) => {
-                        if let Some((addr, buf, time)) = Sfu::handle_dequeue(sfu, addr, now) {
-                            if let Some(buf) = buf {
-                                time_scope!(
-                                    "calling.udp.generic.send_packet_from_timer_heap",
-                                    TimingOptions::nanosecond_1000_per_minute()
-                                );
-                                Self::sample(buf.len());
-                                self.send_packet(&buf, addr);
-                            }
-                            if let Some(time) = time {
-                                heap.schedule(time, addr);
-                            }
-                        }
+                        Sfu::handle_dequeue(
+                            sfu,
+                            addr,
+                            now,
+                            &mut packets_to_send,
+                            &mut dequeues_to_schedule,
+                        );
                     }
                     TimerHeapNextResult::Wait(timeout) => {
                         let _ = self.socket.set_read_timeout(Some(timeout.into()));
@@ -142,6 +138,22 @@ impl PacketServerState {
                         let _ = self.socket.set_read_timeout(None);
                         break;
                     }
+                }
+            }
+
+            for (buf, addr) in packets_to_send {
+                time_scope!(
+                    "calling.udp.generic.send_packet_from_timer_heap",
+                    TimingOptions::nanosecond_1000_per_minute()
+                );
+                Self::sample(buf.len());
+                self.send_packet(&buf, addr);
+            }
+
+            if !dequeues_to_schedule.is_empty() {
+                let mut timer_heap = self.timer_heap.lock();
+                for (time, addr) in dequeues_to_schedule {
+                    timer_heap.schedule(time, addr);
                 }
             }
         }

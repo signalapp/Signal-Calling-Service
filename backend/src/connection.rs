@@ -499,8 +499,8 @@ impl Connection {
         // but that actually makes it more difficult for sfu.rs to aggregate the
         // results of calling this across many connections.
         // So we use this vec of (packet, addr) for convenience.
-        rtp_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
-        outgoing_dequeue_schedule: &mut Vec<(Instant, SocketLocator)>,
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
+        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
         now: Instant,
     ) {
         let rtp_endpoint = &mut self.rtp.endpoint;
@@ -515,10 +515,10 @@ impl Connection {
                     if let Some(outgoing_rtp) = outgoing_rtp {
                         rtp_endpoint.remember_sent(&outgoing_rtp, now);
                         self.push_outgoing_video(outgoing_rtp.size(), now);
-                        rtp_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
+                        packets_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
                     }
                     if let Some(dequeue_time) = dequeue_time {
-                        outgoing_dequeue_schedule.push((dequeue_time, outgoing_addr));
+                        dequeues_to_schedule.push((dequeue_time, outgoing_addr));
                     }
                 } else {
                     rtp_endpoint.remember_sent_for_reports(&outgoing_rtp, now);
@@ -539,7 +539,7 @@ impl Connection {
                             now,
                         );
                     }
-                    rtp_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
+                    packets_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
                 }
             }
         } else if outgoing_rtp.tcc_seqnum().is_some() && outgoing_rtp.is_video() {
@@ -553,10 +553,15 @@ impl Connection {
     pub fn dequeue_outgoing_rtp(
         &mut self,
         now: Instant,
-    ) -> Option<(SocketLocator, Option<PacketToSend>, Option<Instant>)> {
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
+        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
+    ) -> bool {
         let rtp_endpoint = &mut self.rtp.endpoint;
         let generate_padding = |padding_ssrc| rtp_endpoint.send_padding(padding_ssrc, now);
-        let outgoing_addr = self.candidate_selector.outbound_address()?;
+        let outgoing_addr = match self.candidate_selector.outbound_address() {
+            Some(addr) => addr,
+            None => return false,
+        };
 
         let (outgoing_rtp, dequeue_time) =
             self.congestion_control.pacer.dequeue(generate_padding, now);
@@ -583,15 +588,17 @@ impl Connection {
                 }
                 self.push_outgoing_video(size, now);
             }
-            Some((
-                outgoing_addr,
-                Some(outgoing_rtp.into_serialized()),
-                dequeue_time,
-            ))
-        } else if dequeue_time.is_some() {
-            Some((outgoing_addr, None, dequeue_time))
+
+            packets_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
+            if let Some(dequeue_time) = dequeue_time {
+                dequeues_to_schedule.push((dequeue_time, outgoing_addr));
+            }
+            true
+        } else if let Some(dequeue_time) = dequeue_time {
+            dequeues_to_schedule.push((dequeue_time, outgoing_addr));
+            false
         } else {
-            None
+            false
         }
     }
 
@@ -714,7 +721,7 @@ impl Connection {
 
     pub fn configure_congestion_control(
         &mut self,
-        outgoing_dequeue_schedule: &mut Vec<(Instant, SocketLocator)>,
+        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
         googcc_request: googcc::Request,
         pacer_config: pacer::Config,
         now: Instant,
@@ -722,7 +729,7 @@ impl Connection {
         self.congestion_control.controller.request(googcc_request);
         if let Some(dequeue_time) = self.congestion_control.pacer.set_config(pacer_config, now) {
             if let Some(outgoing_addr) = self.candidate_selector.outbound_address() {
-                outgoing_dequeue_schedule.push((dequeue_time, outgoing_addr));
+                dequeues_to_schedule.push((dequeue_time, outgoing_addr));
             }
         }
     }
@@ -1278,21 +1285,26 @@ mod connection_tests {
         let encrypted_rtp = new_encrypted_rtp(2, None, &encrypt, now);
         let unencrypted_rtp = decrypt_rtp(&encrypted_rtp, &encrypt);
 
-        let mut rtp_to_send = vec![];
-        connection.send_or_enqueue_rtp(unencrypted_rtp.clone(), &mut rtp_to_send, &mut vec![], now);
+        let mut packets_to_send = vec![];
+        connection.send_or_enqueue_rtp(
+            unencrypted_rtp.clone(),
+            &mut packets_to_send,
+            &mut vec![],
+            now,
+        );
 
         // Can't send yet because there is no outgoing address.
-        assert_eq!(0, rtp_to_send.len());
+        assert_eq!(0, packets_to_send.len());
 
         let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
         establish_outbound_address(&mut connection, client_addr, now);
         // Packets without tcc seqnums skip the pacer queue and still go out even if the rate is 0.
         set_send_rate(&mut connection, DataRate::from_kbps(0), now);
-        connection.send_or_enqueue_rtp(unencrypted_rtp, &mut rtp_to_send, &mut vec![], now);
+        connection.send_or_enqueue_rtp(unencrypted_rtp, &mut packets_to_send, &mut vec![], now);
 
         assert_eq!(
             vec![(encrypted_rtp.into_serialized(), client_addr)],
-            rtp_to_send
+            packets_to_send
         );
     }
 
@@ -1333,13 +1345,23 @@ mod connection_tests {
         );
 
         // 500kbps * 20ms = 1250 bytes, just enough for a padding packet of around 1200 bytes
-        let (_addr, buf, _) = connection
-            .dequeue_outgoing_rtp(at(20))
-            .expect("sent padding");
-        let buf = buf.expect("has padding");
+
+        let mut packets_to_send = vec![];
+        let mut dequeues_to_schedule = vec![];
+
+        assert!(
+            connection.dequeue_outgoing_rtp(
+                at(20),
+                &mut packets_to_send,
+                &mut dequeues_to_schedule
+            ),
+            "sent padding"
+        );
+        assert_eq!(1, packets_to_send.len(), "has padding");
+        let (buf, _addr) = &packets_to_send[0];
 
         assert_eq!(1172, buf.len());
-        let actual_padding_header = rtp::Header::parse(&buf).unwrap();
+        let actual_padding_header = rtp::Header::parse(buf).unwrap();
         assert_eq!(padding_ssrc, actual_padding_header.ssrc);
         assert_eq!(99, actual_padding_header.payload_type);
         assert_eq!(1136, actual_padding_header.payload_range.len());
@@ -1351,12 +1373,35 @@ mod connection_tests {
             Some(padding_ssrc),
             at(40),
         );
-        assert_eq!(None, connection.dequeue_outgoing_rtp(at(40)));
+
+        let mut packets_to_send = vec![];
+        let mut dequeues_to_schedule = vec![];
+        assert!(
+            !connection.dequeue_outgoing_rtp(
+                at(40),
+                &mut packets_to_send,
+                &mut dequeues_to_schedule
+            ),
+            "sent nothing"
+        );
+
+        assert!(packets_to_send.is_empty());
 
         // Don't send padding if the SSRC isn't set.
         set_padding_send_rate(&mut connection, DataRate::from_kbps(500), None, at(40));
 
-        assert_eq!(None, connection.dequeue_outgoing_rtp(at(40)));
+        let mut packets_to_send = vec![];
+        let mut dequeues_to_schedule = vec![];
+
+        assert!(
+            !connection.dequeue_outgoing_rtp(
+                at(40),
+                &mut packets_to_send,
+                &mut dequeues_to_schedule
+            ),
+            "sent nothing"
+        );
+        assert!(packets_to_send.is_empty());
 
         // Can still send some more
         set_padding_send_rate(
@@ -1366,12 +1411,21 @@ mod connection_tests {
             at(60),
         );
 
-        let (_addr, buf, _) = connection
-            .dequeue_outgoing_rtp(at(60))
-            .expect("sent padding");
-        let buf = buf.expect("has padding");
+        let mut packets_to_send = vec![];
+        let mut dequeues_to_schedule = vec![];
+        assert!(
+            connection.dequeue_outgoing_rtp(
+                at(60),
+                &mut packets_to_send,
+                &mut dequeues_to_schedule
+            ),
+            "sent padding"
+        );
+        assert_eq!(1, packets_to_send.len(), "has padding");
+        let (buf, _addr) = &packets_to_send[0];
+
         assert_eq!(1172, buf.len());
-        let actual_padding_header = rtp::Header::parse(&buf).unwrap();
+        let actual_padding_header = rtp::Header::parse(buf).unwrap();
         assert_eq!(padding_ssrc, actual_padding_header.ssrc);
         assert_eq!(99, actual_padding_header.payload_type);
         assert_eq!(1136, actual_padding_header.payload_range.len());
@@ -1390,16 +1444,16 @@ mod connection_tests {
 
         let encrypted_rtp = new_encrypted_rtp(1, None, &encrypt, at(20));
         let unencrypted_rtp = decrypt_rtp(&encrypted_rtp, &encrypt);
-        let mut rtp_to_send = vec![];
+        let mut packets_to_send = vec![];
         connection.send_or_enqueue_rtp(
             unencrypted_rtp.clone(),
-            &mut rtp_to_send,
+            &mut packets_to_send,
             &mut vec![],
             at(20),
         );
         assert_eq!(
             vec![(encrypted_rtp.clone().into_serialized(), client_addr)],
-            rtp_to_send
+            packets_to_send
         );
 
         let mut nacks = rtp::ControlPacket::serialize_and_encrypt_nack(
@@ -1425,16 +1479,16 @@ mod connection_tests {
 
         let encrypted_rtp2 = new_encrypted_rtp(2, None, &encrypt, at(40));
         let unencrypted_rtp2 = decrypt_rtp(&encrypted_rtp2, &encrypt);
-        let mut rtp_to_send = vec![];
+        let mut packets_to_send = vec![];
         connection.send_or_enqueue_rtp(
             unencrypted_rtp2.clone(),
-            &mut rtp_to_send,
+            &mut packets_to_send,
             &mut vec![],
             at(40),
         );
         assert_eq!(
             vec![(encrypted_rtp2.clone().into_serialized(), client_addr)],
-            rtp_to_send
+            packets_to_send
         );
 
         // The first one is resent again, and the second one is sent for the first time.
@@ -1463,12 +1517,21 @@ mod connection_tests {
         expected_rtx2
             .encrypt_in_place(&encrypt.rtp.key, &encrypt.rtp.salt)
             .unwrap();
-        let (addr, buf, _) = connection
-            .dequeue_outgoing_rtp(at(60))
-            .expect("sent padding");
-        let buf = buf.expect("has padding");
-        assert_eq!(client_addr, addr);
-        assert_eq!(buf, expected_rtx2.into_serialized());
+
+        let mut packets_to_send = vec![];
+        let mut dequeues_to_schedule = vec![];
+        assert!(
+            connection.dequeue_outgoing_rtp(
+                at(60),
+                &mut packets_to_send,
+                &mut dequeues_to_schedule
+            ),
+            "sent padding"
+        );
+        assert_eq!(1, packets_to_send.len(), "has padding");
+        let (buf, addr) = &packets_to_send[0];
+        assert_eq!(client_addr, *addr);
+        assert_eq!(*buf, expected_rtx2.into_serialized());
     }
 
     #[test]

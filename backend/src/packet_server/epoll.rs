@@ -545,32 +545,53 @@ impl PacketServerState {
             }
 
             let mut dequeues_left = MAX_EPOLL_EVENTS;
+            let mut packets_to_send = vec![];
+            let mut dequeues_to_schedule = vec![];
             while dequeues_left > 0 {
                 let now = Instant::now();
                 let mut timer_heap = self.timer_heap.lock();
                 match timer_heap.next(now) {
                     TimerHeapNextResult::Value(addr) => {
-                        if let Some((addr, buf, time)) = Sfu::handle_dequeue(sfu, addr, now) {
-                            if let Some(buf) = buf {
-                                dequeues_left -= 1;
-                                self.send_packet(&buf, addr);
-                            }
-                            if let Some(time) = time {
-                                timer_heap.schedule(time, addr);
-                            }
+                        if Sfu::handle_dequeue(
+                            sfu,
+                            addr,
+                            now,
+                            &mut packets_to_send,
+                            &mut dequeues_to_schedule,
+                        ) {
+                            dequeues_left -= 1;
                         }
                     }
                     TimerHeapNextResult::Wait(_timeout) => {
-                        if let Some(timer) = &timer {
-                            timer_heap.set_timer(timer, now);
+                        if !dequeues_to_schedule.is_empty() {
+                            for (time, addr) in &dequeues_to_schedule {
+                                timer_heap.schedule(*time, *addr);
+                            }
+                            dequeues_to_schedule.clear();
+                        } else {
+                            if let Some(timer) = &timer {
+                                timer_heap.set_timer(timer, now);
+                            }
+                            break;
                         }
-                        break;
                     }
                     TimerHeapNextResult::WaitForever => {
                         break;
                     }
                 }
             }
+
+            for (buf, addr) in packets_to_send {
+                self.send_packet(&buf, addr)
+            }
+
+            if !dequeues_to_schedule.is_empty() {
+                let mut timer_heap = self.timer_heap.lock();
+                for (time, addr) in dequeues_to_schedule {
+                    timer_heap.schedule(time, addr);
+                }
+            }
+
             if dequeues_left == 0 {
                 poll_timeout_ms = 0; // busy loop
             } else {

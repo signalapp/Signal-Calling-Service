@@ -922,16 +922,33 @@ impl Sfu {
                 .username()
                 .ok_or(SfuError::IceBindingRequestHasNoUsername)?;
 
-            let (incoming_connection_id, packets_to_send) = {
+            let (incoming_connection_id, packets_to_send, dequeues_to_schedule) = {
                 let (incoming_connection_id, incoming_connection) = sfu
                     .lock()
                     .get_connection_from_ice_request_username(username)?;
                 let mut incoming_connection = incoming_connection.lock();
                 time_scope_us!("calling.sfu.handle_packet.ice.in_locks");
-                let packets_to_send = incoming_connection
-                    .handle_ice_binding_request(sender_addr, ice_binding_request, Instant::now())
+                let now = Instant::now();
+                let mut packets_to_send = incoming_connection
+                    .handle_ice_binding_request(sender_addr, ice_binding_request, now)
                     .map_err(SfuError::ConnectionError)?;
-                (incoming_connection_id, packets_to_send)
+
+                let mut dequeues_to_schedule = vec![];
+
+                // TODO: Remove when all clients allow server to do active
+                // ICE; We should dequeue on ICE response, but without
+                // server active ICE there are no ICE responses.
+
+                incoming_connection.dequeue_outgoing_rtp(
+                    now,
+                    &mut packets_to_send,
+                    &mut dequeues_to_schedule,
+                );
+                (
+                    incoming_connection_id,
+                    packets_to_send,
+                    dequeues_to_schedule,
+                )
             };
 
             // Removal of old addresses is done in tick().
@@ -941,7 +958,7 @@ impl Sfu {
 
             return Ok(HandleOutput {
                 packets_to_send,
-                dequeues_to_schedule: vec![],
+                dequeues_to_schedule,
             });
         }
 
@@ -965,13 +982,22 @@ impl Sfu {
 
             let mut incoming_connection = incoming_connection.lock();
             time_scope_us!("calling.sfu.handle_packet.ice.response.in_locks");
+            let now = Instant::now();
             incoming_connection
                 .handle_ice_binding_response(sender_addr, ice_binding_response, Instant::now())
                 .map_err(SfuError::ConnectionError)?;
 
+            let mut dequeues_to_schedule = vec![];
+            let mut packets_to_send = vec![];
+            incoming_connection.dequeue_outgoing_rtp(
+                now,
+                &mut packets_to_send,
+                &mut dequeues_to_schedule,
+            );
+
             return Ok(HandleOutput {
-                packets_to_send: vec![],
-                dequeues_to_schedule: vec![],
+                packets_to_send,
+                dequeues_to_schedule,
             });
         }
 
@@ -982,16 +1008,21 @@ impl Sfu {
         sfu: &Mutex<Self>,
         addr: SocketLocator,
         now: Instant,
-    ) -> Option<(SocketLocator, Option<PacketToSend>, Option<Instant>)> {
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
+        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
+    ) -> bool {
         trace!("handle_dequeue():");
 
         time_scope_us!("calling.sfu.handle_dequeue");
 
-        let (_connection_id, connection) = sfu.lock().get_connection_from_address(&addr).ok()?;
-        let mut connection = connection.lock();
-        time_scope_us!("calling.sfu.handle_dequeue.connection_lock");
+        if let Ok((_connection_id, connection)) = sfu.lock().get_connection_from_address(&addr) {
+            let mut connection = connection.lock();
+            time_scope_us!("calling.sfu.handle_dequeue.connection_lock");
 
-        connection.dequeue_outgoing_rtp(now)
+            connection.dequeue_outgoing_rtp(now, packets_to_send, dequeues_to_schedule)
+        } else {
+            false
+        }
     }
 
     /// Handle the periodic tick, which could be fired every 100ms in production.
