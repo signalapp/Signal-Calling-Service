@@ -476,12 +476,6 @@ impl Connection {
         self.send_nacks_if_its_been_too_long(packets_to_send, now);
         self.send_rtcp_report_if_its_been_too_long(packets_to_send, now);
         self.candidate_selector.tick(packets_to_send, now);
-        if self.candidate_selector.outbound_address().is_none() {
-            // If there is no address to send to, implicit processing of
-            // timed out packets while sending won't be triggered, so do it
-            // explicitly
-            self.congestion_control.pacer.process_timeouts(now);
-        }
     }
 
     pub fn inactive(&self, now: Instant) -> bool {

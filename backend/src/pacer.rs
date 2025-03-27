@@ -352,26 +352,6 @@ impl Pacer {
             (None, None)
         }
     }
-
-    pub fn process_timeouts(&mut self, now: Instant) {
-        while self
-            .rtx_queue
-            .front()
-            .is_some_and(|media| media.is_past_deadline(now))
-        {
-            event!("calling.pacer.process_timeout_skip_rtx");
-            self.rtx_queue.pop_front();
-        }
-
-        while self
-            .video_queue
-            .front()
-            .is_some_and(|media| media.is_past_deadline(now))
-        {
-            event!("calling.pacer.process_timeout_skip_video");
-            self.video_queue.pop_front();
-        }
-    }
 }
 
 #[cfg(test)]
