@@ -21,7 +21,6 @@ partial-default = { version = "0.1.0", features = ["derive"] }
 # For error handling
 anyhow = "1.0.97"
 thiserror = "2.0.12"
-scopeguard = "1.2.0"
 
 # For logging and command line operations
 log = "0.4.26"
@@ -77,7 +76,7 @@ async-stream = "0.3.6"
 pin-project = "1.1.10"
 
 # For low-level UDP sockets and tracking TCP sockets
-nix = { version = "0.26.4", optional = true }
+nix = { version = "0.27.1", optional = true, features = ["time", "socket", "event", "signal", "net"] }
 unique_id = "0.1.5"
 
 # For current process memory stats

@@ -12,7 +12,10 @@ use std::{
         IpAddr::{V4, V6},
         SocketAddr, TcpListener, TcpStream, UdpSocket,
     },
-    os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    os::{
+        fd::AsFd,
+        unix::io::{AsRawFd, RawFd},
+    },
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
         Arc,
@@ -31,7 +34,6 @@ use nix::{
 };
 use parking_lot::{Mutex, RwLock};
 use rustls::{ServerConfig, ServerConnection};
-use scopeguard::ScopeGuard;
 use unique_id::{sequence::SequenceGenerator, Generator};
 
 use crate::{
@@ -161,22 +163,11 @@ impl PacketServerState {
             SockFlag::empty(),
             SockProtocol::Udp,
         )?;
-        // Don't pass ownership into a std::net::UdpSocket just yet;
-        // it's not clear whether it's correct to do that before binding.
-        // Instead, use an ad-hoc ScopeGuard.
-        let socket_fd = scopeguard::guard(socket_fd, |fd| match nix::unistd::close(fd) {
-            Ok(()) => {}
-            Err(e) => warn!("error closing failed socket: {}", e),
-        });
         // Allow later sockets to handle connections.
-        setsockopt(*socket_fd, sockopt::ReusePort, &true)?;
+        setsockopt(&socket_fd, sockopt::ReusePort, &true)?;
         // Bind the socket to the given local address.
-        bind(*socket_fd, &SockaddrStorage::from(*local_addr))?;
-        // Pass ownership from ScopeGuard into a proper Rust UdpSocket.
-        // std::net::UdpSocket can only be created and bound in one step, which
-        // doesn't allow us to set SO_REUSEPORT.
-        // Safety: we have just created this socket FD, so we know it's valid.
-        let result = unsafe { UdpSocket::from_raw_fd(ScopeGuard::into_inner(socket_fd)) };
+        bind(socket_fd.as_raw_fd(), &SockaddrStorage::from(*local_addr))?;
+        let result = UdpSocket::from(socket_fd);
         // Set a read timeout for a "pseudo-nonblocking" interface.
         // Why? Because epoll might wake up more than one thread to read from a single socket.
         result.set_read_timeout(Some(Duration::from_millis(10).into()))?;
@@ -197,26 +188,17 @@ impl PacketServerState {
             SockFlag::empty(),
             SockProtocol::Tcp,
         )?;
-        // Don't pass ownership into a std::net::TcpListener just yet;
-        // it's not clear whether it's correct to do that before binding.
-        // Instead, use an ad-hoc ScopeGuard.
-        let socket_fd = scopeguard::guard(socket_fd, |fd| match nix::unistd::close(fd) {
-            Ok(()) => {}
-            Err(e) => warn!("error closing failed socket: {}", e),
-        });
 
-        setsockopt(*socket_fd, sockopt::SndBuf, &TCP_SEND_BUFFER_BYTES)?;
+        setsockopt(&socket_fd, sockopt::SndBuf, &TCP_SEND_BUFFER_BYTES)?;
 
         // Allow later sockets to handle connections.
-        setsockopt(*socket_fd, sockopt::ReusePort, &true)?;
+        setsockopt(&socket_fd, sockopt::ReusePort, &true)?;
         // Bind the socket to the given local address.
-        bind(*socket_fd, &SockaddrStorage::from(*local_addr))?;
+        bind(socket_fd.as_raw_fd(), &SockaddrStorage::from(*local_addr))?;
 
-        listen(*socket_fd, TCP_BACKLOG)?;
+        listen(&socket_fd, TCP_BACKLOG)?;
 
-        // Pass ownership from ScopeGuard into a proper Rust TcpListener.
-        // Safety: we have just created this socket FD, so we know it's valid.
-        let result = unsafe { TcpListener::from_raw_fd(ScopeGuard::into_inner(socket_fd)) };
+        let result = TcpListener::from(socket_fd);
         // set listen socket to non-blocking, in case more than one thread polls the socket while it's ready
         result
             .set_nonblocking(true)
@@ -281,7 +263,7 @@ impl PacketServerState {
 
         let (timer, timer_fd) = match TimerFd::new(ClockId::CLOCK_MONOTONIC, TimerFlags::empty()) {
             Ok(timer) => {
-                let timer_fd = timer.as_raw_fd();
+                let timer_fd = timer.as_fd().as_raw_fd();
                 let mut event_read_only = EpollEvent::new(
                     EpollFlags::EPOLLIN | EpollFlags::EPOLLEXCLUSIVE,
                     timer_fd as u64,
