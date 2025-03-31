@@ -365,6 +365,7 @@ impl Sfu {
         let mut outgoing_queue_size = HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
         let mut outgoing_queue_delay_ms = HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
         let mut client_rtt_ms = HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut stun_rtt_ms = HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
         let mut connection_outgoing_data_rate =
             HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
 
@@ -399,6 +400,12 @@ impl Sfu {
                 user_agent,
             ));
 
+            if let Some(rtt_estimate) = connection.stun_rtt() {
+                stun_rtt_ms
+                    .entry(tags)
+                    .or_default()
+                    .push(rtt_estimate.as_millis() as usize);
+            }
             let stats = connection.rtp_endpoint_stats(now);
             if let Some(rtt_estimate) = stats.rtt_estimate {
                 client_rtt_ms
@@ -469,6 +476,7 @@ impl Sfu {
             connection_outgoing_data_rate,
         );
         histograms.insert("calling.sfu.connections.rtt_ms", client_rtt_ms);
+        histograms.insert("calling.sfu.connections.stun_rtt_ms", stun_rtt_ms);
         values.insert("calling.sfu.connections.udp_v4_count", udp_v4_connections);
         values.insert("calling.sfu.connections.udp_v6_count", udp_v6_connections);
         values.insert("calling.sfu.connections.tcp_v4_count", tcp_v4_connections);
@@ -1053,15 +1061,19 @@ impl Sfu {
                         let mut connection_id = ConnectionId::from_call_id(call_id.clone());
                         for client in stats.clients {
                             connection_id.demux_id = client.demux_id;
-                            let rtt = if let Some(connection) =
+                            let (rtt, stun_rtt) = if let Some(connection) =
                                 self.get_connection_from_id(&connection_id)
                             {
-                                connection.lock().rtt(now).as_millis()
+                                let mut connection = connection.lock();
+                                (
+                                    connection.rtt(now).as_millis(),
+                                    connection.stun_rtt().unwrap_or(Duration::ZERO).as_millis(),
+                                )
                             } else {
-                                0
+                                (0, 0)
                             };
 
-                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), incoming_padding: {}, incoming_audio: {}, incoming_rtx: {}, incoming_non_media: {}, incoming_discard: {}, min_target: {}, target: {}, requested_base: {}, ideal: {}, allocated: {}, queue_drain: {}, max_requested_height: {}, rtt_ms: {}, video_rate: {}, audio_rate: {}, rtx_rate: {}, padding_rate: {}, non_media_rate: {} }}",
+                            let _ = write!(diagnostic_string, " {{ demux_id: {}, incoming_heights: ({}, {}, {}), incoming_rates: ({}, {}, {}), incoming_padding: {}, incoming_audio: {}, incoming_rtx: {}, incoming_non_media: {}, incoming_discard: {}, min_target: {}, target: {}, requested_base: {}, ideal: {}, allocated: {}, queue_drain: {}, max_requested_height: {}, rtt_ms: {}, stun_rtt_ms: {}, video_rate: {}, audio_rate: {}, rtx_rate: {}, padding_rate: {}, non_media_rate: {} }}",
                                   client.demux_id.as_u32(),
                                   client.video0_incoming_height.unwrap_or_default().as_u16(),
                                   client.video1_incoming_height.unwrap_or_default().as_u16(),
@@ -1082,6 +1094,7 @@ impl Sfu {
                                   client.outgoing_queue_drain_rate.as_kbps(),
                                   client.max_requested_height.unwrap_or_default().as_u16(),
                                   rtt,
+                                  stun_rtt,
                                   client.connection_rates.video_rate.as_kbps(),
                                   client.connection_rates.audio_rate.as_kbps(),
                                   client.connection_rates.rtx_rate.as_kbps(),

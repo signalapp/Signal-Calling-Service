@@ -742,6 +742,10 @@ impl Connection {
         cc_rtt
     }
 
+    pub fn stun_rtt(&self) -> Option<Duration> {
+        self.candidate_selector.rtt()
+    }
+
     pub fn region_relation(&self) -> RegionRelation {
         self.region_relation
     }

@@ -256,16 +256,8 @@ impl Candidate {
         self.ping_transaction_id = Some(transaction_id.clone());
         self.ping_sent_time = now;
         self.ping_retransmit_count = 0;
-        // Determine the RTO. The currently estimated RTT is used as RTO if it is
-        // available and greater than the default RTO. Otherwise, the default RTO
-        // is used.
-        self.ping_rto = {
-            if let Some(rtt) = self.rtt_estimator.rtt() {
-                Duration::max(rtt, PING_RTO)
-            } else {
-                PING_RTO
-            }
-        };
+        // Always use the default RTO.
+        self.ping_rto = PING_RTO;
         // Pre-emptively schedule a ping retransmit. If a response arrives the next
         // ping will be scheduled in its place.
         self.ping_next_send_time = now + self.ping_rto;
@@ -524,6 +516,11 @@ impl CandidateSelector {
     /// if one is available.
     pub fn outbound_address_type(&self) -> Option<AddressType> {
         self.selected_candidate().map(|c| c.address_type)
+    }
+
+    /// Returns the estimated rtt of the currently selected remote candidate, if one is available.
+    pub fn rtt(&self) -> Option<Duration> {
+        self.selected_candidate().map(|c| c.rtt_estimator.rtt())?
     }
 
     fn get_or_create_candidate(
