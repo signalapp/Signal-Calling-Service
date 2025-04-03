@@ -29,10 +29,7 @@ const PRIORITY_ADJUSTMENT_FACTOR: f32 = ADJUSTED_PRIORITY_MAXIMUM / (u32::MAX as
 // the [0, 1] range.
 const PENALTY_LAG: f32 = 5.0;
 
-// PING_RTO is the default initial RTO for pings going out over all transports. We use
-// the currently estimated RTT as RTO if it is available and greater than this value.
-// Otherwise, this value is used. The RTO for all subsequent retransmits, if any, is
-// calculated from this value.
+// RTO for pings going out over all transports.
 const PING_RTO: Duration = Duration::from_millis(500);
 // The final timeout value is the product of the initial RTO and PING_RTO_RM.
 const PING_RTO_RM: u32 = 16;
@@ -180,8 +177,6 @@ pub struct Candidate {
     ping_next_send_time: Instant,
     #[partial_default(value = "Duration::ZERO")]
     ping_period: Duration,
-    #[partial_default(value = "Duration::ZERO")]
-    ping_rto: Duration,
 }
 
 impl Candidate {
@@ -256,11 +251,9 @@ impl Candidate {
         self.ping_transaction_id = Some(transaction_id.clone());
         self.ping_sent_time = now;
         self.ping_retransmit_count = 0;
-        // Always use the default RTO.
-        self.ping_rto = PING_RTO;
         // Pre-emptively schedule a ping retransmit. If a response arrives the next
         // ping will be scheduled in its place.
-        self.ping_next_send_time = now + self.ping_rto;
+        self.ping_next_send_time = now + PING_RTO;
 
         Action::SendPing(transaction_id)
     }
@@ -270,7 +263,7 @@ impl Candidate {
 
         // Pre-emptively schedule a ping retransmit. If a response arrives the next
         // ping will be scheduled in its place.
-        let delay = self.ping_rto
+        let delay = PING_RTO
             * if self.ping_retransmit_count < PING_MAX_RETRANSMITS - 1 {
                 2 << self.ping_retransmit_count
             } else {
