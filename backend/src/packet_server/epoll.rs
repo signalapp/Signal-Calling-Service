@@ -120,6 +120,7 @@ impl PacketServerState {
             None
         };
 
+        #[allow(deprecated)]
         let all_epoll_fds = (0..num_threads)
             .map(|_| epoll_create1(EpollCreateFlags::empty()))
             .collect::<nix::Result<_>>()?;
@@ -218,6 +219,7 @@ impl PacketServerState {
             socket_fd as u64,
         );
         for &epoll_fd in &self.all_epoll_fds {
+            #[allow(deprecated)]
             epoll_ctl(
                 epoll_fd,
                 EpollOp::EpollCtlAdd,
@@ -269,6 +271,7 @@ impl PacketServerState {
                     timer_fd as u64,
                 );
 
+                #[allow(deprecated)]
                 match epoll_ctl(
                     epoll_fd,
                     EpollOp::EpollCtlAdd,
@@ -293,6 +296,7 @@ impl PacketServerState {
 
         loop {
             let mut current_events = [EpollEvent::empty(); MAX_EPOLL_EVENTS];
+            #[allow(deprecated)]
             let num_events = epoll_wait(epoll_fd, &mut current_events, poll_timeout_ms)
                 .unwrap_or_else(|err| {
                     warn!("epoll_wait() failed: {}", err);
