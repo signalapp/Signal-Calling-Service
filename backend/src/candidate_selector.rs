@@ -1135,7 +1135,7 @@ mod tests {
         // Perform 1000 ticks, during which we'll receive pings every 1000ms.
         // Since there is only one candidate, the only packet that will ever be
         // deposited in the packet array will be a ping from the selector.
-        for _ in 0..1000 {
+        for _ in 0..=1000 {
             packets.clear();
             selector.tick(&mut packets, now);
             if !packets.is_empty() {
@@ -1151,14 +1151,18 @@ mod tests {
                 total_pings += 1;
                 last_ping_time = now;
             }
-            packets.clear();
-            selector.tick(&mut packets, now);
             now += TICK_PERIOD;
         }
 
         let avg_delta = total_delta.as_millis() as f32 / total_pings as f32;
 
+        println!("Pings sent: {}", total_pings);
+
         assert!((avg_delta - 1000.0).abs() <= 0.1);
+        assert_eq!(
+            total_pings,
+            1000 * TICK_PERIOD.as_millis() / PING_PERIOD.as_millis()
+        );
     }
 
     #[test]

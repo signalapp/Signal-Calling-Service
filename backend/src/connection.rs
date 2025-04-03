@@ -465,6 +465,19 @@ impl Connection {
         })
     }
 
+    fn candidate_selector_tick(
+        &mut self,
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
+        now: Instant,
+    ) {
+        let mut outbound_packets = vec![];
+        self.candidate_selector.tick(&mut outbound_packets, now);
+        outbound_packets.into_iter().for_each(|packet| {
+            self.push_outgoing_non_media_bytes(packet.0.len(), now);
+            packets_to_send.push(packet);
+        });
+    }
+
     /// This must be called regularly (at least every 100ms, preferably more often) to
     /// keep ACKs and NACKs being sent to the client.
     // It would make more sense to return a Vec of packets, since the outgoing address is fixed,
@@ -475,7 +488,7 @@ impl Connection {
         self.send_acks_if_its_been_too_long(packets_to_send, now);
         self.send_nacks_if_its_been_too_long(packets_to_send, now);
         self.send_rtcp_report_if_its_been_too_long(packets_to_send, now);
-        self.candidate_selector.tick(packets_to_send, now);
+        self.candidate_selector_tick(packets_to_send, now);
     }
 
     pub fn inactive(&self, now: Instant) -> bool {
