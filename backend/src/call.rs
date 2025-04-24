@@ -39,6 +39,14 @@ mod approval_persistence;
 use approval_persistence::ApprovedUsers;
 use metrics::{metric_config::StaticStrTagsRef, *};
 
+use crate::{
+    protos::{
+        sfu_to_device::{DeviceJoinedOrLeft, Speaker},
+        SfuToDevice,
+    },
+    sfu::CallSignalingInfo,
+};
+
 pub const CLIENT_SERVER_DATA_SSRC: rtp::Ssrc = 1;
 pub const CLIENT_SERVER_DATA_PAYLOAD_TYPE: rtp::PayloadType = 101;
 
@@ -347,6 +355,7 @@ pub enum CallActivity {
 pub struct Call {
     // Immutable
     room_id: Option<RoomId>,
+    call_id: CallId,
     loggable_call_id: LoggableCallId,
     creator_id: UserId, // AKA the first user to join
     new_clients_require_approval: bool,
@@ -441,7 +450,7 @@ pub struct RaisedHand {
 impl Call {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        loggable_call_id: LoggableCallId,
+        call_id: CallId,
         room_id: Option<RoomId>,
         creator_id: UserId,
         new_clients_require_approval: bool,
@@ -455,10 +464,12 @@ impl Call {
         approved_users: Option<Vec<UserId>>,
         approved_users_persistence_url: Option<&'static Url>,
     ) -> Self {
+        let loggable_call_id = LoggableCallId::from(&call_id);
         info!("call: {} creating", loggable_call_id);
         Self {
             room_id: room_id.clone(),
             loggable_call_id,
+            call_id,
             creator_id,
             new_clients_require_approval,
             call_type,
@@ -500,6 +511,10 @@ impl Call {
 
     pub fn room_id(&self) -> Option<&RoomId> {
         self.room_id.as_ref()
+    }
+
+    pub fn call_id(&self) -> CallId {
+        self.call_id.clone()
     }
 
     pub fn call_type(&self) -> CallType {
@@ -582,6 +597,16 @@ impl Call {
         self.clients
             .iter()
             .any(|client| client.is_admin && &client.user_id == user_id)
+    }
+
+    /// occasionally check who the active speaker is. Do intermittently to avoid CPU and thrash
+    fn need_update_speaker(&self, now: Instant) -> bool {
+        now > self.active_speaker_calculated + ACTIVE_SPEAKER_CALCULATION_INTERVAL
+    }
+
+    /// occasionally resend speaker message since notifications are lossy
+    fn need_refresh_speaker(&self, now: Instant) -> bool {
+        now >= self.active_speaker_update_sent + self.active_speaker_message_interval
     }
 
     pub fn add_client(
@@ -1211,23 +1236,37 @@ impl Call {
             }
         }
 
-        let mut new_active_speaker: Option<DemuxId> = None;
-        if now > self.active_speaker_calculated + ACTIVE_SPEAKER_CALCULATION_INTERVAL {
+        let (admin_device_joined_or_left_update, non_admin_device_joined_or_left_update) =
+            if self.client_added_or_removed > self.clients_update_sent {
+                self.clients_update_sent = now;
+                (
+                    Some(DeviceJoinedOrLeft {
+                        peek_info: Some(self.get_signaling_info(true).into()),
+                    }),
+                    Some(DeviceJoinedOrLeft {
+                        peek_info: Some(self.get_signaling_info(false).into()),
+                    }),
+                )
+            } else {
+                (None, None)
+            };
+        let new_active_speaker = if self.need_update_speaker(now) {
             time_scope_us!("calling.call.tick.calculate_active_speaker");
-
-            self.active_speaker_calculated = now;
-            new_active_speaker = self.calculate_active_speaker(now);
-            if new_active_speaker.is_some() {
-                trace!("  active speaker changed");
-                trace!("  send rtp packet with active speaker change to all clients in the sender's call");
-                // update proto is sent down below
-            }
-        }
-
-        let client_was_added_or_removed = self.client_added_or_removed > self.clients_update_sent;
-        if client_was_added_or_removed {
-            self.clients_update_sent = now;
-        }
+            self.calculate_active_speaker(now)
+        } else {
+            None
+        };
+        let speaker_update = if new_active_speaker.is_some()
+            || admin_device_joined_or_left_update.is_some()
+            || self.need_refresh_speaker(now)
+        {
+            self.active_speaker_update_sent = now;
+            Some(Speaker {
+                demux_id: self.active_speaker_id.map(|demux_id| demux_id.as_u32()),
+            })
+        } else {
+            None
+        };
 
         // A change to the layer rate or resolution may impact how the receiver allocates the target sent rate.
         // So can a change in active speaker.
@@ -1235,18 +1274,35 @@ impl Call {
         self.reallocate_target_send_rates_if_its_been_too_long(now);
 
         // Do this after reallocation so it has the latest info about what is being forwarded.
+        let key_frame_requests_to_send = self.send_key_frame_requests(now, new_active_speaker);
+
         let mut rtp_to_send = vec![];
         self.send_update_proto_to_participating_clients(
-            client_was_added_or_removed,
-            new_active_speaker.is_some(),
+            admin_device_joined_or_left_update.as_ref(),
+            non_admin_device_joined_or_left_update.as_ref(),
+            speaker_update,
             &mut rtp_to_send,
             now,
         );
-        self.send_update_proto_to_pending_clients(client_was_added_or_removed, &mut rtp_to_send);
+        self.send_update_proto_to_pending_clients(
+            non_admin_device_joined_or_left_update.as_ref(),
+            &mut rtp_to_send,
+        );
         self.send_update_proto_to_removed_clients(&mut rtp_to_send, now);
         self.send_raised_hands_proto_to_clients(&mut rtp_to_send, now);
 
         // Reallocation can change what key frames to send, so we should do this after reallocating.
+
+        self.send_mrp_updates(&mut rtp_to_send, now);
+
+        (rtp_to_send, key_frame_requests_to_send)
+    }
+
+    fn send_key_frame_requests(
+        &mut self,
+        now: Instant,
+        new_active_speaker: Option<DemuxId>,
+    ) -> Vec<KeyFrameRequestToSend> {
         let mut key_frame_requests_to_send = self.send_key_frame_requests_if_its_been_too_long(now);
 
         if let Some(active_speaker_id) = new_active_speaker {
@@ -1287,9 +1343,7 @@ impl Call {
             }
         }
 
-        self.send_mrp_updates(&mut rtp_to_send, now);
-
-        (rtp_to_send, key_frame_requests_to_send)
+        key_frame_requests_to_send
     }
 
     /// Adjust the target send rate for the given client according to what congestion control has
@@ -1556,33 +1610,14 @@ impl Call {
 
     fn send_update_proto_to_participating_clients(
         &mut self,
-        client_was_added_or_removed: bool,
-        active_speaker_just_changed: bool,
+        admin_update_device_joined_or_left: Option<&DeviceJoinedOrLeft>,
+        non_admin_update_device_joined_or_left: Option<&DeviceJoinedOrLeft>,
+        speaker: Option<Speaker>,
         rtp_to_send: &mut Vec<RtpToSend>,
         now: Instant,
     ) {
-        let mut update = protos::SfuToDevice::default();
-
-        if client_was_added_or_removed {
-            // The fields aren't used by the client, so they are None.
-            update.device_joined_or_left =
-                Some(protos::sfu_to_device::DeviceJoinedOrLeft::default());
-        }
-
-        if active_speaker_just_changed
-            || update.device_joined_or_left.is_some()
-            || (now >= self.active_speaker_update_sent + self.active_speaker_message_interval)
-        {
-            if let Some(demux_id) = self.active_speaker_id {
-                update.speaker = Some(protos::sfu_to_device::Speaker {
-                    demux_id: Some(demux_id.as_u32()),
-                });
-            }
-            self.active_speaker_update_sent = now;
-        }
-
-        let send_stats = now >= self.stats_update_sent + STATS_MESSAGE_INTERVAL;
-        if update.device_joined_or_left.is_some() || update.speaker.is_some() || send_stats {
+        let should_send_stats = now >= self.stats_update_sent + STATS_MESSAGE_INTERVAL;
+        if admin_update_device_joined_or_left.is_some() || speaker.is_some() || should_send_stats {
             let raw_demux_ids: Vec<u32> = self
                 .clients
                 .iter()
@@ -1613,7 +1648,7 @@ impl Call {
                     })
                     .unzip();
 
-                update.current_devices = Some(protos::sfu_to_device::CurrentDevices {
+                let current_devices = Some(protos::sfu_to_device::CurrentDevices {
                     all_demux_ids: if cfg!(test) {
                         raw_demux_ids.clone()
                     } else {
@@ -1628,22 +1663,54 @@ impl Call {
                     demux_ids_with_video,
                     allocated_heights,
                 });
-                if send_stats {
-                    update.stats = Some(protos::sfu_to_device::Stats {
+                let stats = if should_send_stats {
+                    Some(protos::sfu_to_device::Stats {
                         target_send_rate_kbps: Some(client.target_send_rate.as_kbps() as u32),
                         ideal_send_rate_kbps: Some(client.ideal_send_rate.as_kbps() as u32),
                         allocated_send_rate_kbps: Some(client.allocated_send_rate.as_kbps() as u32),
-                    });
-                }
+                    })
+                } else {
+                    None
+                };
+                let update = SfuToDevice {
+                    speaker,
+                    device_joined_or_left: admin_update_device_joined_or_left
+                        .map(|_| DeviceJoinedOrLeft::default()),
+                    current_devices,
+                    stats,
+
+                    video_request: None,
+                    removed: None,
+                    raised_hands: None,
+                    mrp_header: None,
+                };
 
                 let update_rtp = Self::encode_sfu_to_device_update(
                     &update,
                     &mut client.next_server_to_client_data_rtp_seqnum,
                 );
-                rtp_to_send.push((client.demux_id, update_rtp))
+                rtp_to_send.push((client.demux_id, update_rtp));
+
+                if admin_update_device_joined_or_left.is_some() {
+                    let fragmentable_update = SfuToDevice {
+                        device_joined_or_left: if self.call_type != CallType::Adhoc
+                            || client.is_admin
+                        {
+                            admin_update_device_joined_or_left.cloned()
+                        } else {
+                            non_admin_update_device_joined_or_left.cloned()
+                        },
+                        ..Default::default()
+                    };
+                    let fragmentable_update = Self::encode_sfu_to_device_update(
+                        &fragmentable_update,
+                        &mut client.next_server_to_client_data_rtp_seqnum,
+                    );
+                    rtp_to_send.push((client.demux_id, fragmentable_update));
+                }
             }
 
-            if send_stats {
+            if should_send_stats {
                 self.stats_update_sent = now;
             }
         }
@@ -1651,15 +1718,20 @@ impl Call {
 
     fn send_update_proto_to_pending_clients(
         &mut self,
-        client_was_added_or_removed: bool,
+        device_joined_or_left: Option<&DeviceJoinedOrLeft>,
         rtp_to_send: &mut Vec<RtpToSend>,
     ) {
-        if self.pending_clients.is_empty() || !client_was_added_or_removed {
+        if self.pending_clients.is_empty() || device_joined_or_left.is_none() {
             return;
         }
 
         let update = protos::SfuToDevice {
-            device_joined_or_left: Some(protos::sfu_to_device::DeviceJoinedOrLeft::default()),
+            device_joined_or_left: Some(DeviceJoinedOrLeft::default()),
+            ..Default::default()
+        };
+
+        let fragmentable_update = protos::SfuToDevice {
+            device_joined_or_left: device_joined_or_left.cloned(),
             ..Default::default()
         };
 
@@ -1670,7 +1742,14 @@ impl Call {
                     &update,
                     &mut pending_client.next_server_to_client_data_rtp_seqnum,
                 ),
-            ))
+            ));
+            rtp_to_send.push((
+                pending_client.demux_id,
+                Self::encode_sfu_to_device_update(
+                    &fragmentable_update,
+                    &mut pending_client.next_server_to_client_data_rtp_seqnum,
+                ),
+            ));
         }
     }
 
@@ -1750,6 +1829,17 @@ impl Call {
         }
     }
 
+    pub fn get_signaling_info(&self, include_pending_user_ids: bool) -> CallSignalingInfo {
+        CallSignalingInfo {
+            era_id: Some(self.call_id.clone()),
+            size: self.size(),
+            created: self.created(),
+            creator_id: self.creator_id().clone(),
+            client_ids: self.get_client_ids(),
+            pending_client_ids: self.get_pending_client_ids(include_pending_user_ids),
+        }
+    }
+
     /// Preps and appends MRP acks and retries to clients in the call
     fn send_mrp_updates(&mut self, rtp_to_send: &mut Vec<RtpToSend>, now: Instant) {
         let unwrapped_now = now.into();
@@ -1820,6 +1910,7 @@ impl Call {
     }
 
     fn calculate_active_speaker(&mut self, now: Instant) -> Option<DemuxId> {
+        self.active_speaker_calculated = now;
         let first = self.clients.first()?;
         let mut most_active = self
             .active_speaker_id
@@ -3122,6 +3213,9 @@ mod call_tests {
     use calling_common::PixelSize;
 
     use super::*;
+    use crate::protos::sfu_to_device::{peek_info::PeekDeviceInfo, PeekInfo};
+
+    static CALL_ID: &[u8; 7] = b"call_id";
 
     #[test]
     fn test_forward_audio() {
@@ -4155,11 +4249,33 @@ mod call_tests {
         let initial_target_send_rate = DataRate::from_kbps(600);
         let default_requested_max_send_rate = DataRate::from_kbps(20000);
         Call::new(
-            LoggableCallId::from(call_id),
+            CallId::from(call_id.to_vec()),
             None,
             creator_id,
             false,
             CallType::GroupV2,
+            false,
+            active_speaker_message_interval,
+            initial_target_send_rate,
+            default_requested_max_send_rate,
+            now,
+            system_now,
+            None,
+            None,
+        )
+    }
+
+    fn create_adhoc_call(call_id: &[u8], now: Instant, system_now: SystemTime) -> Call {
+        let creator_id = UserId::from("creator_id".to_string());
+        let active_speaker_message_interval = Duration::from_secs(1);
+        let initial_target_send_rate = DataRate::from_kbps(600);
+        let default_requested_max_send_rate = DataRate::from_kbps(20000);
+        Call::new(
+            CallId::from(call_id.to_vec()),
+            None,
+            creator_id,
+            true,
+            CallType::Adhoc,
             false,
             active_speaker_message_interval,
             initial_target_send_rate,
@@ -4279,6 +4395,19 @@ mod call_tests {
         )
     }
 
+    fn create_server_to_client_rtps<T: AsRef<[u8]>>(
+        base_seqnum: rtp::FullSequenceNumber,
+        payloads: &[T],
+    ) -> Vec<rtp::Packet<Vec<u8>>> {
+        payloads
+            .iter()
+            .enumerate()
+            .map(|(i, payload)| {
+                create_server_to_client_rtp(base_seqnum + i as u64, payload.as_ref())
+            })
+            .collect()
+    }
+
     fn create_server_to_client_rtp(
         seqnum: rtp::FullSequenceNumber,
         payload: &[u8],
@@ -4301,14 +4430,34 @@ mod call_tests {
         rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, tcc_seqnum, None, payload)
     }
 
+    trait EncodeCollection {
+        fn encode_collection(self) -> Vec<Vec<u8>>;
+    }
+
+    impl<U: Message, T: IntoIterator<Item = U>> EncodeCollection for T {
+        fn encode_collection(self) -> Vec<Vec<u8>> {
+            self.into_iter().map(|msg| msg.encode_to_vec()).collect()
+        }
+    }
+
+    fn to_rtp_to_send(
+        payloads: Vec<(DemuxId, Vec<rtp::Packet<Vec<u8>>>)>,
+    ) -> Vec<(DemuxId, rtp::Packet<Vec<u8>>)> {
+        payloads
+            .into_iter()
+            .flat_map(|(demux_id, payloads)| payloads.into_iter().map(move |pkt| (demux_id, pkt)))
+            .collect()
+    }
+
     fn create_sfu_to_device(
         joined_or_left: bool,
         active_speaker_id: Option<DemuxId>,
-        all_demux_ids: &[DemuxId],
-    ) -> protos::SfuToDevice {
-        protos::SfuToDevice {
+        participant_demux_ids: &[DemuxId],
+        pending_demux_ids: &[DemuxId],
+    ) -> Vec<protos::SfuToDevice> {
+        let mut updates = vec![protos::SfuToDevice {
             device_joined_or_left: if joined_or_left {
-                Some(protos::sfu_to_device::DeviceJoinedOrLeft::default())
+                Some(Default::default())
             } else {
                 None
             },
@@ -4317,11 +4466,70 @@ mod call_tests {
             }),
             current_devices: Some(protos::sfu_to_device::CurrentDevices {
                 demux_ids_with_video: vec![],
-                all_demux_ids: all_demux_ids.iter().map(|id| id.as_u32()).collect(),
+                all_demux_ids: participant_demux_ids.iter().map(|id| id.as_u32()).collect(),
                 allocated_heights: vec![],
             }),
             ..Default::default()
+        }];
+
+        if joined_or_left {
+            updates.push(protos::SfuToDevice {
+                device_joined_or_left: Some(protos::sfu_to_device::DeviceJoinedOrLeft {
+                    peek_info: Some(PeekInfo {
+                        era_id: Some(hex::encode(CALL_ID)),
+                        max_devices: None,
+                        creator: Some("creator_id".to_string()),
+                        devices: participant_demux_ids
+                            .iter()
+                            .map(|demux| PeekDeviceInfo {
+                                demux_id: Some(demux.as_u32()),
+                                opaque_user_id: Some((demux.as_u32() >> 4).to_string()),
+                            })
+                            .collect(),
+                        pending_devices: pending_demux_ids
+                            .iter()
+                            .map(|demux| PeekDeviceInfo {
+                                demux_id: Some(demux.as_u32()),
+                                opaque_user_id: Some((demux.as_u32() >> 4).to_string()),
+                            })
+                            .collect(),
+                        call_link_state: None,
+                    }),
+                }),
+                ..Default::default()
+            });
         }
+
+        updates
+    }
+
+    fn create_nonadmin_sfu_to_device(
+        joined_or_left: bool,
+        active_speaker_id: Option<DemuxId>,
+        participant_demux_ids: &[DemuxId],
+        pending_demux_ids: &[DemuxId],
+    ) -> Vec<protos::SfuToDevice> {
+        let mut protos = create_sfu_to_device(
+            joined_or_left,
+            active_speaker_id,
+            participant_demux_ids,
+            pending_demux_ids,
+        );
+
+        if let Some(fragmentable_update) = protos.get_mut(1) {
+            fragmentable_update
+                .device_joined_or_left
+                .as_mut()
+                .map(|joined_or_left| {
+                    joined_or_left.peek_info.as_mut().map(|p| {
+                        p.pending_devices.iter_mut().for_each(|d| {
+                            d.opaque_user_id = None;
+                        })
+                    })
+                });
+        }
+
+        protos
     }
 
     fn create_resolution_request_rtp(
@@ -4420,7 +4628,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
 
         let sender_demux_id = demux_id_from_unshifted(1);
         let mut rtp1 = create_data_rtp(sender_demux_id, 1);
@@ -4474,7 +4682,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
 
         let sender_demux_id = demux_id_from_unshifted(1);
         let mut rtp1 = create_audio_rtp(sender_demux_id, 1);
@@ -4563,7 +4771,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
 
         let sender_demux_id = demux_id_from_unshifted(1);
         let mut frame_number = 101;
@@ -4914,40 +5122,41 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
 
         // It's a little weird that you get updates for when you join, but it doesn't really do any harm and it's much easier to implement.
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
 
         let expected_update_payload_just_client1 =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1]).encode_to_vec();
+            create_sfu_to_device(true, Some(demux_id1), &[demux_id1], &[]).encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
         assert_eq!(
-            vec![(
+            to_rtp_to_send(vec![(
                 demux_id1,
-                create_server_to_client_rtp(1, &expected_update_payload_just_client1)
-            )],
+                create_server_to_client_rtps(1, &expected_update_payload_just_client1)
+            )]),
             rtp_to_send
         );
 
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
 
         let expected_update_payload_both_clients =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id2]).encode_to_vec();
+            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id2], &[])
+                .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
         assert_eq!(
-            vec![
+            to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(2, &expected_update_payload_both_clients)
+                    create_server_to_client_rtps(3, &expected_update_payload_both_clients)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(1, &expected_update_payload_both_clients)
+                    create_server_to_client_rtps(1, &expected_update_payload_both_clients)
                 )
-            ],
+            ]),
             rtp_to_send
         );
 
@@ -4961,15 +5170,16 @@ mod call_tests {
             true,
             Some(demux_id1), // Is it okay that the active speaker left?
             &[demux_id2],
+            &[],
         )
-        .encode_to_vec();
+        .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
         assert_eq!(
-            vec![(
+            to_rtp_to_send(vec![(
                 demux_id2,
-                create_server_to_client_rtp(2, &expected_update_payload_just_client2)
-            )],
+                create_server_to_client_rtps(3, &expected_update_payload_just_client2)
+            )]),
             rtp_to_send
         );
     }
@@ -4980,101 +5190,152 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_adhoc_call(CALL_ID, now, system_now);
 
         // It's a little weird that you get updates for when you join, but it doesn't really do any harm and it's much easier to implement.
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
+        call.approve_pending_client(demux_id1, at(99));
 
         let expected_update_payload_just_client1 =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1]).encode_to_vec();
-        let expected_update_payload_for_pending = protos::SfuToDevice {
-            device_joined_or_left: Some(protos::sfu_to_device::DeviceJoinedOrLeft {}),
-            ..Default::default()
-        }
-        .encode_to_vec();
-
+            create_nonadmin_sfu_to_device(true, Some(demux_id1), &[demux_id1], &[])
+                .encode_collection();
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
         assert_eq!(
-            vec![(
+            to_rtp_to_send(vec![(
                 demux_id1,
-                create_server_to_client_rtp(1, &expected_update_payload_just_client1)
-            )],
+                create_server_to_client_rtps(1, &expected_update_payload_just_client1)
+            )]),
             rtp_to_send
         );
 
-        call.new_clients_require_approval = true;
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
+        let demux_id3 = add_admin(&mut call, "3", 3, at(200));
+
+        let expected_update_payload_admin =
+            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id3], &[demux_id2])
+                .encode_collection();
+
+        let expected_update_payload_nonadmin = create_nonadmin_sfu_to_device(
+            true,
+            Some(demux_id1),
+            &[demux_id1, demux_id3],
+            &[demux_id2],
+        );
+
+        let expected_update_payload_pending = expected_update_payload_nonadmin
+            .iter()
+            .map(|msg| SfuToDevice {
+                device_joined_or_left: msg.device_joined_or_left.clone(),
+                ..Default::default()
+            })
+            .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
         assert_eq!(
-            vec![
+            to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(2, &expected_update_payload_just_client1)
+                    create_server_to_client_rtps(
+                        3,
+                        &expected_update_payload_nonadmin.encode_collection()
+                    )
+                ),
+                (
+                    demux_id3,
+                    create_server_to_client_rtps(1, &expected_update_payload_admin,)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(1, &expected_update_payload_for_pending)
+                    create_server_to_client_rtps(1, &expected_update_payload_pending,)
                 )
-            ],
+            ]),
             rtp_to_send
         );
 
         call.approve_pending_client(demux_id2, at(300));
 
-        let expected_update_payload_both_clients =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id2]).encode_to_vec();
+        let expected_update_payload_all_clients = create_sfu_to_device(
+            true,
+            Some(demux_id1),
+            &[demux_id1, demux_id3, demux_id2],
+            &[],
+        )
+        .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
         assert_eq!(
-            vec![
+            to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(3, &expected_update_payload_both_clients)
+                    create_server_to_client_rtps(5, &expected_update_payload_all_clients)
+                ),
+                (
+                    demux_id3,
+                    create_server_to_client_rtps(3, &expected_update_payload_all_clients)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(2, &expected_update_payload_both_clients)
+                    create_server_to_client_rtps(3, &expected_update_payload_all_clients)
                 )
-            ],
+            ]),
             rtp_to_send
         );
 
         call.drop_client(demux_id2, at(400));
 
+        let expected_update_payload =
+            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id3], &[])
+                .encode_collection();
+
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
         assert_eq!(
-            vec![(
-                demux_id1,
-                create_server_to_client_rtp(4, &expected_update_payload_just_client1)
-            )],
+            to_rtp_to_send(vec![
+                (
+                    demux_id1,
+                    create_server_to_client_rtps(7, &expected_update_payload)
+                ),
+                (
+                    demux_id3,
+                    create_server_to_client_rtps(5, &expected_update_payload)
+                )
+            ]),
             rtp_to_send
         );
 
         // Re-add the same user.
-        let demux_id22 = add_client(&mut call, "2", 22, at(500));
+        let demux_id2 = add_client(&mut call, "2", 2, at(500));
 
-        let expected_update_payload_both_clients_after_rejoin =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id22]).encode_to_vec();
+        let expected_update_payload_nonadmin = create_nonadmin_sfu_to_device(
+            true,
+            Some(demux_id1),
+            &[demux_id1, demux_id3, demux_id2],
+            &[],
+        )
+        .encode_collection();
+        let expected_update_payload_admin = create_sfu_to_device(
+            true,
+            Some(demux_id1),
+            &[demux_id1, demux_id3, demux_id2],
+            &[],
+        )
+        .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500));
         assert_eq!(
-            vec![
+            to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(
-                        5,
-                        &expected_update_payload_both_clients_after_rejoin
-                    )
+                    create_server_to_client_rtps(9, &expected_update_payload_nonadmin,)
                 ),
                 (
-                    demux_id22,
-                    create_server_to_client_rtp(
-                        1,
-                        &expected_update_payload_both_clients_after_rejoin
-                    )
+                    demux_id3,
+                    create_server_to_client_rtps(7, &expected_update_payload_admin,)
+                ),
+                (
+                    demux_id2,
+                    create_server_to_client_rtps(1, &expected_update_payload_nonadmin,)
                 )
-            ],
+            ]),
             rtp_to_send
         );
     }
@@ -5103,7 +5364,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let _non_admin = add_client(&mut call, "1", 1, at(100));
@@ -5118,7 +5379,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let client_device_1 = add_client(&mut call, "Them", 1, at(100));
@@ -5147,7 +5408,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let client_device_1 = add_client(&mut call, "Them", 1, at(100));
@@ -5176,7 +5437,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let non_admin = add_client(&mut call, "1", 1, at(100));
@@ -5197,7 +5458,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
 
         let non_admin = add_client(&mut call, "1", 1, at(100));
         assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
@@ -5222,40 +5483,43 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_adhoc_call(CALL_ID, now, system_now);
 
         // It's a little weird that you get updates for when you join, but it doesn't really do any harm and it's much easier to implement.
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
+        call.approve_pending_client(demux_id1, at(99));
 
         let expected_update_payload_just_client1 =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1]).encode_to_vec();
+            create_sfu_to_device(true, Some(demux_id1), &[demux_id1], &[]).encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
         assert_eq!(
-            vec![(
+            to_rtp_to_send(vec![(
                 demux_id1,
-                create_server_to_client_rtp(1, &expected_update_payload_just_client1)
-            )],
+                create_server_to_client_rtps(1, &expected_update_payload_just_client1)
+            )]),
             rtp_to_send
         );
 
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
+        call.approve_pending_client(demux_id2, at(200));
 
         let expected_update_payload_both_clients =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id2]).encode_to_vec();
+            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id2], &[])
+                .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
         assert_eq!(
-            vec![
+            to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(2, &expected_update_payload_both_clients)
+                    create_server_to_client_rtps(3, &expected_update_payload_both_clients)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(1, &expected_update_payload_both_clients)
+                    create_server_to_client_rtps(1, &expected_update_payload_both_clients)
                 )
-            ],
+            ]),
             rtp_to_send
         );
 
@@ -5268,16 +5532,19 @@ mod call_tests {
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
         assert_eq!(
-            vec![
+            to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(3, &expected_update_payload_just_client1)
+                    create_server_to_client_rtps(5, &expected_update_payload_just_client1)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(2, &expected_update_payload_for_removed)
+                    vec![create_server_to_client_rtp(
+                        3,
+                        &expected_update_payload_for_removed
+                    )]
                 )
-            ],
+            ]),
             rtp_to_send
         );
 
@@ -5288,30 +5555,34 @@ mod call_tests {
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
         assert_eq!(0, rtp_to_send.len());
 
-        // Re-add the same user.
-        let demux_id22 = add_client(&mut call, "2", 22, at(500));
+        // Re-add the same user. Should be a pending client
+        let demux_id2 = add_client(&mut call, "2", 2, at(500));
 
-        let expected_update_payload_both_clients_after_rejoin =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id22]).encode_to_vec();
+        let expected_update_payload_participant =
+            create_nonadmin_sfu_to_device(true, Some(demux_id1), &[demux_id1], &[demux_id2]);
+        let expected_update_payload_pending = expected_update_payload_participant
+            .iter()
+            .map(|msg| SfuToDevice {
+                device_joined_or_left: msg.device_joined_or_left.clone(),
+                ..Default::default()
+            })
+            .encode_collection();
+
+        let expected_update_payload_participant =
+            expected_update_payload_participant.encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500));
         assert_eq!(
-            vec![
+            to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(
-                        4,
-                        &expected_update_payload_both_clients_after_rejoin
-                    )
+                    create_server_to_client_rtps(7, &expected_update_payload_participant)
                 ),
                 (
-                    demux_id22,
-                    create_server_to_client_rtp(
-                        1,
-                        &expected_update_payload_both_clients_after_rejoin
-                    )
+                    demux_id2,
+                    create_server_to_client_rtps(1, &expected_update_payload_pending)
                 )
-            ],
+            ]),
             rtp_to_send
         );
     }
@@ -5322,7 +5593,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let alice_device_1 = add_client(&mut call, "Alice", 1, at(100));
@@ -5390,7 +5661,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let alice_user_id = UserId::from("Alice".to_string());
@@ -5451,7 +5722,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let alice_user_id = UserId::from("Alice".to_string());
@@ -5487,7 +5758,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let alice_user_id = UserId::from("Alice".to_string());
@@ -5538,7 +5809,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let alice_user_id = UserId::from("Alice".to_string());
@@ -5577,7 +5848,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let alice_user_id = UserId::from("Alice".to_string());
@@ -5654,26 +5925,27 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         // If there is no audio activity from anyone, we choose the first client as the active speaker
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(301));
 
         let expected_update_payload =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id2]).encode_to_vec();
+            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id2], &[])
+                .encode_collection();
         assert_eq!(Some(demux_id1), call.active_speaker_id);
         assert_eq!(
-            vec![
+            to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(1, &expected_update_payload)
+                    create_server_to_client_rtps(1, &expected_update_payload)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(1, &expected_update_payload)
+                    create_server_to_client_rtps(1, &expected_update_payload)
                 )
-            ],
+            ]),
             rtp_to_send
         );
 
@@ -5687,19 +5959,20 @@ mod call_tests {
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(602));
 
         let expected_update_payload =
-            create_sfu_to_device(false, Some(demux_id2), &[demux_id1, demux_id2]).encode_to_vec();
+            create_sfu_to_device(false, Some(demux_id2), &[demux_id1, demux_id2], &[])
+                .encode_collection();
         assert_eq!(Some(demux_id2), call.active_speaker_id);
         assert_eq!(
-            vec![
+            to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(2, &expected_update_payload)
+                    create_server_to_client_rtps(3, &expected_update_payload)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(2, &expected_update_payload)
+                    create_server_to_client_rtps(3, &expected_update_payload)
                 )
-            ],
+            ]),
             rtp_to_send
         );
 
@@ -5717,19 +5990,20 @@ mod call_tests {
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(903));
 
         let expected_update_payload =
-            create_sfu_to_device(false, Some(demux_id1), &[demux_id1, demux_id2]).encode_to_vec();
+            create_sfu_to_device(false, Some(demux_id1), &[demux_id1, demux_id2], &[])
+                .encode_collection();
         assert_eq!(Some(demux_id1), call.active_speaker_id);
         assert_eq!(
-            vec![
+            to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(3, &expected_update_payload)
+                    create_server_to_client_rtps(4, &expected_update_payload)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(3, &expected_update_payload)
+                    create_server_to_client_rtps(4, &expected_update_payload)
                 )
-            ],
+            ]),
             rtp_to_send
         );
 
@@ -5766,16 +6040,16 @@ mod call_tests {
         // But do resend after 1001ms
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(1904));
         assert_eq!(
-            vec![
+            to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtp(5, &expected_update_payload)
+                    create_server_to_client_rtps(6, &expected_update_payload)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtp(5, &expected_update_payload)
+                    create_server_to_client_rtps(6, &expected_update_payload)
                 )
-            ],
+            ]),
             rtp_to_send
         );
 
@@ -5806,7 +6080,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         // If there is no audio activity from anyone, we choose the first client as the active speaker
@@ -5931,7 +6205,7 @@ mod call_tests {
                 Some(demux_ids)
             };
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         let demux_id3 = add_client(&mut call, "3", 3, at(3));
@@ -6052,7 +6326,7 @@ mod call_tests {
             Some(demux_ids_and_heights)
         };
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
 
@@ -6174,7 +6448,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
 
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
@@ -6191,12 +6465,12 @@ mod call_tests {
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
         let expected_update_payload =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id2]).encode_to_vec();
+            create_sfu_to_device(true, Some(demux_id1), &[demux_id2], &[]).encode_collection();
         assert_eq!(
-            vec![(
+            to_rtp_to_send(vec![(
                 demux_id2,
-                create_server_to_client_rtp(2, &expected_update_payload)
-            )],
+                create_server_to_client_rtps(3, &expected_update_payload)
+            )]),
             rtp_to_send
         );
     }
@@ -6207,7 +6481,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
 
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
@@ -6253,14 +6527,14 @@ mod call_tests {
                 (
                     demux_id1,
                     create_server_to_client_rtp(
-                        2,
+                        3,
                         &expected_update_payload_for_raised_hands_client1
                     )
                 ),
                 (
                     demux_id2,
                     create_server_to_client_rtp(
-                        2,
+                        3,
                         &expected_update_payload_for_raised_hands_client2
                     )
                 )
@@ -6275,7 +6549,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let alice_device_1 = add_admin(&mut call, "Alice", 1, at(100));
@@ -6416,7 +6690,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         call.new_clients_require_approval = true;
 
         let alice_device_1 = add_admin(&mut call, "Alice", 1, at(100));
@@ -6588,7 +6862,7 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
 
         let alice_device_1 = add_client(&mut call, "Alice", 1, at(100));
 
@@ -6645,7 +6919,7 @@ mod call_tests {
                 Some(demux_ids)
             };
 
-        let mut call = create_call(b"call_id", now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         let demux_id3 = add_client(&mut call, "3", 3, at(3));

@@ -223,13 +223,7 @@ impl Sfu {
         let call = self.call_by_call_id.get(&call_id)?;
         let call = call.lock();
         let should_include_pending_user_ids = user_id.is_some_and(|user_id| call.is_admin(user_id));
-        Some(CallSignalingInfo {
-            size: call.size(),
-            created: call.created(),
-            creator_id: call.creator_id().clone(),
-            client_ids: call.get_client_ids(),
-            pending_client_ids: call.get_pending_client_ids(should_include_pending_user_ids),
-        })
+        Some(call.get_signaling_info(should_include_pending_user_ids))
     }
 
     pub fn set_packet_server(&mut self, server: Option<Arc<PacketServerState>>) {
@@ -557,23 +551,26 @@ impl Sfu {
 
         let active_speaker_message_interval_ms = self.config.active_speaker_message_interval_ms;
 
-        let call = self.call_by_call_id.entry(call_id).or_insert_with(|| {
-            Arc::new(Mutex::new(Call::new(
-                loggable_call_id.clone(),
-                room_id.clone(),
-                user_id.clone(),
-                new_clients_require_approval,
-                call_type,
-                self.config.persist_approval_for_all_users_who_join,
-                Duration::from_millis(active_speaker_message_interval_ms),
-                initial_target_send_rate,
-                default_requested_max_send_rate,
-                now,
-                created,
-                approved_users,
-                self.config.approved_users_persistence_url.as_ref(),
-            )))
-        });
+        let call = self
+            .call_by_call_id
+            .entry(call_id.clone())
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(Call::new(
+                    call_id,
+                    room_id.clone(),
+                    user_id.clone(),
+                    new_clients_require_approval,
+                    call_type,
+                    self.config.persist_approval_for_all_users_who_join,
+                    Duration::from_millis(active_speaker_message_interval_ms),
+                    initial_target_send_rate,
+                    default_requested_max_send_rate,
+                    now,
+                    created,
+                    approved_users,
+                    self.config.approved_users_persistence_url.as_ref(),
+                )))
+            });
 
         let client_status = {
             let mut call = call.lock();
@@ -1385,6 +1382,7 @@ impl Sfu {
 /// Info about a call that is relevant to call signaling.
 /// See Sfu::get_call_signaling_info()
 pub struct CallSignalingInfo {
+    pub era_id: Option<CallId>,
     pub size: usize,
     pub created: SystemTime,
     pub creator_id: UserId,
