@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 
 use calling_common::{Duration, Instant};
-use log::{info, trace, warn};
+use log::{trace, warn};
 use metrics::event;
 use partial_default::PartialDefault;
 
@@ -291,10 +291,7 @@ impl Candidate {
         if self.ping_transaction_id.is_none() {
             self.will_transmit_ping(now)
         } else if self.ping_retransmit_count == PING_MAX_RETRANSMITS {
-            info!(
-                "{}: timed out after {} retransmits",
-                self.address, self.ping_retransmit_count
-            );
+            trace!("{}: timed out", self.address);
             self.state = State::Dead;
             Action::ForgetTransaction(
                 self.ping_transaction_id
