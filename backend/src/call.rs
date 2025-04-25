@@ -42,7 +42,7 @@ use metrics::{metric_config::StaticStrTagsRef, *};
 use crate::{
     protos::{
         sfu_to_device::{DeviceJoinedOrLeft, Speaker},
-        SfuToDevice,
+        DeviceToSfu, SfuToDevice,
     },
     sfu::CallSignalingInfo,
 };
@@ -75,7 +75,7 @@ const REMOVED_CLIENTS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 /// This is how often we send raised hands messages to clients.
 const RAISED_HANDS_MESSAGE_INTERVAL: Duration = Duration::from_secs(1);
 /// This should match the buffer size used by clients
-const MAX_MRP_WINDOW_SIZE: usize = 64;
+const MAX_MRP_WINDOW_SIZE: usize = 128;
 /// How long the SFU waits for an MRP ack before resending
 const MRP_SEND_TIMEOUT_INTERVAL: Duration = Duration::from_secs(1);
 /// How long the generations are for minimum target send rate; layer
@@ -85,6 +85,14 @@ const MIN_TARGET_SEND_RATE_GENERATION_INTERVAL: Duration = Duration::from_millis
 const TARGET_RATE_MINIMUM_ALLOCATION_RATIO: f64 = 0.9;
 /// How much bitrate to assume clients will use to send layer 0 video.
 const ASSUMED_LAYER0_KBPS: u64 = 150;
+/// The max byte size of Packet serialized size before needing to be fragemented
+const MAX_PACKET_SERIALIZED_BYTE_SIZE: usize = 1200;
+/// The non-content byte size overhead of an MRP fragment
+/// With an MRP header with seqnum, num_packets, and content specified, the overhead is 22. We add
+/// a safety margin in case of unexpected overhead increases.
+const MRP_FRAGMENT_OVERHEAD: usize = 60;
+/// Max byte size for content in an MRP fragment
+const MAX_MRP_FRAGMENT_BYTE_SIZE: usize = MAX_PACKET_SERIALIZED_BYTE_SIZE - MRP_FRAGMENT_OVERHEAD;
 
 #[derive(Debug, EnumString, EnumIter, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum CallSizeBucket {
@@ -624,6 +632,7 @@ impl Call {
             is_admin,
             region_relation,
             user_agent,
+            mrp_stream: MrpStream::with_capacity_limit(MAX_MRP_WINDOW_SIZE),
             next_server_to_client_data_rtp_seqnum: 1,
         };
         if self.blocked_users.contains(&pending_client.user_id) {
@@ -1020,7 +1029,7 @@ impl Call {
         let sender_mrp_stream = &mut self
             .find_client_mut(sender_demux_id)
             .ok_or(Error::UnknownDemuxId(sender_demux_id))?
-            .reliable_mrp_stream;
+            .mrp_stream;
         let ready_protos = if let Some(header) = proto.mrp_header.as_ref() {
             match sender_mrp_stream.receive(&header.into(), proto) {
                 Ok(ready_protos) => ready_protos,
@@ -1287,6 +1296,7 @@ impl Call {
         self.send_update_proto_to_pending_clients(
             non_admin_device_joined_or_left_update.as_ref(),
             &mut rtp_to_send,
+            now,
         );
         self.send_update_proto_to_removed_clients(&mut rtp_to_send, now);
         self.send_raised_hands_proto_to_clients(&mut rtp_to_send, now);
@@ -1683,13 +1693,11 @@ impl Call {
                     removed: None,
                     raised_hands: None,
                     mrp_header: None,
+                    content: None,
                 };
 
-                let update_rtp = Self::encode_sfu_to_device_update(
-                    &update,
-                    &mut client.next_server_to_client_data_rtp_seqnum,
-                );
-                rtp_to_send.push((client.demux_id, update_rtp));
+                let update_rtp = Self::send_reliable_sfu_to_device_update(client, update, now);
+                rtp_to_send.extend(update_rtp);
 
                 if admin_update_device_joined_or_left.is_some() {
                     let fragmentable_update = SfuToDevice {
@@ -1702,11 +1710,9 @@ impl Call {
                         },
                         ..Default::default()
                     };
-                    let fragmentable_update = Self::encode_sfu_to_device_update(
-                        &fragmentable_update,
-                        &mut client.next_server_to_client_data_rtp_seqnum,
-                    );
-                    rtp_to_send.push((client.demux_id, fragmentable_update));
+                    let fragmentable_update_rtp =
+                        Self::send_reliable_sfu_to_device_update(client, fragmentable_update, now);
+                    rtp_to_send.extend(fragmentable_update_rtp);
                 }
             }
 
@@ -1720,6 +1726,7 @@ impl Call {
         &mut self,
         device_joined_or_left: Option<&DeviceJoinedOrLeft>,
         rtp_to_send: &mut Vec<RtpToSend>,
+        now: Instant,
     ) {
         if self.pending_clients.is_empty() || device_joined_or_left.is_none() {
             return;
@@ -1736,20 +1743,16 @@ impl Call {
         };
 
         for pending_client in &mut self.pending_clients {
-            rtp_to_send.push((
-                pending_client.demux_id,
-                Self::encode_sfu_to_device_update(
-                    &update,
-                    &mut pending_client.next_server_to_client_data_rtp_seqnum,
-                ),
-            ));
-            rtp_to_send.push((
-                pending_client.demux_id,
-                Self::encode_sfu_to_device_update(
-                    &fragmentable_update,
-                    &mut pending_client.next_server_to_client_data_rtp_seqnum,
-                ),
-            ));
+            let update_rtp =
+                Self::send_reliable_sfu_to_device_update(pending_client, update.clone(), now);
+            rtp_to_send.extend(update_rtp);
+
+            let fragmentable_update_rtp = Self::send_reliable_sfu_to_device_update(
+                pending_client,
+                fragmentable_update.clone(),
+                now,
+            );
+            rtp_to_send.extend(fragmentable_update_rtp);
         }
     }
 
@@ -1845,7 +1848,7 @@ impl Call {
         let unwrapped_now = now.into();
         for client in &mut self.clients {
             let client_demux_id = client.demux_id;
-            let _ = client.reliable_mrp_stream.try_send_ack(|header| {
+            let _ = client.mrp_stream.try_send_ack(|header| {
                 let ack = protos::SfuToDevice {
                     mrp_header: Some(header.into()),
                     ..Default::default()
@@ -1857,7 +1860,7 @@ impl Call {
                 rtp_to_send.push((client_demux_id, update_rtp));
                 Ok(())
             });
-            let _ = client.reliable_mrp_stream.try_resend(unwrapped_now, |pkt| {
+            let _ = client.mrp_stream.try_resend(unwrapped_now, |pkt| {
                 let update_rtp = Self::encode_reliable_sfu_to_device(
                     pkt,
                     &mut client.next_server_to_client_data_rtp_seqnum,
@@ -1865,6 +1868,58 @@ impl Call {
                 rtp_to_send.push((client_demux_id, update_rtp));
                 Ok(unwrapped_now + MRP_SEND_TIMEOUT_INTERVAL.into())
             });
+        }
+    }
+
+    fn send_reliable_sfu_to_device_update<T: ReliableRtpSender>(
+        client: &mut T,
+        mut update: protos::SfuToDevice,
+        now: Instant,
+    ) -> Vec<RtpToSend> {
+        let mut rtp_to_send = vec![];
+        let unwrapped_now: std::time::Instant = now.into();
+        let serialized = update.encode_to_vec();
+        let num_packets = (serialized.len() / MAX_PACKET_SERIALIZED_BYTE_SIZE) + 1;
+        let demux_id = client.demux_id();
+        let (stream, next_rtp_seqnum) = client.mrp_stream_and_rtp_seqnum_mut();
+
+        let result = if num_packets == 1 {
+            stream.try_send(|header| {
+                update.mrp_header = Some(header.into());
+                let update_rtp = Self::encode_reliable_sfu_to_device(&update, next_rtp_seqnum);
+                rtp_to_send.push((demux_id, update_rtp));
+                Ok((update, unwrapped_now + MRP_SEND_TIMEOUT_INTERVAL.into()))
+            })
+        } else {
+            let mut fragments = serialized.chunks(MAX_MRP_FRAGMENT_BYTE_SIZE).enumerate();
+            loop {
+                let Some((i, content)) = fragments.next() else {
+                    break Ok(());
+                };
+                if let Err(e) = stream.try_send(|mut mrp_header| {
+                    if i == 0 {
+                        mrp_header.num_packets = Some(num_packets as u32);
+                    }
+
+                    let update = SfuToDevice {
+                        mrp_header: Some(mrp_header.into()),
+                        content: Some(content.to_vec()),
+                        ..Default::default()
+                    };
+                    let update_rtp = Self::encode_reliable_sfu_to_device(&update, next_rtp_seqnum);
+                    rtp_to_send.push((demux_id, update_rtp));
+                    Ok((update, unwrapped_now + MRP_SEND_TIMEOUT_INTERVAL.into()))
+                }) {
+                    break Err(e);
+                }
+            }
+        };
+
+        if let Err(e) = result {
+            error!("Failed to send reliable sfu to device update: {}", e);
+            vec![]
+        } else {
+            rtp_to_send
         }
     }
 
@@ -2067,6 +2122,16 @@ impl Call {
     }
 }
 
+trait ReliableRtpSender {
+    fn mrp_stream_and_rtp_seqnum_mut(
+        &mut self,
+    ) -> (
+        &mut MrpStream<protos::SfuToDevice, protos::DeviceToSfu>,
+        &mut rtp::FullSequenceNumber,
+    );
+    fn demux_id(&self) -> DemuxId;
+}
+
 /// Enough information to send RTP data messages to and from the client, but not do any forwarding.
 struct NonParticipantClient {
     // Immutable
@@ -2076,8 +2141,29 @@ struct NonParticipantClient {
     region_relation: RegionRelation,
     user_agent: SignalUserAgent,
 
+    // Used for reliable RTP transmissions point-to-point
+    mrp_stream: mrp::MrpStream<protos::SfuToDevice, protos::DeviceToSfu>,
+
     // Update with each proto send from server to client
     next_server_to_client_data_rtp_seqnum: rtp::FullSequenceNumber,
+}
+
+impl ReliableRtpSender for NonParticipantClient {
+    fn mrp_stream_and_rtp_seqnum_mut(
+        &mut self,
+    ) -> (
+        &mut MrpStream<SfuToDevice, DeviceToSfu>,
+        &mut rtp::FullSequenceNumber,
+    ) {
+        (
+            &mut self.mrp_stream,
+            &mut self.next_server_to_client_data_rtp_seqnum,
+        )
+    }
+
+    fn demux_id(&self) -> DemuxId {
+        self.demux_id
+    }
 }
 
 impl From<Client> for NonParticipantClient {
@@ -2089,6 +2175,7 @@ impl From<Client> for NonParticipantClient {
             region_relation: client.region_relation,
             user_agent: client.user_agent,
 
+            mrp_stream: client.mrp_stream,
             next_server_to_client_data_rtp_seqnum: client.next_server_to_client_data_rtp_seqnum,
         }
     }
@@ -2099,6 +2186,7 @@ impl From<&protos::MrpHeader> for mrp::MrpHeader {
         Self {
             ack_num: value.ack_num,
             seqnum: value.seqnum,
+            num_packets: value.num_packets,
         }
     }
 }
@@ -2108,6 +2196,7 @@ impl From<mrp::MrpHeader> for protos::MrpHeader {
         Self {
             ack_num: value.ack_num,
             seqnum: value.seqnum,
+            num_packets: value.num_packets,
         }
     }
 }
@@ -2171,10 +2260,28 @@ struct Client {
     allocated_height_by_sender_demux_id: HashMap<DemuxId, VideoHeight>,
 
     // Used for reliable RTP transmissions point-to-point
-    reliable_mrp_stream: mrp::MrpStream<protos::SfuToDevice, protos::DeviceToSfu>,
+    mrp_stream: mrp::MrpStream<protos::SfuToDevice, protos::DeviceToSfu>,
 
     // Update with each proto send from server to client
     next_server_to_client_data_rtp_seqnum: rtp::FullSequenceNumber,
+}
+
+impl ReliableRtpSender for Client {
+    fn mrp_stream_and_rtp_seqnum_mut(
+        &mut self,
+    ) -> (
+        &mut MrpStream<SfuToDevice, DeviceToSfu>,
+        &mut rtp::FullSequenceNumber,
+    ) {
+        (
+            &mut self.mrp_stream,
+            &mut self.next_server_to_client_data_rtp_seqnum,
+        )
+    }
+
+    fn demux_id(&self) -> DemuxId {
+        self.demux_id
+    }
 }
 
 impl Client {
@@ -2226,7 +2333,8 @@ impl Client {
             data_forwarder_by_sender_demux_id: HashMap::new(),
             allocated_height_by_sender_demux_id: HashMap::new(),
 
-            reliable_mrp_stream: MrpStream::new(MAX_MRP_WINDOW_SIZE),
+            // must keep reliable stream state
+            mrp_stream: pending_client_info.mrp_stream,
 
             next_server_to_client_data_rtp_seqnum: pending_client_info
                 .next_server_to_client_data_rtp_seqnum,
@@ -3211,9 +3319,10 @@ mod loggable_call_id_tests {
 #[cfg(test)]
 mod call_tests {
     use calling_common::PixelSize;
+    use mrp::MrpHeader;
 
     use super::*;
-    use crate::protos::sfu_to_device::{peek_info::PeekDeviceInfo, PeekInfo};
+    use crate::protos::sfu_to_device::{peek_info::PeekDeviceInfo, CurrentDevices, PeekInfo};
 
     static CALL_ID: &[u8; 7] = b"call_id";
 
@@ -4419,6 +4528,33 @@ mod call_tests {
         rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, tcc_seqnum, None, payload)
     }
 
+    fn ack_all_mrp(call: &mut Call) {
+        for i in 0..call.clients.len() {
+            let demux_id = call.clients.get(i).unwrap().demux_id;
+            ack_latest_mrp(demux_id, call);
+        }
+    }
+
+    fn ack_latest_mrp(demux_id: DemuxId, call: &mut Call) {
+        let Some(client) = call.clients.iter_mut().find(|c| c.demux_id == demux_id) else {
+            return;
+        };
+
+        let mut header: MrpHeader = Default::default();
+        let _ = client.mrp_stream.try_send(|h| {
+            header.ack_num = h.seqnum;
+            Err(anyhow::anyhow!("ignored"))
+        });
+        let pkt = DeviceToSfu {
+            mrp_header: Some(header.clone().into()),
+            ..Default::default()
+        };
+        client
+            .mrp_stream
+            .receive(&header, pkt)
+            .expect("Failed to ack latest mrp");
+    }
+
     fn create_reliable_server_to_client_rtp(
         seqnum: rtp::FullSequenceNumber,
         payload: &[u8],
@@ -4451,11 +4587,41 @@ mod call_tests {
 
     fn create_sfu_to_device(
         joined_or_left: bool,
+        mrp_header: Option<protos::MrpHeader>,
         active_speaker_id: Option<DemuxId>,
         participant_demux_ids: &[DemuxId],
         pending_demux_ids: &[DemuxId],
     ) -> Vec<protos::SfuToDevice> {
-        let mut updates = vec![protos::SfuToDevice {
+        let mut updates = vec![create_sfu_to_device_update(
+            joined_or_left,
+            mrp_header,
+            active_speaker_id,
+            participant_demux_ids,
+        )];
+
+        if joined_or_left {
+            let mrp_header = mrp_header.map(|mut header| {
+                header.seqnum = header.seqnum.map(|seqnum| seqnum + 1);
+                header
+            });
+            updates.push(create_sfu_to_device_fragmented_update(
+                mrp_header,
+                participant_demux_ids,
+                pending_demux_ids,
+            ));
+        }
+
+        updates
+    }
+
+    fn create_sfu_to_device_update(
+        joined_or_left: bool,
+        mrp_header: Option<protos::MrpHeader>,
+        active_speaker_id: Option<DemuxId>,
+        participant_demux_ids: &[DemuxId],
+    ) -> protos::SfuToDevice {
+        protos::SfuToDevice {
+            mrp_header,
             device_joined_or_left: if joined_or_left {
                 Some(Default::default())
             } else {
@@ -4470,47 +4636,72 @@ mod call_tests {
                 allocated_heights: vec![],
             }),
             ..Default::default()
-        }];
-
-        if joined_or_left {
-            updates.push(protos::SfuToDevice {
-                device_joined_or_left: Some(protos::sfu_to_device::DeviceJoinedOrLeft {
-                    peek_info: Some(PeekInfo {
-                        era_id: Some(hex::encode(CALL_ID)),
-                        max_devices: None,
-                        creator: Some("creator_id".to_string()),
-                        devices: participant_demux_ids
-                            .iter()
-                            .map(|demux| PeekDeviceInfo {
-                                demux_id: Some(demux.as_u32()),
-                                opaque_user_id: Some((demux.as_u32() >> 4).to_string()),
-                            })
-                            .collect(),
-                        pending_devices: pending_demux_ids
-                            .iter()
-                            .map(|demux| PeekDeviceInfo {
-                                demux_id: Some(demux.as_u32()),
-                                opaque_user_id: Some((demux.as_u32() >> 4).to_string()),
-                            })
-                            .collect(),
-                        call_link_state: None,
-                    }),
-                }),
-                ..Default::default()
-            });
         }
+    }
 
-        updates
+    fn create_sfu_to_device_fragmented_update(
+        mrp_header: Option<protos::MrpHeader>,
+        participant_demux_ids: &[DemuxId],
+        pending_demux_ids: &[DemuxId],
+    ) -> protos::SfuToDevice {
+        protos::SfuToDevice {
+            mrp_header,
+            device_joined_or_left: Some(protos::sfu_to_device::DeviceJoinedOrLeft {
+                peek_info: Some(PeekInfo {
+                    era_id: Some(hex::encode(CALL_ID)),
+                    max_devices: None,
+                    creator: Some("creator_id".to_string()),
+                    devices: participant_demux_ids
+                        .iter()
+                        .map(|demux| PeekDeviceInfo {
+                            demux_id: Some(demux.as_u32()),
+                            opaque_user_id: Some((demux.as_u32() >> 4).to_string()),
+                        })
+                        .collect(),
+                    pending_devices: pending_demux_ids
+                        .iter()
+                        .map(|demux| PeekDeviceInfo {
+                            demux_id: Some(demux.as_u32()),
+                            opaque_user_id: Some((demux.as_u32() >> 4).to_string()),
+                        })
+                        .collect(),
+                    call_link_state: None,
+                }),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn create_nonadmin_sfu_to_device_fragmented_update(
+        mrp_header: Option<protos::MrpHeader>,
+        participant_demux_ids: &[DemuxId],
+        pending_demux_ids: &[DemuxId],
+    ) -> protos::SfuToDevice {
+        let mut proto = create_sfu_to_device_fragmented_update(
+            mrp_header,
+            participant_demux_ids,
+            pending_demux_ids,
+        );
+        proto.device_joined_or_left.as_mut().map(|joined_or_left| {
+            joined_or_left.peek_info.as_mut().map(|p| {
+                p.pending_devices.iter_mut().for_each(|d| {
+                    d.opaque_user_id = None;
+                })
+            })
+        });
+        proto
     }
 
     fn create_nonadmin_sfu_to_device(
         joined_or_left: bool,
+        mrp_header: Option<protos::MrpHeader>,
         active_speaker_id: Option<DemuxId>,
         participant_demux_ids: &[DemuxId],
         pending_demux_ids: &[DemuxId],
     ) -> Vec<protos::SfuToDevice> {
         let mut protos = create_sfu_to_device(
             joined_or_left,
+            mrp_header,
             active_speaker_id,
             participant_demux_ids,
             pending_demux_ids,
@@ -4530,6 +4721,14 @@ mod call_tests {
         }
 
         protos
+    }
+
+    fn mrp_header(seqnum: u64, num_packets: Option<u32>) -> Option<protos::MrpHeader> {
+        Some(protos::MrpHeader {
+            seqnum: Some(seqnum),
+            num_packets,
+            ack_num: None,
+        })
     }
 
     fn create_resolution_request_rtp(
@@ -5127,8 +5326,14 @@ mod call_tests {
         // It's a little weird that you get updates for when you join, but it doesn't really do any harm and it's much easier to implement.
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
 
-        let expected_update_payload_just_client1 =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1], &[]).encode_collection();
+        let expected_update_payload_just_client1 = create_sfu_to_device(
+            true,
+            mrp_header(1, None),
+            Some(demux_id1),
+            &[demux_id1],
+            &[],
+        )
+        .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
         assert_eq!(
@@ -5141,20 +5346,33 @@ mod call_tests {
 
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
 
-        let expected_update_payload_both_clients =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id2], &[])
-                .encode_collection();
+        let expected_update_payload_demux1 = create_sfu_to_device(
+            true,
+            mrp_header(3, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id2],
+            &[],
+        )
+        .encode_collection();
+        let expected_update_payload_demux2 = create_sfu_to_device(
+            true,
+            mrp_header(1, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id2],
+            &[],
+        )
+        .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(3, &expected_update_payload_both_clients)
+                    create_server_to_client_rtps(3, &expected_update_payload_demux1)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(1, &expected_update_payload_both_clients)
+                    create_server_to_client_rtps(1, &expected_update_payload_demux2)
                 )
             ]),
             rtp_to_send
@@ -5168,6 +5386,7 @@ mod call_tests {
 
         let expected_update_payload_just_client2 = create_sfu_to_device(
             true,
+            mrp_header(3, None),
             Some(demux_id1), // Is it okay that the active speaker left?
             &[demux_id2],
             &[],
@@ -5196,9 +5415,14 @@ mod call_tests {
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
         call.approve_pending_client(demux_id1, at(99));
 
-        let expected_update_payload_just_client1 =
-            create_nonadmin_sfu_to_device(true, Some(demux_id1), &[demux_id1], &[])
-                .encode_collection();
+        let expected_update_payload_just_client1 = create_nonadmin_sfu_to_device(
+            true,
+            mrp_header(1, None),
+            Some(demux_id1),
+            &[demux_id1],
+            &[],
+        )
+        .encode_collection();
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
         assert_eq!(
             to_rtp_to_send(vec![(
@@ -5211,42 +5435,51 @@ mod call_tests {
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
         let demux_id3 = add_admin(&mut call, "3", 3, at(200));
 
-        let expected_update_payload_admin =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id3], &[demux_id2])
-                .encode_collection();
-
-        let expected_update_payload_nonadmin = create_nonadmin_sfu_to_device(
+        let expected_update_payload_demux1 = create_nonadmin_sfu_to_device(
             true,
+            mrp_header(3, None),
             Some(demux_id1),
             &[demux_id1, demux_id3],
             &[demux_id2],
-        );
-
-        let expected_update_payload_pending = expected_update_payload_nonadmin
-            .iter()
-            .map(|msg| SfuToDevice {
-                device_joined_or_left: msg.device_joined_or_left.clone(),
-                ..Default::default()
-            })
-            .encode_collection();
+        )
+        .encode_collection();
+        let expected_update_payload_demux3 = create_sfu_to_device(
+            true,
+            mrp_header(1, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id3],
+            &[demux_id2],
+        )
+        .encode_collection();
+        let expected_update_payload_demux2 = create_nonadmin_sfu_to_device(
+            true,
+            mrp_header(1, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id3],
+            &[demux_id2],
+        )
+        .into_iter()
+        .map(|msg| SfuToDevice {
+            mrp_header: msg.mrp_header,
+            device_joined_or_left: msg.device_joined_or_left,
+            ..Default::default()
+        })
+        .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(
-                        3,
-                        &expected_update_payload_nonadmin.encode_collection()
-                    )
+                    create_server_to_client_rtps(3, &expected_update_payload_demux1)
                 ),
                 (
                     demux_id3,
-                    create_server_to_client_rtps(1, &expected_update_payload_admin,)
+                    create_server_to_client_rtps(1, &expected_update_payload_demux3,)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(1, &expected_update_payload_pending,)
+                    create_server_to_client_rtps(1, &expected_update_payload_demux2,)
                 )
             ]),
             rtp_to_send
@@ -5254,28 +5487,38 @@ mod call_tests {
 
         call.approve_pending_client(demux_id2, at(300));
 
-        let expected_update_payload_all_clients = create_sfu_to_device(
+        let expected_update_payload_demux_1 = create_sfu_to_device(
             true,
+            mrp_header(5, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id3, demux_id2],
+            &[],
+        )
+        .encode_collection();
+        let expected_update_payload_demux_3_and_2 = create_sfu_to_device(
+            true,
+            mrp_header(3, None),
             Some(demux_id1),
             &[demux_id1, demux_id3, demux_id2],
             &[],
         )
         .encode_collection();
 
+        ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(5, &expected_update_payload_all_clients)
+                    create_server_to_client_rtps(5, &expected_update_payload_demux_1)
                 ),
                 (
                     demux_id3,
-                    create_server_to_client_rtps(3, &expected_update_payload_all_clients)
+                    create_server_to_client_rtps(3, &expected_update_payload_demux_3_and_2)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(3, &expected_update_payload_all_clients)
+                    create_server_to_client_rtps(3, &expected_update_payload_demux_3_and_2)
                 )
             ]),
             rtp_to_send
@@ -5283,20 +5526,34 @@ mod call_tests {
 
         call.drop_client(demux_id2, at(400));
 
-        let expected_update_payload =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id3], &[])
-                .encode_collection();
+        let expected_update_payload_demux1 = create_sfu_to_device(
+            true,
+            mrp_header(7, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id3],
+            &[],
+        )
+        .encode_collection();
+        let expected_update_payload_demux3 = create_sfu_to_device(
+            true,
+            mrp_header(5, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id3],
+            &[],
+        )
+        .encode_collection();
 
+        ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(7, &expected_update_payload)
+                    create_server_to_client_rtps(7, &expected_update_payload_demux1)
                 ),
                 (
                     demux_id3,
-                    create_server_to_client_rtps(5, &expected_update_payload)
+                    create_server_to_client_rtps(5, &expected_update_payload_demux3)
                 )
             ]),
             rtp_to_send
@@ -5305,35 +5562,46 @@ mod call_tests {
         // Re-add the same user.
         let demux_id2 = add_client(&mut call, "2", 2, at(500));
 
-        let expected_update_payload_nonadmin = create_nonadmin_sfu_to_device(
+        let expected_update_payload_demux1 = create_nonadmin_sfu_to_device(
             true,
+            mrp_header(9, None),
             Some(demux_id1),
             &[demux_id1, demux_id3, demux_id2],
             &[],
         )
         .encode_collection();
-        let expected_update_payload_admin = create_sfu_to_device(
+        let expected_update_payload_demux2 = create_nonadmin_sfu_to_device(
             true,
+            mrp_header(1, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id3, demux_id2],
+            &[],
+        )
+        .encode_collection();
+        let expected_update_payload_demux3 = create_sfu_to_device(
+            true,
+            mrp_header(7, None),
             Some(demux_id1),
             &[demux_id1, demux_id3, demux_id2],
             &[],
         )
         .encode_collection();
 
+        ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(9, &expected_update_payload_nonadmin,)
+                    create_server_to_client_rtps(9, &expected_update_payload_demux1,)
                 ),
                 (
                     demux_id3,
-                    create_server_to_client_rtps(7, &expected_update_payload_admin,)
+                    create_server_to_client_rtps(7, &expected_update_payload_demux3,)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(1, &expected_update_payload_nonadmin,)
+                    create_server_to_client_rtps(1, &expected_update_payload_demux2,)
                 )
             ]),
             rtp_to_send
@@ -5489,9 +5757,16 @@ mod call_tests {
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
         call.approve_pending_client(demux_id1, at(99));
 
-        let expected_update_payload_just_client1 =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1], &[]).encode_collection();
+        let expected_update_payload_just_client1 = create_sfu_to_device(
+            true,
+            mrp_header(1, None),
+            Some(demux_id1),
+            &[demux_id1],
+            &[],
+        )
+        .encode_collection();
 
+        ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
         assert_eq!(
             to_rtp_to_send(vec![(
@@ -5504,26 +5779,48 @@ mod call_tests {
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
         call.approve_pending_client(demux_id2, at(200));
 
-        let expected_update_payload_both_clients =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id2], &[])
-                .encode_collection();
+        let expected_update_payload_demux1 = create_sfu_to_device(
+            true,
+            mrp_header(3, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id2],
+            &[],
+        )
+        .encode_collection();
 
+        let expected_update_payload_demux2 = create_sfu_to_device(
+            true,
+            mrp_header(1, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id2],
+            &[],
+        )
+        .encode_collection();
+        ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(3, &expected_update_payload_both_clients)
+                    create_server_to_client_rtps(3, &expected_update_payload_demux1)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(1, &expected_update_payload_both_clients)
+                    create_server_to_client_rtps(1, &expected_update_payload_demux2)
                 )
             ]),
             rtp_to_send
         );
 
         call.force_remove_client(demux_id2, at(300));
+        let expected_update_payload_demux1 = create_sfu_to_device(
+            true,
+            mrp_header(5, None),
+            Some(demux_id1),
+            &[demux_id1],
+            &[],
+        )
+        .encode_collection();
         let expected_update_payload_for_removed = protos::SfuToDevice {
             removed: Some(protos::sfu_to_device::Removed::default()),
             ..Default::default()
@@ -5535,7 +5832,7 @@ mod call_tests {
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(5, &expected_update_payload_just_client1)
+                    create_server_to_client_rtps(5, &expected_update_payload_demux1)
                 ),
                 (
                     demux_id2,
@@ -5558,29 +5855,34 @@ mod call_tests {
         // Re-add the same user. Should be a pending client
         let demux_id2 = add_client(&mut call, "2", 2, at(500));
 
-        let expected_update_payload_participant =
-            create_nonadmin_sfu_to_device(true, Some(demux_id1), &[demux_id1], &[demux_id2]);
-        let expected_update_payload_pending = expected_update_payload_participant
+        let expected_update_payload_demux1 = create_nonadmin_sfu_to_device(
+            true,
+            mrp_header(7, None),
+            Some(demux_id1),
+            &[demux_id1],
+            &[demux_id2],
+        );
+        let expected_update_payload_demux2 = expected_update_payload_demux1
             .iter()
-            .map(|msg| SfuToDevice {
+            .enumerate()
+            .map(|(i, msg)| SfuToDevice {
+                mrp_header: mrp_header(i as u64 + 1, None),
                 device_joined_or_left: msg.device_joined_or_left.clone(),
                 ..Default::default()
             })
             .encode_collection();
-
-        let expected_update_payload_participant =
-            expected_update_payload_participant.encode_collection();
+        let expected_update_payload_demux1 = expected_update_payload_demux1.encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(7, &expected_update_payload_participant)
+                    create_server_to_client_rtps(7, &expected_update_payload_demux1)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(1, &expected_update_payload_pending)
+                    create_server_to_client_rtps(1, &expected_update_payload_demux2)
                 )
             ]),
             rtp_to_send
@@ -5929,11 +6231,17 @@ mod call_tests {
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         // If there is no audio activity from anyone, we choose the first client as the active speaker
+        ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(301));
 
-        let expected_update_payload =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id1, demux_id2], &[])
-                .encode_collection();
+        let expected_update_payload = create_sfu_to_device(
+            true,
+            mrp_header(1, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id2],
+            &[],
+        )
+        .encode_collection();
         assert_eq!(Some(demux_id1), call.active_speaker_id);
         assert_eq!(
             to_rtp_to_send(vec![
@@ -5956,11 +6264,17 @@ mod call_tests {
             rtp.audio_level = Some(seqnum as u8);
             let _rtp_to_send = call.handle_rtp(demux_id2, rtp.borrow_mut(), at(301 + seqnum));
         }
+        ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(602));
 
-        let expected_update_payload =
-            create_sfu_to_device(false, Some(demux_id2), &[demux_id1, demux_id2], &[])
-                .encode_collection();
+        let expected_update_payload = create_sfu_to_device(
+            false,
+            mrp_header(3, None),
+            Some(demux_id2),
+            &[demux_id1, demux_id2],
+            &[],
+        )
+        .encode_collection();
         assert_eq!(Some(demux_id2), call.active_speaker_id);
         assert_eq!(
             to_rtp_to_send(vec![
@@ -5987,11 +6301,17 @@ mod call_tests {
             rtp.audio_level = Some(0);
             let _rtp_to_send = call.handle_rtp(demux_id2, rtp.borrow_mut(), at(602 + seqnum));
         }
+        ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(903));
 
-        let expected_update_payload =
-            create_sfu_to_device(false, Some(demux_id1), &[demux_id1, demux_id2], &[])
-                .encode_collection();
+        let expected_update_payload = create_sfu_to_device(
+            false,
+            mrp_header(4, None),
+            Some(demux_id1),
+            &[demux_id1, demux_id2],
+            &[],
+        )
+        .encode_collection();
         assert_eq!(Some(demux_id1), call.active_speaker_id);
         assert_eq!(
             to_rtp_to_send(vec![
@@ -6018,6 +6338,7 @@ mod call_tests {
         };
 
         // Don't resend anything after just 301ms (except stats)
+        ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(1204));
         assert_eq!(2, rtp_to_send.len());
         assert_eq!(
@@ -6038,18 +6359,34 @@ mod call_tests {
         );
 
         // But do resend after 1001ms
+        let expected_update_payload = SfuToDevice {
+            speaker: Some(protos::sfu_to_device::Speaker {
+                demux_id: Some(demux_id1.as_u32()),
+            }),
+            current_devices: Some(CurrentDevices {
+                all_demux_ids: vec![demux_id1.as_u32(), demux_id2.as_u32()],
+                ..Default::default()
+            }),
+            mrp_header: Some(protos::MrpHeader {
+                seqnum: Some(6),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(1904));
         assert_eq!(
-            to_rtp_to_send(vec![
+            vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(6, &expected_update_payload)
+                    create_server_to_client_rtp(6, &expected_update_payload)
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(6, &expected_update_payload)
+                    create_server_to_client_rtp(6, &expected_update_payload)
                 )
-            ]),
+            ],
             rtp_to_send
         );
 
@@ -6464,8 +6801,14 @@ mod call_tests {
         assert_eq!(1, call.clients.len());
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
-        let expected_update_payload =
-            create_sfu_to_device(true, Some(demux_id1), &[demux_id2], &[]).encode_collection();
+        let expected_update_payload = create_sfu_to_device(
+            true,
+            mrp_header(3, None),
+            Some(demux_id1),
+            &[demux_id2],
+            &[],
+        )
+        .encode_collection();
         assert_eq!(
             to_rtp_to_send(vec![(
                 demux_id2,
@@ -7082,5 +7425,131 @@ mod call_tests {
             call.send_key_frame_requests_if_its_been_too_long(at(3500));
         outgoing_key_frame_requests.sort_unstable_by_key(|r| r.0);
         assert_eq!(outgoing_key_frame_requests, expected_key_frame_requests);
+    }
+
+    #[test]
+    fn test_mrp_max_size_limit() {
+        let content = [5u8; MAX_MRP_FRAGMENT_BYTE_SIZE];
+        let sfu_to_device = SfuToDevice {
+            mrp_header: Some(protos::MrpHeader {
+                seqnum: Some(u64::MAX),
+                num_packets: Some(u32::MAX),
+                ack_num: None,
+            }),
+            content: Some(content.to_vec()),
+            video_request: None,
+            speaker: None,
+            device_joined_or_left: None,
+            current_devices: None,
+            stats: None,
+            removed: None,
+            raised_hands: None,
+        };
+
+        assert!(sfu_to_device.encode_to_vec().len() <= MAX_PACKET_SERIALIZED_BYTE_SIZE);
+    }
+
+    #[test]
+    fn test_fragment_large_update() {
+        fn expected_rtp(
+            demux_ids: &[DemuxId],
+            seqnum_base: rtp::FullSequenceNumber,
+            non_fragmented: &[u8],
+            fragments: &[&[u8]],
+        ) -> Vec<RtpToSend> {
+            demux_ids
+                .iter()
+                .flat_map(|demux_id| {
+                    let num_packets = fragments.len() as u32;
+                    let mut rtp = vec![(
+                        *demux_id,
+                        create_reliable_server_to_client_rtp(seqnum_base, non_fragmented),
+                    )];
+
+                    rtp.extend(fragments.iter().enumerate().map(|(i, content)| {
+                        let seqnum = seqnum_base + 1 + i as rtp::FullSequenceNumber;
+                        let mrp_header = if i == 0 {
+                            mrp_header(seqnum, Some(num_packets))
+                        } else {
+                            mrp_header(seqnum, None)
+                        };
+                        let update = SfuToDevice {
+                            mrp_header,
+                            content: Some(content.to_vec()),
+                            ..Default::default()
+                        }
+                        .encode_to_vec();
+                        let pkt = create_reliable_server_to_client_rtp(seqnum, &update);
+                        (*demux_id, pkt)
+                    }));
+                    rtp
+                })
+                .collect()
+        }
+
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_adhoc_call(CALL_ID, now, system_now);
+
+        let demux_ids = (1..=110)
+            .map(|i| add_admin(&mut call, &i.to_string(), i, at(99)))
+            .collect::<Vec<_>>();
+
+        let [update, content] = [
+            create_sfu_to_device_update(true, mrp_header(1, None), Some(demux_ids[0]), &demux_ids)
+                .encode_to_vec(),
+            create_sfu_to_device_fragmented_update(None, &demux_ids, &[]).encode_to_vec(),
+        ];
+        assert!(content.len() > MAX_PACKET_SERIALIZED_BYTE_SIZE);
+        let fragment1 = &content[0..MAX_MRP_FRAGMENT_BYTE_SIZE];
+        let fragment2 = &content[MAX_MRP_FRAGMENT_BYTE_SIZE..];
+        let expected = expected_rtp(&demux_ids, 1, &update, &[fragment1, fragment2]);
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
+        assert_eq!(expected, rtp_to_send);
+
+        let pending_demux_ids = (101..=150)
+            .map(|i| add_client(&mut call, &i.to_string(), i, at(101)))
+            .collect::<Vec<_>>();
+
+        let [update, admin_content] = [
+            create_sfu_to_device_update(true, mrp_header(4, None), Some(demux_ids[0]), &demux_ids)
+                .encode_to_vec(),
+            create_sfu_to_device_fragmented_update(None, &demux_ids, &pending_demux_ids)
+                .encode_to_vec(),
+        ];
+        assert!(admin_content.len() > MAX_PACKET_SERIALIZED_BYTE_SIZE);
+        let fragment1 = &admin_content[0..MAX_MRP_FRAGMENT_BYTE_SIZE];
+        let fragment2 = &admin_content[MAX_MRP_FRAGMENT_BYTE_SIZE..];
+        let mut expected = expected_rtp(&demux_ids, 4, &update, &[fragment1, fragment2]);
+
+        let mut msgs = [
+            create_sfu_to_device_update(true, mrp_header(1, None), Some(demux_ids[0]), &demux_ids),
+            create_nonadmin_sfu_to_device_fragmented_update(None, &demux_ids, &pending_demux_ids),
+        ]
+        .into_iter()
+        .map(|msg| SfuToDevice {
+            mrp_header: msg.mrp_header,
+            device_joined_or_left: msg.device_joined_or_left,
+            ..Default::default()
+        })
+        .encode_collection()
+        .into_iter();
+        let update = msgs.next().unwrap();
+        let pending_content = msgs.next().unwrap();
+        assert!(pending_content.len() > MAX_PACKET_SERIALIZED_BYTE_SIZE);
+        let fragment1 = &pending_content[0..MAX_MRP_FRAGMENT_BYTE_SIZE];
+        let fragment2 = &pending_content[MAX_MRP_FRAGMENT_BYTE_SIZE..];
+        expected.extend(expected_rtp(
+            &pending_demux_ids,
+            1,
+            &update,
+            &[fragment1, fragment2],
+        ));
+
+        ack_all_mrp(&mut call);
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
+        assert_eq!(expected, rtp_to_send);
     }
 }

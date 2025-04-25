@@ -12,6 +12,8 @@ message MRPHeader {
   optional uint64 seqnum = 1;
 
   optional uint64 ack_num = 2;
+
+  optional uint32 num_packets = 3;
 }
 
 message DeviceToSfu {
@@ -132,4 +134,6 @@ message SfuToDevice {
   optional Removed removed                          = 9;
   optional RaisedHands raised_hands                 = 10;
   optional MRPHeader mrp_header                     = 11;
+  // Must be used in conjunction with MrpHeader
+  optional bytes content                            = 12;
 }
