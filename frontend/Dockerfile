@@ -25,22 +25,6 @@ COPY rust-toolchain ./
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $(cat rust-toolchain)
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Create a stub version of the project to cache dependencies.
-RUN cargo new common --lib
-RUN cargo new metrics --lib
-RUN cargo new backend
-RUN cargo new docker/bootstrap
-RUN cargo new frontend
-
-COPY Cargo.toml Cargo.lock ./
-COPY common/Cargo.toml ./common/
-COPY metrics/Cargo.toml ./metrics/
-COPY docker/bootstrap/Cargo.toml ./docker/bootstrap/
-COPY frontend/Cargo.toml ./frontend/
-
-# Do the initial stub build.
-RUN cargo build --bin calling_frontend --release
-
 # Copy the source and build the project normally.
 COPY . .
 RUN cargo build --bin calling_frontend --release
