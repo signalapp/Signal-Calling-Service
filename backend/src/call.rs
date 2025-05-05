@@ -74,8 +74,8 @@ const STATS_MESSAGE_INTERVAL: Duration = Duration::from_secs(1);
 const REMOVED_CLIENTS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 /// This is how often we send raised hands messages to clients.
 const RAISED_HANDS_MESSAGE_INTERVAL: Duration = Duration::from_secs(1);
-/// This should match the buffer size used by clients
-const MAX_MRP_WINDOW_SIZE: usize = 128;
+/// This should match the buffer size used by clients. In non-ideal conditions, the server can be larger.
+const MAX_MRP_WINDOW_SIZE: usize = 256;
 /// How long the SFU waits for an MRP ack before resending
 const MRP_SEND_TIMEOUT_INTERVAL: Duration = Duration::from_secs(1);
 /// How long the generations are for minimum target send rate; layer
@@ -1846,6 +1846,7 @@ impl Call {
     /// Preps and appends MRP acks and retries to clients in the call
     fn send_mrp_updates(&mut self, rtp_to_send: &mut Vec<RtpToSend>, now: Instant) {
         let unwrapped_now = now.into();
+        let tags = self.call_tags();
         for client in &mut self.clients {
             let client_demux_id = client.demux_id;
             let _ = client.mrp_stream.try_send_ack(|header| {
@@ -1861,6 +1862,11 @@ impl Call {
                 Ok(())
             });
             let _ = client.mrp_stream.try_resend(unwrapped_now, |pkt| {
+                event!(
+                    "call.backend.client.sfu_to_device.retry_send_count",
+                    1,
+                    tags
+                );
                 let update_rtp = Self::encode_reliable_sfu_to_device(
                     pkt,
                     &mut client.next_server_to_client_data_rtp_seqnum,
@@ -1868,6 +1874,16 @@ impl Call {
                 rtp_to_send.push((client_demux_id, update_rtp));
                 Ok(unwrapped_now + MRP_SEND_TIMEOUT_INTERVAL.into())
             });
+            value_histogram!(
+                "calling.backend.client.sfu_to_device.send_buffer.size",
+                client.mrp_stream.send_len(),
+                tags
+            );
+            value_histogram!(
+                "calling.backend.client.sfu_to_device.receive_buffer.size",
+                client.mrp_stream.receive_len(),
+                tags
+            );
         }
     }
 
