@@ -298,15 +298,15 @@ impl<'a> BitBuffer<'a> {
     fn read_u8(&mut self, bits: u8) -> Result<u8> {
         assert!(bits > 0 && bits <= 8);
 
-        let last_byte = self.bytes.len() - 1;
-        if self.byte_index > last_byte
-            || (self.byte_index == last_byte && self.bit_offset + bits > 8)
+        let bytes_len = self.bytes.len();
+        if self.byte_index >= bytes_len
+            || (self.bit_offset + bits > 8 && self.byte_index + 1 == bytes_len)
         {
             bail!(
                 "out of bounds access: byte_index={}, bit_offset={}, bits={bits}, bytes_len={}",
                 self.byte_index,
                 self.bit_offset,
-                self.bytes.len(),
+                bytes_len,
             );
         }
 
@@ -374,8 +374,7 @@ impl<'a> BitBuffer<'a> {
     }
 
     fn has_more(&mut self) -> bool {
-        let last_byte = self.bytes.len() - 1;
-        self.byte_index <= last_byte
+        self.byte_index < self.bytes.len()
     }
 
     fn zero_pad(&mut self) {
@@ -504,6 +503,14 @@ impl SpatialLayer {
 }
 
 fn read_video_layers_allocation(bytes: &[u8]) -> Result<Vec<RtpStreamAllocation>> {
+    if bytes.is_empty() {
+        event!("calling.rtp.video_layers_allocation.len_zero");
+        return Err(anyhow!("video_layers_allocation zero length"));
+    } else if bytes.len() == 1 && bytes[0] == 0 {
+        event!("calling.rtp.video_layers_allocation.zero_byte");
+        return Ok(vec![]);
+    }
+
     let mut data = BitBuffer::new(bytes);
 
     let _rid = data.read_u8(2)?;
@@ -1300,6 +1307,81 @@ mod bit_buffer_tests {
     }
 
     #[test]
+    fn read_u8_error() -> Result<()> {
+        let bytes = [];
+        let mut rdr = BitBuffer::new(&bytes);
+        assert!(!rdr.has_more());
+        assert!(rdr.read_u8(8).is_err());
+        assert!(rdr.read_u8(1).is_err());
+
+        let bytes = [0b1000_0000];
+        let mut rdr = BitBuffer::new(&bytes);
+        assert!(rdr.has_more());
+        assert_eq!(rdr.read_u8(1)?, 1);
+
+        assert!(rdr.has_more());
+        assert!(rdr.read_u8(8).is_err());
+
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert!(rdr.has_more());
+        assert!(rdr.read_u8(8).is_err());
+        assert!(rdr.read_u8(7).is_err());
+
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert!(rdr.has_more());
+        assert!(rdr.read_u8(8).is_err());
+        assert!(rdr.read_u8(7).is_err());
+        assert!(rdr.read_u8(6).is_err());
+
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert!(rdr.has_more());
+        assert!(rdr.read_u8(8).is_err());
+        assert!(rdr.read_u8(7).is_err());
+        assert!(rdr.read_u8(6).is_err());
+        assert!(rdr.read_u8(5).is_err());
+
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert!(rdr.has_more());
+        assert!(rdr.read_u8(8).is_err());
+        assert!(rdr.read_u8(7).is_err());
+        assert!(rdr.read_u8(6).is_err());
+        assert!(rdr.read_u8(5).is_err());
+        assert!(rdr.read_u8(4).is_err());
+
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert!(rdr.has_more());
+        assert!(rdr.read_u8(8).is_err());
+        assert!(rdr.read_u8(7).is_err());
+        assert!(rdr.read_u8(6).is_err());
+        assert!(rdr.read_u8(5).is_err());
+        assert!(rdr.read_u8(4).is_err());
+        assert!(rdr.read_u8(3).is_err());
+
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert!(rdr.has_more());
+        assert!(rdr.read_u8(8).is_err());
+        assert!(rdr.read_u8(7).is_err());
+        assert!(rdr.read_u8(6).is_err());
+        assert!(rdr.read_u8(5).is_err());
+        assert!(rdr.read_u8(4).is_err());
+        assert!(rdr.read_u8(3).is_err());
+        assert!(rdr.read_u8(2).is_err());
+
+        assert_eq!(rdr.read_u8(1)?, 0);
+        assert!(!rdr.has_more());
+        assert!(rdr.read_u8(8).is_err());
+        assert!(rdr.read_u8(7).is_err());
+        assert!(rdr.read_u8(6).is_err());
+        assert!(rdr.read_u8(5).is_err());
+        assert!(rdr.read_u8(4).is_err());
+        assert!(rdr.read_u8(3).is_err());
+        assert!(rdr.read_u8(2).is_err());
+        assert!(rdr.read_u8(1).is_err());
+
+        Ok(())
+    }
+
+    #[test]
     fn read_u8_two_bytes() -> Result<()> {
         let bytes = [0b0000_0010, 0b1010_0011];
         let mut rdr = BitBuffer::new(&bytes);
@@ -1709,6 +1791,22 @@ mod video_layers_allocation_tests {
                 }],
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn read_empty() -> Result<()> {
+        let bytes = [];
+        let layers = read_video_layers_allocation(&bytes);
+        assert!(layers.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn read_zero_byte() -> Result<()> {
+        let bytes = [0];
+        let layers = read_video_layers_allocation(&bytes)?;
+        assert!(layers.is_empty());
         Ok(())
     }
 }
