@@ -1932,7 +1932,7 @@ impl Call {
         };
 
         if let Err(e) = result {
-            error!("Failed to send reliable sfu to device update: {}", e);
+            error!("Failed to send reliable sfu to device update to demuxId {} with send buffer size of {}: {}", demux_id.as_u32(), stream.send_len(), e);
             vec![]
         } else {
             rtp_to_send
