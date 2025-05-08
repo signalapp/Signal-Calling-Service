@@ -94,13 +94,6 @@ pub struct Config {
     #[arg(long)]
     pub diagnostics_interval_secs: Option<u64>,
 
-    /// Interval for sending active speaker messages (ms). The amount of time
-    /// to wait between sending messages to the clients to remind them of the
-    /// current active speaker for the call. Using milliseconds in case sub-
-    /// second resolution is needed.
-    #[arg(long, default_value = "1000")]
-    pub active_speaker_message_interval_ms: u64,
-
     /// Inactivity check interval (seconds). The amount of time to wait between
     /// iterating structures for inactive calls and clients.
     #[arg(long, default_value = "5")]
@@ -289,7 +282,6 @@ pub(crate) fn default_test_config() -> Config {
         tick_interval_ms: 100,
         outgoing_queue_drain_ms: 500,
         diagnostics_interval_secs: None,
-        active_speaker_message_interval_ms: 1000,
         inactivity_check_interval_secs: 5,
         inactivity_timeout_secs: 30,
         new_clients_require_approval: false,

@@ -549,8 +549,6 @@ impl Sfu {
         let connection_id = ConnectionId::from_call_id_and_demux_id(call_id.clone(), demux_id);
         let region_relation = self.get_region_relation(region);
 
-        let active_speaker_message_interval_ms = self.config.active_speaker_message_interval_ms;
-
         let call = self
             .call_by_call_id
             .entry(call_id.clone())
@@ -562,7 +560,6 @@ impl Sfu {
                     new_clients_require_approval,
                     call_type,
                     self.config.persist_approval_for_all_users_who_join,
-                    Duration::from_millis(active_speaker_message_interval_ms),
                     initial_target_send_rate,
                     default_requested_max_send_rate,
                     now,

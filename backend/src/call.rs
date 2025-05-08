@@ -370,7 +370,6 @@ pub struct Call {
     call_type: CallType,
     persist_approval_for_all_users_who_join: bool,
     created: SystemTime, // For knowing how old the call is
-    active_speaker_message_interval: Duration,
     initial_target_send_rate: DataRate,
     default_requested_max_send_rate: DataRate,
 
@@ -464,7 +463,6 @@ impl Call {
         new_clients_require_approval: bool,
         call_type: CallType,
         persist_approval_for_all_users_who_join: bool,
-        active_speaker_message_interval: Duration,
         initial_target_send_rate: DataRate,
         default_requested_max_send_rate: DataRate,
         now: Instant,
@@ -483,7 +481,6 @@ impl Call {
             call_type,
             persist_approval_for_all_users_who_join,
             created: system_now,
-            active_speaker_message_interval,
             initial_target_send_rate,
             default_requested_max_send_rate,
 
@@ -610,11 +607,6 @@ impl Call {
     /// occasionally check who the active speaker is. Do intermittently to avoid CPU and thrash
     fn need_update_speaker(&self, now: Instant) -> bool {
         now > self.active_speaker_calculated + ACTIVE_SPEAKER_CALCULATION_INTERVAL
-    }
-
-    /// occasionally resend speaker message since notifications are lossy
-    fn need_refresh_speaker(&self, now: Instant) -> bool {
-        now >= self.active_speaker_update_sent + self.active_speaker_message_interval
     }
 
     pub fn add_client(
@@ -1265,17 +1257,15 @@ impl Call {
         } else {
             None
         };
-        let speaker_update = if new_active_speaker.is_some()
-            || admin_device_joined_or_left_update.is_some()
-            || self.need_refresh_speaker(now)
-        {
-            self.active_speaker_update_sent = now;
-            Some(Speaker {
-                demux_id: self.active_speaker_id.map(|demux_id| demux_id.as_u32()),
-            })
-        } else {
-            None
-        };
+        let speaker_update =
+            if new_active_speaker.is_some() || admin_device_joined_or_left_update.is_some() {
+                self.active_speaker_update_sent = now;
+                Some(Speaker {
+                    demux_id: self.active_speaker_id.map(|demux_id| demux_id.as_u32()),
+                })
+            } else {
+                None
+            };
 
         // A change to the layer rate or resolution may impact how the receiver allocates the target sent rate.
         // So can a change in active speaker.
@@ -3338,7 +3328,7 @@ mod call_tests {
     use mrp::MrpHeader;
 
     use super::*;
-    use crate::protos::sfu_to_device::{peek_info::PeekDeviceInfo, CurrentDevices, PeekInfo};
+    use crate::protos::sfu_to_device::{peek_info::PeekDeviceInfo, PeekInfo};
 
     static CALL_ID: &[u8; 7] = b"call_id";
 
@@ -4370,7 +4360,6 @@ mod call_tests {
 
     fn create_call(call_id: &[u8], now: Instant, system_now: SystemTime) -> Call {
         let creator_id = UserId::from("creator_id".to_string());
-        let active_speaker_message_interval = Duration::from_secs(1);
         let initial_target_send_rate = DataRate::from_kbps(600);
         let default_requested_max_send_rate = DataRate::from_kbps(20000);
         Call::new(
@@ -4380,7 +4369,6 @@ mod call_tests {
             false,
             CallType::GroupV2,
             false,
-            active_speaker_message_interval,
             initial_target_send_rate,
             default_requested_max_send_rate,
             now,
@@ -4392,7 +4380,6 @@ mod call_tests {
 
     fn create_adhoc_call(call_id: &[u8], now: Instant, system_now: SystemTime) -> Call {
         let creator_id = UserId::from("creator_id".to_string());
-        let active_speaker_message_interval = Duration::from_secs(1);
         let initial_target_send_rate = DataRate::from_kbps(600);
         let default_requested_max_send_rate = DataRate::from_kbps(20000);
         Call::new(
@@ -4402,7 +4389,6 @@ mod call_tests {
             true,
             CallType::Adhoc,
             false,
-            active_speaker_message_interval,
             initial_target_send_rate,
             default_requested_max_send_rate,
             now,
@@ -6374,37 +6360,11 @@ mod call_tests {
             get_stats(&rtp_to_send, demux_id2)
         );
 
-        // But do resend after 1001ms
-        let expected_update_payload = SfuToDevice {
-            speaker: Some(protos::sfu_to_device::Speaker {
-                demux_id: Some(demux_id1.as_u32()),
-            }),
-            current_devices: Some(CurrentDevices {
-                all_demux_ids: vec![demux_id1.as_u32(), demux_id2.as_u32()],
-                ..Default::default()
-            }),
-            mrp_header: Some(protos::MrpHeader {
-                seqnum: Some(6),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-        .encode_to_vec();
+        // Still don't resend after 1001ms
+        // active speaker updates are sent with mrp and don't need to be refreshed
         ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(1904));
-        assert_eq!(
-            vec![
-                (
-                    demux_id1,
-                    create_server_to_client_rtp(6, &expected_update_payload)
-                ),
-                (
-                    demux_id2,
-                    create_server_to_client_rtp(6, &expected_update_payload)
-                )
-            ],
-            rtp_to_send
-        );
+        assert!(rtp_to_send.is_empty());
 
         // And more stats a little later.
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(2205));
