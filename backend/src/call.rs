@@ -1686,8 +1686,17 @@ impl Call {
                     content: None,
                 };
 
-                let update_rtp = Self::send_reliable_sfu_to_device_update(client, update, now);
-                rtp_to_send.extend(update_rtp);
+                if admin_update_device_joined_or_left.is_some() || speaker.is_some() {
+                    let update_rtp = Self::send_reliable_sfu_to_device_update(client, update, now);
+                    rtp_to_send.extend(update_rtp);
+                } else {
+                    // This is a stats update, we don't need it to be reliable
+                    let update_rtp = Self::encode_sfu_to_device_update(
+                        &update,
+                        &mut client.next_server_to_client_data_rtp_seqnum,
+                    );
+                    rtp_to_send.push((client.demux_id, update_rtp))
+                }
 
                 if admin_update_device_joined_or_left.is_some() {
                     let fragmentable_update = SfuToDevice {
