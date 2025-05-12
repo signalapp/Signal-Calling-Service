@@ -218,6 +218,34 @@ fn handle_packet(
                 event!("calling.sfu.error.expected.ice_binding_request_unknown_username");
                 trace!("handle_packet() failed: {}", err);
             }
+            SfuError::ParseIceBindingRequest(_) => {
+                event!("calling.sfu.error.expected.ice_binding_request_parse_failure");
+                trace!("handle_packet() failed: {}", err);
+            }
+            SfuError::IceBindingRequestHasNoUsername => {
+                event!("calling.sfu.error.expected.ice_binding_request_no_username");
+                trace!("handle_packet() failed: {}", err);
+            }
+            SfuError::ParseIceBindingResponse(_) => {
+                event!("calling.sfu.error.expected.ice_binding_response_parse_failure");
+                trace!("handle_packet() failed: {}", err);
+            }
+            SfuError::IceBindingInvalidTransactionId => {
+                event!("calling.sfu.error.expected.ice_binding_response_invalid_transaction_id");
+                trace!("handle_packet() failed: {}", err);
+            }
+            SfuError::UnknownAddress(_) => {
+                event!("calling.sfu.error.expected.non_ice_from_unknown_address");
+                trace!("handle_packet() failed: {}", err);
+            }
+            SfuError::MissingConnection(_, _) => {
+                event!("calling.sfu.error.expected.missing_connection");
+                trace!("handle_packet() failed: {}", err);
+            }
+            SfuError::MissingCall(_) => {
+                event!("calling.sfu.error.expected.missing_call");
+                trace!("handle_packet() failed: {}", err);
+            }
             _ => {
                 event!("calling.sfu.error.unexpected");
                 debug!("handle_packet() failed: {}", err);
