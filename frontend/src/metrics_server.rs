@@ -22,7 +22,11 @@ use tokio::sync::oneshot::Receiver;
 
 use crate::{config::Config, frontend::Frontend};
 
-pub async fn start(frontend: Arc<Frontend>, shutdown_signal_rx: Receiver<()>) -> Result<()> {
+pub async fn start(
+    frontend: Arc<Frontend>,
+    shutdown_signal_rx: Receiver<()>,
+    fd_limit: usize,
+) -> Result<()> {
     match Datadog::new(frontend.config) {
         None => {
             metrics!().disable();
@@ -66,7 +70,7 @@ pub async fn start(frontend: Arc<Frontend>, shutdown_signal_rx: Receiver<()>) ->
 
                     let mut datadog = datadog.open_pipeline();
 
-                    for (metric_name, value) in get_value_metrics() {
+                    for (metric_name, value) in get_value_metrics(fd_limit) {
                         datadog.gauge(metric_name, value as f64);
                     }
 
@@ -210,16 +214,16 @@ impl DatadogPipeline<'_> {
 }
 
 /// Gets a vector of (metric_names, values)
-fn get_value_metrics() -> Vec<(&'static str, f32)> {
+fn get_value_metrics(fd_limit: usize) -> Vec<(&'static str, f32)> {
     let mut value_metrics = Vec::new();
 
-    value_metrics.extend(get_process_metrics());
+    value_metrics.extend(get_process_metrics(fd_limit));
 
     value_metrics
 }
 
 /// Gets a vector of (metric_names, values) for current process metrics
-fn get_process_metrics() -> Vec<(&'static str, f32)> {
+fn get_process_metrics(fd_limit: usize) -> Vec<(&'static str, f32)> {
     let mut value_metrics = Vec::new();
 
     static CURRENT_PROCESS: Lazy<Mutex<Process>> =
@@ -239,9 +243,11 @@ fn get_process_metrics() -> Vec<(&'static str, f32)> {
     #[cfg(target_os = "linux")]
     match current_process.open_files() {
         Ok(open_files) => {
+            let fd_count = open_files.len();
+            value_metrics.push(("calling.frontend.system.memory.fd.count", fd_count as f32));
             value_metrics.push((
-                "calling.frontend.system.memory.fd.count",
-                open_files.len() as f32,
+                "calling.frontend.system.memory.fd.avail",
+                (fd_limit - fd_count) as f32,
             ));
         }
         Err(psutil::process::ProcessError::NoSuchProcess { .. }) => {

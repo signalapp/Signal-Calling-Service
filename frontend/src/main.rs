@@ -24,6 +24,7 @@ use clap::Parser;
 use env_logger::Env;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use rlimit::increase_nofile_limit;
 use tokio::{
     runtime,
     signal::unix::{signal, SignalKind},
@@ -114,6 +115,10 @@ fn main() -> Result<()> {
     let config = &CONFIG;
     print_config(config);
 
+    let fd_limit =
+        increase_nofile_limit(rlimit::INFINITY).expect("should be able to set RLIMIT_NOFILE");
+    info!("FD limit: {}", fd_limit);
+
     let (deadlock_monitor_ender_tx, deadlock_monitor_ender_rx) = std::sync::mpsc::channel();
     let deadlock_monitor_handle =
         metrics::monitor_deadlocks(MONITOR_DEADLOCK_INTERVAL.into(), deadlock_monitor_ender_rx);
@@ -197,7 +202,12 @@ fn main() -> Result<()> {
 
         // Start the metrics server.
         let metrics_handle = tokio::spawn(async move {
-            let _ = metrics_server::start(frontend_clone_for_metrics, metrics_ender_rx).await;
+            let _ = metrics_server::start(
+                frontend_clone_for_metrics,
+                metrics_ender_rx,
+                fd_limit as usize,
+            )
+            .await;
             let _ = signal_canceller_tx_clone_for_metrics.send(()).await;
         });
 

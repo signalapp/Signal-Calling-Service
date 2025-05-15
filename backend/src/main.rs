@@ -21,6 +21,7 @@ use clap::Parser;
 use env_logger::Env;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use rlimit::increase_nofile_limit;
 use rustls::{server::NoServerSessionStorage, version::TLS13, ServerConfig};
 use tokio::{
     runtime,
@@ -120,6 +121,10 @@ fn main() -> Result<()> {
     // Parse the command line arguments.
     let config = &CONFIG;
     print_config(config);
+
+    let fd_limit =
+        increase_nofile_limit(rlimit::INFINITY).expect("should be able to set RLIMIT_NOFILE");
+    info!("FD limit: {}", fd_limit);
 
     let tls_config = if config.ice_candidate_port_tls.is_some()
         && config.hostname.is_some()
@@ -231,7 +236,13 @@ fn main() -> Result<()> {
 
         // Start the metrics_server.
         let metrics_server_handle = tokio::spawn(async move {
-            let _ = metrics_server::start(config, sfu_clone_for_metrics, metrics_ender_rx).await;
+            let _ = metrics_server::start(
+                config,
+                sfu_clone_for_metrics,
+                metrics_ender_rx,
+                fd_limit as usize,
+            )
+            .await;
             let _ = signal_canceller_tx_clone_for_metrics.send(()).await;
         });
 

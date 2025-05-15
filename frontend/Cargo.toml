@@ -66,6 +66,7 @@ serde_dynamo = { version = "4.2.14", features = ["aws-sdk-dynamodb+1"] }
 # For metrics
 parking_lot = "0.12.3"
 psutil = { version = "3.3.0", default-features = false, features = ["process"] }
+rlimit = "0.10.2"
 
 # For the call link credentials
 bincode = "1.3.3"

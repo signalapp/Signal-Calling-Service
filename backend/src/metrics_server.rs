@@ -41,6 +41,7 @@ pub async fn start(
     config: &'static config::Config,
     sfu: Arc<Mutex<Sfu>>,
     shutdown_signal_rx: Receiver<()>,
+    fd_limit: usize,
 ) -> Result<()> {
     match Datadog::new(config) {
         None => {
@@ -64,7 +65,7 @@ pub async fn start(
                     tick_interval.tick().await;
                     let mut datadog = datadog.open_pipeline();
 
-                    for (metric_name, value) in get_value_metrics() {
+                    for (metric_name, value) in get_value_metrics(fd_limit) {
                         datadog.gauge(metric_name, value as f64);
                     }
 
@@ -236,16 +237,16 @@ impl DatadogPipeline<'_> {
 }
 
 /// Gets a vector of (metric_names, values)
-fn get_value_metrics() -> Vec<(&'static str, f32)> {
+fn get_value_metrics(fd_limit: usize) -> Vec<(&'static str, f32)> {
     let mut value_metrics = Vec::new();
 
-    value_metrics.extend(get_process_metrics());
+    value_metrics.extend(get_process_metrics(fd_limit));
 
     value_metrics
 }
 
 /// Gets a vector of (metric_names, values) for current process metrics
-fn get_process_metrics() -> Vec<(&'static str, f32)> {
+fn get_process_metrics(fd_limit: usize) -> Vec<(&'static str, f32)> {
     let mut value_metrics = Vec::new();
 
     let mut current_process = CURRENT_PROCESS.lock();
@@ -262,7 +263,12 @@ fn get_process_metrics() -> Vec<(&'static str, f32)> {
     #[cfg(target_os = "linux")] // open_files is not yet implemented for macos
     match current_process.open_files() {
         Ok(open_files) => {
-            value_metrics.push(("calling.system.memory.fd.count", open_files.len() as f32));
+            let fd_count = open_files.len();
+            value_metrics.push(("calling.system.memory.fd.count", fd_count as f32));
+            value_metrics.push((
+                "calling.system.memory.fd.avail",
+                (fd_limit - fd_count) as f32,
+            ));
         }
         Err(psutil::process::ProcessError::NoSuchProcess { .. }) => {
             // This is really "no such *file*", which can happen if a file descriptor is closed
