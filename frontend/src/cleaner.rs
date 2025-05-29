@@ -15,6 +15,9 @@ use rand::{thread_rng, Rng};
 use tokio::sync::{oneshot::Receiver, Semaphore};
 
 use crate::{
+    api::call_links::{
+        CallLinkEpochGenerator, DefaultCallLinkEpochGenerator, NullCallLinkEpochGenerator,
+    },
     backend::{self, Backend, BackendError, BackendHttpClient},
     config,
     storage::{CallRecord, CallRecordKey, DynamoDb, Storage},
@@ -55,7 +58,13 @@ async fn does_call_exist_on_backend(call_record: &CallRecord, backend: &BackendH
 pub async fn start(config: &'static config::Config, ender_rx: Receiver<()>) -> Result<()> {
     let cleanup_interval = Duration::from_millis(config.cleanup_interval_ms);
 
-    let storage = Arc::new(DynamoDb::new(config).await?);
+    let call_link_epoch_generator: Box<dyn CallLinkEpochGenerator> =
+        if config.enable_call_link_epochs {
+            Box::new(DefaultCallLinkEpochGenerator)
+        } else {
+            Box::new(NullCallLinkEpochGenerator)
+        };
+    let storage = DynamoDb::new(config, call_link_epoch_generator).await?;
     let backend = Arc::new(BackendHttpClient::from_config(config).await?);
 
     // Spawn a normal (cooperative) task to cleanup calls from storage periodically.
@@ -174,7 +183,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_inject_random_records() -> Result<()> {
-        let storage = DynamoDb::new(&default_test_config()).await?;
+        let storage = DynamoDb::new(
+            &default_test_config(),
+            Box::new(DefaultCallLinkEpochGenerator),
+        )
+        .await?;
 
         for _ in 0..1000 {
             let call_record = CallRecord {

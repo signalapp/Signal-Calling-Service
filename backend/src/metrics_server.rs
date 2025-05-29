@@ -246,6 +246,7 @@ fn get_value_metrics(fd_limit: usize) -> Vec<(&'static str, f32)> {
 }
 
 /// Gets a vector of (metric_names, values) for current process metrics
+#[cfg(target_os = "linux")]
 fn get_process_metrics(fd_limit: usize) -> Vec<(&'static str, f32)> {
     let mut value_metrics = Vec::new();
 
@@ -260,7 +261,6 @@ fn get_process_metrics(fd_limit: usize) -> Vec<(&'static str, f32)> {
         }
     }
 
-    #[cfg(target_os = "linux")] // open_files is not yet implemented for macos
     match current_process.open_files() {
         Ok(open_files) => {
             let fd_count = open_files.len();
@@ -277,6 +277,34 @@ fn get_process_metrics(fd_limit: usize) -> Vec<(&'static str, f32)> {
         }
         Err(e) => {
             warn!("Error getting fd count {:?}", e)
+        }
+    }
+
+    match current_process.cpu_percent() {
+        Ok(cpu_percentage) => {
+            value_metrics.push(("calling.system.cpu.pc", cpu_percentage));
+        }
+        Err(e) => {
+            warn!("Error getting cpu percentage {:?}", e)
+        }
+    }
+
+    value_metrics
+}
+
+/// Gets a vector of (metric_names, values) for current process metrics
+#[cfg(not(target_os = "linux"))]
+fn get_process_metrics(_fd_limit: usize) -> Vec<(&'static str, f32)> {
+    let mut value_metrics = Vec::new();
+
+    let mut current_process = CURRENT_PROCESS.lock();
+
+    match current_process.memory_percent() {
+        Ok(memory_percentage) => {
+            value_metrics.push(("calling.system.memory.pc", memory_percentage));
+        }
+        Err(e) => {
+            warn!("Error getting memory percentage {:?}", e)
         }
     }
 

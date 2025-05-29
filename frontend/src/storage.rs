@@ -21,9 +21,9 @@ use aws_sdk_dynamodb::{
     Client, Config,
 };
 use aws_smithy_async::rt::sleep::default_async_sleep;
-use aws_smithy_types::{retry::RetryConfigBuilder, timeout::TimeoutConfig, Blob};
+use aws_smithy_types::{retry::RetryConfigBuilder, timeout::TimeoutConfig};
 use aws_types::region::Region;
-use calling_common::{Duration, RoomId};
+use calling_common::{CallLinkEpoch, Duration, RoomId};
 use log::*;
 use metrics::{metric_config::Timer, *};
 #[cfg(test)]
@@ -33,7 +33,7 @@ use serde_dynamo::{from_item, to_item, Item};
 use serde_with::{ser::SerializeAsWrap, serde_as, Bytes};
 use tokio::{io::AsyncWriteExt, sync::oneshot::Receiver};
 
-use crate::{config, frontend::UserId};
+use crate::{api::call_links::CallLinkEpochGenerator, config, frontend::UserId};
 
 const ROOM_ID_KEY: &str = "roomId";
 const RECORD_TYPE_KEY: &str = "recordType";
@@ -101,6 +101,12 @@ pub struct CallLinkState {
     /// Bytes chosen by the room creator to identify admins.
     #[serde_as(as = "Bytes")]
     pub admin_passkey: Vec<u8>,
+    /// Call link epoch.
+    ///
+    /// This value will be None for those links created prior to the introduction of call link
+    /// epochs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<CallLinkEpoch>,
     /// A serialized CallLinkPublicParams, used to verify credentials.
     #[serde_as(as = "Bytes")]
     pub zkparams: Vec<u8>,
@@ -133,17 +139,25 @@ pub struct CallLinkState {
 
 impl CallLinkState {
     const RECORD_TYPE: &'static str = "CallLinkState";
-    const PEEK_ATTRIBUTES: &'static str =
-        "adminPasskey,zkparams,restrictions,encryptedName,approvedUsers,revoked,expiration,deleteAt";
+    const GET_CALL_LINK_ATTRIBUTES_WITHOUT_APPROVED_USERS: &'static str =
+        "adminPasskey,zkparams,restrictions,encryptedName,revoked,expiration,deleteAt,epoch";
+    const GET_CALL_LINK_ATTRIBUTES: &'static str =
+        "adminPasskey,zkparams,restrictions,encryptedName,revoked,expiration,deleteAt,epoch,approvedUsers";
 
     pub const EXPIRATION_TIMER: std::time::Duration =
         std::time::Duration::from_secs(60 * 60 * 24 * 90);
     pub const DELETION_TIMER: std::time::Duration =
         std::time::Duration::from_secs(60 * 60 * 24 * 90);
 
-    pub fn new(admin_passkey: Vec<u8>, zkparams: Vec<u8>, now: SystemTime) -> Self {
+    pub fn new(
+        admin_passkey: Vec<u8>,
+        zkparams: Vec<u8>,
+        epoch: Option<CallLinkEpoch>,
+        now: SystemTime,
+    ) -> Self {
         Self {
             admin_passkey,
+            epoch,
             zkparams,
             restrictions: CallLinkRestrictions::None,
             encrypted_name: vec![],
@@ -228,11 +242,16 @@ pub trait Storage: Sync + Send {
     ) -> Result<Vec<CallRecord>, StorageError>;
 
     /// Fetches the current state for a call link.
-    async fn get_call_link(&self, room_id: &RoomId) -> Result<Option<CallLinkState>, StorageError>;
+    async fn get_call_link(
+        &self,
+        room_id: &RoomId,
+        epoch: Option<CallLinkEpoch>,
+    ) -> Result<Option<CallLinkState>, StorageError>;
     /// Updates some or all of a call link's attributes.
     async fn update_call_link(
         &self,
         room_id: &RoomId,
+        epoch: Option<CallLinkEpoch>,
         new_attributes: CallLinkUpdate,
         zkparams_for_creation: Option<Vec<u8>>,
     ) -> Result<CallLinkState, CallLinkUpdateError>;
@@ -240,6 +259,7 @@ pub trait Storage: Sync + Send {
     async fn reset_call_link_expiration(
         &self,
         room_id: &RoomId,
+        epoch: Option<CallLinkEpoch>,
         now: SystemTime,
     ) -> Result<(), CallLinkUpdateError>;
     /// Deletes a call link, ensuring that a matching call record does not exist
@@ -247,6 +267,7 @@ pub trait Storage: Sync + Send {
     async fn delete_call_link(
         &self,
         room_id: &RoomId,
+        epoch: Option<CallLinkEpoch>,
         admin_passkey: &[u8],
     ) -> Result<(), CallLinkDeleteError>;
     /// Fetches both the current state for a call link and the call record.
@@ -256,6 +277,7 @@ pub trait Storage: Sync + Send {
     async fn get_call_link_and_record(
         &self,
         room_id: &RoomId,
+        epoch: Option<CallLinkEpoch>,
         peek_info_only: bool,
     ) -> Result<(Option<CallLinkState>, Option<CallRecord>), StorageError>;
     async fn update_call_link_approved_users(
@@ -268,12 +290,16 @@ pub trait Storage: Sync + Send {
 pub struct DynamoDb {
     client: Client,
     table_name: String,
+    call_link_epoch_generator: Box<dyn CallLinkEpochGenerator>,
 }
 
 impl DynamoDb {
     const TRANSACT_WRITE_ITEMS_LIMIT: usize = 100;
 
-    pub async fn new(config: &config::Config) -> Result<Self> {
+    pub async fn new(
+        config: &config::Config,
+        call_link_epoch_generator: Box<dyn CallLinkEpochGenerator>,
+    ) -> Result<Self> {
         let sleep_impl =
             default_async_sleep().ok_or_else(|| anyhow!("failed to create sleep_impl"))?;
 
@@ -326,6 +352,7 @@ impl DynamoDb {
         Ok(Self {
             client,
             table_name: config.storage_table.to_string(),
+            call_link_epoch_generator,
         })
     }
 }
@@ -342,21 +369,23 @@ impl DynamoDb {
 struct UpsertableItem {
     update_attributes: Item,
     default_attributes: Item,
+    condition_attributes: Item,
 }
 
 impl UpsertableItem {
     fn with_updates(attributes: Item) -> Self {
-        Self::new(attributes, Default::default())
+        Self::new(attributes, Default::default(), Default::default())
     }
 
     fn with_defaults(attributes: Item) -> Self {
-        Self::new(Default::default(), attributes)
+        Self::new(Default::default(), attributes, Default::default())
     }
 
-    fn new(update_attributes: Item, default_attributes: Item) -> Self {
+    fn new(update_attributes: Item, default_attributes: Item, condition_attributes: Item) -> Self {
         Self {
             update_attributes,
             default_attributes,
+            condition_attributes,
         }
     }
 
@@ -399,11 +428,15 @@ impl UpsertableItem {
         let default_attributes = std::mem::take(&mut self.default_attributes)
             .into_inner()
             .into_iter();
+        let condition_attributes = std::mem::take(&mut self.condition_attributes)
+            .into_inner()
+            .into_iter();
 
         // Allow update-attributes to override default-attributes if both have an entry for the same
         // field.
         default_attributes
             .chain(update_attributes)
+            .chain(condition_attributes)
             .map(|(k, v)| (format!(":{k}"), v.into()))
             .collect()
     }
@@ -600,45 +633,73 @@ impl Storage for DynamoDb {
         Ok(vec![])
     }
 
-    async fn get_call_link(&self, room_id: &RoomId) -> Result<Option<CallLinkState>, StorageError> {
-        let response = self
+    async fn get_call_link(
+        &self,
+        room_id: &RoomId,
+        epoch: Option<CallLinkEpoch>,
+    ) -> Result<Option<CallLinkState>, StorageError> {
+        let query = self
             .client
-            .get_item()
+            .query()
             .table_name(&self.table_name)
-            .key(ROOM_ID_KEY, AttributeValue::S(call_link_room_key(room_id)))
-            .key(
-                RECORD_TYPE_KEY,
+            .key_condition_expression("roomId = :roomId AND recordType = :recordType")
+            .expression_attribute_values(":roomId", AttributeValue::S(call_link_room_key(room_id)))
+            .expression_attribute_values(
+                ":recordType",
                 AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
-            )
-            .projection_expression(CallLinkState::PEEK_ATTRIBUTES)
+            );
+        let query = if let Some(epoch) = epoch {
+            query
+                .filter_expression("epoch = :epoch")
+                .expression_attribute_values(
+                    ":epoch",
+                    AttributeValue::N(epoch.as_ref().to_string()),
+                )
+        } else {
+            query.filter_expression("attribute_not_exists(epoch)")
+        };
+
+        let response = query
+            .projection_expression(CallLinkState::GET_CALL_LINK_ATTRIBUTES_WITHOUT_APPROVED_USERS)
             .consistent_read(true)
+            .limit(1)
             .send()
             .await
-            .context("failed to get_item from storage")?;
+            .context("failed to query storage")?;
 
-        Ok(response
-            .item
-            .map(|item| from_item(item).context("failed to convert item to CallLinkState"))
-            .transpose()?)
+        Ok(response.items.and_then(|items| {
+            items
+                .into_iter()
+                .next()
+                .map(|item| from_item(item).expect("failed to convert item to CallLinkState"))
+        }))
     }
 
     /// Updates some or all of a call link's attributes.
     async fn update_call_link(
         &self,
         room_id: &RoomId,
+        epoch: Option<CallLinkEpoch>,
         new_attributes: CallLinkUpdate,
         zkparams_for_creation: Option<Vec<u8>>,
     ) -> Result<CallLinkState, CallLinkUpdateError> {
-        let mut call_as_item = UpsertableItem::with_updates(
+        // Serialize the new attributes into an "upsertable" item. An item is a a hash map that
+        // maps attribute names to their corresponding values (instances of AttributeValue).
+        let mut upsertable_item = UpsertableItem::with_updates(
             to_item(&new_attributes).expect("failed to convert CallLinkUpdate to item"),
         );
 
         let must_exist;
         let condition;
         if let Some(zkparams_for_creation) = zkparams_for_creation {
-            call_as_item.default_attributes = to_item(CallLinkState::new(
+            let epoch = self.call_link_epoch_generator.new_epoch();
+            // This is a new call link. Generate a CallLinkState instance initialized with
+            // default values and convert it into an "item". A "union" of this set of attributes
+            // and the attributes in "new_attributes" represents the final call link record.
+            upsertable_item.default_attributes = to_item(CallLinkState::new(
                 new_attributes.admin_passkey,
                 zkparams_for_creation,
+                epoch,
                 SystemTime::now(),
             ))
             .expect("failed to convert CallLinkState to item");
@@ -649,7 +710,16 @@ impl Storage for DynamoDb {
             );
         } else {
             must_exist = true;
-            condition = "adminPasskey = :adminPasskey";
+            if let Some(epoch) = epoch {
+                let attr_val = AttributeValue::N(epoch.as_ref().to_string());
+                upsertable_item
+                    .condition_attributes
+                    .as_mut()
+                    .insert("epoch".to_string(), attr_val.into());
+                condition = "adminPasskey = :adminPasskey AND epoch = :epoch";
+            } else {
+                condition = "adminPasskey = :adminPasskey AND attribute_not_exists(epoch)";
+            }
         }
 
         let response = self
@@ -661,10 +731,10 @@ impl Storage for DynamoDb {
                 RECORD_TYPE_KEY,
                 AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
             )
-            .update_expression(call_as_item.generate_update_expression())
+            .update_expression(upsertable_item.generate_update_expression())
             .condition_expression(condition)
-            .set_expression_attribute_names(Some(call_as_item.generate_attribute_names()))
-            .set_expression_attribute_values(Some(call_as_item.into_attribute_values()))
+            .set_expression_attribute_names(Some(upsertable_item.generate_attribute_names()))
+            .set_expression_attribute_values(Some(upsertable_item.into_attribute_values()))
             .return_values(ReturnValue::AllNew)
             .send()
             .await;
@@ -681,7 +751,7 @@ impl Storage for DynamoDb {
                         Err(CallLinkUpdateError::AdminPasskeyDidNotMatch)
                     } else {
                         // Check if the room exists.
-                        match self.get_call_link(room_id).await {
+                        match self.get_call_link(room_id, epoch).await {
                             Ok(Some(_)) => Err(CallLinkUpdateError::AdminPasskeyDidNotMatch),
                             Ok(None) => Err(CallLinkUpdateError::RoomDoesNotExist),
                             Err(inner_err) => Err(CallLinkUpdateError::UnexpectedError(
@@ -703,21 +773,32 @@ impl Storage for DynamoDb {
     async fn delete_call_link(
         &self,
         room_id: &RoomId,
+        epoch: Option<CallLinkEpoch>,
         admin_passkey: &[u8],
     ) -> Result<(), CallLinkDeleteError> {
         let room_id_key = call_link_room_key(room_id);
+
         let delete_link = Delete::builder()
             .table_name(&self.table_name)
             .key(ROOM_ID_KEY, AttributeValue::S(room_id_key.clone()))
             .key(
                 RECORD_TYPE_KEY,
                 AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
+            );
+        let delete_link = if let Some(epoch) = epoch {
+            delete_link
+                .condition_expression("adminPasskey = :adminPasskey AND epoch = :epoch")
+                .expression_attribute_values(
+                    ":epoch",
+                    AttributeValue::N(epoch.as_ref().to_string()),
+                )
+        } else {
+            delete_link.condition_expression(
+                "adminPasskey = :adminPasskey AND attribute_not_exists(epoch)",
             )
-            .condition_expression("adminPasskey = :adminPassKey")
-            .set_expression_attribute_values(Some(HashMap::from([(
-                ":adminPassKey".to_string(),
-                AttributeValue::B(Blob::new(admin_passkey)),
-            )])))
+        };
+        let delete_link = delete_link
+            .expression_attribute_values(":adminPasskey", AttributeValue::B(admin_passkey.into()))
             .build()
             .map(|d| TransactWriteItem::builder().delete(d).build())
             .map_err(|err| {
@@ -757,11 +838,10 @@ impl Storage for DynamoDb {
             Err(err) => match err.into_service_error() {
                 TransactWriteItemsError::TransactionCanceledException(ref cancellation) => {
                     let reasons = cancellation.cancellation_reasons();
-
                     if let Some(code) = reasons[0].code() {
                         if code == BatchStatementErrorCodeEnum::ConditionalCheckFailed.as_str() {
                             // disambiguate check error
-                            return match self.get_call_link(room_id).await {
+                            return match self.get_call_link(room_id, epoch).await {
                                 Ok(Some(_)) => Err(CallLinkDeleteError::AdminPasskeyDidNotMatch),
                                 Ok(None) => Err(CallLinkDeleteError::RoomDoesNotExist),
                                 Err(inner_err) => Err(CallLinkDeleteError::UnexpectedError(
@@ -791,6 +871,7 @@ impl Storage for DynamoDb {
     async fn reset_call_link_expiration(
         &self,
         room_id: &RoomId,
+        epoch: Option<CallLinkEpoch>,
         now: SystemTime,
     ) -> Result<(), CallLinkUpdateError> {
         let expiration = now + CallLinkState::EXPIRATION_TIMER;
@@ -805,7 +886,7 @@ impl Storage for DynamoDb {
         )
         .expect("failed to convert timestamp to attribute");
 
-        let response = self
+        let builder = self
             .client
             .update_item()
             .table_name(&self.table_name)
@@ -817,9 +898,21 @@ impl Storage for DynamoDb {
             .update_expression("SET expiration = :newExpiration, deleteAt = :newDeleteAt")
             .condition_expression("attribute_exists(recordType)")
             .expression_attribute_values(":newExpiration", expiration_attribute_value)
-            .expression_attribute_values(":newDeleteAt", delete_at_attribute_value)
-            .send()
-            .await;
+            .expression_attribute_values(":newDeleteAt", delete_at_attribute_value);
+        let builder = if let Some(epoch) = epoch {
+            builder
+                .condition_expression("attribute_exists(recordType) AND epoch = :epoch")
+                .expression_attribute_values(
+                    ":epoch",
+                    AttributeValue::N(epoch.as_ref().to_string()),
+                )
+        } else {
+            builder.condition_expression(
+                "attribute_exists(recordType) AND attribute_not_exists(epoch)",
+            )
+        };
+
+        let response = builder.send().await;
 
         match response {
             Ok(_) => Ok(()),
@@ -838,33 +931,34 @@ impl Storage for DynamoDb {
     async fn get_call_link_and_record(
         &self,
         room_id: &RoomId,
+        epoch: Option<CallLinkEpoch>,
         peek_info_only: bool,
     ) -> Result<(Option<CallLinkState>, Option<CallRecord>), StorageError> {
-        let query = self
+        let call_link_projection_attributes = if peek_info_only {
+            CallLinkState::GET_CALL_LINK_ATTRIBUTES_WITHOUT_APPROVED_USERS
+        } else {
+            CallLinkState::GET_CALL_LINK_ATTRIBUTES
+        };
+
+        let response = self
             .client
             .query()
             .table_name(&self.table_name)
             .key_condition_expression("roomId = :value")
             .expression_attribute_values(":value", AttributeValue::S(call_link_room_key(room_id)))
-            .consistent_read(true);
-        let query = if peek_info_only {
-            query
-                .projection_expression(format!(
-                    "{},{},{}",
-                    RECORD_TYPE_KEY,
-                    CallLinkState::PEEK_ATTRIBUTES,
-                    CallRecord::ATTRIBUTES
-                ))
-                .expression_attribute_names("#region", "region")
-        } else {
-            query
-        };
-        let response = query
+            .consistent_read(true)
+            .projection_expression(format!(
+                "{},{},{}",
+                RECORD_TYPE_KEY,
+                call_link_projection_attributes,
+                CallRecord::ATTRIBUTES
+            ))
+            .expression_attribute_names("#region", "region")
             .send()
             .await
             .context("failed to query for call link and record from storage")?;
 
-        let mut link_state = None;
+        let mut link_state: Option<CallLinkState> = None;
         let mut call_record = None;
 
         if let Some(items) = response.items {
@@ -890,6 +984,17 @@ impl Storage for DynamoDb {
             }
         }
 
+        // Ideally, we would want to have DynamoDB exclude the records if there is an epoch
+        // mismatch. We, however, cannot do that since the filter expression is applied to all
+        // matching records, regardless of their type. Call records do *not* have the epoch field
+        // and, therefore, they always get excluded. *If* we could use the record type field in the
+        // filter expression we could work around this issue, but, alas, we cannot.
+        if let Some(link_state) = &link_state {
+            if link_state.epoch != epoch {
+                return Ok((None, None));
+            }
+        }
+
         Ok((link_state, call_record))
     }
 
@@ -906,8 +1011,8 @@ impl Storage for DynamoDb {
             .key(
                 RECORD_TYPE_KEY,
                 AttributeValue::S(CallLinkState::RECORD_TYPE.to_string()),
-            )
-            .condition_expression("attribute_exists(recordType)");
+            );
+
         let request = if approved_users.is_empty() {
             request.update_expression("REMOVE approvedUsers")
         } else {
@@ -1009,7 +1114,6 @@ impl IdentityFetcher {
 
 #[cfg(test)]
 mod tests {
-    use once_cell::sync::Lazy;
 
     use super::*;
 
@@ -1032,8 +1136,9 @@ mod tests {
             make_item(&[("defaultOnly", "default"), ("defaultAndUpdate", "default")]);
         let update_attributes =
             make_item(&[("updateOnly", "update"), ("defaultAndUpdate", "update")]);
+        let condition_attributes = make_item(&[]);
 
-        let item = UpsertableItem::new(update_attributes, default_attributes);
+        let item = UpsertableItem::new(update_attributes, default_attributes, condition_attributes);
         assert_eq!(
             item.generate_update_expression(),
             "SET #defaultAndUpdate = :defaultAndUpdate,#defaultOnly = if_not_exists(#defaultOnly, :defaultOnly),#updateOnly = :updateOnly"
@@ -1094,40 +1199,6 @@ mod tests {
         assert_eq!(serialized_keys, known_keys);
     }
 
-    #[test]
-    fn check_call_link_state_peek_attributes() {
-        let example_record = Some(CallLinkState {
-            admin_passkey: vec![1, 2, 3],
-            zkparams: vec![10, 20, 30],
-            restrictions: CallLinkRestrictions::AdminApproval,
-            encrypted_name: b"abc".to_vec(),
-            revoked: true,
-            expiration: *TESTING_EXPIRATION,
-            delete_at: *TESTING_DELETE_AT,
-            approved_users: vec!["user".to_owned()],
-        });
-        let record_as_json = serde_json::to_value(example_record).expect("can serialize");
-        let mut serialized_keys: Vec<&str> = record_as_json
-            .as_object()
-            .expect("serialized as object")
-            .keys()
-            .map(|s| s.as_str())
-            .collect();
-        serialized_keys.sort();
-
-        let mut known_keys: Vec<&str> = CallLinkState::PEEK_ATTRIBUTES.split(',').collect();
-        known_keys.sort();
-        assert_eq!(serialized_keys, known_keys);
-    }
-
-    static TESTING_EXPIRATION: Lazy<SystemTime> =
-        Lazy::new(|| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2524608000)); // 2050-01-01
-    static TESTING_DELETE_AT: Lazy<SystemTime> = Lazy::new(|| {
-        SystemTime::UNIX_EPOCH
-            + std::time::Duration::from_secs(2524608000)
-            + CallLinkState::DELETION_TIMER
-    }); // 2050-04-01
-
     #[cfg(feature = "storage-tests")]
     mod test_operations {
         use std::{collections::HashSet, future::Future, process::Command};
@@ -1139,13 +1210,25 @@ mod tests {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use futures::FutureExt;
         use lazy_static::lazy_static;
+        use once_cell::sync::Lazy;
 
         use super::*;
-        use crate::config::default_test_config;
+        use crate::{
+            api::call_links::{DefaultCallLinkEpochGenerator, NullCallLinkEpochGenerator},
+            config::default_test_config,
+        };
 
         lazy_static! {
             static ref DYNAMODB_STATUS: std::process::ExitStatus = start_dynamodb();
         }
+
+        static TESTING_EXPIRATION: Lazy<SystemTime> =
+            Lazy::new(|| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2524608000)); // 2050-01-01
+        static TESTING_DELETE_AT: Lazy<SystemTime> = Lazy::new(|| {
+            SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(2524608000)
+                + CallLinkState::DELETION_TIMER
+        }); // 2050-04-01
 
         const ERA_ID_KEY: &str = "eraId";
 
@@ -1164,7 +1247,7 @@ mod tests {
             })
         }
 
-        fn default_call_link_state_json(room_id: &str) -> serde_json::Value {
+        fn default_call_link_state_json_without_epoch(room_id: &str) -> serde_json::Value {
             serde_json::json!({
             ROOM_ID_KEY: {"S": call_link_room_key_str(room_id)},
             RECORD_TYPE_KEY: {"S": CallLinkState::RECORD_TYPE},
@@ -1178,11 +1261,41 @@ mod tests {
             })
         }
 
+        fn default_call_link_state_json_with_epoch(
+            room_id: &str,
+            epoch: &str,
+        ) -> serde_json::Value {
+            serde_json::json!({
+            ROOM_ID_KEY: {"S": call_link_room_key_str(room_id)},
+            RECORD_TYPE_KEY: {"S": CallLinkState::RECORD_TYPE},
+            "epoch": {"N": epoch},
+            "adminPasskey": {"B": STANDARD.encode([1, 2, 3])},
+            "zkparams": {"B": ""},
+            "restrictions": {"S": "adminApproval"},
+            "encryptedName": {"B": STANDARD.encode(b"abc")},
+            "revoked": {"BOOL": false},
+            "expiration": {"N": timestamp_to_string(*TESTING_EXPIRATION)},
+            "deleteAt": {"N": timestamp_to_string(*TESTING_DELETE_AT)},
+            })
+        }
+
+        fn default_call_link_state_json(
+            room_id: &str,
+            epoch: Option<CallLinkEpoch>,
+        ) -> serde_json::Value {
+            if let Some(epoch) = epoch {
+                default_call_link_state_json_with_epoch(room_id, &epoch.as_ref().to_string())
+            } else {
+                default_call_link_state_json_without_epoch(room_id)
+            }
+        }
+
         fn default_call_link_state_json_with(
             room_id: &str,
+            epoch: Option<CallLinkEpoch>,
             mut extra_keys: serde_json::Value,
         ) -> serde_json::Value {
-            let mut state = default_call_link_state_json(room_id);
+            let mut state = default_call_link_state_json(room_id, epoch);
             state
                 .as_object_mut()
                 .unwrap()
@@ -1216,10 +1329,41 @@ mod tests {
             StartupError,
         }
 
-        // Create a local DynamoDb client. Attempt to contact local DynamoDb, if fail - bring up
-        // local DynamoDb using Docker Compose and retry.
+        #[derive(Default)]
+        struct StaticCallLinkEpochGenerator;
+
+        impl StaticCallLinkEpochGenerator {
+            const GENERATED_EPOCH: Option<CallLinkEpoch> = Some(CallLinkEpoch::new(0));
+        }
+
+        impl CallLinkEpochGenerator for StaticCallLinkEpochGenerator {
+            fn new_epoch(&self) -> Option<calling_common::CallLinkEpoch> {
+                Self::GENERATED_EPOCH
+            }
+        }
+
+        // Create a local DynamoDb client. The client will be set up to use the default call link
+        // epoch generator. Attempt to contact local DynamoDb, if fail - bring up local DynamoDb
+        // using Docker Compose and retry.
         async fn bootstrap_storage() -> Result<DynamoDb, BootstrapError> {
-            let client = DynamoDb::new(&default_test_config()).await.unwrap();
+            bootstrap_storage_with_epoch_generator(Box::new(DefaultCallLinkEpochGenerator)).await
+        }
+
+        // Create a local DynamoDb client. The client will be set up not to use an epoch generator.
+        // Attempt to contact local DynamoDb, if fail - bring up local DynamoDb using Docker Compose and retry.
+        async fn bootstrap_storage_without_epoch_generator() -> Result<DynamoDb, BootstrapError> {
+            bootstrap_storage_with_epoch_generator(Box::new(NullCallLinkEpochGenerator)).await
+        }
+
+        // Create a local DynamoDb client. The client will be set up to use the given epoch
+        // generator. Attempt to contact local DynamoDb, if fail - bring up local DynamoDb using
+        // Docker Compose and retry.
+        async fn bootstrap_storage_with_epoch_generator(
+            generator: Box<dyn CallLinkEpochGenerator>,
+        ) -> Result<DynamoDb, BootstrapError> {
+            let client = DynamoDb::new(&default_test_config(), generator)
+                .await
+                .unwrap();
             println!("Checking local DynamoDB connection...");
             match client.client.list_tables().send().await {
                 Ok(_) => {
@@ -1348,11 +1492,14 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_absent_call_link() -> Result<()> {
+        async fn test_absent_call_link_with_epoch() -> Result<()> {
             let storage = bootstrap_storage().await?;
             assert_eq!(
                 storage
-                    .get_call_link(&RoomId::from("testing-nonexistent".to_string()))
+                    .get_call_link(
+                        &RoomId::from("testing-nonexistent".to_string()),
+                        StaticCallLinkEpochGenerator::GENERATED_EPOCH,
+                    )
                     .await?,
                 None
             );
@@ -1360,16 +1507,40 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_present_call_link() -> Result<()> {
+        async fn test_absent_call_link_without_epoch() -> Result<()> {
             let storage = bootstrap_storage().await?;
+            assert_eq!(
+                storage
+                    .get_call_link(&RoomId::from("testing-nonexistent".to_string()), None)
+                    .await?,
+                None
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_present_call_link_with_epoch() -> Result<()> {
+            // Attempting to retrieve a call with an epoch.
             let room_id = format!("testing-room-{}", line!());
+            test_present_call_link(&room_id, StaticCallLinkEpochGenerator::GENERATED_EPOCH).await
+        }
+
+        #[tokio::test]
+        async fn test_present_call_link_without_epoch() -> Result<()> {
+            // Attempting to retrieve a call without an epoch.
+            let room_id = format!("testing-room-{}", line!());
+            test_present_call_link(&room_id, None).await
+        }
+
+        async fn test_present_call_link(room_id: &str, epoch: Option<CallLinkEpoch>) -> Result<()> {
+            let storage = bootstrap_storage().await?;
             with_db_items(
                 &storage,
-                [default_call_link_state_json(&room_id)],
+                [default_call_link_state_json(room_id, epoch)],
                 [],
                 async {
                     assert_eq!(
-                        storage.get_call_link(&RoomId::from(room_id)).await?,
+                        storage.get_call_link(&RoomId::from(room_id), epoch).await?,
                         Some(CallLinkState {
                             admin_passkey: vec![1, 2, 3],
                             zkparams: vec![],
@@ -1379,6 +1550,7 @@ mod tests {
                             expiration: *TESTING_EXPIRATION,
                             delete_at: *TESTING_DELETE_AT,
                             approved_users: vec![],
+                            epoch,
                         })
                     );
                     Ok(())
@@ -1388,13 +1560,54 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_get_call_link_skips_approved_users() -> Result<()> {
-            let storage = bootstrap_storage().await?;
+        async fn test_present_call_link_with_epoch_not_provided() -> Result<()> {
+            // Attempting to retrieve a call link with an epoch without providing an epoch.
             let room_id = format!("testing-room-{}", line!());
+            let epoch = StaticCallLinkEpochGenerator::GENERATED_EPOCH;
+            let storage = bootstrap_storage().await?;
+            with_db_items(
+                &storage,
+                [default_call_link_state_json(room_id.as_str(), epoch)],
+                [],
+                async {
+                    assert_eq!(
+                        storage
+                            .get_call_link(&RoomId::from(room_id.as_str()), None)
+                            .await?,
+                        None
+                    );
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_skips_approved_users_with_epoch() -> Result<()> {
+            let room_id = format!("testing-room-{}", line!());
+            test_get_call_link_skips_approved_users(
+                &room_id,
+                StaticCallLinkEpochGenerator::GENERATED_EPOCH,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_skips_approved_users_without_epoch() -> Result<()> {
+            let room_id = format!("testing-room-{}", line!());
+            test_get_call_link_skips_approved_users(&room_id, None).await
+        }
+
+        async fn test_get_call_link_skips_approved_users(
+            room_id: &str,
+            epoch: Option<CallLinkEpoch>,
+        ) -> Result<()> {
+            let storage = bootstrap_storage().await?;
             with_db_items(
                 &storage,
                 [default_call_link_state_json_with(
-                    &room_id,
+                    room_id,
+                    epoch,
                     serde_json::json!({
                     "approvedUsers": {"SS": ["Moxie", "Brian", "Meredith"]},
                     }),
@@ -1402,8 +1615,9 @@ mod tests {
                 [],
                 async {
                     assert_eq!(
-                        storage.get_call_link(&RoomId::from(room_id)).await?,
+                        storage.get_call_link(&RoomId::from(room_id), epoch).await?,
                         Some(CallLinkState {
+                            epoch,
                             admin_passkey: vec![1, 2, 3],
                             zkparams: vec![],
                             restrictions: CallLinkRestrictions::AdminApproval,
@@ -1421,12 +1635,23 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_get_call_link_and_record_absent() -> Result<()> {
+        async fn test_get_call_link_and_record_absent_with_epoch() -> Result<()> {
+            test_get_call_link_and_record_absent(StaticCallLinkEpochGenerator::GENERATED_EPOCH)
+                .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_and_record_absent_without_epoch() -> Result<()> {
+            test_get_call_link_and_record_absent(None).await
+        }
+
+        async fn test_get_call_link_and_record_absent(epoch: Option<CallLinkEpoch>) -> Result<()> {
             let storage = bootstrap_storage().await?;
             assert_eq!(
                 storage
                     .get_call_link_and_record(
                         &RoomId::from("testing-nonexistent".to_string()),
+                        epoch,
                         false
                     )
                     .await?,
@@ -1436,6 +1661,7 @@ mod tests {
                 storage
                     .get_call_link_and_record(
                         &RoomId::from("testing-nonexistent".to_string()),
+                        epoch,
                         true
                     )
                     .await?,
@@ -1445,16 +1671,31 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_get_call_link_and_record_with_no_call() -> Result<()> {
+        async fn test_get_call_link_and_record_with_no_call_with_epoch() -> Result<()> {
+            test_get_call_link_and_record_with_no_call(
+                StaticCallLinkEpochGenerator::GENERATED_EPOCH,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_and_record_with_no_call_without_epoch() -> Result<()> {
+            test_get_call_link_and_record_with_no_call(None).await
+        }
+
+        async fn test_get_call_link_and_record_with_no_call(
+            epoch: Option<CallLinkEpoch>,
+        ) -> Result<()> {
             let storage = bootstrap_storage().await?;
             let room_id = format!("testing-room-{}", line!());
             with_db_items(
                 &storage,
-                [default_call_link_state_json(&room_id)],
+                [default_call_link_state_json(&room_id, epoch)],
                 [],
                 async {
                     let expected = (
                         Some(CallLinkState {
+                            epoch,
                             admin_passkey: vec![1, 2, 3],
                             zkparams: vec![],
                             restrictions: CallLinkRestrictions::AdminApproval,
@@ -1468,13 +1709,13 @@ mod tests {
                     );
                     assert_eq!(
                         &storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), epoch, false)
                             .await?,
                         &expected
                     );
                     assert_eq!(
                         &storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), epoch, true)
                             .await?,
                         &expected
                     );
@@ -1485,13 +1726,30 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_get_call_link_and_record_with_no_call_and_approved_users() -> Result<()> {
+        async fn test_get_call_link_and_record_with_no_call_and_approved_users_with_epoch(
+        ) -> Result<()> {
+            test_get_call_link_and_record_with_no_call_and_approved_users(
+                StaticCallLinkEpochGenerator::GENERATED_EPOCH,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_and_record_with_no_call_and_approved_users_without_epoch(
+        ) -> Result<()> {
+            test_get_call_link_and_record_with_no_call_and_approved_users(None).await
+        }
+
+        async fn test_get_call_link_and_record_with_no_call_and_approved_users(
+            epoch: Option<CallLinkEpoch>,
+        ) -> Result<()> {
             let storage = bootstrap_storage().await?;
             let room_id = format!("testing-room-{}", line!());
             with_db_items(
                 &storage,
                 [default_call_link_state_json_with(
                     &room_id,
+                    epoch,
                     serde_json::json!({
                     "approvedUsers": {"SS": ["Moxie", "Brian", "Meredith"]},
                     }),
@@ -1500,6 +1758,7 @@ mod tests {
                 async {
                     let mut expected = (
                         Some(CallLinkState {
+                            epoch,
                             admin_passkey: vec![1, 2, 3],
                             zkparams: vec![],
                             restrictions: CallLinkRestrictions::AdminApproval,
@@ -1518,7 +1777,11 @@ mod tests {
                     assert_eq!(
                         with_approved_users_sorted(
                             &mut storage
-                                .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                                .get_call_link_and_record(
+                                    &RoomId::from(room_id.clone()),
+                                    epoch,
+                                    false
+                                )
                                 .await?
                         ),
                         &expected
@@ -1527,7 +1790,11 @@ mod tests {
                     assert_eq!(
                         with_approved_users_sorted(
                             &mut storage
-                                .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
+                                .get_call_link_and_record(
+                                    &RoomId::from(room_id.clone()),
+                                    epoch,
+                                    true
+                                )
                                 .await?
                         ),
                         &expected
@@ -1539,19 +1806,31 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_get_call_link_and_record_with_call() -> Result<()> {
+        async fn test_get_call_link_and_record_with_call_with_epoch() -> Result<()> {
+            test_get_call_link_and_record_with_call(Some(CallLinkEpoch::from(0))).await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_and_record_with_call_without_epoch() -> Result<()> {
+            test_get_call_link_and_record_with_call(None).await
+        }
+
+        async fn test_get_call_link_and_record_with_call(
+            epoch: Option<CallLinkEpoch>,
+        ) -> Result<()> {
             let storage = bootstrap_storage().await?;
             let room_id = format!("testing-room-{}", line!());
             with_db_items(
                 &storage,
                 [
-                    default_call_link_state_json(&room_id),
+                    default_call_link_state_json(&room_id, epoch),
                     default_call_link_call_record_state(&room_id, "mesozoic"),
                 ],
                 [],
                 async {
                     let expected = (
                         Some(CallLinkState {
+                            epoch,
                             admin_passkey: vec![1, 2, 3],
                             zkparams: vec![],
                             restrictions: CallLinkRestrictions::AdminApproval,
@@ -1571,13 +1850,13 @@ mod tests {
                     );
                     assert_eq!(
                         &storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), epoch, false)
                             .await?,
                         &expected
                     );
                     assert_eq!(
                         &storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), epoch, true)
                             .await?,
                         &expected
                     );
@@ -1588,7 +1867,23 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_get_call_link_and_record_with_call_and_approved_users() -> Result<()> {
+        async fn test_get_call_link_and_record_with_call_and_approved_users_with_epoch(
+        ) -> Result<()> {
+            test_get_call_link_and_record_with_call_and_approved_users(
+                StaticCallLinkEpochGenerator::GENERATED_EPOCH,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_get_call_link_and_record_with_call_and_approved_users_without_epoch(
+        ) -> Result<()> {
+            test_get_call_link_and_record_with_call_and_approved_users(None).await
+        }
+
+        async fn test_get_call_link_and_record_with_call_and_approved_users(
+            epoch: Option<CallLinkEpoch>,
+        ) -> Result<()> {
             let storage = bootstrap_storage().await?;
             let room_id = format!("testing-room-{}", line!());
             with_db_items(
@@ -1596,6 +1891,7 @@ mod tests {
                 [
                     default_call_link_state_json_with(
                         &room_id,
+                        epoch,
                         serde_json::json!({
                         "approvedUsers": {"SS": ["Moxie", "Brian", "Meredith"]},
                         }),
@@ -1606,6 +1902,7 @@ mod tests {
                 async {
                     let mut expected = (
                         Some(CallLinkState {
+                            epoch,
                             admin_passkey: vec![1, 2, 3],
                             zkparams: vec![],
                             restrictions: CallLinkRestrictions::AdminApproval,
@@ -1630,7 +1927,11 @@ mod tests {
                     assert_eq!(
                         with_approved_users_sorted(
                             &mut storage
-                                .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                                .get_call_link_and_record(
+                                    &RoomId::from(room_id.clone()),
+                                    epoch,
+                                    false
+                                )
                                 .await?
                         ),
                         &expected
@@ -1639,7 +1940,11 @@ mod tests {
                     assert_eq!(
                         with_approved_users_sorted(
                             &mut storage
-                                .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
+                                .get_call_link_and_record(
+                                    &RoomId::from(room_id.clone()),
+                                    epoch,
+                                    true
+                                )
                                 .await?
                         ),
                         &expected
@@ -1674,13 +1979,13 @@ mod tests {
                     let expected = (None, None);
                     assert_eq!(
                         &storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), None, false)
                             .await?,
                         &expected
                     );
                     assert_eq!(
                         &storage
-                            .get_call_link_and_record(&RoomId::from(room_id.clone()), true)
+                            .get_call_link_and_record(&RoomId::from(room_id.clone()), None, true)
                             .await?,
                         &expected
                     );
@@ -1694,9 +1999,10 @@ mod tests {
         async fn test_update_call_link_approved_users() -> Result<()> {
             let storage = bootstrap_storage().await?;
             let room_id = format!("testing-room-{}", line!());
+            let epoch = StaticCallLinkEpochGenerator::GENERATED_EPOCH;
             with_db_items(
                 &storage,
-                [default_call_link_state_json(&room_id)],
+                [default_call_link_state_json(&room_id, epoch)],
                 [],
                 async {
                     storage
@@ -1708,6 +2014,7 @@ mod tests {
 
                     let mut expected = (
                         Some(CallLinkState {
+                            epoch,
                             admin_passkey: vec![1, 2, 3],
                             zkparams: vec![],
                             restrictions: CallLinkRestrictions::AdminApproval,
@@ -1722,7 +2029,11 @@ mod tests {
                     assert_eq!(
                         with_approved_users_sorted(
                             &mut storage
-                                .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                                .get_call_link_and_record(
+                                    &RoomId::from(room_id.clone()),
+                                    epoch,
+                                    false
+                                )
                                 .await?
                         ),
                         &expected
@@ -1739,7 +2050,11 @@ mod tests {
                     assert_eq!(
                         with_approved_users_sorted(
                             &mut storage
-                                .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
+                                .get_call_link_and_record(
+                                    &RoomId::from(room_id.clone()),
+                                    epoch,
+                                    false
+                                )
                                 .await?
                         ),
                         &expected
@@ -1752,12 +2067,16 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_update_call_link() -> Result<()> {
-            let storage = bootstrap_storage().await?;
+        async fn test_create_call_link_with_epoch() -> Result<()> {
+            let storage =
+                bootstrap_storage_with_epoch_generator(Box::new(StaticCallLinkEpochGenerator))
+                    .await?;
             let room_id = format!("testing-room-{}", line!());
-            let actual = storage
+
+            let update_result = storage
                 .update_call_link(
                     &RoomId::from(room_id.clone()),
+                    None,
                     CallLinkUpdate {
                         admin_passkey: vec![1, 2, 3],
                         restrictions: Some(CallLinkRestrictions::AdminApproval),
@@ -1768,47 +2087,210 @@ mod tests {
                 )
                 .await?;
 
-            let expected = (
-                Some(CallLinkState {
-                    admin_passkey: vec![1, 2, 3],
-                    zkparams: vec![],
-                    restrictions: CallLinkRestrictions::AdminApproval,
-                    encrypted_name: b"abc".to_vec(),
-                    revoked: false,
-                    expiration: actual.expiration,
-                    delete_at: actual.delete_at,
-                    approved_users: vec![],
-                }),
-                None,
-            );
-            assert_eq!(
-                with_approved_users_sorted(
-                    &mut storage
-                        .get_call_link_and_record(&RoomId::from(room_id.clone()), false)
-                        .await?
-                ),
-                &expected
-            );
+            let fetch_result = storage
+                .get_call_link(
+                    &RoomId::from(room_id.clone()),
+                    StaticCallLinkEpochGenerator::GENERATED_EPOCH,
+                )
+                .await?;
+
+            storage
+                .delete_call_link(
+                    &RoomId::from(room_id.clone()),
+                    update_result.epoch,
+                    &update_result.admin_passkey,
+                )
+                .await?;
+
+            assert_eq!(fetch_result, Some(update_result));
 
             Ok(())
         }
 
         #[tokio::test]
-        async fn test_delete_call_link_present_succeeds() -> Result<()> {
+        async fn test_create_call_link_without_epoch() -> Result<()> {
+            let storage = bootstrap_storage_without_epoch_generator().await?;
+            let room_id = format!("testing-room-{}", line!());
+
+            let update_result = storage
+                .update_call_link(
+                    &RoomId::from(room_id.clone()),
+                    None,
+                    CallLinkUpdate {
+                        admin_passkey: vec![1, 2, 3],
+                        restrictions: Some(CallLinkRestrictions::AdminApproval),
+                        encrypted_name: Some(b"abc".to_vec()),
+                        revoked: Some(false),
+                    },
+                    Some(vec![]),
+                )
+                .await?;
+
+            let fetch_result = storage
+                .get_call_link(&RoomId::from(room_id.clone()), None)
+                .await?;
+
+            storage
+                .delete_call_link(
+                    &RoomId::from(room_id.clone()),
+                    None,
+                    &update_result.admin_passkey,
+                )
+                .await?;
+
+            assert_eq!(fetch_result, Some(update_result));
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_update_call_link_with_epoch() -> Result<()> {
+            // Test call link update with a valid epoch
+            test_update_call_link(
+                StaticCallLinkEpochGenerator::GENERATED_EPOCH,
+                StaticCallLinkEpochGenerator::GENERATED_EPOCH,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_update_call_link_without_epoch() -> Result<()> {
+            // Test call link update without an epoch
+            test_update_call_link(None, None).await
+        }
+
+        #[tokio::test]
+        async fn test_update_call_link_with_mismatched_epoch_1() -> Result<()> {
+            // Test call link update failure; epoch does not exist in the DB, but is given as a
+            // lookup parameter.
+            test_update_call_link_failure(None, StaticCallLinkEpochGenerator::GENERATED_EPOCH).await
+        }
+
+        #[tokio::test]
+        async fn test_update_call_link_with_mismatched_epoch_2() -> Result<()> {
+            // Test call link update failure; epoch exists in the DB, but is not given as a lookup
+            // parameter.
+            test_update_call_link_failure(StaticCallLinkEpochGenerator::GENERATED_EPOCH, None).await
+        }
+
+        async fn test_update_call_link(
+            epoch_at_creation: Option<CallLinkEpoch>,
+            epoch_at_update: Option<CallLinkEpoch>,
+        ) -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            with_db_items(
+                &storage,
+                [default_call_link_state_json(&room_id, epoch_at_creation)],
+                [],
+                async {
+                    let call_link = storage
+                        .update_call_link(
+                            &RoomId::from(room_id.clone()),
+                            epoch_at_update,
+                            CallLinkUpdate {
+                                admin_passkey: vec![1, 2, 3],
+                                restrictions: Some(CallLinkRestrictions::AdminApproval),
+                                encrypted_name: Some(b"abc".to_vec()),
+                                revoked: Some(false),
+                            },
+                            None,
+                        )
+                        .await?;
+
+                    let expected = CallLinkState {
+                        epoch: epoch_at_creation,
+                        admin_passkey: vec![1, 2, 3],
+                        zkparams: vec![],
+                        restrictions: CallLinkRestrictions::AdminApproval,
+                        encrypted_name: b"abc".to_vec(),
+                        revoked: false,
+                        expiration: *TESTING_EXPIRATION,
+                        delete_at: *TESTING_DELETE_AT,
+                        approved_users: vec![],
+                    };
+
+                    assert_eq!(&call_link, &expected);
+
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        async fn test_update_call_link_failure(
+            epoch_at_creation: Option<CallLinkEpoch>,
+            epoch_at_update: Option<CallLinkEpoch>,
+        ) -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id = format!("testing-room-{}", line!());
+            with_db_items(
+                &storage,
+                [default_call_link_state_json(&room_id, epoch_at_creation)],
+                [],
+                async {
+                    let result = storage
+                        .update_call_link(
+                            &RoomId::from(room_id.clone()),
+                            epoch_at_update,
+                            CallLinkUpdate {
+                                admin_passkey: vec![1, 2, 3],
+                                restrictions: Some(CallLinkRestrictions::AdminApproval),
+                                encrypted_name: Some(b"abc".to_vec()),
+                                revoked: Some(false),
+                            },
+                            None,
+                        )
+                        .await;
+
+                    assert!(result.is_err());
+
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_delete_call_link_present_succeeds_with_epoch() -> Result<()> {
+            // Delete call link with an epoch
+            test_delete_call_link_present_succeeds(
+                StaticCallLinkEpochGenerator::GENERATED_EPOCH,
+                StaticCallLinkEpochGenerator::GENERATED_EPOCH,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_delete_call_link_present_succeeds_without_epoch() -> Result<()> {
+            // Delete call link without an epoch
+            test_delete_call_link_present_succeeds(None, None).await
+        }
+
+        async fn test_delete_call_link_present_succeeds(
+            epoch_at_creation: Option<CallLinkEpoch>,
+            epoch_at_deletion: Option<CallLinkEpoch>,
+        ) -> Result<()> {
             let storage = bootstrap_storage().await?;
             let room_id_raw = format!("testing-room-{}", line!());
             let room_id = RoomId::from(room_id_raw.clone());
             let admin_passkey = vec![1, 2, 3];
             with_db_items(
                 &storage,
-                [default_call_link_state_json(&room_id_raw)],
+                [default_call_link_state_json(
+                    &room_id_raw,
+                    epoch_at_creation,
+                )],
                 [],
                 async {
-                    if let Err(err) = storage.delete_call_link(&room_id, &admin_passkey).await {
+                    if let Err(err) = storage
+                        .delete_call_link(&room_id, epoch_at_deletion, &admin_passkey)
+                        .await
+                    {
                         panic!("{:?}", err)
                     }
 
-                    match storage.get_call_link(&room_id).await? {
+                    match storage.get_call_link(&room_id, epoch_at_creation).await? {
                         None => Ok(()),
                         _ => panic!("expected call link to be deleted"),
                     }
@@ -1818,12 +2300,64 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_delete_call_link_absent_fails() -> Result<()> {
+        async fn test_delete_call_link_present_fails_epoch_mismatch_1() -> Result<()> {
+            // Attempt and fail to delete a call link with an epoch without providing an epoch
+            test_delete_call_link_present_fails(StaticCallLinkEpochGenerator::GENERATED_EPOCH, None)
+                .await
+        }
+
+        #[tokio::test]
+        async fn test_delete_call_link_present_fails_epoch_mismatch_2() -> Result<()> {
+            // Attempt and fail to delete a call link without an epoch by providing an epoch
+            test_delete_call_link_present_fails(None, StaticCallLinkEpochGenerator::GENERATED_EPOCH)
+                .await
+        }
+
+        async fn test_delete_call_link_present_fails(
+            epoch_at_creation: Option<CallLinkEpoch>,
+            epoch_at_deletion: Option<CallLinkEpoch>,
+        ) -> Result<()> {
+            let storage = bootstrap_storage().await?;
+            let room_id_raw = format!("testing-room-{}", line!());
+            let room_id = RoomId::from(room_id_raw.clone());
+            let admin_passkey = vec![1, 2, 3];
+            with_db_items(
+                &storage,
+                [default_call_link_state_json(
+                    &room_id_raw,
+                    epoch_at_creation,
+                )],
+                [],
+                async {
+                    if storage
+                        .delete_call_link(&room_id, epoch_at_deletion, &admin_passkey)
+                        .await
+                        .is_ok()
+                    {
+                        panic!("did not expect to be able to delete call link");
+                    }
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_delete_call_link_absent_fails_with_epoch() -> Result<()> {
+            test_delete_call_link_absent_fails(StaticCallLinkEpochGenerator::GENERATED_EPOCH).await
+        }
+
+        #[tokio::test]
+        async fn test_delete_call_link_absent_fails_without_epoch() -> Result<()> {
+            test_delete_call_link_absent_fails(None).await
+        }
+
+        async fn test_delete_call_link_absent_fails(epoch: Option<CallLinkEpoch>) -> Result<()> {
             let storage = bootstrap_storage().await?;
             let room_id = format!("testing-room-{}", line!());
             let admin_passkey = vec![1, 2, 3];
             match storage
-                .delete_call_link(&RoomId::from(room_id), &admin_passkey)
+                .delete_call_link(&RoomId::from(room_id), epoch, &admin_passkey)
                 .await
             {
                 Err(CallLinkDeleteError::RoomDoesNotExist) => Ok(()),
@@ -1833,17 +2367,31 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_delete_call_link_mismatched_admin_key_fails() -> Result<()> {
+        async fn test_delete_call_link_mismatched_admin_key_fails_with_epoch() -> Result<()> {
+            test_delete_call_link_mismatched_admin_key_fails(
+                StaticCallLinkEpochGenerator::GENERATED_EPOCH,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn test_delete_call_link_mismatched_admin_key_fails_without_epoch() -> Result<()> {
+            test_delete_call_link_mismatched_admin_key_fails(None).await
+        }
+
+        async fn test_delete_call_link_mismatched_admin_key_fails(
+            epoch: Option<CallLinkEpoch>,
+        ) -> Result<()> {
             let storage = bootstrap_storage().await?;
             let room_id = format!("testing-room-{}", line!());
             let admin_passkey = vec![1, 2, 4];
             with_db_items(
                 &storage,
-                [default_call_link_state_json(&room_id)],
+                [default_call_link_state_json(&room_id, epoch)],
                 [],
                 async {
                     match storage
-                        .delete_call_link(&RoomId::from(room_id), &admin_passkey)
+                        .delete_call_link(&RoomId::from(room_id), epoch, &admin_passkey)
                         .await
                     {
                         Err(CallLinkDeleteError::AdminPasskeyDidNotMatch) => Ok(()),
@@ -1856,7 +2404,19 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_delete_call_link_active_call_fails() -> Result<()> {
+        async fn test_delete_call_link_active_call_fails_with_epoch() -> Result<()> {
+            test_delete_call_link_active_call_fails(StaticCallLinkEpochGenerator::GENERATED_EPOCH)
+                .await
+        }
+
+        #[tokio::test]
+        async fn test_delete_call_link_active_call_fails_without_epoch() -> Result<()> {
+            test_delete_call_link_active_call_fails(None).await
+        }
+
+        async fn test_delete_call_link_active_call_fails(
+            epoch: Option<CallLinkEpoch>,
+        ) -> Result<()> {
             let storage = bootstrap_storage().await?;
             let room_id = format!("testing-room-{}", line!());
             let era_id = format!("{:x}", line!());
@@ -1864,13 +2424,13 @@ mod tests {
             with_db_items(
                 &storage,
                 [
-                    default_call_link_state_json(&room_id),
+                    default_call_link_state_json(&room_id, epoch),
                     default_call_link_call_record_state(&room_id, &era_id),
                 ],
                 [],
                 async {
                     match storage
-                        .delete_call_link(&RoomId::from(room_id), &admin_passkey)
+                        .delete_call_link(&RoomId::from(room_id), epoch, &admin_passkey)
                         .await
                     {
                         Err(CallLinkDeleteError::CallRecordConflict) => Ok(()),

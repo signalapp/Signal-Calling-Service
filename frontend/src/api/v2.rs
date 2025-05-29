@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Redirect},
     Extension, Json,
 };
-use axum_extra::{headers::UserAgent, TypedHeader};
+use axum_extra::{headers::UserAgent, typed_header::TypedHeaderRejection, TypedHeader};
 use calling_common::{CallType, SignalUserAgent};
 use hex::ToHex;
 use http::StatusCode;
@@ -23,7 +23,9 @@ use subtle::ConstantTimeEq;
 use zkgroup::call_links::CallLinkAuthCredentialPresentation;
 
 use crate::{
-    api::call_links::{self, verify_auth_credential_against_zkparams, CallLinkState, RoomId},
+    api::call_links::{
+        self, verify_auth_credential_against_zkparams, CallLinkEpoch, CallLinkState, RoomId,
+    },
     authenticator::UserAuthorization,
     frontend::{Frontend, JoinRequestWrapper, UserId},
     storage::{self, CallLinkRestrictions},
@@ -88,6 +90,22 @@ pub struct ErrorResponse<'a> {
     pub reason: &'a str,
 }
 
+// This helper function extracts checked, optional typed header values. Returns Ok(Some(V)) if a
+// valid value is in the typed header, Ok(None) if the header was missing, or
+// Err(TypedHeaderRejection) if any other error was encountered.
+fn extract_optional_header_value<T, V>(
+    typed_header_result: Result<TypedHeader<T>, TypedHeaderRejection>,
+) -> Result<Option<V>, TypedHeaderRejection>
+where
+    V: From<T>,
+{
+    match typed_header_result {
+        Ok(TypedHeader(v)) => Ok(Some(v.into())),
+        Err(err) if err.is_missing() => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 fn temporary_redirect(uri: &str) -> Result<axum::response::Response, StatusCode> {
     if http::HeaderValue::try_from(uri).is_ok() {
         Ok(Redirect::temporary(uri).into_response())
@@ -112,6 +130,7 @@ impl From<storage::CallLinkState> for call_links::CallLinkState {
             revoked: value.revoked,
             expiration: value.expiration,
             delete_at: value.delete_at,
+            epoch: value.epoch,
         }
     }
 }
@@ -122,24 +141,26 @@ pub async fn get_participants(
     group_auth: Option<Extension<UserAuthorization>>,
     call_links_auth: Option<Extension<Arc<CallLinkAuthCredentialPresentation>>>,
     room_id: Option<TypedHeader<RoomId>>,
+    epoch: Result<TypedHeader<CallLinkEpoch>, TypedHeaderRejection>,
     OriginalUri(original_uri): OriginalUri,
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("get_participants:");
 
-    let (call, user_id, call_link_state) = match (group_auth, call_links_auth, room_id) {
-        (Some(Extension(user_authorization)), None, None) => (
+    let epoch = extract_optional_header_value(epoch).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let (call, user_id, call_link_state) = match (group_auth, call_links_auth, room_id, epoch) {
+        (Some(Extension(user_authorization)), None, None, None) => (
             frontend
                 .get_call_record(&user_authorization.room_id)
                 .await?,
             user_authorization.user_id,
             None,
         ),
-        (None, Some(Extension(auth_credential)), Some(TypedHeader(room_id))) => {
+        (None, Some(Extension(auth_credential)), Some(TypedHeader(room_id)), epoch) => {
             let room_id = room_id.into();
-
             match frontend
                 .storage
-                .get_call_link_and_record(&room_id, true)
+                .get_call_link_and_record(&room_id, epoch, true)
                 .await
             {
                 Ok((Some(state), call)) => {
@@ -163,7 +184,7 @@ pub async fn get_participants(
                 }
             }
         }
-        (_, None, Some(_)) => return Err(StatusCode::UNAUTHORIZED), // wrong auth type for call link
+        (_, None, Some(_), _) => return Err(StatusCode::UNAUTHORIZED), // wrong auth type for call link
         _ => return Err(StatusCode::BAD_REQUEST),
     };
     if let Some(redirect_uri) = frontend.get_redirect_uri(&call.backend_region, &original_uri) {
@@ -230,12 +251,16 @@ pub async fn join(
     group_auth: Option<Extension<UserAuthorization>>,
     call_links_auth: Option<Extension<Arc<CallLinkAuthCredentialPresentation>>>,
     room_id: Option<TypedHeader<RoomId>>,
+    epoch: Result<TypedHeader<CallLinkEpoch>, TypedHeaderRejection>,
     user_agent: Option<TypedHeader<UserAgent>>,
     OriginalUri(original_uri): OriginalUri,
     Query(region): Query<Region>,
     Json(request): Json<JoinRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("join: ");
+
+    let epoch = extract_optional_header_value(epoch).map_err(|_| StatusCode::BAD_REQUEST)?;
+
     // Do some simple request verification.
     if request.dhe_public_key.is_empty() {
         warn!("join: dhe_public_key is empty");
@@ -254,8 +279,9 @@ pub async fn join(
         group_auth,
         call_links_auth,
         room_id,
+        epoch,
     ) {
-        (Some(Extension(user_authorization)), None, None) => {
+        (Some(Extension(user_authorization)), None, None, None) => {
             let get_or_create_timer =
                 start_timer_us!("calling.frontend.api.v2.join.get_or_create_call_record.timed");
             let call = frontend
@@ -275,12 +301,11 @@ pub async fn join(
                 CallType::GroupV2,
             )
         }
-        (None, Some(Extension(auth_credential)), Some(TypedHeader(room_id))) => {
+        (None, Some(Extension(auth_credential)), Some(TypedHeader(room_id)), epoch) => {
             let room_id = room_id.into();
-
             match frontend
                 .storage
-                .get_call_link_and_record(&room_id, false)
+                .get_call_link_and_record(&room_id, epoch, false)
                 .await
             {
                 Ok((Some(state), call)) => {
@@ -315,7 +340,7 @@ pub async fn join(
                                     time_scope_us!("calling.frontend.api.v2.join_by_room_id.reset_call_link_expiration_in_background.timed");
                                     match frontend_for_task
                                         .storage
-                                        .reset_call_link_expiration(&room_id, now)
+                                        .reset_call_link_expiration(&room_id, epoch, now)
                                         .await
                                     {
                                         Ok(()) => {
@@ -348,7 +373,7 @@ pub async fn join(
                 }
             }
         }
-        (_, None, Some(_)) => return Err(StatusCode::UNAUTHORIZED), // wrong auth type for call link
+        (_, None, Some(_), _) => return Err(StatusCode::UNAUTHORIZED), // wrong auth type for call link
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
@@ -402,7 +427,7 @@ pub mod api_server_v2_tests {
 
     use axum::body::Body;
     use base64::{engine::general_purpose::STANDARD, Engine};
-    use calling_common::{DemuxId, RoomId};
+    use calling_common::{CallLinkEpoch, DemuxId, RoomId};
     use hex::{FromHex, ToHex};
     use hmac::Mac;
     use http::{header, Request};
@@ -417,9 +442,9 @@ pub mod api_server_v2_tests {
             call_links::tests::{
                 call_link_state_with_approved, create_authorization_header_for_creator,
                 create_authorization_header_for_user as create_call_links_authorization_header_for_user,
-                default_call_link_state, ADMIN_PASSKEY, USER_ID_1 as CALL_LINKS_USER_ID_1,
-                USER_ID_1_DOUBLE_ENCODED, USER_ID_2_DOUBLE_ENCODED, USER_ID_3,
-                USER_ID_3_DOUBLE_ENCODED, X_ROOM_ID,
+                default_call_link_state, default_call_link_state_with_epoch, ADMIN_PASSKEY,
+                USER_ID_1 as CALL_LINKS_USER_ID_1, USER_ID_1_DOUBLE_ENCODED,
+                USER_ID_2_DOUBLE_ENCODED, USER_ID_3, USER_ID_3_DOUBLE_ENCODED, X_EPOCH, X_ROOM_ID,
             },
         },
         authenticator::{Authenticator, HmacSha256, GV2_AUTH_MATCH_LIMIT},
@@ -453,6 +478,7 @@ pub mod api_server_v2_tests {
     const BACKEND_DHE_PUBLIC_KEY: &str = "24c41251f82b1f3481cce4bdaab8976a";
 
     const ROOM_ID: &str = "ff0000dd";
+    const EPOCH: u32 = 0x0000c350;
     const CALL_LINK_ROOM_ID: &str = "adhoc:ff0000dd";
 
     static CONFIG: Lazy<config::Config> = Lazy::new(|| {
@@ -1402,9 +1428,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
-            .return_once(|_, _| Ok((Some(default_call_link_state()), None)));
+            .return_once(|_, _, _| Ok((Some(default_call_link_state()), None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -1434,6 +1460,146 @@ pub mod api_server_v2_tests {
         assert!(body.is_empty());
     }
 
+    /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is
+    /// no call, the epoch exists for the call link, and the epoch that was provided by the caller
+    /// matches the one provided in the call link.
+    #[tokio::test]
+    async fn test_call_link_get_with_epoch_and_no_call() {
+        let config = &CONFIG;
+
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(
+                eq(RoomId::from(ROOM_ID)),
+                eq(Some(CallLinkEpoch::from(EPOCH))),
+                eq(true),
+            )
+            .once()
+            .return_once(|_, _, _| Ok((Some(default_call_link_state_with_epoch()), None)));
+        let backend = create_mocked_backend_unused();
+
+        let frontend = create_frontend(config, storage, backend);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/v2/conference/participants".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(X_EPOCH, EPOCH)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    // Invoke the "GET /v2/conference/participants" for a call link in the case where there is no
+    // call, the epoch exists in the call link record, but the epoch that was provided by the
+    // caller does not match the one in the call record.
+    #[tokio::test]
+    async fn test_call_link_get_with_no_call_and_epoch_mismatch() {
+        let config = &CONFIG;
+
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(
+                eq(RoomId::from(ROOM_ID)),
+                eq(Some(CallLinkEpoch::from(0))),
+                eq(true),
+            )
+            .once()
+            .return_once(|_, _, _| Ok((None, None)));
+        let backend = create_mocked_backend_unused();
+
+        let frontend = create_frontend(config, storage, backend);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/v2/conference/participants".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(X_EPOCH, 0)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error_response.reason, "invalid");
+    }
+
+    // Invoke the "GET /v2/conference/participants" for a call link in the case where there is no
+    // call, the epoch exists in the call link record, but the requester provided no epoch.
+    #[tokio::test]
+    async fn test_call_link_get_with_no_call_and_epoch_missing() {
+        let config = &CONFIG;
+
+        // Create mocked dependencies with expectations.
+        let mut storage = Box::new(MockStorage::new());
+        storage
+            .expect_get_call_link_and_record()
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
+            .once()
+            .return_once(|_, _, _| Ok((None, None)));
+        let backend = create_mocked_backend_unused();
+
+        let frontend = create_frontend(config, storage, backend);
+
+        // Create an axum application.
+        let app = app(frontend.clone());
+
+        // Create the request.
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/v2/conference/participants".to_string())
+            .header(X_ROOM_ID, ROOM_ID)
+            .header(header::USER_AGENT, "test/user/agent")
+            .header(
+                header::AUTHORIZATION,
+                create_call_links_authorization_header_for_user(&frontend, CALL_LINKS_USER_ID_1),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        // Submit the request.
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error_response: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error_response.reason, "invalid");
+    }
+
     /// Invoke the "GET /v2/conference/participants" for a call link in the case where there is no call, and the call link is expired.
     #[tokio::test]
     async fn test_call_link_get_with_no_call_expired() {
@@ -1446,9 +1612,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
-            .return_once(|_, _| Ok((Some(call_link_state), None)));
+            .return_once(|_, _, _| Ok((Some(call_link_state), None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -1491,9 +1657,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
-            .return_once(|_, _| Ok((Some(call_link_state), None)));
+            .return_once(|_, _, _| Ok((Some(call_link_state), None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -1533,9 +1699,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
-            .return_once(|_, _| Ok((None, None)));
+            .return_once(|_, _, _| Ok((None, None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -1575,9 +1741,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
-            .return_once(|_, _| Ok((None, Some(create_call_record(ROOM_ID, LOCAL_REGION)))));
+            .return_once(|_, _, _| Ok((None, Some(create_call_record(ROOM_ID, LOCAL_REGION)))));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -1621,9 +1787,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok((
                     Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -1699,9 +1865,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok((
                     Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -1804,9 +1970,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok((
                     Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -1948,9 +2114,9 @@ pub mod api_server_v2_tests {
             let mut storage = Box::new(MockStorage::new());
             storage
                 .expect_get_call_link_and_record()
-                .with(eq(RoomId::from(ROOM_ID)), eq(true))
+                .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
                 .once()
-                .return_once(|_, _| {
+                .return_once(|_, _, _| {
                     Ok((
                         Some(call_link_state),
                         Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -2024,9 +2190,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok((
                     Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -2103,9 +2269,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok((
                     Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -2178,9 +2344,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, ALT_REGION)),
@@ -2239,10 +2405,10 @@ pub mod api_server_v2_tests {
         storage
             .expect_get_call_link_and_record()
             // room_id: &RoomId
-            .with(eq(RoomId::from(ROOM_ID)), eq(true))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(true))
             .once()
             // Result<Option<CallRecord>>
-            .returning(move |_, _| {
+            .returning(move |_, _, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, &config.region)),
@@ -2310,9 +2476,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| Ok((Some(default_call_link_state()), None)))
+            .return_once(|_, _, _| Ok((Some(default_call_link_state()), None)))
             .in_sequence(&mut seq);
 
         storage
@@ -2441,9 +2607,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 let mut state = default_call_link_state();
                 state.restrictions = CallLinkRestrictions::AdminApproval;
                 Ok((Some(state), None))
@@ -2576,9 +2742,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 let mut state = default_call_link_state();
                 state.restrictions = CallLinkRestrictions::AdminApproval;
                 state.approved_users = vec!["11223344".to_string(), "aabbccdd".to_string()];
@@ -2707,8 +2873,8 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
-            .return_once(|_, _| {
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
+            .return_once(|_, _, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -2817,8 +2983,8 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
-            .return_once(|_, _| {
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
+            .return_once(|_, _, _| {
                 let mut state = default_call_link_state();
                 state.restrictions = CallLinkRestrictions::AdminApproval;
                 state.approved_users = vec!["11223344".to_string(), "aabbccdd".to_string()];
@@ -2930,9 +3096,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok((
                     Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -2981,9 +3147,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok((
                     Some(call_link_state),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -3030,9 +3196,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -3141,9 +3307,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, LOCAL_REGION)),
@@ -3255,9 +3421,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| Ok((Some(call_link_state), None)));
+            .return_once(|_, _, _| Ok((Some(call_link_state), None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -3303,9 +3469,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| Ok((Some(call_link_state), None)));
+            .return_once(|_, _, _| Ok((Some(call_link_state), None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -3349,9 +3515,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| Ok((None, None)));
+            .return_once(|_, _, _| Ok((None, None)));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -3395,9 +3561,9 @@ pub mod api_server_v2_tests {
 
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| Ok((None, Some(create_call_record(ROOM_ID, LOCAL_REGION)))));
+            .return_once(|_, _, _| Ok((None, Some(create_call_record(ROOM_ID, LOCAL_REGION)))));
         let backend = create_mocked_backend_unused();
 
         let frontend = create_frontend(config, storage, backend);
@@ -3441,9 +3607,9 @@ pub mod api_server_v2_tests {
         let mut storage = Box::new(MockStorage::new());
         storage
             .expect_get_call_link_and_record()
-            .with(eq(RoomId::from(ROOM_ID)), eq(false))
+            .with(eq(RoomId::from(ROOM_ID)), eq(None), eq(false))
             .once()
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok((
                     Some(default_call_link_state()),
                     Some(create_call_record(ROOM_ID, ALT_REGION)),

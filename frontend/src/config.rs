@@ -101,6 +101,10 @@ pub struct Config {
     /// present, metrics will be disabled.
     #[arg(long)]
     pub metrics_datadog_host: Option<String>,
+
+    /// Enables support for call link epochs.
+    #[arg(long, default_value = "false")]
+    pub enable_call_link_epochs: bool,
 }
 
 #[cfg(test)]
@@ -128,5 +132,6 @@ pub fn default_test_config() -> Config {
         storage_region: "us-west-1".to_string(),
         storage_endpoint: Some("http://localhost:8000".to_string()),
         metrics_datadog_host: None,
+        enable_call_link_epochs: true,
     }
 }

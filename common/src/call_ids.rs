@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::fmt;
+use std::{fmt, num::ParseIntError};
 
 use serde::{Deserialize, Serialize};
 use strum_macros::{EnumIter, EnumString};
@@ -101,5 +101,46 @@ impl fmt::Display for RoomId {
 impl fmt::Debug for RoomId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:.4}", self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct CallLinkEpoch(u32);
+
+impl CallLinkEpoch {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+impl Default for CallLinkEpoch {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl From<u32> for CallLinkEpoch {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+impl TryFrom<&str> for CallLinkEpoch {
+    type Error = ParseIntError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Ok(Self(value.parse::<u32>()?))
+    }
+}
+
+impl AsRef<u32> for CallLinkEpoch {
+    fn as_ref(&self) -> &u32 {
+        &self.0
+    }
+}
+
+impl From<CallLinkEpoch> for u32 {
+    fn from(value: CallLinkEpoch) -> Self {
+        value.0
     }
 }

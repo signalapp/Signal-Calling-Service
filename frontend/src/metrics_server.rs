@@ -240,7 +240,7 @@ fn get_process_metrics(fd_limit: usize) -> Vec<(&'static str, f32)> {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     match current_process.open_files() {
         Ok(open_files) => {
             let fd_count = open_files.len();

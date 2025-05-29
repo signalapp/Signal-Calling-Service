@@ -12,7 +12,12 @@ use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use calling_common::Duration;
 use calling_frontend::{
-    api,
+    api::{
+        self,
+        call_links::{
+            CallLinkEpochGenerator, DefaultCallLinkEpochGenerator, NullCallLinkEpochGenerator,
+        },
+    },
     authenticator::Authenticator,
     backend::BackendHttpClient,
     cleaner, config,
@@ -57,6 +62,7 @@ fn print_config(config: &'static config::Config) {
               Some(host) => host,
               None => "Disabled",
           });
+    info!("  {:38}{}", "enable_call_link_epochs:", config.enable_call_link_epochs);
 }
 
 /// Waits for a SIGINT or SIGTERM signal and returns. Can be cancelled
@@ -158,7 +164,15 @@ fn main() -> Result<()> {
 
         identity_fetcher
     };
-    let storage = threaded_rt.block_on(DynamoDb::new(config))?;
+
+    let call_link_epoch_generator: Box<dyn CallLinkEpochGenerator> =
+        if config.enable_call_link_epochs {
+            Box::new(DefaultCallLinkEpochGenerator)
+        } else {
+            Box::new(NullCallLinkEpochGenerator)
+        };
+    let storage = threaded_rt.block_on(DynamoDb::new(config, call_link_epoch_generator))?;
+
     let backend = threaded_rt.block_on(BackendHttpClient::from_config(config))?;
 
     threaded_rt.block_on(async {
