@@ -20,7 +20,7 @@ use calling_common::{DataRate, Duration, Instant};
 use clap::Parser;
 use env_logger::Env;
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use rlimit::increase_nofile_limit;
 use rustls::{server::NoServerSessionStorage, version::TLS13, ServerConfig};
 use tokio::{
@@ -181,7 +181,7 @@ fn main() -> Result<()> {
         metrics::monitor_deadlocks(MONITOR_DEADLOCK_INTERVAL.into(), deadlock_monitor_ender_rx);
 
     // Create the shared SFU context.
-    let sfu: Arc<Mutex<Sfu>> = Arc::new(Mutex::new(Sfu::new(Instant::now(), config)?));
+    let sfu: Arc<RwLock<Sfu>> = Arc::new(RwLock::new(Sfu::new(Instant::now(), config)?));
 
     // Create a threaded tokio runtime. By default, starts a worker thread
     // for each core on the system.

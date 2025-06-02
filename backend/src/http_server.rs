@@ -22,7 +22,7 @@ use axum_extra::{
 use calling_common::{CallType, DemuxId, SignalUserAgent};
 use hex::{FromHex, ToHex};
 use log::*;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot::Receiver;
@@ -161,11 +161,11 @@ fn parse_and_authenticate(
 }
 
 async fn get_metrics(
-    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
+    Extension(sfu): Extension<Arc<RwLock<Sfu>>>,
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("get_metrics():");
 
-    let calls = sfu.lock().get_calls_snapshot(); // SFU lock released here.
+    let calls = sfu.read().get_calls_snapshot(); // SFU lock released here.
 
     let calls = calls
         .iter()
@@ -225,7 +225,7 @@ async fn get_metrics(
 
 async fn get_participants(
     Extension(config): Extension<&'static config::Config>,
-    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
+    Extension(sfu): Extension<Arc<RwLock<Sfu>>>,
     TypedHeader(authorization_header): TypedHeader<headers::Authorization<Basic>>,
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("get_participants():");
@@ -238,7 +238,7 @@ async fn get_participants(
         }
     };
 
-    let sfu = sfu.lock();
+    let sfu = sfu.read();
 
     if let Some(signaling) = sfu.get_call_signaling_info(call_id, Some(&user_id)) {
         let max_devices = sfu.config.max_clients_per_call;
@@ -281,7 +281,7 @@ async fn get_participants(
 
 async fn join_conference(
     Extension(config): Extension<&'static config::Config>,
-    Extension(sfu): Extension<Arc<Mutex<Sfu>>>,
+    Extension(sfu): Extension<Arc<RwLock<Sfu>>>,
     TypedHeader(authorization_header): TypedHeader<headers::Authorization<Basic>>,
     Json(join_request): Json<JoinRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -333,7 +333,7 @@ async fn join_conference(
     let server_ice_ufrag = ice::random_ufrag();
     let server_ice_pwd = ice::random_pwd();
 
-    let mut sfu = sfu.lock();
+    let mut sfu = sfu.write();
     // Make the first user to join an admin.
     let is_admin = sfu.get_call_signaling_info(call_id.clone(), None).is_none();
     let call_type = if config.new_clients_require_approval {
@@ -398,7 +398,7 @@ async fn join_conference(
     }
 }
 
-fn app(sfu: Arc<Mutex<Sfu>>, config: &'static config::Config) -> Router {
+fn app(sfu: Arc<RwLock<Sfu>>, config: &'static config::Config) -> Router {
     let metrics_route = Router::new()
         .route("/metrics", get(get_metrics))
         .layer(Extension(sfu.clone()));
@@ -419,7 +419,7 @@ fn app(sfu: Arc<Mutex<Sfu>>, config: &'static config::Config) -> Router {
 
 pub async fn start(
     config: &'static config::Config,
-    sfu: Arc<Mutex<Sfu>>,
+    sfu: Arc<RwLock<Sfu>>,
     http_ender_rx: Receiver<()>,
 ) -> Result<()> {
     let addr = SocketAddr::new(config.binding_ip, config.signaling_port);

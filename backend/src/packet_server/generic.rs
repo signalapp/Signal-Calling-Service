@@ -15,7 +15,7 @@ use anyhow::Result;
 use calling_common::{Duration, Instant};
 use log::*;
 use metrics::{metric_config::TimingOptions, *};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rustls::ServerConfig;
 
 use crate::{
@@ -58,7 +58,7 @@ impl PacketServerState {
     /// (possibly empty) set of outgoing packets.
     ///
     /// This should only be called once.
-    pub fn start_threads(self: Arc<Self>, sfu: &Arc<Mutex<Sfu>>) -> impl Future {
+    pub fn start_threads(self: Arc<Self>, sfu: &Arc<RwLock<Sfu>>) -> impl Future {
         let all_handles = (0..self.num_threads).map(|_| {
             let self_for_thread = self.clone();
             let sfu_for_thread = sfu.clone();
@@ -74,7 +74,7 @@ impl PacketServerState {
     /// Runs a single listener on the current thread.
     ///
     /// See [`PacketServerState::start_threads`].
-    fn run(self: Arc<Self>, sfu: &Arc<Mutex<Sfu>>) {
+    fn run(self: Arc<Self>, sfu: &Arc<RwLock<Sfu>>) {
         let mut buf = [0u8; 1500];
 
         loop {

@@ -23,7 +23,7 @@ use metrics::{
     *,
 };
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rand::rngs::OsRng;
 use sha2::Sha256;
 use strum::IntoEnumIterator;
@@ -137,7 +137,7 @@ impl std::fmt::Debug for ConnectionId {
 }
 
 type ConnectionTags = (CallType, CallSizeBucket, RegionRelation, SignalUserAgent);
-pub type CallEndHandler = dyn Fn(&CallId, &Call) -> Result<()> + Send + 'static;
+pub type CallEndHandler = dyn Fn(&CallId, &Call) -> Result<()> + Send + Sync + 'static;
 pub struct Sfu {
     /// Configuration structure originally from the command line or environment.
     pub config: &'static config::Config,
@@ -667,6 +667,7 @@ impl Sfu {
     }
 
     /// Remove a client from a call.
+    #[cfg(test)]
     pub fn remove_client_from_call(&mut self, now: Instant, call_id: CallId, demux_id: DemuxId) {
         let loggable_call_id = LoggableCallId::from(&call_id);
         let connection_id = ConnectionId::from_call_id_and_demux_id(call_id, demux_id);
@@ -756,7 +757,7 @@ impl Sfu {
     }
 
     pub fn handle_packet(
-        sfu: &Mutex<Self>,
+        sfu: &RwLock<Self>,
         sender_addr: SocketLocator,
         incoming_packet: &mut [u8],
     ) -> Result<HandleOutput, SfuError> {
@@ -769,7 +770,7 @@ impl Sfu {
 
             let (incoming_connection_id, incoming_rtp) = {
                 let (incoming_connection_id, incoming_connection) =
-                    sfu.lock().get_connection_from_address(&sender_addr)?;
+                    sfu.read().get_connection_from_address(&sender_addr)?;
                 let mut incoming_connection = incoming_connection.lock();
                 time_scope_us!("calling.sfu.handle_packet.rtp.in_incoming_connection_lock");
                 if let Some(incoming_rtp) = incoming_connection
@@ -790,7 +791,7 @@ impl Sfu {
 
             let outgoing_rtp = {
                 let call = sfu
-                    .lock()
+                    .read()
                     .get_call_from_id(&incoming_connection_id.call_id)?;
                 let mut call = call.lock();
                 time_scope_us!("calling.sfu.handle_packet.rtp.in_call_lock");
@@ -802,7 +803,7 @@ impl Sfu {
                     Ok(outgoing_rtp) => outgoing_rtp,
                     Err(call::Error::Leave) => {
                         drop(call);
-                        sfu.lock().remove_connection(
+                        sfu.write().remove_connection(
                             incoming_connection_id.call_id,
                             incoming_connection_id.demux_id,
                         );
@@ -819,7 +820,7 @@ impl Sfu {
             for (demux_id, outgoing_rtp) in outgoing_rtp {
                 outgoing_connection_id.demux_id = demux_id;
                 if let Some(outgoing_connection) =
-                    sfu.lock().get_connection_from_id(&outgoing_connection_id)
+                    sfu.read().get_connection_from_id(&outgoing_connection_id)
                 {
                     let mut outgoing_connection = outgoing_connection.lock();
                     time_scope_us!("calling.sfu.handle_packet.rtp.in_outgoing_connection_lock");
@@ -853,7 +854,7 @@ impl Sfu {
                 },
             ) = {
                 let (incoming_connection_id, incoming_connection) =
-                    sfu.lock().get_connection_from_address(&sender_addr)?;
+                    sfu.read().get_connection_from_address(&sender_addr)?;
                 let mut incoming_connection = incoming_connection.lock();
 
                 time_scope_us!("calling.sfu.handle_packet.rtcp.in_incomin_connection_lock");
@@ -866,7 +867,7 @@ impl Sfu {
 
             let outgoing_key_frame_requests = {
                 let call = sfu
-                    .lock()
+                    .read()
                     .get_call_from_id(&incoming_connection_id.call_id)?;
                 let mut call = call.lock();
                 time_scope_us!("calling.sfu.handle_packet.rtcp.in_call_lock");
@@ -893,7 +894,7 @@ impl Sfu {
             for (demux_id, key_frame_request) in outgoing_key_frame_requests {
                 outgoing_connection_id.demux_id = demux_id;
                 if let Some(outgoing_connection) =
-                    sfu.lock().get_connection_from_id(&outgoing_connection_id)
+                    sfu.read().get_connection_from_id(&outgoing_connection_id)
                 {
                     let mut outgoing_connection = outgoing_connection.lock();
 
@@ -926,7 +927,7 @@ impl Sfu {
 
             let (incoming_connection_id, packets_to_send, dequeues_to_schedule) = {
                 let (incoming_connection_id, incoming_connection) = sfu
-                    .lock()
+                    .read()
                     .get_connection_from_ice_request_username(username)?;
                 let mut incoming_connection = incoming_connection.lock();
                 time_scope_us!("calling.sfu.handle_packet.ice.in_locks");
@@ -954,7 +955,7 @@ impl Sfu {
             };
 
             // Removal of old addresses is done in tick().
-            sfu.lock()
+            sfu.write()
                 .connection_id_by_address
                 .insert_without_removing_old(sender_addr, incoming_connection_id);
 
@@ -975,7 +976,7 @@ impl Sfu {
                 IceTransactionTable::claim(sender_addr, &ice_binding_response.transaction_id())
                     .ok_or(SfuError::IceBindingInvalidTransactionId)?;
             let incoming_connection = sfu
-                .lock()
+                .read()
                 .get_connection_from_id(&incoming_connection_id)
                 .ok_or(SfuError::MissingConnection(
                     incoming_connection_id.call_id.clone(),
@@ -1007,7 +1008,7 @@ impl Sfu {
     }
 
     pub fn handle_dequeue(
-        sfu: &Mutex<Self>,
+        sfu: &RwLock<Self>,
         addr: SocketLocator,
         now: Instant,
         packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
@@ -1017,7 +1018,7 @@ impl Sfu {
 
         time_scope_us!("calling.sfu.handle_dequeue");
 
-        if let Ok((_connection_id, connection)) = sfu.lock().get_connection_from_address(&addr) {
+        if let Ok((_connection_id, connection)) = sfu.read().get_connection_from_address(&addr) {
             let mut connection = connection.lock();
             time_scope_us!("calling.sfu.handle_dequeue.connection_lock");
 
@@ -1031,22 +1032,31 @@ impl Sfu {
     /// For every tick, we need to iterate all calls, with the goal of iterating
     /// only once. Since we need to sometimes remove clients or calls, we will
     /// generally iterate with retain().
-    pub fn tick(&mut self, now: Instant) -> TickOutput {
+    pub fn tick(sfu: &RwLock<Self>, now: Instant) -> TickOutput {
         time_scope_us!("calling.sfu.tick");
-        let config = self.config;
+        let (config, diagnostics_logged, activity_checked) = {
+            let sfu = sfu.read();
+            (
+                sfu.config.clone(),
+                sfu.diagnostics_logged,
+                sfu.activity_checked,
+            )
+        };
+
         let mut packets_to_send = vec![];
         let mut dequeues_to_schedule = vec![];
 
         // Post diagnostics to the log if needed.
         if let Some(diagnostics_interval_secs) = config.diagnostics_interval_secs {
-            if now >= self.diagnostics_logged + Duration::from_secs(diagnostics_interval_secs) {
+            if now >= diagnostics_logged + Duration::from_secs(diagnostics_interval_secs) {
                 time_scope_us!("calling.sfu.tick.diagnostics");
-                self.diagnostics_logged = now;
+                sfu.write().diagnostics_logged = now;
+                let sfu = sfu.read();
 
                 // Keep a string buffer we can reuse for posting diagnostic logs.
                 let mut diagnostic_string: String = String::with_capacity(3072);
 
-                for (call_id, call) in &self.call_by_call_id {
+                for (call_id, call) in &sfu.call_by_call_id {
                     let call = call.lock();
                     let stats = call.get_stats();
                     if !stats.clients.is_empty() {
@@ -1056,7 +1066,7 @@ impl Sfu {
                         for client in stats.clients {
                             connection_id.demux_id = client.demux_id;
                             let (rtt, stun_rtt) = if let Some(connection) =
-                                self.get_connection_from_id(&connection_id)
+                                sfu.get_connection_from_id(&connection_id)
                             {
                                 let mut connection = connection.lock();
                                 (
@@ -1105,17 +1115,14 @@ impl Sfu {
 
         // Set a flag if we need to check for inactivity while we iterate.
         let check_for_inactivity = if now
-            >= self.activity_checked + Duration::from_secs(config.inactivity_check_interval_secs)
+            >= activity_checked + Duration::from_secs(config.inactivity_check_interval_secs)
         {
             trace!("tick: checking for inactivity");
-            self.activity_checked = now;
+            sfu.write().activity_checked = now;
             true
         } else {
             false
         };
-
-        // Borrow this explicitly so that we can modify it at the same time as self.call_by_call_id.
-        let connection_id_by_ice_request_username = &mut self.connection_id_by_ice_request_username;
 
         let remove_inactive_calls_timer = start_timer_us!("calling.sfu.tick.remove_inactive_calls");
 
@@ -1125,176 +1132,238 @@ impl Sfu {
         let mut connection_rates_by_call_id: HashMap<CallId, Vec<(DemuxId, ConnectionRates)>> =
             HashMap::new();
 
-        self.connection_by_id.retain(|connection_id, connection| {
-            let mut connection = connection.lock();
-            if check_for_inactivity && connection.inactive(now) {
-                info!("dropping connection: {}", connection_id);
+        {
+            let mut sfu = sfu.upgradable_read();
+            let mut inactive_connections = Vec::new();
 
-                connection_id_by_ice_request_username
-                    .remove_entry(connection.ice_request_username());
-
-                // Addresses in sfu.client_by_address will get aged out
-                // by self.client_by_address.remove_old() below.
-                // and don't need to be removed here.
-
-                expired_demux_ids_by_call_id
-                    .entry(connection_id.call_id.clone())
-                    .or_default()
-                    .push(connection_id.demux_id);
-
-                if connection.outgoing_addr().is_none() {
-                    event!("calling.sfu.close_connection.no_nominee");
+            for (connection_id, connection) in &sfu.connection_by_id {
+                let mut connection = connection.lock();
+                if check_for_inactivity && connection.inactive(now) {
+                    inactive_connections.push(connection_id.clone());
                 } else {
-                    event!("calling.sfu.close_connection.inactive");
+                    // Don't remove the connection; it's still active!
+                    connection.tick(&mut packets_to_send, now);
+                    outgoing_queue_sizes_by_call_id
+                        .entry(connection_id.call_id.clone())
+                        .or_default()
+                        .push((connection_id.demux_id, connection.outgoing_queue_size()));
+                    connection_rates_by_call_id
+                        .entry(connection_id.call_id.clone())
+                        .or_default()
+                        .push((connection_id.demux_id, connection.current_rates(now)));
                 }
-
-                false
-            } else {
-                // Don't remove the connection; it's still active!
-                connection.tick(&mut packets_to_send, now);
-                outgoing_queue_sizes_by_call_id
-                    .entry(connection_id.call_id.clone())
-                    .or_default()
-                    .push((connection_id.demux_id, connection.outgoing_queue_size()));
-                connection_rates_by_call_id
-                    .entry(connection_id.call_id.clone())
-                    .or_default()
-                    .push((connection_id.demux_id, connection.current_rates(now)));
-                true
             }
-        });
+
+            if !inactive_connections.is_empty() {
+                sfu.with_upgraded(|sfu| {
+                    for connection_id in inactive_connections {
+                        if let Some(connection) = sfu.connection_by_id.get(&connection_id) {
+                            let connection = connection.lock();
+                            if connection.inactive(now) {
+                                info!("dropping connection: {}", connection_id);
+
+                                sfu.connection_id_by_ice_request_username
+                                    .remove_entry(connection.ice_request_username());
+
+                                // Addresses in sfu.client_by_address will get aged out
+                                // by self.client_by_address.remove_old() below.
+                                // and don't need to be removed here.
+
+                                expired_demux_ids_by_call_id
+                                    .entry(connection_id.call_id.clone())
+                                    .or_default()
+                                    .push(connection_id.demux_id);
+
+                                if connection.outgoing_addr().is_none() {
+                                    event!("calling.sfu.close_connection.no_nominee");
+                                } else {
+                                    event!("calling.sfu.close_connection.inactive");
+                                }
+                                drop(connection);
+                                sfu.connection_by_id.remove(&connection_id);
+                            } else {
+                                event!("calling.sfu.close_connection.race");
+                            }
+                        }
+                    }
+                });
+            }
+        }
 
         let mut call_tick_results = vec![];
         let inactivity_timeout = Duration::from_secs(config.inactivity_timeout_secs);
         // Iterate all calls, maybe dropping some that are inactive.
-        let outgoing_queue_drain_duration =
-            Duration::from_millis(self.config.outgoing_queue_drain_ms);
-        self.call_by_call_id.retain(|call_id, call| {
-            let mut call = call.lock();
+        let outgoing_queue_drain_duration = Duration::from_millis(config.outgoing_queue_drain_ms);
 
-            if let Some(expired_demux_ids) = expired_demux_ids_by_call_id.get(call_id) {
-                for expired_demux_id in expired_demux_ids {
-                    call.drop_client(*expired_demux_id, now);
+        {
+            let mut sfu = sfu.upgradable_read();
+            let mut inactive_calls = Vec::new();
+
+            for (call_id, call) in &sfu.call_by_call_id {
+                let mut call = call.lock();
+
+                if let Some(expired_demux_ids) = expired_demux_ids_by_call_id.get(call_id) {
+                    for expired_demux_id in expired_demux_ids {
+                        call.drop_client(*expired_demux_id, now);
+                    }
+                }
+
+                match call.activity(&now, &inactivity_timeout) {
+                    CallActivity::Inactive => {
+                        inactive_calls.push(call_id.clone());
+                    }
+                    CallActivity::Waiting => {
+                        // Keep the call around for a while longer.
+                    }
+                    CallActivity::Active => {
+                        if let Some(outgoing_queue_sizes) =
+                            outgoing_queue_sizes_by_call_id.get(call_id)
+                        {
+                            for (demux_id, outgoing_queue_size) in outgoing_queue_sizes {
+                                // Note: this works even if the duration is zero.
+                                // Normally, we shouldn't ever be configured with 0 drain duration
+                                // But perhaps allowing it to mean "as fast as possible"?
+                                // would be an interesting thing to be able to do.
+                                let outgoing_queue_drain_rate =
+                                    *outgoing_queue_size / outgoing_queue_drain_duration;
+                                // Ignore the error because it can only mean the client is gone, in which case it doesn't matter.
+                                let _ = call.set_outgoing_queue_drain_rate(
+                                    *demux_id,
+                                    outgoing_queue_drain_rate,
+                                );
+                            }
+                        }
+
+                        if let Some(connection_rates) = connection_rates_by_call_id.get(call_id) {
+                            for (demux_id, rates) in connection_rates {
+                                let _ = call.set_connection_rates(*demux_id, *rates);
+                            }
+                        }
+                        // Don't remove the call; there are still clients!
+                        let (outgoing_rtp, outgoing_key_frame_requests) = call.tick(now);
+                        let send_rate_allocation_infos =
+                            call.get_send_rate_allocation_info().collect::<Vec<_>>();
+
+                        call_tick_results.push((
+                            call_id.clone(),
+                            outgoing_rtp,
+                            outgoing_key_frame_requests,
+                            send_rate_allocation_infos,
+                        ));
+                    }
                 }
             }
 
-            match call.activity(&now, &inactivity_timeout) {
-                CallActivity::Inactive => {
-                    // If the call hasn't had any activity recently, remove it.
-                    let call_tags = Call::call_tags_from(call.call_type(), call.peak_call_size());
-                    let call_duration = call.call_duration();
-                    let active_time = (call_duration.pair + call_duration.many).as_secs() as usize;
-                    let inactive_time =
-                        (call_duration.empty + call_duration.solo).as_secs() as usize;
-                    info!(
-                        "call_id: {} removed; seconds empty: {}, solo: {}, pair: {}, many: {}",
-                        call.loggable_call_id(),
-                        call_duration.empty.as_secs(),
-                        call_duration.solo.as_secs(),
-                        call_duration.pair.as_secs(),
-                        call_duration.many.as_secs()
-                    );
+            if !inactive_calls.is_empty() {
+                sfu.with_upgraded(|sfu| {
+                    for call_id in inactive_calls {
+                        if let Some(call) = sfu.call_by_call_id.get(&call_id) {
+                            let mut call = call.lock();
+                            match call.activity(&now, &inactivity_timeout) {
+                                CallActivity::Inactive => {
+                                    // If the call hasn't had any activity recently, remove it.
+                                    let call_tags = Call::call_tags_from(
+                                        call.call_type(),
+                                        call.peak_call_size(),
+                                    );
+                                    let call_duration = call.call_duration();
+                                    let active_time = (call_duration.pair + call_duration.many)
+                                        .as_secs()
+                                        as usize;
+                                    let inactive_time = (call_duration.empty + call_duration.solo)
+                                        .as_secs()
+                                        as usize;
+                                    info!("call_id: {} removed; seconds empty: {}, solo: {}, pair: {}, many: {}",
+                                        call.loggable_call_id(),
+                                        call_duration.empty.as_secs(),
+                                        call_duration.solo.as_secs(),
+                                        call_duration.pair.as_secs(),
+                                        call_duration.many.as_secs()
+                                    );
 
-                    event!("calling.sfu.call_complete.count", 1, call_tags);
-                    value_histogram!("calling.sfu.call_length.active", active_time, call_tags);
-                    value_histogram!("calling.sfu.call_length.inactive", inactive_time, call_tags);
+                                    event!("calling.sfu.call_complete.count", 1, call_tags);
+                                    value_histogram!(
+                                        "calling.sfu.call_length.active",
+                                        active_time,
+                                        call_tags
+                                    );
+                                    value_histogram!(
+                                        "calling.sfu.call_length.inactive",
+                                        inactive_time,
+                                        call_tags
+                                    );
 
-                    // deprecate some of following events
-                    if !call_duration.many.is_zero() {
-                        event!("calling.sfu.call_complete.many");
-                    } else if !call_duration.pair.is_zero() {
-                        event!("calling.sfu.call_complete.pair");
-                    } else if !call_duration.solo.is_zero() {
-                        event!("calling.sfu.call_complete.solo");
-                    } else {
-                        event!("calling.sfu.call_complete.empty");
-                    }
+                                    // deprecate some of following events
+                                    if !call_duration.many.is_zero() {
+                                        event!("calling.sfu.call_complete.many");
+                                    } else if !call_duration.pair.is_zero() {
+                                        event!("calling.sfu.call_complete.pair");
+                                    } else if !call_duration.solo.is_zero() {
+                                        event!("calling.sfu.call_complete.solo");
+                                    } else {
+                                        event!("calling.sfu.call_complete.empty");
+                                    }
 
-                    if active_time == 0 {
-                    } else if active_time < 60 {
-                        event!("calling.sfu.call_complete.active.1min");
-                    } else if active_time < 10 * 60 {
-                        event!("calling.sfu.call_complete.active.10mins");
-                    } else if active_time < 30 * 60 {
-                        event!("calling.sfu.call_complete.active.30mins");
-                    } else if active_time < 60 * 60 {
-                        event!("calling.sfu.call_complete.active.1hr");
-                    } else {
-                        event!("calling.sfu.call_complete.active.more");
-                    }
+                                    if active_time == 0 {
+                                    } else if active_time < 60 {
+                                        event!("calling.sfu.call_complete.active.1min");
+                                    } else if active_time < 10 * 60 {
+                                        event!("calling.sfu.call_complete.active.10mins");
+                                    } else if active_time < 30 * 60 {
+                                        event!("calling.sfu.call_complete.active.30mins");
+                                    } else if active_time < 60 * 60 {
+                                        event!("calling.sfu.call_complete.active.1hr");
+                                    } else {
+                                        event!("calling.sfu.call_complete.active.more");
+                                    }
 
-                    if inactive_time == 0 {
-                    } else if inactive_time < 60 {
-                        event!("calling.sfu.call_complete.inactive.1min");
-                    } else if inactive_time < 10 * 60 {
-                        event!("calling.sfu.call_complete.inactive.10mins");
-                    } else {
-                        event!("calling.sfu.call_complete.inactive.more");
-                    }
+                                    if inactive_time == 0 {
+                                    } else if inactive_time < 60 {
+                                        event!("calling.sfu.call_complete.inactive.1min");
+                                    } else if inactive_time < 10 * 60 {
+                                        event!("calling.sfu.call_complete.inactive.10mins");
+                                    } else {
+                                        event!("calling.sfu.call_complete.inactive.more");
+                                    }
 
-                    if active_time > 60 {
-                        if let Ok(seconds) = call_duration.pair.as_secs().try_into() {
-                            event!("calling.sfu.call_seconds_over_1m.pair", seconds);
+                                    if active_time > 60 {
+                                        if let Ok(seconds) = call_duration.pair.as_secs().try_into()
+                                        {
+                                            event!(
+                                                "calling.sfu.call_seconds_over_1m.pair",
+                                                seconds
+                                            );
+                                        }
+                                        if let Ok(seconds) = call_duration.many.as_secs().try_into()
+                                        {
+                                            event!(
+                                                "calling.sfu.call_seconds_over_1m.many",
+                                                seconds
+                                            );
+                                        }
+                                    }
+
+                                    if let Ok(seconds) = call_duration.pair.as_secs().try_into() {
+                                        event!("calling.sfu.all_call_seconds.pair", seconds);
+                                    }
+                                    if let Ok(seconds) = call_duration.many.as_secs().try_into() {
+                                        event!("calling.sfu.all_call_seconds.many", seconds);
+                                    }
+
+                                    if let Some(call_ended_handler) = sfu.call_end_handler.as_ref()
+                                    {
+                                        let _ = call_ended_handler(&call_id, &call);
+                                    }
+                                    drop(call);
+                                    sfu.call_by_call_id.remove(&call_id);
+                                }
+                                _ => event!("calling.sfu.call_complete.race"),
+                            }
                         }
-                        if let Ok(seconds) = call_duration.many.as_secs().try_into() {
-                            event!("calling.sfu.call_seconds_over_1m.many", seconds);
-                        }
                     }
-
-                    if let Ok(seconds) = call_duration.pair.as_secs().try_into() {
-                        event!("calling.sfu.all_call_seconds.pair", seconds);
-                    }
-                    if let Ok(seconds) = call_duration.many.as_secs().try_into() {
-                        event!("calling.sfu.all_call_seconds.many", seconds);
-                    }
-
-                    if let Some(call_ended_handler) = self.call_end_handler.as_ref() {
-                        let _ = call_ended_handler(call_id, &call);
-                    }
-                    false
-                }
-                CallActivity::Waiting => {
-                    // Keep the call around for a while longer.
-                    true
-                }
-                CallActivity::Active => {
-                    if let Some(outgoing_queue_sizes) = outgoing_queue_sizes_by_call_id.get(call_id)
-                    {
-                        for (demux_id, outgoing_queue_size) in outgoing_queue_sizes {
-                            // Note: this works even if the duration is zero.
-                            // Normally, we shouldn't ever be configured with 0 drain duration
-                            // But perhaps allowing it to mean "as fast as possible"?
-                            // would be an interesting thing to be able to do.
-                            let outgoing_queue_drain_rate =
-                                *outgoing_queue_size / outgoing_queue_drain_duration;
-                            // Ignore the error because it can only mean the client is gone, in which case it doesn't matter.
-                            let _ = call.set_outgoing_queue_drain_rate(
-                                *demux_id,
-                                outgoing_queue_drain_rate,
-                            );
-                        }
-                    }
-
-                    if let Some(connection_rates) = connection_rates_by_call_id.get(call_id) {
-                        for (demux_id, rates) in connection_rates {
-                            let _ = call.set_connection_rates(*demux_id, *rates);
-                        }
-                    }
-                    // Don't remove the call; there are still clients!
-                    let (outgoing_rtp, outgoing_key_frame_requests) = call.tick(now);
-                    let send_rate_allocation_infos =
-                        call.get_send_rate_allocation_info().collect::<Vec<_>>();
-
-                    call_tick_results.push((
-                        call_id.clone(),
-                        outgoing_rtp,
-                        outgoing_key_frame_requests,
-                        send_rate_allocation_infos,
-                    ));
-                    true
-                }
+                });
             }
-        });
+        }
         remove_inactive_calls_timer.stop();
 
         for (call_id, outgoing_rtp, outgoing_key_frame_requests, send_rate_allocation_infos) in
@@ -1310,7 +1379,7 @@ impl Sfu {
             // based on info after the Call.tick().
             for send_rate_allocation_info in send_rate_allocation_infos {
                 outgoing_connection_id.demux_id = send_rate_allocation_info.demux_id;
-                if let Some(connection) = self.connection_by_id.get_mut(&outgoing_connection_id) {
+                if let Some(connection) = sfu.read().connection_by_id.get(&outgoing_connection_id) {
                     let mut connection = connection.lock();
                     connection.configure_congestion_control(
                         &mut dequeues_to_schedule,
@@ -1335,7 +1404,7 @@ impl Sfu {
             for (demux_id, key_frame_request) in outgoing_key_frame_requests {
                 outgoing_connection_id.demux_id = demux_id;
                 if let Some(outgoing_connection) =
-                    self.connection_by_id.get_mut(&outgoing_connection_id)
+                    sfu.read().connection_by_id.get(&outgoing_connection_id)
                 {
                     let mut outgoing_connection = outgoing_connection.lock();
                     if let Some(key_frame_request) =
@@ -1350,7 +1419,7 @@ impl Sfu {
             for (demux_id, outgoing_rtp) in outgoing_rtp {
                 outgoing_connection_id.demux_id = demux_id;
                 if let Some(outgoing_connection) =
-                    self.connection_by_id.get_mut(&outgoing_connection_id)
+                    sfu.read().connection_by_id.get(&outgoing_connection_id)
                 {
                     let mut outgoing_connection = outgoing_connection.lock();
                     outgoing_connection.send_or_enqueue_rtp(
@@ -1365,7 +1434,7 @@ impl Sfu {
 
         let expired_client_addrs = {
             time_scope_us!("calling.sfu.tick.remove_inactive_client_addresses");
-            self.connection_id_by_address.remove_old(now)
+            sfu.write().connection_id_by_address.remove_old(now)
         };
 
         TickOutput {
@@ -1399,7 +1468,6 @@ mod sfu_tests {
 
     use hex::FromHex;
     use once_cell::sync::Lazy;
-    use parking_lot::Mutex;
     use rand::{thread_rng, Rng};
 
     use super::*;
@@ -1424,8 +1492,8 @@ mod sfu_tests {
 
     static DEFAULT_CONFIG: Lazy<config::Config> = Lazy::new(config::default_test_config);
 
-    fn new_sfu(now: Instant, config: &'static config::Config) -> Arc<Mutex<Sfu>> {
-        Arc::new(Mutex::new(
+    fn new_sfu(now: Instant, config: &'static config::Config) -> Arc<RwLock<Sfu>> {
+        Arc::new(RwLock::new(
             Sfu::new(now, config).expect("Sfu::new should be working"),
         ))
     }
@@ -1471,7 +1539,7 @@ mod sfu_tests {
         let sfu = new_sfu(initial_now, &DEFAULT_CONFIG);
 
         // Make sure elements exist correctly.
-        let sfu = sfu.lock();
+        let sfu = sfu.read();
         assert_eq!(Ipv4Addr::LOCALHOST, sfu.config.binding_ip);
         assert_eq!(8080, sfu.config.signaling_port);
         assert_eq!(8, sfu.config.max_clients_per_call);
@@ -1504,7 +1572,7 @@ mod sfu_tests {
         let demux_id = 123392u32.try_into().unwrap();
 
         // We add a client but won't do anything with it in this test.
-        let mut sfu = sfu.lock();
+        let mut sfu = sfu.write();
         let _ = add_test_client(
             &mut sfu,
             &call_id,
@@ -1532,7 +1600,7 @@ mod sfu_tests {
         let call_ids = random_call_ids(count);
 
         // We aren't measuring lock time in this test.
-        let mut sfu = sfu.lock();
+        let mut sfu = sfu.write();
 
         let start = Instant::now();
         for (index, call_id) in call_ids.iter().enumerate() {
@@ -1572,7 +1640,7 @@ mod sfu_tests {
         let call_id = random_call_id();
         let demux_id = 123392.try_into().unwrap();
 
-        let mut sfu = sfu.lock();
+        let mut sfu = sfu.write();
         match add_test_client(
             &mut sfu,
             &call_id,
@@ -1613,7 +1681,7 @@ mod sfu_tests {
         let call_ids = random_call_ids(call_count);
 
         // We aren't measuring lock time in this test.
-        let mut sfu = sfu.lock();
+        let mut sfu = sfu.write();
 
         let start = Instant::now();
         for call_id in &call_ids {
@@ -1667,7 +1735,7 @@ mod sfu_tests {
         let user_ids = random_user_ids(user_count);
         let call_id = random_call_id();
 
-        let mut sfu = sfu.lock();
+        let mut sfu = sfu.write();
 
         let mut failure_count = 0;
 
@@ -1713,12 +1781,12 @@ mod sfu_tests {
     }
 
     fn setup_calls_and_clients(
-        sfu: Arc<Mutex<Sfu>>,
+        sfu: Arc<RwLock<Sfu>>,
         call_ids: &[CallId],
         user_ids: &[UserId],
     ) -> Vec<GroupRecord> {
         // Get one write lock to fill the calls and clients.
-        let mut sfu = sfu.lock();
+        let mut sfu = sfu.write();
 
         let mut group_record: Vec<GroupRecord> = Vec::new();
 
@@ -1769,7 +1837,7 @@ mod sfu_tests {
 
         {
             // Now get read access here and check the numbers.
-            let sfu = sfu.lock();
+            let sfu = sfu.read();
 
             // Make sure there were no collisions to skew results.
             assert_eq!(call_ids.len(), sfu.call_by_call_id.len());
@@ -1783,29 +1851,31 @@ mod sfu_tests {
 
         {
             // Now get write access and remove all the users.
-            let mut sfu = sfu.lock();
+            {
+                let mut sfu = sfu.write();
 
-            for record in group_record {
-                sfu.remove_client_from_call(initial_now, record.call_id, record.demux_id);
+                for record in group_record {
+                    sfu.remove_client_from_call(initial_now, record.call_id, record.demux_id);
+                }
             }
 
             // There should still be calls but no more clients.
-            assert_eq!(1000, sfu.call_by_call_id.len());
+            assert_eq!(1000, sfu.read().call_by_call_id.len());
 
             // Run the tick for (inactivity_timeout_secs * 1000) / tick_interval_ms times.
             for i in 0..((INACTIVITY_TIMEOUT_SECS * 1000) / TICK_PERIOD_MS) {
                 let elapsed = Duration::from_millis((i + 1) * TICK_PERIOD_MS);
-                sfu.tick(initial_now.add(elapsed));
+                Sfu::tick(&sfu, initial_now.add(elapsed));
             }
 
             // The calls should now be gone.
-            assert_eq!(0, sfu.call_by_call_id.len());
+            assert_eq!(0, sfu.read().call_by_call_id.len());
         }
     }
 
     /// This version obtains a lock for every operation instead for all.
     fn setup_calls_and_clients_parallel(
-        sfu: Arc<Mutex<Sfu>>,
+        sfu: Arc<RwLock<Sfu>>,
         call_ids: &[CallId],
         user_ids: &[UserId],
     ) -> Vec<GroupRecord> {
@@ -1815,7 +1885,7 @@ mod sfu_tests {
             for (index, user_id) in user_ids.iter().enumerate() {
                 let demux_id = ((index as u32) << 4).try_into().unwrap();
                 // Get the write lock to the sfu for this block.
-                let mut sfu = sfu.lock();
+                let mut sfu = sfu.write();
 
                 match add_test_client(
                     &mut sfu,
@@ -1849,14 +1919,14 @@ mod sfu_tests {
 
         let count = 200;
 
-        let client_a = |sfu: Arc<Mutex<Sfu>>, count: usize| async move {
+        let client_a = |sfu: Arc<RwLock<Sfu>>, count: usize| async move {
             // N calls with 8 users each.
             let call_ids = random_call_ids(count);
             let user_ids = random_user_ids(8);
             let _ = setup_calls_and_clients_parallel(sfu, &call_ids, &user_ids);
         };
 
-        let client_b = |sfu: Arc<Mutex<Sfu>>, count: usize| async move {
+        let client_b = |sfu: Arc<RwLock<Sfu>>, count: usize| async move {
             // N calls with 8 users each.
             let call_ids = random_call_ids(count);
             let user_ids = random_user_ids(8);
@@ -1868,7 +1938,7 @@ mod sfu_tests {
             tokio::spawn(client_b(sfu.clone(), count / 2)),
         );
 
-        let sfu = sfu.lock();
+        let sfu = sfu.read();
 
         assert_eq!(count, sfu.call_by_call_id.len());
     }
@@ -1880,14 +1950,14 @@ mod sfu_tests {
 
         let count = 1000;
 
-        let client_a = |sfu: Arc<Mutex<Sfu>>, count: usize| async move {
+        let client_a = |sfu: Arc<RwLock<Sfu>>, count: usize| async move {
             // N calls with 8 users each.
             let call_ids = random_call_ids(count);
             let user_ids = random_user_ids(8);
             let _ = setup_calls_and_clients_parallel(sfu, &call_ids, &user_ids);
         };
 
-        let client_b = |sfu: Arc<Mutex<Sfu>>, count: usize| async move {
+        let client_b = |sfu: Arc<RwLock<Sfu>>, count: usize| async move {
             // N calls with 8 users each.
             let call_ids = random_call_ids(count);
             let user_ids = random_user_ids(8);
@@ -1901,7 +1971,7 @@ mod sfu_tests {
         );
         let end = Instant::now();
 
-        let sfu = sfu.lock();
+        let sfu = sfu.read();
 
         assert_eq!(count, sfu.call_by_call_id.len());
 

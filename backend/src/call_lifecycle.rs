@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use log::*;
 use metrics::event;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot::Receiver};
 
 use crate::{
@@ -26,14 +26,14 @@ const CALL_REMOVAL_QUEUE_CAPACITY: usize = 2048;
 /// On failure, we issue error metrics and discard the call keys.
 pub async fn start(
     config: &'static config::Config,
-    sfu: Arc<Mutex<Sfu>>,
+    sfu: Arc<RwLock<Sfu>>,
     shutdown_signal_rx: Receiver<()>,
 ) -> anyhow::Result<()> {
     let (call_removal_queue_tx, mut call_removal_queue_rx) =
         mpsc::channel(CALL_REMOVAL_QUEUE_CAPACITY);
     let frontend_client = FrontendHttpClient::from_config(config);
 
-    sfu.lock()
+    sfu.write()
         .set_call_ended_handler(Box::new(move |call_id, call| {
             if call.room_id().is_none() {
                 event!("hangup with no room_id, leaving for cleaner");

@@ -19,7 +19,7 @@ use anyhow::Result;
 use log::*;
 #[cfg(all(feature = "epoll", target_os = "linux"))]
 use nix::sys::{time::TimeSpec, timer::Expiration::OneShot, timerfd::*};
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use rustls::ServerConfig;
 use tokio::sync::oneshot::Receiver;
 #[cfg(all(feature = "epoll", target_os = "linux"))]
@@ -115,7 +115,7 @@ impl fmt::Display for SocketLocator {
 pub async fn start(
     config: &'static config::Config,
     tls_config: Option<Arc<ServerConfig>>,
-    sfu: Arc<Mutex<Sfu>>,
+    sfu: Arc<RwLock<Sfu>>,
     packet_ender_rx: Receiver<()>,
     is_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -148,7 +148,7 @@ pub async fn start(
         local_addr_udp, local_addr_tcp, num_threads
     );
 
-    sfu.lock()
+    sfu.write()
         .set_packet_server(Some(packet_handler_state_for_stats));
 
     // Spawn (blocking) threads for the packet server.
@@ -163,7 +163,7 @@ pub async fn start(
             tokio::time::sleep(tick_interval.into()).await;
             time_scope_us!("calling.udp_server.tick.processing");
 
-            let tick_output = { sfu_for_tick.lock().tick(Instant::now()) };
+            let tick_output = { Sfu::tick(&sfu_for_tick, Instant::now()) };
 
             // Process outside the scope of the lock on the sfu.
             match packet_handler_state_for_tick.tick(tick_output) {
@@ -183,13 +183,13 @@ pub async fn start(
         _ = packet_ender_rx => {},
     );
 
-    sfu_for_cleanup.lock().set_packet_server(None);
+    sfu_for_cleanup.write().set_packet_server(None);
     info!("packet_server shutdown");
     Ok(())
 }
 
 fn handle_packet(
-    sfu: &Arc<Mutex<Sfu>>,
+    sfu: &Arc<RwLock<Sfu>>,
     sender_address: SocketLocator,
     incoming_packet: &mut [u8],
 ) -> HandleOutput {
