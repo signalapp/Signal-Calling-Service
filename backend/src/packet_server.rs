@@ -118,7 +118,8 @@ pub async fn start(
     packet_ender_rx: Receiver<()>,
     is_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
-    let num_threads = num_cpus::get();
+    let core_ids = core_affinity::get_core_ids().expect("should be able to call get_core_ids()");
+    let num_threads = core_ids.len();
 
     let tick_interval = Duration::from_millis(config.tick_interval_ms);
 
@@ -150,7 +151,7 @@ pub async fn start(
     sfu.set_packet_server(Some(packet_handler_state_for_stats));
 
     // Spawn (blocking) threads for the packet server.
-    let packet_handles = packet_handler_state.start_threads(&sfu);
+    let packet_handles = packet_handler_state.start_threads(&sfu, core_ids);
 
     // Spawn a normal (cooperative) task to run some regular maintenance on an interval.
     let tick_handle = tokio::spawn(async move {
@@ -294,8 +295,8 @@ enum TimerHeapNextResult<T> {
     WaitForever,
 }
 
-impl<T> TimerHeap<T> {
-    fn new() -> Self {
+impl<T> Default for TimerHeap<T> {
+    fn default() -> Self {
         let tasks = BinaryHeap::new();
         let active_timer = None;
         Self {
@@ -303,7 +304,9 @@ impl<T> TimerHeap<T> {
             active_timer,
         }
     }
+}
 
+impl<T> TimerHeap<T> {
     pub fn schedule(&mut self, time: Instant, value: T) {
         self.tasks.push(ScheduledValue { time, value });
     }
@@ -370,7 +373,7 @@ mod tests {
     fn test_basics() {
         // test basic ordering
         let epoch = Instant::now();
-        let mut heap = TimerHeap::new();
+        let mut heap = TimerHeap::default();
 
         for i in 0..2000 {
             heap.schedule(epoch + Duration::from_millis(i), i);
@@ -398,7 +401,7 @@ mod tests {
     #[test]
     fn test_heap_ref_movement() {
         let epoch = Instant::now();
-        let mut heap = TimerHeap::new();
+        let mut heap = TimerHeap::default();
 
         heap.schedule(epoch + Duration::from_millis(500), 500);
         assert_eq!(
@@ -423,7 +426,7 @@ mod tests {
     #[test]
     fn test_heap_big_jump() {
         let epoch = Instant::now();
-        let mut heap = TimerHeap::new();
+        let mut heap = TimerHeap::default();
 
         heap.schedule(epoch + Duration::from_millis(50_000), 50_000);
         heap.schedule(epoch + Duration::from_millis(25_000), 25_000);

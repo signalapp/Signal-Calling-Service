@@ -30,7 +30,7 @@ tokio = { version = "1.44.0", features = ["full"] }
 parking_lot = {  version = "0.12.3", features = ["deadlock_detection"] }
 once_cell = "1.21.0"
 futures = "0.3.31"
-num_cpus = "1.16.0"
+core_affinity = "0.8.3"
 async-trait = "0.1.87"
 
 # For http

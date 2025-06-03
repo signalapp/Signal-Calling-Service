@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::Result;
 use calling_common::{Duration, Instant};
+use core_affinity::CoreId;
 use log::*;
 use metrics::{metric_config::TimingOptions, *};
 use parking_lot::Mutex;
@@ -47,7 +48,7 @@ impl PacketServerState {
         Ok(Arc::new(Self {
             socket: UdpSocket::bind(local_addr_udp)?,
             num_threads,
-            timer_heap: Mutex::new(TimerHeap::new()),
+            timer_heap: Default::default(),
         }))
     }
 
@@ -58,7 +59,7 @@ impl PacketServerState {
     /// (possibly empty) set of outgoing packets.
     ///
     /// This should only be called once.
-    pub fn start_threads(self: Arc<Self>, sfu: &Arc<Sfu>) -> impl Future {
+    pub fn start_threads(self: Arc<Self>, sfu: &Arc<Sfu>, _core_ids: Vec<CoreId>) -> impl Future {
         let all_handles = (0..self.num_threads).map(|_| {
             let self_for_thread = self.clone();
             let sfu_for_thread = sfu.clone();

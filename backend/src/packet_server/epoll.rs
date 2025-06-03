@@ -6,6 +6,7 @@
 use std::{
     cmp::Ordering,
     collections::{hash_map, HashMap, VecDeque},
+    ffi::c_int,
     future::Future,
     io::{self, IoSlice, Read, Write},
     net::{
@@ -13,7 +14,7 @@ use std::{
         SocketAddr, TcpListener, TcpStream, UdpSocket,
     },
     os::{
-        fd::AsFd,
+        fd::{AsFd, BorrowedFd, OwnedFd},
         unix::io::{AsRawFd, RawFd},
     },
     sync::{
@@ -26,10 +27,12 @@ use std::{
 use anyhow::Result;
 use byteorder::{BigEndian, ByteOrder};
 use calling_common::{try_scoped, Duration, Instant};
+use core_affinity::CoreId;
 use log::*;
 use metrics::{metric_config::TimingOptions, *};
 use nix::{
     errno::Errno,
+    libc,
     sys::{epoll::*, timerfd::*},
 };
 use parking_lot::{Mutex, RwLock};
@@ -72,6 +75,12 @@ const TCP_SEND_BUFFER_BYTES: usize = 10_000_000 / 8;
 /// limits the maximum delay for those timers. A larger value reduces CPU load.
 const EPOLL_WAIT_TIMEOUT_MS: isize = 25;
 
+/// Time between logging errors when receiving packets to the unpinned socket.
+///
+/// This indicates a singificant setup error, but if it happens at all, it
+/// will likely happen often, so don't overwelm the logs.
+const UNPINNED_LOG_INTERVAL: Duration = Duration::from_secs(60 * 5);
+
 /// The shared state for an epoll-based packet server.
 ///
 /// This server is implemented with a "new client" socket that receives new connections, plus a map
@@ -87,16 +96,15 @@ const EPOLL_WAIT_TIMEOUT_MS: isize = 25;
 /// [epoll]: https://man7.org/linux/man-pages/man7/epoll.7.html
 pub struct PacketServerState {
     local_addr_udp: SocketAddr,
-    new_client_socket: Socket,
-    new_tcp_socket: TcpListener,
-    new_tls_socket: Option<TcpListener>,
+    local_addr_tcp: SocketAddr,
+    local_addr_tls: Option<SocketAddr>,
     tls_config: Option<Arc<ServerConfig>>,
-    all_epoll_fds: Vec<RawFd>,
     all_connections: RwLock<ConnectionMap>,
     tick_interval: Duration,
     tick_number: AtomicU64, // u64 will never rollover
-    tcp_id_generator: SequenceGenerator,
-    timer_heap: Mutex<TimerHeap<SocketLocator>>,
+    tcp_id_generator: Arc<SequenceGenerator>,
+    timer_heaps: Vec<Mutex<TimerHeap<SocketLocator>>>,
+    num_threads: usize,
 }
 
 impl PacketServerState {
@@ -111,46 +119,49 @@ impl PacketServerState {
         num_threads: usize,
         tick_interval: Duration,
     ) -> Result<Arc<Self>> {
-        let new_client_socket = Socket::Udp(Self::open_socket_with_reusable_port(&local_addr_udp)?);
-        let new_tcp_socket = Self::open_listen_socket(&local_addr_tcp)?;
+        let tcp_id_generator = Arc::new(SequenceGenerator);
 
-        let new_tls_socket = if let Some(local_addr_tls) = local_addr_tls {
-            Some(Self::open_listen_socket(&local_addr_tls)?)
-        } else {
-            None
-        };
-
-        #[allow(deprecated)]
-        let all_epoll_fds = (0..num_threads)
-            .map(|_| epoll_create1(EpollCreateFlags::empty()))
-            .collect::<nix::Result<_>>()?;
-        let tcp_id_generator = SequenceGenerator;
+        let mut timer_heaps = Vec::with_capacity(num_threads);
+        timer_heaps.resize_with(num_threads, Default::default);
 
         let result = Self {
             local_addr_udp,
-            new_client_socket,
-            new_tcp_socket,
-            new_tls_socket,
+            local_addr_tcp,
+            local_addr_tls,
             tls_config,
-            all_epoll_fds,
             all_connections: RwLock::new(ConnectionMap::new()),
             tick_interval,
             tick_number: 0.into(),
             tcp_id_generator,
-            timer_heap: Mutex::new(TimerHeap::new()),
+            timer_heaps,
+            num_threads,
         };
-        result.add_socket_to_poll_for_reads(&result.new_client_socket)?;
-        result.add_socket_to_poll_for_reads(&result.new_tcp_socket)?;
-        if let Some(listen_socket) = &result.new_tls_socket {
-            result.add_socket_to_poll_for_reads(listen_socket)?;
-        }
         Ok(Arc::new(result))
     }
 
     /// Opens a socket and binds it to `local_addr` after setting the `SO_REUSEPORT` sockopt.
     ///
     /// This allows multiple sockets to bind to the same address.
-    fn open_socket_with_reusable_port(local_addr: &SocketAddr) -> Result<UdpSocket> {
+    fn open_socket_with_reusable_port(
+        local_addr: &SocketAddr,
+        core: Option<&CoreId>,
+    ) -> Result<(Socket, RawFd)> {
+        let socket = Self::open_socket_impl(local_addr, core)?;
+        let raw_fd = socket.as_raw_fd();
+        Ok((Socket::Udp(socket), raw_fd))
+    }
+
+    fn connect_udp_socket(
+        local_addr: &SocketAddr,
+        remote_addr: &SocketAddr,
+    ) -> Result<(Socket, RawFd)> {
+        let socket = Self::open_socket_impl(local_addr, None)?;
+        socket.connect(remote_addr)?;
+        let raw_fd = socket.as_raw_fd();
+        Ok((Socket::Udp(socket), raw_fd))
+    }
+
+    fn open_socket_impl(local_addr: &SocketAddr, core: Option<&CoreId>) -> Result<UdpSocket> {
         use nix::sys::socket::*;
 
         // Open a UDP socket in blocking mode.
@@ -166,6 +177,10 @@ impl PacketServerState {
         )?;
         // Allow later sockets to handle connections.
         setsockopt(&socket_fd, sockopt::ReusePort, &true)?;
+        if let Some(core) = core {
+            Self::set_sockopt_incoming_cpu(&socket_fd, core)?;
+        }
+
         // Bind the socket to the given local address.
         bind(socket_fd.as_raw_fd(), &SockaddrStorage::from(*local_addr))?;
         let result = UdpSocket::from(socket_fd);
@@ -176,7 +191,10 @@ impl PacketServerState {
         Ok(result)
     }
 
-    fn open_listen_socket(local_addr: &SocketAddr) -> Result<TcpListener> {
+    fn open_listen_socket(
+        local_addr: &SocketAddr,
+        core: Option<&CoreId>,
+    ) -> Result<(TcpListener, RawFd)> {
         use nix::sys::socket::*;
 
         // Open a TCP socket in blocking mode.
@@ -195,6 +213,9 @@ impl PacketServerState {
 
         // Allow later sockets to handle connections.
         setsockopt(&socket_fd, sockopt::ReusePort, &true)?;
+        if let Some(core) = core {
+            Self::set_sockopt_incoming_cpu(&socket_fd, core)?;
+        }
         // Bind the socket to the given local address.
         bind(socket_fd.as_raw_fd(), &SockaddrStorage::from(*local_addr))?;
 
@@ -205,28 +226,24 @@ impl PacketServerState {
         result
             .set_nonblocking(true)
             .expect("Cannot set non-blocking");
-        Ok(result)
+        let raw_fd = result.as_raw_fd();
+        Ok((result, raw_fd))
     }
 
-    /// Adds `socket` to be polled by each of the descriptors in `self.all_epoll_fds`.
-    ///
-    /// Specifically, this is only polling for read events with "exclusive" wakeups. That is,
-    /// "out-of-band" data will be ignored, and only one epoll FD will receive an event for any
-    /// particular socket being ready.
-    fn add_socket_to_poll_for_reads(&self, socket: &impl AsRawFd) -> Result<()> {
-        let socket_fd = socket.as_raw_fd();
-        let mut event_read_only = EpollEvent::new(
-            EpollFlags::EPOLLIN | EpollFlags::EPOLLEXCLUSIVE,
-            socket_fd as u64,
-        );
-        for &epoll_fd in &self.all_epoll_fds {
-            #[allow(deprecated)]
-            epoll_ctl(
-                epoll_fd,
-                EpollOp::EpollCtlAdd,
-                socket_fd,
-                &mut event_read_only,
-            )?;
+    /// nix::sys::socket doesn't have a sockopt for SO_INCOMING_CPU, so do it ourselves...
+    fn set_sockopt_incoming_cpu(socket: &OwnedFd, core: &CoreId) -> Result<()> {
+        let core: c_int = core.id.try_into()?;
+        unsafe {
+            let ret = libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_INCOMING_CPU,
+                &core as *const _ as *const libc::c_void,
+                size_of_val(&core).try_into()?,
+            );
+            if ret != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
         }
         Ok(())
     }
@@ -235,49 +252,97 @@ impl PacketServerState {
     /// ([`tokio::task::spawn_blocking`]).
     ///
     /// This should only be called once.
-    pub fn start_threads(self: Arc<Self>, sfu: &Arc<Sfu>) -> impl Future {
-        let all_handles = self
-            .all_epoll_fds
-            .iter()
-            .enumerate()
-            .map(|(thread_num, &epoll_fd)| {
-                let self_for_thread = self.clone();
-                let sfu_for_thread = sfu.clone();
-                tokio::task::spawn_blocking(move || {
-                    let builder = thread::Builder::new().name(format!("epoll {}", thread_num));
-                    builder
-                        .spawn(move || self_for_thread.run(epoll_fd, &sfu_for_thread))
-                        .unwrap()
-                        .join()
-                })
-            });
+    pub fn start_threads(self: Arc<Self>, sfu: &Arc<Sfu>, core_ids: Vec<CoreId>) -> impl Future {
+        assert!(
+            self.num_threads == core_ids.len(),
+            "Number of threads must be equal to number of cores to pin to"
+        );
+        let all_handles = core_ids.iter().enumerate().map(|(thread_num, core_id)| {
+            let self_for_thread = self.clone();
+            let sfu_for_thread = sfu.clone();
+            let core_id = *core_id;
+            tokio::task::spawn_blocking(move || {
+                let builder =
+                    thread::Builder::new().name(format!("epoll{:3}/{:3}", thread_num, core_id.id));
+                builder
+                    .spawn(move || self_for_thread.run(&sfu_for_thread, thread_num, core_id))
+                    .unwrap()
+                    .join()
+            })
+        });
         futures::future::select_all(all_handles)
     }
 
     /// Runs a single listener on the current thread, polling `epoll_fd`.
     ///
     /// See [`PacketServerState::start_threads`].
-    fn run(self: Arc<Self>, epoll_fd: RawFd, sfu: &Arc<Sfu>) {
-        let new_client_socket_fd = self.new_client_socket.as_raw_fd();
-        let new_tcp_socket_fd = self.new_tcp_socket.as_raw_fd();
-        let new_tls_socket_fd = self.new_tls_socket.as_ref().map_or(-1, |s| s.as_raw_fd());
+    fn run(&self, sfu: &Arc<Sfu>, thread_num: usize, core: CoreId) -> Result<()> {
+        let timer_heap = &self.timer_heaps[thread_num];
+
+        if !core_affinity::set_for_current(core) {
+            error!("Could not cpu pin to core {}", core.id);
+        }
+        let (new_client_socket, new_client_socket_fd) =
+            Self::open_socket_with_reusable_port(&self.local_addr_udp, None)?;
+
+        let (new_pinned_client_socket, new_pinned_client_socket_fd) =
+            Self::open_socket_with_reusable_port(&self.local_addr_udp, Some(&core))?;
+
+        let (new_tcp_socket, new_tcp_socket_fd) =
+            Self::open_listen_socket(&self.local_addr_tcp, None)?;
+        let (new_pinned_tcp_socket, new_pinned_tcp_socket_fd) =
+            Self::open_listen_socket(&self.local_addr_tcp, Some(&core))?;
+
+        let (new_tls_socket, new_tls_socket_fd, new_pinned_tls_socket, new_pinned_tls_socket_fd) =
+            if let Some(local_addr_tls) = self.local_addr_tls {
+                let (tls_socket, tls_fd) = Self::open_listen_socket(&local_addr_tls, None)?;
+                let (pinned_socket, pinned_fd) =
+                    Self::open_listen_socket(&local_addr_tls, Some(&core))?;
+                (Some(tls_socket), tls_fd, Some(pinned_socket), pinned_fd)
+            } else {
+                (None, -1, None, -1)
+            };
+
+        let epoll = Epoll::new(EpollCreateFlags::empty())?;
+        epoll.add(
+            &new_client_socket,
+            EpollEvent::new(EpollFlags::EPOLLIN, new_client_socket_fd as u64),
+        )?;
+        epoll.add(
+            &new_pinned_client_socket,
+            EpollEvent::new(EpollFlags::EPOLLIN, new_pinned_client_socket_fd as u64),
+        )?;
+        epoll.add(
+            &new_tcp_socket,
+            EpollEvent::new(EpollFlags::EPOLLIN, new_tcp_socket_fd as u64),
+        )?;
+        epoll.add(
+            &new_pinned_tcp_socket,
+            EpollEvent::new(EpollFlags::EPOLLIN, new_pinned_tcp_socket_fd as u64),
+        )?;
+
+        if let Some(listen_socket) = &new_tls_socket {
+            epoll.add(
+                listen_socket,
+                EpollEvent::new(EpollFlags::EPOLLIN, new_tls_socket_fd as u64),
+            )?;
+        }
+        if let Some(listen_socket) = &new_pinned_tls_socket {
+            epoll.add(
+                listen_socket,
+                EpollEvent::new(EpollFlags::EPOLLIN, new_pinned_tls_socket_fd as u64),
+            )?;
+        }
+
         let mut bufs = vec![PacketBuffer::new()];
         let mut poll_timeout_ms = EPOLL_WAIT_TIMEOUT_MS;
 
         let (timer, timer_fd) = match TimerFd::new(ClockId::CLOCK_MONOTONIC, TimerFlags::empty()) {
             Ok(timer) => {
                 let timer_fd = timer.as_fd().as_raw_fd();
-                let mut event_read_only = EpollEvent::new(
-                    EpollFlags::EPOLLIN | EpollFlags::EPOLLEXCLUSIVE,
-                    timer_fd as u64,
-                );
-
-                #[allow(deprecated)]
-                match epoll_ctl(
-                    epoll_fd,
-                    EpollOp::EpollCtlAdd,
-                    timer_fd,
-                    &mut event_read_only,
+                match epoll.add(
+                    &timer,
+                    EpollEvent::new(EpollFlags::EPOLLIN, timer_fd as u64),
                 ) {
                     Ok(()) => (Some(timer), timer_fd),
                     Err(e) => {
@@ -295,10 +360,12 @@ impl PacketServerState {
             }
         };
 
+        let mut unpinned_recv = None;
+
         loop {
             let mut current_events = [EpollEvent::empty(); MAX_EPOLL_EVENTS];
-            #[allow(deprecated)]
-            let num_events = epoll_wait(epoll_fd, &mut current_events, poll_timeout_ms)
+            let num_events = epoll
+                .wait(&mut current_events, poll_timeout_ms)
                 .unwrap_or_else(|err| {
                     warn!("epoll_wait() failed: {}", err);
                     0
@@ -307,15 +374,67 @@ impl PacketServerState {
                 let socket_fd = event.data() as i32;
                 let connections_lock = self.all_connections.read();
                 let socket = if socket_fd == new_client_socket_fd {
-                    &self.new_client_socket
-                } else if socket_fd == new_tcp_socket_fd || socket_fd == new_tls_socket_fd {
+                    if unpinned_recv.is_none_or(|instant| {
+                        Instant::now().saturating_duration_since(instant) > UNPINNED_LOG_INTERVAL
+                    }) {
+                        error!(
+                            "packet delivered to unpinned UDP socket on core {}; check cpu pinning",
+                            core.id
+                        );
+                        unpinned_recv = Some(Instant::now());
+                    }
+                    &new_client_socket
+                } else if socket_fd == new_pinned_client_socket_fd {
+                    &new_pinned_client_socket
+                } else if socket_fd == new_tcp_socket_fd
+                    || socket_fd == new_pinned_tcp_socket_fd
+                    || socket_fd == new_tls_socket_fd
+                    || socket_fd == new_pinned_tls_socket_fd
+                {
                     drop(connections_lock);
 
                     let (accepted, tls_config) = if socket_fd == new_tcp_socket_fd {
-                        (self.new_tcp_socket.accept(), None)
+                        if unpinned_recv.is_none_or(|instant| {
+                            Instant::now().saturating_duration_since(instant)
+                                > UNPINNED_LOG_INTERVAL
+                        }) {
+                            error!(
+                                "packet delivered to unpinned TCP socket on core {}; check cpu pinning",
+                                core.id
+                            );
+                            unpinned_recv = Some(Instant::now());
+                        }
+
+                        (new_tcp_socket.accept(), None)
+                    } else if socket_fd == new_pinned_tcp_socket_fd {
+                        (new_pinned_tcp_socket.accept(), None)
+                    } else if socket_fd == new_tls_socket_fd {
+                        if unpinned_recv.is_none_or(|instant| {
+                            Instant::now().saturating_duration_since(instant)
+                                > UNPINNED_LOG_INTERVAL
+                        }) {
+                            error!(
+                                "packet delivered to unpinned TLS socket on core {}; check cpu pinning",
+                                core.id
+                            );
+                            unpinned_recv = Some(Instant::now());
+                        }
+
+                        (
+                            new_tls_socket
+                                .as_ref()
+                                .expect("tls socket must exist if we got an event on it")
+                                .accept(),
+                            Some(
+                                self.tls_config
+                                    .as_ref()
+                                    .expect("tls config must exist if we got a tls accept")
+                                    .clone(),
+                            ),
+                        )
                     } else {
                         (
-                            self.new_tls_socket
+                            new_pinned_tls_socket
                                 .as_ref()
                                 .expect("tls socket must exist if we got an event on it")
                                 .accept(),
@@ -346,7 +465,16 @@ impl PacketServerState {
                                 Socket::new_tcp(client_socket, id, is_ipv6, tls_config)
                             {
                                 let mut write_lock = self.all_connections.write();
-                                if self.add_socket_to_poll_for_reads(&client_socket).is_ok() {
+                                if epoll
+                                    .add(
+                                        &client_socket,
+                                        EpollEvent::new(
+                                            EpollFlags::EPOLLIN,
+                                            client_socket.as_raw_fd() as u64,
+                                        ),
+                                    )
+                                    .is_ok()
+                                {
                                     write_lock.get_or_insert_connected(
                                         client_socket,
                                         SocketLocator::Tcp {
@@ -518,11 +646,11 @@ impl PacketServerState {
                         } = packet_server::handle_packet(sfu, sender_addr, inbuf.as_mut());
 
                         for (buf, addr) in packets_to_send {
-                            self.send_packet(&buf, addr)
+                            self.send_packet(&epoll, &buf, addr)
                         }
 
                         if !dequeues_to_schedule.is_empty() {
-                            let mut timer_heap = self.timer_heap.lock();
+                            let mut timer_heap = timer_heap.lock();
                             for (time, addr) in dequeues_to_schedule {
                                 timer_heap.schedule(time, addr);
                             }
@@ -536,7 +664,7 @@ impl PacketServerState {
             let mut dequeues_to_schedule = vec![];
             while dequeues_left > 0 {
                 let now = Instant::now();
-                let mut timer_heap = self.timer_heap.lock();
+                let mut timer_heap = timer_heap.lock();
                 match timer_heap.next(now) {
                     TimerHeapNextResult::Value(addr) => {
                         if Sfu::handle_dequeue(
@@ -569,11 +697,11 @@ impl PacketServerState {
             }
 
             for (buf, addr) in packets_to_send {
-                self.send_packet(&buf, addr)
+                self.send_packet(&epoll, &buf, addr)
             }
 
             if !dequeues_to_schedule.is_empty() {
-                let mut timer_heap = self.timer_heap.lock();
+                let mut timer_heap = timer_heap.lock();
                 for (time, addr) in dequeues_to_schedule {
                     timer_heap.schedule(time, addr);
                 }
@@ -648,7 +776,7 @@ impl PacketServerState {
         true
     }
 
-    pub fn send_packet(&self, buf: &[u8], addr: SocketLocator) {
+    pub fn send_packet(&self, epoll: &Epoll, buf: &[u8], addr: SocketLocator) {
         trace!("sending packet of {} bytes to {}", buf.len(), addr);
         time_scope!(
             "calling.udp.epoll.send_packet",
@@ -720,11 +848,15 @@ impl PacketServerState {
                         match addr {
                             SocketLocator::Udp(udp_addr) => {
                                 let result = try_scoped(|| {
-                                    let client_socket =
-                                        Self::open_socket_with_reusable_port(&self.local_addr_udp)?;
-                                    client_socket.connect(udp_addr)?;
-                                    self.add_socket_to_poll_for_reads(&client_socket)?;
-                                    let client_socket = Socket::Udp(client_socket);
+                                    let (client_socket, client_socket_fd) =
+                                        Self::connect_udp_socket(&self.local_addr_udp, &udp_addr)?;
+                                    epoll.add(
+                                        &client_socket,
+                                        EpollEvent::new(
+                                            EpollFlags::EPOLLIN,
+                                            client_socket_fd as u64,
+                                        ),
+                                    )?;
                                     let client_socket = write_lock.get_or_insert_connected(
                                         client_socket,
                                         addr,
@@ -795,9 +927,15 @@ impl PacketServerState {
         {
             time_scope_us!("calling.packet_server.tick.dequeue_scheduling");
             if !tick_update.dequeues_to_schedule.is_empty() {
-                let mut timer_heap = self.timer_heap.lock();
+                // Round robin through the timer heaps
+                let mut counter = self.timer_heaps.len() - 1;
                 for (time, addr) in tick_update.dequeues_to_schedule {
-                    timer_heap.schedule(time, addr);
+                    self.timer_heaps[counter].lock().schedule(time, addr);
+                    if counter > 0 {
+                        counter -= 1;
+                    } else {
+                        counter = self.timer_heaps.len() - 1;
+                    }
                 }
             }
         }
@@ -1089,9 +1227,39 @@ impl AsRawFd for Socket {
     }
 }
 
+impl AsFd for Socket {
+    fn as_fd(&self) -> BorrowedFd {
+        match self {
+            Socket::Udp(s) => s.as_fd(),
+            Socket::Tcp(m) => {
+                let lock = m.lock();
+                let fd = lock.stream.as_fd();
+                // SAFETY: we're using this value immediately with nix::sys::epoll::Epoll::add.
+                // epoll gracefully handles closed FDs
+                unsafe {
+                    let laundered_fd = BorrowedFd::borrow_raw(fd.as_raw_fd());
+                    laundered_fd
+                }
+            }
+        }
+    }
+}
+
 enum SocketStream {
     Tcp(TcpStream),
     Tls(Box<(ServerConnection, TcpStream)>),
+}
+
+impl AsFd for SocketStream {
+    fn as_fd(&self) -> BorrowedFd {
+        match self {
+            SocketStream::Tcp(s) => s.as_fd(),
+            SocketStream::Tls(b) => {
+                let (_c, s) = b.as_ref();
+                s.as_fd()
+            }
+        }
+    }
 }
 
 impl SocketStream {
