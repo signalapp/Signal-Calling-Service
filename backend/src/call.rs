@@ -1891,10 +1891,14 @@ impl Call {
         mut update: protos::SfuToDevice,
         now: Instant,
     ) -> Vec<RtpToSend> {
-        let mut rtp_to_send = vec![];
         let unwrapped_now: std::time::Instant = now.into();
         let serialized = update.encode_to_vec();
-        let num_packets = (serialized.len() / MAX_PACKET_SERIALIZED_BYTE_SIZE) + 1;
+        if serialized.is_empty() {
+            return vec![];
+        }
+
+        let mut rtp_to_send = vec![];
+        let num_packets = serialized.len().div_ceil(MAX_MRP_FRAGMENT_BYTE_SIZE);
         let demux_id = client.demux_id();
         let (stream, next_rtp_seqnum) = client.mrp_stream_and_rtp_seqnum_mut();
 
