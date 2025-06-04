@@ -230,7 +230,6 @@ impl DatadogPipeline<'_> {
         tags: TagsRef<T>,
     ) {
         for (value, frequency) in histogram.iter() {
-            self.histogram_at_rate(metric_name, *value as f64, 1f64 / (*frequency as f64), tags);
             self.distribution_at_rate(metric_name, *value as f64, 1f64 / (*frequency as f64), tags);
         }
     }

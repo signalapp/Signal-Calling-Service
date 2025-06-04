@@ -207,7 +207,6 @@ impl DatadogPipeline<'_> {
     ) {
         for (value, frequency) in histogram.iter() {
             let value_seconds = *value as f64 / 1000000.0;
-            self.histogram_at_rate(metric_name, value_seconds, 1f64 / (*frequency as f64), tags);
             self.distribution_at_rate(metric_name, value_seconds, 1f64 / (*frequency as f64), tags);
         }
     }
