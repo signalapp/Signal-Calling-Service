@@ -9,23 +9,26 @@ use std::{
     convert::{From, TryFrom},
     fmt::{self, Display, Formatter},
     sync::Arc,
-    time::SystemTime,
 };
 
+use bincode::Options;
 use calling_common::{
     CallType, ClientStatus, DataRate, DataRateTracker, DemuxId, Duration, Instant, PixelSize,
-    RoomId, SignalUserAgent, VideoHeight,
+    RoomId, SignalUserAgent, SystemTime, VideoHeight,
 };
 use hex::ToHex;
 use log::*;
+use metrics::metric_config::Timer;
 use mrp::{self, MrpReceiveError, MrpStream};
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use prost::Message;
 use reqwest::Url;
 use serde::Serialize;
 use strum::IntoEnumIterator;
 use strum_macros::{EnumIter, EnumString};
 use thiserror::Error;
+use zkgroup::groups::UuidCiphertext;
 
 use crate::{
     audio,
@@ -40,6 +43,7 @@ use approval_persistence::ApprovedUsers;
 use metrics::{metric_config::StaticStrTagsRef, *};
 
 use crate::{
+    endorsements::{CallEndorsementIssuer, CallSendEndorsements, EndorsementIssuer},
     protos::{
         sfu_to_device::{DeviceJoinedOrLeft, Speaker},
         DeviceToSfu, SfuToDevice,
@@ -225,7 +229,7 @@ impl Display for LoggableCallId {
 ///
 /// UserId deliberately does not implement Display or Debug; it will be consistent across calls in
 /// the same group and is thus considered sensitive.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, PartialOrd, Ord)]
 #[serde(transparent)]
 pub struct UserId(String);
 
@@ -241,9 +245,54 @@ impl From<UserId> for String {
     }
 }
 
+impl From<&UserId> for String {
+    fn from(value: &UserId) -> Self {
+        value.0.clone()
+    }
+}
+
+impl TryFrom<UserId> for UuidCiphertext {
+    type Error = ();
+
+    fn try_from(value: UserId) -> Result<Self, Self::Error> {
+        let Ok(bytes) = hex::decode(&value.0) else {
+            return Err(());
+        };
+
+        zkgroup::deserialize(&bytes).map_err(|_| ())
+    }
+}
+
+impl TryFrom<&UserId> for UuidCiphertext {
+    type Error = ();
+
+    fn try_from(value: &UserId) -> Result<Self, Self::Error> {
+        let Ok(bytes) = hex::decode(&value.0) else {
+            return Err(());
+        };
+
+        zkgroup::deserialize(&bytes).map_err(|_| ())
+    }
+}
+
 impl UserId {
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+}
+
+impl TryFrom<&UuidCiphertext> for UserId {
+    type Error = ();
+
+    fn try_from(value: &UuidCiphertext) -> Result<Self, ()> {
+        // must match zkgroup::serialize config, but don't panic on errors
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_little_endian()
+            .reject_trailing_bytes()
+            .serialize(&value)
+            .map_err(|_| ())
+            .map(|bytes| UserId::from(hex::encode(bytes)))
     }
 }
 
@@ -384,6 +433,8 @@ pub struct Call {
     /// The last time a clients update was sent to the clients
     clients_update_sent: Instant,
 
+    endorsement_issuer: Option<CallEndorsementIssuer>,
+
     /// Clients that are considered pre-approved to join the call
     approved_users: ApprovedUsers,
     /// Clients that have denied approval to join the call.
@@ -469,6 +520,7 @@ impl Call {
         system_now: SystemTime,
         approved_users: Option<Vec<UserId>>,
         approved_users_persistence_url: Option<&'static Url>,
+        endorsement_issuer: Option<Arc<Mutex<EndorsementIssuer>>>,
     ) -> Self {
         let loggable_call_id = LoggableCallId::from(&call_id);
         info!("call: {} creating", loggable_call_id);
@@ -489,6 +541,8 @@ impl Call {
             removed_clients: Vec::new(),
             client_added_or_removed: now,
             clients_update_sent: now,
+
+            endorsement_issuer: endorsement_issuer.map(CallEndorsementIssuer::new),
 
             approved_users: ApprovedUsers::new(
                 approved_users.unwrap_or_default(),
@@ -512,6 +566,10 @@ impl Call {
             key_frame_request_sent_by_ssrc: HashMap::new(),
             call_stats: CallStats::default(),
         }
+    }
+
+    fn is_adhoc_call(&self) -> bool {
+        self.call_type == CallType::Adhoc
     }
 
     pub fn room_id(&self) -> Option<&RoomId> {
@@ -618,9 +676,11 @@ impl Call {
         user_agent: SignalUserAgent,
         now: Instant,
     ) -> ClientStatus {
+        let member_ciphertext = (&user_id).try_into().ok();
         let pending_client = NonParticipantClient {
             demux_id,
             user_id,
+            member_ciphertext,
             is_admin,
             region_relation,
             user_agent,
@@ -678,6 +738,9 @@ impl Call {
         time_scope_us!("calling.call.promote_client");
 
         self.will_add_or_remove_client(now);
+        if let Some(endorsement_issuer) = self.endorsement_issuer.as_mut() {
+            endorsement_issuer.track_member_added(pending_client.user_id.clone());
+        }
 
         let demux_id = pending_client.demux_id;
         self.clients.push(Client::new(
@@ -1226,7 +1289,11 @@ impl Call {
     /// incoming data rates, send rate allocations, and the active speaker.
     /// Send packets to clients that should either be delayed or be sent regularly,
     /// such as key frame requests and active speaker changes.
-    pub fn tick(&mut self, now: Instant) -> (Vec<RtpToSend>, Vec<KeyFrameRequestToSend>) {
+    pub fn tick(
+        &mut self,
+        now: Instant,
+        sys_now: SystemTime,
+    ) -> (Vec<RtpToSend>, Vec<KeyFrameRequestToSend>) {
         time_scope_us!("calling.call.tick");
 
         self.approved_users.tick();
@@ -1251,21 +1318,28 @@ impl Call {
             } else {
                 (None, None)
             };
+        let endorsements = if self.is_adhoc_call() {
+            self.check_for_endorsement_updates(sys_now)
+        } else {
+            None
+        };
         let new_active_speaker = if self.need_update_speaker(now) {
             time_scope_us!("calling.call.tick.calculate_active_speaker");
             self.calculate_active_speaker(now)
         } else {
             None
         };
-        let speaker_update =
-            if new_active_speaker.is_some() || admin_device_joined_or_left_update.is_some() {
-                self.active_speaker_update_sent = now;
-                Some(Speaker {
-                    demux_id: self.active_speaker_id.map(|demux_id| demux_id.as_u32()),
-                })
-            } else {
-                None
-            };
+        let speaker_update = if new_active_speaker.is_some()
+            || admin_device_joined_or_left_update.is_some()
+            || endorsements.is_some()
+        {
+            self.active_speaker_update_sent = now;
+            Some(Speaker {
+                demux_id: self.active_speaker_id.map(|demux_id| demux_id.as_u32()),
+            })
+        } else {
+            None
+        };
 
         // A change to the layer rate or resolution may impact how the receiver allocates the target sent rate.
         // So can a change in active speaker.
@@ -1280,6 +1354,7 @@ impl Call {
             admin_device_joined_or_left_update.as_ref(),
             non_admin_device_joined_or_left_update.as_ref(),
             speaker_update,
+            endorsements,
             &mut rtp_to_send,
             now,
         );
@@ -1613,6 +1688,7 @@ impl Call {
         admin_update_device_joined_or_left: Option<&DeviceJoinedOrLeft>,
         non_admin_update_device_joined_or_left: Option<&DeviceJoinedOrLeft>,
         speaker: Option<Speaker>,
+        call_send_endorsements: Option<CallSendEndorsements>,
         rtp_to_send: &mut Vec<RtpToSend>,
         now: Instant,
     ) {
@@ -1672,6 +1748,18 @@ impl Call {
                 } else {
                     None
                 };
+                let endorsements = call_send_endorsements
+                    .as_ref()
+                    .and_then(|e| e.get_endorsements_for(&client.user_id))
+                    .map(|response| protos::sfu_to_device::SendEndorsementsResponse {
+                        serialized: Some(response.serialized.clone()),
+                        opaque_user_ids: response
+                            .user_ids
+                            .iter()
+                            .map(|uids| hex::decode(uids.as_str()).unwrap())
+                            .collect(),
+                    });
+
                 let update = SfuToDevice {
                     speaker,
                     device_joined_or_left: admin_update_device_joined_or_left
@@ -1679,6 +1767,7 @@ impl Call {
                     current_devices,
                     stats,
 
+                    endorsements: None,
                     video_request: None,
                     removed: None,
                     raised_hands: None,
@@ -1698,7 +1787,7 @@ impl Call {
                     rtp_to_send.push((client.demux_id, update_rtp))
                 }
 
-                if admin_update_device_joined_or_left.is_some() {
+                if admin_update_device_joined_or_left.is_some() || endorsements.is_some() {
                     let fragmentable_update = SfuToDevice {
                         device_joined_or_left: if self.call_type != CallType::Adhoc
                             || client.is_admin
@@ -1707,6 +1796,7 @@ impl Call {
                         } else {
                             non_admin_update_device_joined_or_left.cloned()
                         },
+                        endorsements,
                         ..Default::default()
                     };
                     let fragmentable_update_rtp =
@@ -2125,6 +2215,46 @@ impl Call {
             .collect()
     }
 
+    /// Checks if we need to send updated endorsements
+    pub fn check_for_endorsement_updates(
+        &mut self,
+        now: SystemTime,
+    ) -> Option<CallSendEndorsements> {
+        let endorsement_issuer = self.endorsement_issuer.as_mut()?;
+
+        if !endorsement_issuer.need_reissue(now) {
+            return None;
+        }
+
+        let timer = start_timer_us!("calling.backend.endorsements.issue_latency");
+        let members = self
+            .clients
+            .iter()
+            .flat_map(|c| {
+                c.member_ciphertext
+                    .map(|ciphertext| (c.user_id.clone(), ciphertext))
+            })
+            .collect::<Vec<_>>();
+        if members.len() != self.clients.len() {
+            warn!("Not all clients have valid member ciphertexts, will not issue endorsements");
+            return None;
+        }
+
+        let result = match endorsement_issuer.issue_endorsements(members, now) {
+            Ok(endorsements) => Some(endorsements),
+            Err(e) => {
+                error!(
+                    "Failed to compute endorsements for call {} due to: {}",
+                    self.loggable_call_id(),
+                    e
+                );
+                None
+            }
+        };
+        timer.stop();
+        result
+    }
+
     pub fn get_stats(&self) -> CallStatsReport {
         CallStatsReport {
             loggable_call_id: self.loggable_call_id.clone(),
@@ -2156,6 +2286,7 @@ struct NonParticipantClient {
     // Immutable
     demux_id: DemuxId,
     user_id: UserId,
+    member_ciphertext: Option<UuidCiphertext>,
     is_admin: bool,
     region_relation: RegionRelation,
     user_agent: SignalUserAgent,
@@ -2190,6 +2321,7 @@ impl From<Client> for NonParticipantClient {
         Self {
             demux_id: client.demux_id,
             user_id: client.user_id,
+            member_ciphertext: client.member_ciphertext,
             is_admin: client.is_admin,
             region_relation: client.region_relation,
             user_agent: client.user_agent,
@@ -2225,6 +2357,7 @@ struct Client {
     // Immutable
     demux_id: DemuxId,
     user_id: UserId,
+    member_ciphertext: Option<UuidCiphertext>,
     is_admin: bool,
     region_relation: RegionRelation,
     user_agent: SignalUserAgent,
@@ -2313,6 +2446,7 @@ impl Client {
         Self {
             demux_id: pending_client_info.demux_id,
             user_id: pending_client_info.user_id,
+            member_ciphertext: pending_client_info.member_ciphertext,
             is_admin: pending_client_info.is_admin,
             region_relation: pending_client_info.region_relation,
             user_agent: pending_client_info.user_agent,
@@ -4388,6 +4522,7 @@ mod call_tests {
             system_now,
             None,
             None,
+            None,
         )
     }
 
@@ -4406,6 +4541,7 @@ mod call_tests {
             default_requested_max_send_rate,
             now,
             system_now,
+            None,
             None,
             None,
         )
@@ -4984,6 +5120,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
 
         let mut call = create_call(CALL_ID, now, system_now);
 
@@ -5029,7 +5166,7 @@ mod call_tests {
 
         // This is required to update the incoming rate.
         // We don't trust the incoming rate for 500ms.
-        call.tick(at(501));
+        call.tick(at(501), sys_at(501));
         assert_eq!(
             Some(DataRate::from_bps(40320)),
             call.clients[0].incoming_video[0].rate()
@@ -5059,7 +5196,7 @@ mod call_tests {
                 ssrc: LayerId::Video0.to_ssrc(sender_demux_id),
             },
         );
-        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(506));
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(506), sys_at(506));
         assert_eq!(
             vec![expected_key_frame_request],
             outgoing_key_frame_requests
@@ -5075,7 +5212,7 @@ mod call_tests {
         assert_eq!(0, rtp_to_send.len());
 
         // And keep asking for a key frame
-        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(707));
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(707), sys_at(707));
         assert_eq!(
             vec![expected_key_frame_request],
             outgoing_key_frame_requests
@@ -5115,7 +5252,7 @@ mod call_tests {
         );
 
         // And we don't ask for a key frame any more
-        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(908));
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(908), sys_at(908));
         assert_eq!(0, outgoing_key_frame_requests.len());
 
         // Unless the client requests one
@@ -5124,7 +5261,7 @@ mod call_tests {
             &[expected_key_frame_request.1],
             at(908),
         );
-        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(1110));
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(1110), sys_at(1110));
         assert_eq!(
             vec![expected_key_frame_request],
             outgoing_key_frame_requests
@@ -5156,7 +5293,7 @@ mod call_tests {
 
         // This is required to update the incoming rate.
         // We don't trust the incoming rate for 500ms.
-        call.tick(at(2500));
+        call.tick(at(2500), sys_at(2500));
         assert_eq!(
             Some(DataRate::from_bps(60480)),
             call.clients[0].incoming_video[1].rate()
@@ -5175,7 +5312,7 @@ mod call_tests {
             at(2801),
         )
         .unwrap();
-        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(2801));
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(2801), sys_at(2801));
         let expected_key_frame_request_layer1 = (
             sender_demux_id,
             rtp::KeyFrameRequest {
@@ -5267,7 +5404,7 @@ mod call_tests {
             call.handle_rtp(sender_demux_id, rtp_layer1.borrow_mut(), at(4000))
                 .unwrap();
         }
-        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(4000));
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(4000), sys_at(4000));
         assert_eq!(vec![] as Vec<(DemuxId, _)>, outgoing_key_frame_requests);
 
         for _ in 0..900 {
@@ -5283,7 +5420,7 @@ mod call_tests {
                 .unwrap();
         }
 
-        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(5100));
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(5100), sys_at(5100));
         dbg!(call.clients[0].incoming_video[1].rate().unwrap().as_bps());
         assert_eq!(
             Some(DataRate::from_bps(1043790)),
@@ -5335,6 +5472,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
 
         let mut call = create_call(CALL_ID, now, system_now);
 
@@ -5350,7 +5488,7 @@ mod call_tests {
         )
         .encode_collection();
 
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100), sys_at(100));
         assert_eq!(
             to_rtp_to_send(vec![(
                 demux_id1,
@@ -5378,7 +5516,7 @@ mod call_tests {
         )
         .encode_collection();
 
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200), sys_at(200));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
@@ -5394,7 +5532,7 @@ mod call_tests {
         );
 
         // Nothing is sent out because nothing changed.
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300), sys_at(300));
         assert_eq!(0, rtp_to_send.len());
 
         call.drop_client(demux_id1, at(400));
@@ -5408,7 +5546,7 @@ mod call_tests {
         )
         .encode_collection();
 
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400), sys_at(400));
         assert_eq!(
             to_rtp_to_send(vec![(
                 demux_id2,
@@ -5423,6 +5561,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
 
         let mut call = create_adhoc_call(CALL_ID, now, system_now);
 
@@ -5438,7 +5577,7 @@ mod call_tests {
             &[],
         )
         .encode_collection();
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100), sys_at(100));
         assert_eq!(
             to_rtp_to_send(vec![(
                 demux_id1,
@@ -5481,7 +5620,7 @@ mod call_tests {
         })
         .encode_collection();
 
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200), sys_at(200));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
@@ -5520,7 +5659,7 @@ mod call_tests {
         .encode_collection();
 
         ack_all_mrp(&mut call);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300), sys_at(300));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
@@ -5559,7 +5698,7 @@ mod call_tests {
         .encode_collection();
 
         ack_all_mrp(&mut call);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400), sys_at(400));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
@@ -5603,7 +5742,7 @@ mod call_tests {
         .encode_collection();
 
         ack_all_mrp(&mut call);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500), sys_at(500));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
@@ -5765,6 +5904,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
 
         let mut call = create_adhoc_call(CALL_ID, now, system_now);
 
@@ -5782,7 +5922,7 @@ mod call_tests {
         .encode_collection();
 
         ack_all_mrp(&mut call);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100), sys_at(100));
         assert_eq!(
             to_rtp_to_send(vec![(
                 demux_id1,
@@ -5812,7 +5952,7 @@ mod call_tests {
         )
         .encode_collection();
         ack_all_mrp(&mut call);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200), sys_at(200));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
@@ -5842,7 +5982,7 @@ mod call_tests {
         }
         .encode_to_vec();
 
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300), sys_at(300));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
@@ -5864,7 +6004,7 @@ mod call_tests {
 
         // Clients leaving the "removed" list don't count as participant changes,
         // so there's no update for client 1 at this tick.
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400), sys_at(400));
         assert_eq!(0, rtp_to_send.len());
 
         // Re-add the same user. Should be a pending client
@@ -5888,7 +6028,7 @@ mod call_tests {
             .encode_collection();
         let expected_update_payload_demux1 = expected_update_payload_demux1.encode_collection();
 
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500), sys_at(500));
         assert_eq!(
             to_rtp_to_send(vec![
                 (
@@ -6241,13 +6381,14 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
 
         let mut call = create_call(CALL_ID, now, system_now);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         // If there is no audio activity from anyone, we choose the first client as the active speaker
         ack_all_mrp(&mut call);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(301));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(301), sys_at(301));
 
         let expected_update_payload = create_sfu_to_device(
             true,
@@ -6280,7 +6421,7 @@ mod call_tests {
             let _rtp_to_send = call.handle_rtp(demux_id2, rtp.borrow_mut(), at(301 + seqnum));
         }
         ack_all_mrp(&mut call);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(602));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(602), sys_at(602));
 
         let expected_update_payload = create_sfu_to_device(
             false,
@@ -6317,7 +6458,7 @@ mod call_tests {
             let _rtp_to_send = call.handle_rtp(demux_id2, rtp.borrow_mut(), at(602 + seqnum));
         }
         ack_all_mrp(&mut call);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(903));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(903), sys_at(903));
 
         let expected_update_payload = create_sfu_to_device(
             false,
@@ -6354,7 +6495,7 @@ mod call_tests {
 
         // Don't resend anything after just 301ms (except stats)
         ack_all_mrp(&mut call);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(1204));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(1204), sys_at(1204));
         assert_eq!(2, rtp_to_send.len());
         assert_eq!(
             Some(protos::sfu_to_device::Stats {
@@ -6376,11 +6517,11 @@ mod call_tests {
         // Still don't resend after 1001ms
         // active speaker updates are sent with mrp and don't need to be refreshed
         ack_all_mrp(&mut call);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(1904));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(1904), sys_at(1904));
         assert!(rtp_to_send.is_empty());
 
         // And more stats a little later.
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(2205));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(2205), sys_at(2205));
         assert_eq!(2, rtp_to_send.len());
         assert_eq!(
             Some(protos::sfu_to_device::Stats {
@@ -6405,12 +6546,13 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
 
         let mut call = create_call(CALL_ID, now, system_now);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         // If there is no audio activity from anyone, we choose the first client as the active speaker
-        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(301));
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(301), sys_at(301));
 
         assert_eq!(Some(demux_id1), call.active_speaker_id);
 
@@ -6445,7 +6587,7 @@ mod call_tests {
             rtp.audio_level = Some(seqnum as u8);
             let _rtp_to_send = call.handle_rtp(demux_id2, rtp.borrow_mut(), at(302 + seqnum));
         }
-        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(603));
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(603), sys_at(603));
 
         assert_eq!(Some(demux_id2), call.active_speaker_id);
 
@@ -6500,7 +6642,7 @@ mod call_tests {
             rtp.audio_level = Some(0);
             let _rtp_to_send = call.handle_rtp(demux_id2, rtp.borrow_mut(), at(605 + seqnum));
         }
-        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(906));
+        let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(906), sys_at(906));
 
         assert_eq!(Some(demux_id1), call.active_speaker_id);
 
@@ -6515,6 +6657,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
         let get_forwarding_video_demux_ids =
             |from_server: &[RtpToSend], receiver_demux_id: DemuxId| -> Option<Vec<DemuxId>> {
                 let (_demux_id, rtp) = from_server
@@ -6536,7 +6679,7 @@ mod call_tests {
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         let demux_id3 = add_client(&mut call, "3", 3, at(3));
 
-        let (from_server, _outgoing_key_frame_requests) = call.tick(at(4));
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(4), sys_at(4));
         // Nothing to forward yet
         assert_eq!(
             Some(vec![]),
@@ -6567,7 +6710,7 @@ mod call_tests {
                 .unwrap();
         }
 
-        let (from_server, _outgoing_key_frame_requests) = call.tick(at(1006));
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(1006), sys_at(1006));
         assert_eq!(
             Some(vec![demux_id2]),
             get_forwarding_video_demux_ids(&from_server, demux_id1)
@@ -6595,7 +6738,7 @@ mod call_tests {
         call.handle_rtp(demux_id2, to_server.borrow_mut(), at(1007))
             .unwrap();
 
-        let (from_server, _outgoing_key_frame_requests) = call.tick(at(2008));
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(2008), sys_at(2008));
         assert_eq!(
             Some(vec![demux_id2]),
             get_forwarding_video_demux_ids(&from_server, demux_id1)
@@ -6614,7 +6757,7 @@ mod call_tests {
         call.handle_rtp(demux_id1, to_server.borrow_mut(), at(2009))
             .unwrap();
 
-        let (from_server, _outgoing_key_frame_requests) = call.tick(at(3010));
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(3010), sys_at(3010));
         assert_eq!(
             Some(vec![]),
             get_forwarding_video_demux_ids(&from_server, demux_id1)
@@ -6634,6 +6777,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
         let get_demux_ids_and_heights = |from_server: &[RtpToSend],
                                          receiver_demux_id: DemuxId|
          -> Option<Vec<(DemuxId, u32)>> {
@@ -6664,7 +6808,7 @@ mod call_tests {
         call.handle_rtp(demux_id2, resolution_request.borrow_mut(), at(4))
             .unwrap();
 
-        let (from_server, _outgoing_key_frame_requests) = call.tick(at(5));
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(5), sys_at(5));
 
         // No heights are allocated yet because no video is being sent yet.
         assert_eq!(
@@ -6683,7 +6827,7 @@ mod call_tests {
             rtp.audio_level = Some(seqnum as u8);
             let _rtp_to_send = call.handle_rtp(demux_id2, rtp.borrow_mut(), at(305 + seqnum));
         }
-        let (_from_server, _outgoing_key_frame_requests) = call.tick(at(605));
+        let (_from_server, _outgoing_key_frame_requests) = call.tick(at(605), sys_at(605));
 
         // Send some video from demux_id2 so that there's video to forward.
         for seqnum in 0..10 {
@@ -6714,7 +6858,7 @@ mod call_tests {
                 .unwrap();
         }
 
-        let (from_server, _outgoing_key_frame_requests) = call.tick(at(1607));
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(1607), sys_at(1607));
         assert_eq!(
             Some(vec![(demux_id2, 240)]),
             get_demux_ids_and_heights(&from_server, demux_id1)
@@ -6729,7 +6873,7 @@ mod call_tests {
         call.handle_rtp(demux_id1, resolution_request.borrow_mut(), at(1608))
             .unwrap();
 
-        let (from_server, _outgoing_key_frame_requests) = call.tick(at(2709));
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(2709), sys_at(2709));
         assert_eq!(
             Some(vec![(demux_id2, 480)]),
             get_demux_ids_and_heights(&from_server, demux_id1)
@@ -6760,7 +6904,7 @@ mod call_tests {
         call.handle_rtp(demux_id1, empty_resolution_request.borrow_mut(), at(4711))
             .unwrap();
 
-        let (from_server, _outgoing_key_frame_requests) = call.tick(at(5712));
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(5712), sys_at(5712));
 
         assert_eq!(
             Some(vec![]),
@@ -6773,6 +6917,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
 
         let mut call = create_call(CALL_ID, now, system_now);
 
@@ -6781,7 +6926,7 @@ mod call_tests {
         assert_eq!(2, call.clients.len());
 
         // Clear out updates.
-        let (_rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
+        let (_rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300), sys_at(300));
 
         assert_eq!(
             call.handle_rtp(demux_id1, create_leave_rtp().borrow_mut(), at(400)),
@@ -6789,7 +6934,7 @@ mod call_tests {
         );
         assert_eq!(1, call.clients.len());
 
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400), sys_at(400));
         let expected_update_payload = create_sfu_to_device(
             true,
             mrp_header(3, None),
@@ -6812,6 +6957,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
 
         let mut call = create_call(CALL_ID, now, system_now);
 
@@ -6820,7 +6966,7 @@ mod call_tests {
         assert_eq!(2, call.clients.len());
 
         // Clear out updates.
-        let (_rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300));
+        let (_rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300), sys_at(300));
 
         let rtp_to_send = call
             .handle_rtp(demux_id1, create_raise_hand_rtp().borrow_mut(), at(400))
@@ -6829,7 +6975,7 @@ mod call_tests {
 
         assert_eq!(2, call.clients.len());
 
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400), sys_at(400));
 
         // Client1 should have a target_seqnum of 1
         let expected_update_payload_for_raised_hands_client1 = protos::SfuToDevice {
@@ -7235,6 +7381,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
         let get_forwarding_video_demux_ids =
             |from_server: &[RtpToSend], receiver_demux_id: DemuxId| -> Option<Vec<DemuxId>> {
                 let (_demux_id, rtp) = from_server
@@ -7256,7 +7403,7 @@ mod call_tests {
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         let demux_id3 = add_client(&mut call, "3", 3, at(3));
 
-        let (from_server, _outgoing_key_frame_requests) = call.tick(at(4));
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(4), sys_at(4));
         // Nothing to forward yet
         assert_eq!(
             Some(vec![]),
@@ -7300,7 +7447,7 @@ mod call_tests {
                 .unwrap();
         }
 
-        let (from_server, _outgoing_key_frame_requests) = call.tick(at(1006));
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(1006), sys_at(1006));
         assert_eq!(
             Some(vec![demux_id2, demux_id3]),
             get_forwarding_video_demux_ids(&from_server, demux_id1)
@@ -7433,6 +7580,7 @@ mod call_tests {
             stats: None,
             removed: None,
             raised_hands: None,
+            endorsements: None,
         };
 
         assert!(sfu_to_device.encode_to_vec().len() <= MAX_PACKET_SERIALIZED_BYTE_SIZE);
@@ -7479,6 +7627,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
 
         let mut call = create_adhoc_call(CALL_ID, now, system_now);
 
@@ -7495,7 +7644,7 @@ mod call_tests {
         let fragment1 = &content[0..MAX_MRP_FRAGMENT_BYTE_SIZE];
         let fragment2 = &content[MAX_MRP_FRAGMENT_BYTE_SIZE..];
         let expected = expected_rtp(&demux_ids, 1, &update, &[fragment1, fragment2]);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100), sys_at(100));
         assert_eq!(expected, rtp_to_send);
 
         let pending_demux_ids = (101..=150)
@@ -7538,7 +7687,7 @@ mod call_tests {
         ));
 
         ack_all_mrp(&mut call);
-        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200));
+        let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200), sys_at(200));
         assert_eq!(expected, rtp_to_send);
     }
 }

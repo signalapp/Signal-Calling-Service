@@ -85,6 +85,13 @@ rlimit = "0.10.2"
 rustls = "0.23.23"
 rustls-pemfile = "2.2.0"
 
+# For endorsements
+libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.73.3" }
+zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.73.3" }
+bincode = "1.3.3"
+itertools = "0.14.0"
+base64 = "0.22.1"
+
 [target.'cfg(target_os="linux")'.dependencies]
 # Only currently needed for metrics (won't build on mac, see https://github.com/rust-lang/rust/issues/115149).
 accounting-allocator = "0.2.0"
@@ -96,6 +103,7 @@ prost-build = "0.13.5"
 http = "1.2.0"
 hex-literal = "0.4.1"
 unzip3 = "1.0.0"
+uuid = { version = "1.11.0", features = ["v4"] }
 
 tokio = { version = "1.44.0", features = ["test-util"] }
 

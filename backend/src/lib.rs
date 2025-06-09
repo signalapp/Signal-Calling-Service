@@ -9,6 +9,7 @@ pub mod call_lifecycle;
 pub mod candidate_selector;
 pub mod config;
 pub mod connection;
+pub mod endorsements;
 pub mod frontend;
 pub mod googcc;
 pub mod http_server;

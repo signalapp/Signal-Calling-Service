@@ -134,6 +134,10 @@ pub struct Config {
     #[arg(long)]
     pub key_file_path: Option<String>,
 
+    /// The secret used to issue Send Endorsements
+    #[arg(long)]
+    pub endorsement_secret: Option<String>,
+
     // The hostname to give the client to validate the certificate used for TLS
     #[arg(long)]
     pub hostname: Option<String>,
@@ -293,6 +297,7 @@ pub(crate) fn default_test_config() -> Config {
         certificate_file_path: None,
         key_file_path: None,
         hostname: None,
+        endorsement_secret: None,
         ice_candidate_port_tls: None,
         candidate_selector_options: Default::default(),
     }

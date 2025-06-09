@@ -9,7 +9,7 @@
 //!   GET /v2/conference/participants
 //!   PUT /v2/conference/participants
 
-use std::{net::SocketAddr, str, sync::Arc, time::UNIX_EPOCH};
+use std::{net::SocketAddr, str, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -19,7 +19,7 @@ use axum_extra::{
     headers::{self, authorization::Basic, Authorization},
     TypedHeader,
 };
-use calling_common::{CallType, DemuxId, SignalUserAgent};
+use calling_common::{CallType, DemuxId, SignalUserAgent, SystemTime};
 use hex::{FromHex, ToHex};
 use log::*;
 use parking_lot::RwLock;
@@ -124,8 +124,7 @@ pub fn random_demux_id() -> DemuxId {
 fn conference_id_from_signaling_info(signaling: &sfu::CallSignalingInfo) -> String {
     signaling
         .created
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
+        .saturating_duration_since(SystemTime::UNIX_EPOCH)
         .as_millis()
         .to_string()
 }

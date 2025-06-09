@@ -60,6 +60,9 @@ fn print_config(config: &'static config::Config) {
         info!("  {:38}{:?}", "certificate_file_path:", config.certificate_file_path);
         info!("  {:38}{:?}", "key_file_path:", config.key_file_path);
     }
+    if config.endorsement_secret.is_some() {
+        info!("  {:38}{:?}", "endorsement_secret:", "is_some");
+    }
 }
 
 /// Waits for a SIGINT or SIGTERM signal and returns. Can be cancelled

@@ -90,6 +90,8 @@ impl SubAssign<Duration> for Instant {
 pub struct SystemTime(std::time::SystemTime);
 
 impl SystemTime {
+    pub const UNIX_EPOCH: SystemTime = SystemTime(std::time::SystemTime::UNIX_EPOCH);
+
     pub fn checked_duration_since(&self, earlier: SystemTime) -> Option<Duration> {
         self.0.duration_since(earlier.0).ok().map(Duration)
     }
@@ -102,6 +104,33 @@ impl SystemTime {
 
     pub fn now() -> SystemTime {
         SystemTime(std::time::SystemTime::now())
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        SystemTime::now().saturating_duration_since(*self)
+    }
+
+    /// Returns SystemTime rounded up to the later whole day. Only works for dates after UNIX_EPOCH,
+    /// Example: 2021-01-01 04:17:00 and 2021-01-01 4:41:00 are both rounded to 2021-01-02 00:00:00.
+    pub fn round_up_day(&self) -> Option<SystemTime> {
+        self.0
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|epoch| {
+                let epoch = epoch.as_secs();
+                let delta_over_day = epoch % (60 * 60 * 24);
+                if delta_over_day == 0 {
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(epoch)
+                } else {
+                    let rounded_epoch = Duration::from_secs(epoch - delta_over_day + 86400);
+                    SystemTime::UNIX_EPOCH + rounded_epoch
+                }
+            })
+            .map(Into::into)
+    }
+
+    pub fn saturating_duration_since_epoch(&self) -> Duration {
+        self.saturating_duration_since(Self::UNIX_EPOCH)
     }
 }
 
@@ -413,5 +442,32 @@ mod tests {
         let mut manual_difference = soon;
         manual_difference -= duration;
         assert_eq!(now, manual_difference);
+    }
+
+    #[test]
+    fn system_time_round_up_day() {
+        let day_aligned = SystemTime::UNIX_EPOCH;
+        let secs_in_day = 24 * 60 * 60;
+        let one_day = Duration::from_secs(secs_in_day);
+
+        assert_eq!(
+            Some(day_aligned),
+            day_aligned.round_up_day(),
+            "Does not change already day aligned values"
+        );
+
+        for i in (1..=secs_in_day).step_by(secs_in_day as usize / 10) {
+            assert_eq!(
+                Some(day_aligned + one_day),
+                (day_aligned + Duration::from_secs(i)).round_up_day(),
+                "Should round up day"
+            );
+        }
+
+        assert_eq!(
+            None,
+            (SystemTime::UNIX_EPOCH - Duration::from_secs(1)).round_up_day(),
+            "Does not work for dates before epoch"
+        );
     }
 }

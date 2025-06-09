@@ -8,13 +8,14 @@
 use core::ops::DerefMut;
 use std::{
     cmp::min, collections::HashMap, convert::TryInto, fmt::Write, ops::AddAssign, str::FromStr,
-    sync::Arc, time::SystemTime,
+    sync::Arc,
 };
 
 use anyhow::Result;
+use base64::Engine;
 use calling_common::{
     CallType, ClientStatus, DataRate, DataSize, DemuxId, Duration, Instant, RoomId,
-    SignalUserAgent, TwoGenerationCacheWithManualRemoveOld, DUMMY_DEMUX_ID,
+    SignalUserAgent, SystemTime, TwoGenerationCacheWithManualRemoveOld, DUMMY_DEMUX_ID,
 };
 use hkdf::Hkdf;
 use log::*;
@@ -34,6 +35,7 @@ use crate::{
     call::{self, Call, CallSizeBucket, LoggableCallId, CALL_TAG_VALUES},
     config,
     connection::{self, Connection, ConnectionRates, HandleRtcpResult, PacketToSend},
+    endorsements::EndorsementIssuer,
     googcc,
     ice::{self, BindingRequest, BindingResponse, IceTransactionTable},
     pacer,
@@ -155,6 +157,9 @@ pub struct Sfu {
     connection_id_by_ice_request_username: HashMap<Vec<u8>, ConnectionId>,
     connection_id_by_address: TwoGenerationCacheWithManualRemoveOld<SocketLocator, ConnectionId>,
 
+    /// Endorsement Issuer, reference given to each Call
+    endorsement_issuer: Option<Arc<Mutex<EndorsementIssuer>>>,
+
     /// The last time activity was checked.
     activity_checked: Instant,
     /// The last time diagnostics were logged.
@@ -186,7 +191,23 @@ pub struct SfuStats {
 }
 
 impl Sfu {
+    const ENDORSEMENT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+
     pub fn new(now: Instant, config: &'static config::Config) -> Result<Self> {
+        let endorsement_issuer = if let Some(secret) = config.endorsement_secret.as_ref() {
+            let secret = base64::engine::general_purpose::STANDARD
+                .decode(secret)
+                .map_err(|e| anyhow::anyhow!("Invalid endorsement_secret: {}", e))?;
+            let secret_params = zkgroup::deserialize(&secret)
+                .map_err(|e| anyhow::anyhow!("Invalid endorsement_secret: {}", e))?;
+            Some(Arc::new(Mutex::new(EndorsementIssuer::new(
+                secret_params,
+                Self::ENDORSEMENT_DURATION,
+            ))))
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             // To enable, call set_call_ended_handler
@@ -198,6 +219,7 @@ impl Sfu {
                 Duration::from_secs(30),
                 now,
             ),
+            endorsement_issuer,
             activity_checked: now,
             diagnostics_logged: now,
             packet_server: None,
@@ -281,8 +303,7 @@ impl Sfu {
             let call = call.lock();
             let clients = call.size();
             let clients_squared = clients * clients;
-            let call_duration =
-                (call.created().elapsed().unwrap_or_default().as_secs() / 60) as usize;
+            let call_duration = (call.created().elapsed().as_secs() / 60) as usize;
 
             let call_type = call.call_type();
             let size_bucket = call.size_bucket();
@@ -566,6 +587,7 @@ impl Sfu {
                     created,
                     approved_users,
                     self.config.approved_users_persistence_url.as_ref(),
+                    self.endorsement_issuer.clone(),
                 )))
             });
 
@@ -1032,7 +1054,7 @@ impl Sfu {
     /// For every tick, we need to iterate all calls, with the goal of iterating
     /// only once. Since we need to sometimes remove clients or calls, we will
     /// generally iterate with retain().
-    pub fn tick(sfu: &RwLock<Self>, now: Instant) -> TickOutput {
+    pub fn tick(sfu: &RwLock<Self>, now: Instant, sys_now: SystemTime) -> TickOutput {
         time_scope_us!("calling.sfu.tick");
         let (config, diagnostics_logged, activity_checked) = {
             let sfu = sfu.read();
@@ -1240,7 +1262,7 @@ impl Sfu {
                             }
                         }
                         // Don't remove the call; there are still clients!
-                        let (outgoing_rtp, outgoing_key_frame_requests) = call.tick(now);
+                        let (outgoing_rtp, outgoing_key_frame_requests) = call.tick(now, sys_now);
                         let send_rate_allocation_infos =
                             call.get_send_rate_allocation_info().collect::<Vec<_>>();
 
@@ -1827,6 +1849,7 @@ mod sfu_tests {
     #[tokio::test]
     async fn test_remove_clients() {
         let initial_now = Instant::now();
+        let sys_now = SystemTime::now();
         let sfu = new_sfu(initial_now, &CUSTOM_CONFIG);
 
         // 1000 calls with 8 users each.
@@ -1865,7 +1888,7 @@ mod sfu_tests {
             // Run the tick for (inactivity_timeout_secs * 1000) / tick_interval_ms times.
             for i in 0..((INACTIVITY_TIMEOUT_SECS * 1000) / TICK_PERIOD_MS) {
                 let elapsed = Duration::from_millis((i + 1) * TICK_PERIOD_MS);
-                Sfu::tick(&sfu, initial_now.add(elapsed));
+                Sfu::tick(&sfu, initial_now.add(elapsed), sys_now.add(elapsed));
             }
 
             // The calls should now be gone.

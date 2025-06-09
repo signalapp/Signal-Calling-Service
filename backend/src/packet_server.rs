@@ -28,7 +28,7 @@ mod epoll;
 pub use epoll::PacketServerState;
 #[cfg(not(all(feature = "epoll", target_os = "linux")))]
 mod generic;
-use calling_common::{Duration, Instant};
+use calling_common::{Duration, Instant, SystemTime};
 #[cfg(not(all(feature = "epoll", target_os = "linux")))]
 pub use generic::PacketServerState;
 use metrics::*;
@@ -163,7 +163,7 @@ pub async fn start(
             tokio::time::sleep(tick_interval.into()).await;
             time_scope_us!("calling.udp_server.tick.processing");
 
-            let tick_output = { Sfu::tick(&sfu_for_tick, Instant::now()) };
+            let tick_output = { Sfu::tick(&sfu_for_tick, Instant::now(), SystemTime::now()) };
 
             // Process outside the scope of the lock on the sfu.
             match packet_handler_state_for_tick.tick(tick_output) {

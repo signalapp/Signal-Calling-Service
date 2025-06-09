@@ -58,6 +58,12 @@ message DeviceToSfu {
 }
 
 message SfuToDevice {
+  message SendEndorsementsResponse {
+    // The GroupSendEndorsementResponse serialized by libsignal
+    optional bytes serialized = 1;
+    repeated bytes opaque_user_ids = 2;
+  }
+
   message PeekInfo {
     message PeekDeviceInfo {
       optional fixed32 demux_id = 1;
@@ -136,4 +142,5 @@ message SfuToDevice {
   optional MRPHeader mrp_header                     = 11;
   // Must be used in conjunction with MrpHeader
   optional bytes content                            = 12;
+  optional SendEndorsementsResponse endorsements    = 13;
 }

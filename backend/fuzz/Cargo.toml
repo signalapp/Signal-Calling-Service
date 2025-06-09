@@ -60,3 +60,7 @@ path = "fuzz_targets/googcc.rs"
 test = false
 doc = false
 
+# keep in sync with workspace patches
+[patch.crates-io]
+# Use our fork of curve25519-dalek because we're using zkgroup.
+curve25519-dalek = { git = 'https://github.com/signalapp/curve25519-dalek', tag = 'signal-curve25519-4.1.3' }
