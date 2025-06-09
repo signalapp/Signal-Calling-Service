@@ -84,7 +84,7 @@ pub struct JoinRequest {
     #[serde(rename = "clientIceUfrag")]
     pub ice_ufrag: String,
     #[serde(rename = "clientIcePwd")]
-    pub ice_pwd: Option<String>,
+    pub ice_pwd: String,
     #[serde(rename = "clientDhePublicKey")]
     pub dhe_public_key: Option<String>,
     pub hkdf_extra_info: Option<String>,
@@ -373,7 +373,7 @@ mod tests {
             serde_json::to_value(JoinRequest {
                 user_id: USER_ID_1.to_string(),
                 ice_ufrag: CLIENT_ICE_UFRAG.to_string(),
-                ice_pwd: Some(CLIENT_ICE_PWD.to_string()),
+                ice_pwd: CLIENT_ICE_PWD.to_string(),
                 dhe_public_key: Some(CLIENT_DHE_PUBLIC_KEY.to_string()),
                 hkdf_extra_info: None,
                 region: LOCAL_REGION.to_string(),

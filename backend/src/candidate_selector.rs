@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use calling_common::{Duration, Instant};
 use log::{trace, warn};
 use metrics::event;
-use partial_default::PartialDefault;
 
 use crate::{
     connection::PacketToSend,
@@ -58,7 +57,7 @@ pub struct IceCredentials {
     /// Used to verify the HMAC in requests and generate HMACs in responses.
     pub server_pwd: Vec<u8>,
     /// Used to verify the HMAC in responses and generate HMACs in requests.
-    pub client_pwd: Option<Vec<u8>>,
+    pub client_pwd: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -154,28 +153,19 @@ enum Action {
     None,
 }
 
-#[derive(Debug, Clone, PartialDefault)]
-#[partial_default(bound = "")]
+#[derive(Debug, Clone)]
 pub struct Candidate {
-    #[partial_default(value = "SocketLocator::Udp(\"0.0.0.0:0\".parse().unwrap())")]
     address: SocketLocator,
-    #[partial_default(value = "AddressType::UdpV4")]
     address_type: AddressType,
     remote_priority: u32,
     base_score: f32,
-    #[partial_default(value = "Instant::now()")]
     last_update_time: Instant,
-    #[partial_default(value = "RttEstimator::with_sensitivity(1.0)")]
     rtt_estimator: RttEstimator,
-    #[partial_default(value = "State::New")]
     state: State,
     ping_transaction_id: Option<TransactionId>,
-    #[partial_default(value = "Instant::now()")]
     ping_sent_time: Instant,
     ping_retransmit_count: u32,
-    #[partial_default(value = "Instant::now()")]
     ping_next_send_time: Instant,
-    #[partial_default(value = "Duration::ZERO")]
     ping_period: Duration,
 }
 
@@ -195,21 +185,18 @@ impl Candidate {
             base_score,
             address_type: address.get_address_type(),
             rtt_estimator: RttEstimator::with_sensitivity(rtt_sensitivity),
-            ..PartialDefault::partial_default()
+            last_update_time: now,
+            state: State::New,
+            remote_priority: 0,
+            ping_transaction_id: None,
+            ping_sent_time: now,
+            ping_retransmit_count: 0,
+            ping_next_send_time: now,
         };
 
         let action = candidate.will_transmit_ping(now);
 
         (action, candidate)
-    }
-
-    fn for_passive_mode(address: SocketLocator) -> Self {
-        Self {
-            address,
-            address_type: address.get_address_type(),
-            state: State::Active,
-            ..PartialDefault::partial_default()
-        }
     }
 
     fn maybe_update_priority(&mut self, priority: u32) -> bool {
@@ -336,21 +323,6 @@ impl Candidate {
             self.ping_next_send_time = now + self.ping_period - rtt;
         }
     }
-
-    // Passive client support: update the activity timestamp. This is done
-    // in response to a ping request being received from the candidate.
-    fn update_activity_timestamp_passive(&mut self, now: Instant) {
-        self.last_update_time = now;
-    }
-
-    // Passive client support: if the inactivity timeout is exceeded the client
-    // will transition into the Dead state.
-    fn update_state_passive(&mut self, inactivity_timeout: Duration, now: Instant) {
-        let inactive_time = now.saturating_duration_since(self.last_update_time);
-        if inactive_time >= inactivity_timeout {
-            self.state = State::Dead;
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -364,24 +336,9 @@ pub struct CandidateSelector {
 
 impl CandidateSelector {
     pub fn new(now: Instant, config: Config) -> Self {
-        let mut candidates = vec![];
-
-        // Backward compatibility: the selector will operate in the passive mode
-        // if no client ICE password is provided. The intialization timeout is only
-        // applicable to the active candidates. Inactivity timing for the passive
-        // candidates is managed via the last_update_time Candidate field.
-        let initialization_timeout = if config.ice_credentials.client_pwd.is_none() {
-            event!("calling.sfu.candidate_selector.passive");
-            candidates.push(Candidate::partial_default());
-            None
-        } else {
-            event!("calling.sfu.candidate_selector.active");
-            Some(now + config.inactivity_timeout)
-        };
-
         Self {
-            initialization_timeout,
-            candidates,
+            initialization_timeout: Some(now + config.inactivity_timeout),
+            candidates: vec![],
             config,
             selected_candidate: None,
             nominated_candidate: None,
@@ -390,10 +347,6 @@ impl CandidateSelector {
 
     pub fn ice_credentials(&self) -> &IceCredentials {
         &self.config.ice_credentials
-    }
-
-    pub fn is_passive(&self) -> bool {
-        self.config.ice_credentials.client_pwd.is_none()
     }
 
     /// Selects the most suitable candidate from the list of known candidates.
@@ -547,37 +500,6 @@ impl CandidateSelector {
 
         self.send_ping_response(packets_to_send, &request, source_addr);
 
-        if self.is_passive() {
-            self.handle_ping_request_passive(request, source_addr, now);
-        } else {
-            self.handle_ping_request_default(packets_to_send, request, source_addr, now);
-        }
-    }
-
-    fn handle_ping_request_passive(
-        &mut self,
-        request: BindingRequest,
-        source_addr: SocketLocator,
-        now: Instant,
-    ) {
-        if source_addr != self.candidates[0].address {
-            if request.nominated() {
-                event!("calling.sfu.ice.passive.outgoing_addr_switch");
-                self.candidates[0] = Candidate::for_passive_mode(source_addr);
-                self.selected_candidate = Some(0);
-            }
-        } else {
-            self.candidates[0].update_activity_timestamp_passive(now);
-        }
-    }
-
-    fn handle_ping_request_default(
-        &mut self,
-        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
-        request: BindingRequest,
-        source_addr: SocketLocator,
-        now: Instant,
-    ) {
         let (action, candidate_index) = self.get_or_create_candidate(source_addr, now);
 
         // We transition the selector out of the initialization state if the candidate
@@ -649,13 +571,6 @@ impl CandidateSelector {
     }
 
     pub fn tick(&mut self, packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>, now: Instant) {
-        // For passive selectors we need to force a candidate state update since
-        // we don't probe them with pings.
-        if self.is_passive() {
-            self.candidates[0].update_state_passive(self.config.inactivity_timeout, now);
-            return;
-        }
-
         for candidate in &mut self.candidates {
             let action = candidate.tick(now);
             Self::execute_candidate_action(
@@ -722,13 +637,9 @@ impl CandidateSelector {
             Action::SendPing(transaction_id) => {
                 trace!("sending STUN ping request to {}", candidate.address);
                 IceTransactionTable::put(candidate.address, &transaction_id, connection_id);
-                let ice_pwd = ice_credentials
-                    .client_pwd
-                    .as_ref()
-                    .expect("must have client ice pwd in active mode");
                 let request = StunPacketBuilder::new_binding_request(&transaction_id)
                     .set_username(&ice_credentials.client_username)
-                    .build(ice_pwd);
+                    .build(&ice_credentials.client_pwd);
                 packets_to_send.push((request, candidate.address));
             }
             Action::None => {
@@ -791,34 +702,7 @@ mod tests {
                 server_username: b"some ice req username".to_vec(),
                 client_username: b"some ice res username".to_vec(),
                 server_pwd: b"some server ice pwd".to_vec(),
-                client_pwd: Some(b"some client ice pwd".to_vec()),
-            },
-            connection_id: ConnectionId::null(),
-        };
-        CandidateSelector::new(now, config)
-    }
-
-    fn create_passive_candidate_selector(now: Instant) -> CandidateSelector {
-        let config = Config {
-            ping_period: Duration::ZERO,
-            inactivity_timeout: Duration::from_secs(30),
-            rtt_sensitivity: 0.2,
-            rtt_max_penalty: 2000.0,
-            rtt_limit: 200.0,
-            scoring_values: ScoringValues {
-                score_nominated: 1000,
-                score_udpv4: 500,
-                score_udpv6: 600,
-                score_tcpv4: 250,
-                score_tcpv6: 300,
-                score_tlsv4: 200,
-                score_tlsv6: 300,
-            },
-            ice_credentials: IceCredentials {
-                server_username: b"some ice req username".to_vec(),
-                client_username: b"some ice res username".to_vec(),
-                server_pwd: b"some server ice pwd".to_vec(),
-                client_pwd: None,
+                client_pwd: b"some client ice pwd".to_vec(),
             },
             connection_id: ConnectionId::null(),
         };
@@ -1366,70 +1250,6 @@ mod tests {
         assert_eq!(selector.borrow().candidates.len(), 1);
         assert_eq!(selector.borrow().candidates[0].state, State::Active);
         assert!(matches!(selector.borrow().selected_candidate, Some(0)));
-    }
-
-    #[test]
-    fn test_passive_mode() {
-        const TICK_PERIOD: Duration = Duration::from_millis(100);
-
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            8000,
-        ));
-        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            8001,
-        ));
-
-        let time = Instant::now();
-        let selector = Rc::new(RefCell::new(create_passive_candidate_selector(time)));
-
-        let mut endpoints = vec![
-            SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0),
-            SimulatedEndpoint::new(Rc::clone(&selector), client_addr2, 50..90, 0.0),
-        ];
-
-        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
-
-        // Send a ping for the first candidate, but without a nomination. There should
-        // be no selected candidate.
-        simulator.send_ping_request(client_addr1, time, 32);
-        let time = simulator.run(Duration::from_secs(5), time);
-        assert!(selector.borrow().selected_candidate.is_none());
-
-        // Send a ping for the first candidate, but this time with a nomination.
-        // The candidate should be in the active state and selected.
-        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
-        let time = simulator.run(Duration::from_secs(5), time);
-        assert_eq!(selector.borrow().candidates[0].state, State::Active);
-        assert_eq!(selector.borrow().candidates[0].address, client_addr1);
-        assert_eq!(selector.borrow().selected_candidate, Some(0));
-        assert!(!selector.borrow().inactive(time));
-
-        // Send another ping without a nomination, but with a different address. The current
-        // selection should not change.
-        simulator.send_ping_request(client_addr2, time, 32);
-        let time = simulator.run(Duration::from_secs(5), time);
-        assert_eq!(selector.borrow().candidates[0].state, State::Active);
-        assert_eq!(selector.borrow().candidates[0].address, client_addr1);
-        assert_eq!(selector.borrow().selected_candidate, Some(0));
-        assert!(!selector.borrow().inactive(time));
-
-        // Send a ping with a nomination, but with the second address. The second address
-        // should be selected.
-        simulator.send_ping_request_with_nomination(client_addr2, time, 32);
-        let time = simulator.run(Duration::from_secs(5), time);
-        assert_eq!(selector.borrow().candidates[0].state, State::Active);
-        assert_eq!(selector.borrow().candidates[0].address, client_addr2);
-        assert_eq!(selector.borrow().selected_candidate, Some(0));
-        assert!(!selector.borrow().inactive(time));
-
-        // Let the simulator run for 35 seconds. This will result in the candidate
-        // transitioning into the dead state. Consequently, the selector will become
-        // inactive.
-        let time = simulator.run(Duration::from_secs(35), time);
-        assert_eq!(selector.borrow().candidates[0].state, State::Dead);
-        assert!(selector.borrow().inactive(time));
     }
 
     #[test]

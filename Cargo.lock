@@ -889,7 +889,6 @@ dependencies = [
  "num_cpus",
  "once_cell",
  "parking_lot",
- "partial-default",
  "pin-project",
  "prost",
  "prost-build",

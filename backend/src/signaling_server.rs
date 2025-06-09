@@ -93,7 +93,7 @@ pub struct JoinRequest {
     #[serde(rename = "endpointId")]
     pub user_id: String,
     pub client_ice_ufrag: String,
-    pub client_ice_pwd: Option<String>,
+    pub client_ice_pwd: String,
     pub client_dhe_public_key: String,
     pub hkdf_extra_info: Option<String>,
     pub region: Option<String>,
@@ -560,7 +560,7 @@ mod signaling_server_tests {
                 ice::random_ufrag(),
                 ice::random_pwd(),
                 client_ice_ufrag.to_string(),
-                Some(client_ice_pwd.to_string()),
+                client_ice_pwd.to_string(),
                 client_dhe_pub_key,
                 vec![],
                 Region::Unset,
@@ -595,7 +595,7 @@ mod signaling_server_tests {
                 ice::random_ufrag(),
                 ice::random_pwd(),
                 client_ice_ufrag.to_string(),
-                Some(client_ice_pwd.to_string()),
+                client_ice_pwd.to_string(),
                 client_dhe_pub_key,
                 vec![],
                 Region::Unset,
@@ -1049,7 +1049,7 @@ mod signaling_server_tests {
                         serde_json::to_vec(&JoinRequest {
                             user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
-                            client_ice_pwd: Some(PWD.to_string()),
+                            client_ice_pwd: PWD.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
@@ -1079,7 +1079,7 @@ mod signaling_server_tests {
                         serde_json::to_vec(&JoinRequest {
                             user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
-                            client_ice_pwd: Some(PWD.to_string()),
+                            client_ice_pwd: PWD.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
@@ -1109,7 +1109,7 @@ mod signaling_server_tests {
                         serde_json::to_vec(&JoinRequest {
                             user_id: "".to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
-                            client_ice_pwd: Some(PWD.to_string()),
+                            client_ice_pwd: PWD.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
@@ -1139,7 +1139,7 @@ mod signaling_server_tests {
                         serde_json::to_vec(&JoinRequest {
                             user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
-                            client_ice_pwd: Some(PWD.to_string()),
+                            client_ice_pwd: PWD.to_string(),
                             client_dhe_public_key: "INVALID".to_string(),
                             hkdf_extra_info: None,
                             region: None,
@@ -1169,7 +1169,7 @@ mod signaling_server_tests {
                         serde_json::to_vec(&JoinRequest {
                             user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
-                            client_ice_pwd: Some(PWD.to_string()),
+                            client_ice_pwd: PWD.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: Some("G".to_string()),
                             region: None,
@@ -1199,7 +1199,7 @@ mod signaling_server_tests {
                         serde_json::to_vec(&JoinRequest {
                             user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
-                            client_ice_pwd: Some(PWD.to_string()),
+                            client_ice_pwd: PWD.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
@@ -1248,7 +1248,7 @@ mod signaling_server_tests {
                         serde_json::to_vec(&JoinRequest {
                             user_id: USER_ID_1.to_string(),
                             client_ice_ufrag: UFRAG.to_string(),
-                            client_ice_pwd: Some(PWD.to_string()),
+                            client_ice_pwd: PWD.to_string(),
                             client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                             hkdf_extra_info: None,
                             region: None,
@@ -1290,7 +1290,7 @@ mod signaling_server_tests {
             serde_json::to_value(JoinRequest {
                 user_id: USER_ID_1.to_string(),
                 client_ice_ufrag: UFRAG.to_string(),
-                client_ice_pwd: Some(PWD.to_string()),
+                client_ice_pwd: PWD.to_string(),
                 client_dhe_public_key: CLIENT_DHE_PUB_KEY.encode_hex(),
                 hkdf_extra_info: None,
                 region: Some("pangaea".to_string()),

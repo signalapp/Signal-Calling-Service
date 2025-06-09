@@ -496,7 +496,7 @@ impl Sfu {
         server_ice_ufrag: String,
         server_ice_pwd: String,
         client_ice_ufrag: String,
-        client_ice_pwd: Option<String>,
+        client_ice_pwd: String,
         client_dhe_public_key: DhePublicKey,
         client_hkdf_extra_info: Vec<u8>,
         region: Region,
@@ -536,7 +536,7 @@ impl Sfu {
         trace!("  {:25}{}", "server_ice_pwd:", server_ice_pwd);
 
         let ice_server_pwd = server_ice_pwd.as_bytes().to_vec();
-        let ice_client_pwd = client_ice_pwd.map(|pwd| pwd.as_bytes().to_vec());
+        let ice_client_pwd = client_ice_pwd.as_bytes().to_vec();
 
         let ice_server_username =
             ice::join_username(client_ice_ufrag.as_bytes(), server_ice_ufrag.as_bytes());
@@ -1520,7 +1520,7 @@ mod sfu_tests {
             server_ice_ufrag,
             server_ice_pwd,
             client_ice_ufrag,
-            Some(client_ice_pwd),
+            client_ice_pwd,
             client_dhe_public_key,
             vec![],
             Region::Unset,

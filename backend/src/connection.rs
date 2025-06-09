@@ -161,7 +161,7 @@ impl Connection {
         ice_server_username: Vec<u8>,
         ice_client_username: Vec<u8>,
         ice_server_pwd: Vec<u8>,
-        ice_client_pwd: Option<Vec<u8>>,
+        ice_client_pwd: Vec<u8>,
         srtp_master_key_material: rtp::MasterKeyMaterial,
         ack_ssrc: rtp::Ssrc,
         googcc_config: googcc::Config,
@@ -319,23 +319,10 @@ impl Connection {
     ) -> Result<(), Error> {
         self.push_incoming_non_media_bytes(binding_response.len(), now);
 
-        // We should not be receiving any ICE ping responses if the candidate selector
-        // is in the passive mode.
-        if self.candidate_selector.is_passive() {
-            warn!("unexpected ICE ping response");
-            return Ok(());
-        }
-
-        // Since the candidate selector is not in the passive mode we know that
-        // the client ICE password is available.
         let ice_credentials = self.candidate_selector.ice_credentials();
-        let client_ice_pwd = ice_credentials
-            .client_pwd
-            .as_ref()
-            .expect("must have client ice pwd");
 
         binding_response
-            .verify_integrity(client_ice_pwd)
+            .verify_integrity(&ice_credentials.client_pwd)
             .map_err(|e| {
                 if matches!(e, ice::ParseError::HmacValidationFailure) {
                     Error::ReceivedIceWithInvalidHmac
@@ -895,50 +882,7 @@ mod connection_tests {
                 server_username: ice_server_username.to_vec(),
                 client_username: ice_client_username.to_vec(),
                 server_pwd: ice_server_pwd.to_vec(),
-                client_pwd: Some(ice_client_pwd.to_vec()),
-            },
-        };
-        Connection::with_candidate_selector_config(
-            candidate_selector_config,
-            zeroize::Zeroizing::new([0u8; 56]),
-            ack_ssrc,
-            googcc_config,
-            RegionRelation::Unknown,
-            SignalUserAgent::Unknown,
-            now,
-        )
-    }
-
-    fn new_connection_with_passive_selector(now: Instant) -> Connection {
-        let ice_server_username = b"server:client";
-        let ice_client_username = b"client:server";
-        let ice_server_pwd = b"the_pwd_should_be_long";
-        let ack_ssrc = 0xACC;
-        let googcc_config = googcc::Config {
-            initial_target_send_rate: DataRate::from_kbps(500),
-            ..Default::default()
-        };
-        let candidate_selector_config = candidate_selector::Config {
-            connection_id: ConnectionId::null(),
-            inactivity_timeout: Duration::from_secs(30),
-            ping_period: Duration::from_millis(1000),
-            rtt_sensitivity: 0.2,
-            rtt_max_penalty: 2000.0,
-            rtt_limit: 200.0,
-            scoring_values: ScoringValues {
-                score_nominated: 1000,
-                score_udpv4: 500,
-                score_udpv6: 600,
-                score_tcpv4: 250,
-                score_tcpv6: 300,
-                score_tlsv4: 200,
-                score_tlsv6: 300,
-            },
-            ice_credentials: candidate_selector::IceCredentials {
-                server_username: ice_server_username.to_vec(),
-                client_username: ice_client_username.to_vec(),
-                server_pwd: ice_server_pwd.to_vec(),
-                client_pwd: None,
+                client_pwd: ice_client_pwd.to_vec(),
             },
         };
         Connection::with_candidate_selector_config(
@@ -989,7 +933,7 @@ mod connection_tests {
         packets.retain(|(packet, addr)| {
             if let Some(req) = ice::BindingRequest::try_from_buffer(packet).expect("sane") {
                 let ice_credentials = connection.candidate_selector.ice_credentials();
-                let ice_pwd = ice_credentials.client_pwd.clone().unwrap();
+                let ice_pwd = ice_credentials.client_pwd.clone();
                 let buffer = ice::StunPacketBuilder::new_binding_response(&req.transaction_id())
                     .set_xor_mapped_address(&"1.1.1.1:10".parse().unwrap())
                     .build(&ice_pwd);
@@ -1177,7 +1121,7 @@ mod connection_tests {
         let response = ice::StunPacketBuilder::new_binding_response(&0u128.into())
             .set_username(&ice_credentials.server_username)
             .set_xor_mapped_address(&"1.1.1.1:1".parse().unwrap())
-            .build(ice_credentials.client_pwd.as_ref().unwrap());
+            .build(&ice_credentials.client_pwd);
 
         let sender_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
         assert_eq!(
@@ -1209,28 +1153,6 @@ mod connection_tests {
                 now,
             ),
             Err(Error::ReceivedIceWithInvalidHmac)
-        );
-    }
-
-    #[test]
-    fn test_ice_response_with_passive_selector() {
-        let now = Instant::now();
-
-        let mut connection = new_connection_with_passive_selector(now);
-        let ice_credentials = connection.candidate_selector.ice_credentials();
-
-        let request = ice::StunPacketBuilder::new_binding_response(&0u128.into())
-            .set_username(&ice_credentials.server_username)
-            .build(&ice_credentials.server_pwd);
-
-        let sender_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
-        assert_eq!(
-            connection.handle_ice_binding_response(
-                sender_addr,
-                ice::BindingResponse::from_buffer_without_sanity_check(&request),
-                now,
-            ),
-            Ok(())
         );
     }
 
