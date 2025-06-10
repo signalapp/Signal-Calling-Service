@@ -588,6 +588,7 @@ impl Sfu {
                     approved_users,
                     self.config.approved_users_persistence_url.as_ref(),
                     self.endorsement_issuer.clone(),
+                    true,
                 )))
             });
 

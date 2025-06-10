@@ -470,6 +470,10 @@ pub struct Call {
     key_frame_requests_sent: Instant,
     key_frame_request_sent_by_ssrc: HashMap<rtp::Ssrc, Instant>,
     call_stats: CallStats,
+
+    /// If true, do not send fragmentable updates for this call
+    /// toggle when there is client support for fragmentable updates
+    drop_fragmentable_updates: bool,
 }
 
 #[derive(Debug, Default)]
@@ -521,6 +525,7 @@ impl Call {
         approved_users: Option<Vec<UserId>>,
         approved_users_persistence_url: Option<&'static Url>,
         endorsement_issuer: Option<Arc<Mutex<EndorsementIssuer>>>,
+        drop_fragmentable_updates: bool,
     ) -> Self {
         let loggable_call_id = LoggableCallId::from(&call_id);
         info!("call: {} creating", loggable_call_id);
@@ -565,6 +570,7 @@ impl Call {
             key_frame_requests_sent: now - KEY_FRAME_REQUEST_CALCULATION_INTERVAL, // easier than using None :)
             key_frame_request_sent_by_ssrc: HashMap::new(),
             call_stats: CallStats::default(),
+            drop_fragmentable_updates,
         }
     }
 
@@ -1748,17 +1754,6 @@ impl Call {
                 } else {
                     None
                 };
-                let endorsements = call_send_endorsements
-                    .as_ref()
-                    .and_then(|e| e.get_endorsements_for(&client.user_id))
-                    .map(|response| protos::sfu_to_device::SendEndorsementsResponse {
-                        serialized: Some(response.serialized.clone()),
-                        opaque_user_ids: response
-                            .user_ids
-                            .iter()
-                            .map(|uids| hex::decode(uids.as_str()).unwrap())
-                            .collect(),
-                    });
 
                 let update = SfuToDevice {
                     speaker,
@@ -1787,6 +1782,21 @@ impl Call {
                     rtp_to_send.push((client.demux_id, update_rtp))
                 }
 
+                if self.drop_fragmentable_updates {
+                    continue;
+                }
+
+                let endorsements = call_send_endorsements
+                    .as_ref()
+                    .and_then(|e| e.get_endorsements_for(&client.user_id))
+                    .map(|response| protos::sfu_to_device::SendEndorsementsResponse {
+                        serialized: Some(response.serialized.clone()),
+                        opaque_user_ids: response
+                            .user_ids
+                            .iter()
+                            .map(|uids| hex::decode(uids.as_str()).unwrap())
+                            .collect(),
+                    });
                 if admin_update_device_joined_or_left.is_some() || endorsements.is_some() {
                     let fragmentable_update = SfuToDevice {
                         device_joined_or_left: if self.call_type != CallType::Adhoc
@@ -1835,6 +1845,10 @@ impl Call {
             let update_rtp =
                 Self::send_reliable_sfu_to_device_update(pending_client, update.clone(), now);
             rtp_to_send.extend(update_rtp);
+
+            if self.drop_fragmentable_updates {
+                continue;
+            }
 
             let fragmentable_update_rtp = Self::send_reliable_sfu_to_device_update(
                 pending_client,
@@ -4523,6 +4537,7 @@ mod call_tests {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -4544,6 +4559,7 @@ mod call_tests {
             None,
             None,
             None,
+            false,
         )
     }
 
