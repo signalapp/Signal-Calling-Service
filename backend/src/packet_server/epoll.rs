@@ -169,9 +169,10 @@ impl PacketServerState {
         // Bind the socket to the given local address.
         bind(socket_fd.as_raw_fd(), &SockaddrStorage::from(*local_addr))?;
         let result = UdpSocket::from(socket_fd);
-        // Set a read timeout for a "pseudo-nonblocking" interface.
-        // Why? Because epoll might wake up more than one thread to read from a single socket.
-        result.set_read_timeout(Some(Duration::from_millis(10).into()))?;
+        // set socket to non-blocking, in case more than one thread polls the socket while it's ready
+        result
+            .set_nonblocking(true)
+            .expect("Cannot set non-blocking");
         Ok(result)
     }
 
@@ -1182,7 +1183,15 @@ impl Socket {
 
     fn send(&self, buf: &[u8]) -> io::Result<()> {
         match self {
-            Socket::Udp(s) => s.send(buf).map(|_| ()),
+            Socket::Udp(s) => {
+                let ret = s.send(buf).map(|_| ());
+                if let Err(ref err) = ret {
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        event!("calling.udp.epoll.udp_send.would_block");
+                    }
+                }
+                ret
+            }
             Socket::Tcp(m) => m.lock().send(buf),
         }
     }
