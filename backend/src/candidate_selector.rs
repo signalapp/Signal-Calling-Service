@@ -331,6 +331,7 @@ pub struct CandidateSelector {
     candidates: Vec<Candidate>,
     selected_candidate: Option<usize>,
     nominated_candidate: Option<usize>,
+    had_selected_candidate: bool,
     config: Config,
 }
 
@@ -342,6 +343,7 @@ impl CandidateSelector {
             config,
             selected_candidate: None,
             nominated_candidate: None,
+            had_selected_candidate: false,
         }
     }
 
@@ -412,8 +414,10 @@ impl CandidateSelector {
             );
             if selected.is_none() {
                 event!("calling.sfu.candidate_selector.no_output_address");
-            } else {
+            } else if self.had_selected_candidate {
                 event!("calling.sfu.ice.outgoing_addr_switch");
+            } else {
+                self.had_selected_candidate = true;
             }
         }
     }
@@ -448,6 +452,11 @@ impl CandidateSelector {
 
     fn selected_candidate(&self) -> Option<&Candidate> {
         self.selected_candidate.map(|k| &self.candidates[k])
+    }
+
+    /// Returns true if the selector ever had a selected candidate.
+    pub fn had_selected_candidate(&self) -> bool {
+        self.had_selected_candidate
     }
 
     /// Returns the address of the currently selected remote candidate, if one is available.

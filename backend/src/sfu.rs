@@ -1197,10 +1197,10 @@ impl Sfu {
                                     .or_default()
                                     .push(connection_id.demux_id);
 
-                                if connection.outgoing_addr().is_none() {
-                                    event!("calling.sfu.close_connection.no_nominee");
-                                } else {
+                                if connection.had_selected_candidate() {
                                     event!("calling.sfu.close_connection.inactive");
+                                } else {
+                                    event!("calling.sfu.close_connection.no_nominee");
                                 }
                                 drop(connection);
                                 sfu.connection_by_id.remove(&connection_id);

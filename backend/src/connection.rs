@@ -258,6 +258,11 @@ impl Connection {
         self.candidate_selector.outbound_address_type()
     }
 
+    /// Returns true if at least one candidate was ever selected.
+    pub fn had_selected_candidate(&self) -> bool {
+        self.candidate_selector.had_selected_candidate()
+    }
+
     /// ICE password. This is exposed so that the calling code can validate ICE requests
     /// before submitting them to the connection for further processing.
     pub fn ice_pwd(&self) -> &[u8] {
