@@ -235,7 +235,7 @@ impl PacketServerState {
     /// ([`tokio::task::spawn_blocking`]).
     ///
     /// This should only be called once.
-    pub fn start_threads(self: Arc<Self>, sfu: &Arc<RwLock<Sfu>>) -> impl Future {
+    pub fn start_threads(self: Arc<Self>, sfu: &Arc<Sfu>) -> impl Future {
         let all_handles = self
             .all_epoll_fds
             .iter()
@@ -257,7 +257,7 @@ impl PacketServerState {
     /// Runs a single listener on the current thread, polling `epoll_fd`.
     ///
     /// See [`PacketServerState::start_threads`].
-    fn run(self: Arc<Self>, epoll_fd: RawFd, sfu: &Arc<RwLock<Sfu>>) {
+    fn run(self: Arc<Self>, epoll_fd: RawFd, sfu: &Arc<Sfu>) {
         let new_client_socket_fd = self.new_client_socket.as_raw_fd();
         let new_tcp_socket_fd = self.new_tcp_socket.as_raw_fd();
         let new_tls_socket_fd = self.new_tls_socket.as_ref().map_or(-1, |s| s.as_raw_fd());

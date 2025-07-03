@@ -21,7 +21,7 @@ use metrics::{
     metrics, time_scope_us,
 };
 use once_cell::sync::Lazy;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use psutil::process::Process;
 use tokio::sync::oneshot::Receiver;
 
@@ -39,7 +39,7 @@ static CURRENT_PROCESS: Lazy<Mutex<Process>> =
 
 pub async fn start(
     config: &'static config::Config,
-    sfu: Arc<RwLock<Sfu>>,
+    sfu: Arc<Sfu>,
     shutdown_signal_rx: Receiver<()>,
     fd_limit: usize,
 ) -> Result<()> {
@@ -73,7 +73,7 @@ pub async fn start(
                         time_scope_us!("calling.sfu.get_stats");
                         // Note that we are including the time waiting for the lock in this stat.
 
-                        let stats = sfu.read().get_stats();
+                        let stats = sfu.get_stats();
                         for (name, histogram_map) in stats.histograms {
                             for (tags, histogram) in histogram_map {
                                 datadog.send_count_histogram(name, &histogram, tags);

@@ -6,8 +6,11 @@
 use calling_common::{DataRate, DataRateTracker, DataSize, Duration, Instant, SignalUserAgent};
 use log::*;
 use metrics::event;
+use parking_lot::RwLock;
 use thiserror::Error;
 
+#[cfg(test)]
+use crate::candidate_selector::IceCredentials;
 use crate::{
     candidate_selector::{self, CandidateSelector},
     config::Config,
@@ -55,26 +58,336 @@ pub enum Error {
     ReceivedInvalidRtcp,
 }
 
-/// The state of a connection to a client.
-/// Combines the ICE and SRTP/SRTCP state.
-/// Takes care of transport auth, crypto, ACKs, NACKs,
-/// retransmissions, congestion control, and IP mobility.
 pub struct Connection {
+    inner: RwLock<ConnectionInner>,
+    id: ConnectionId,
+    ice_username: Vec<u8>,
     region_relation: RegionRelation,
     user_agent: SignalUserAgent,
-    rtp: Rtp,
-    congestion_control: CongestionControl,
-    candidate_selector: CandidateSelector,
-    video_rate: DataRateTracker,
-    audio_rate: DataRateTracker,
-    rtx_rate: DataRateTracker,
-    padding_rate: DataRateTracker,
-    non_media_rate: DataRateTracker,
-    incoming_audio_rate: DataRateTracker,
-    incoming_rtx_rate: DataRateTracker,
-    incoming_padding_rate: DataRateTracker,
-    incoming_non_media_rate: DataRateTracker,
-    incoming_discard_rate: DataRateTracker,
+}
+
+pub struct CreateConnectionArgs<'a> {
+    pub config: &'static Config,
+    pub connection_id: &'a ConnectionId,
+    pub ice_server_username: Vec<u8>,
+    pub ice_client_username: Vec<u8>,
+    pub ice_server_pwd: Vec<u8>,
+    pub ice_client_pwd: Vec<u8>,
+    pub srtp_master_key_material: rtp::MasterKeyMaterial,
+    pub ack_ssrc: rtp::Ssrc,
+    pub googcc_config: googcc::Config,
+    pub region_relation: RegionRelation,
+    pub user_agent: SignalUserAgent,
+    pub now: Instant,
+}
+
+impl Connection {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_candidate_selector_config(
+        id: ConnectionId,
+        candidate_selector_config: candidate_selector::Config,
+        srtp_master_key_material: rtp::MasterKeyMaterial,
+        ack_ssrc: rtp::Ssrc,
+        googcc_config: googcc::Config,
+        region_relation: RegionRelation,
+        user_agent: SignalUserAgent,
+        now: Instant,
+    ) -> Self {
+        let ice_username = candidate_selector_config
+            .ice_credentials
+            .server_username
+            .clone();
+
+        let inner = RwLock::new(ConnectionInner::with_candidate_selector_config(
+            candidate_selector_config,
+            srtp_master_key_material,
+            ack_ssrc,
+            googcc_config,
+            now,
+        ));
+
+        Self {
+            id,
+            inner,
+            ice_username,
+            region_relation,
+            user_agent,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn ice_credentials(&self) -> IceCredentials {
+        self.inner
+            .read()
+            .candidate_selector
+            .ice_credentials()
+            .clone()
+    }
+
+    pub fn new(args: CreateConnectionArgs) -> Self {
+        let CreateConnectionArgs {
+            config,
+            connection_id,
+            ice_server_username,
+            ice_client_username,
+            ice_server_pwd,
+            ice_client_pwd,
+            srtp_master_key_material,
+            ack_ssrc,
+            googcc_config,
+            region_relation,
+            user_agent,
+            now,
+        } = args;
+
+        let ice_username = ice_server_username.clone();
+
+        let inner = RwLock::new(ConnectionInner::new(
+            config,
+            connection_id,
+            ice_server_username,
+            ice_client_username,
+            ice_server_pwd,
+            ice_client_pwd,
+            srtp_master_key_material,
+            ack_ssrc,
+            googcc_config,
+            now,
+        ));
+
+        let id = connection_id.clone();
+
+        Self {
+            inner,
+            id,
+            ice_username,
+            region_relation,
+            user_agent,
+        }
+    }
+
+    #[inline(always)]
+    pub fn id(&self) -> &ConnectionId {
+        &self.id
+    }
+
+    // This is a convenience for the SFU to be able to iterate over Connections
+    // and remove them from a table of username => Connection if the Connection is inactive.
+    #[inline(always)]
+    pub fn ice_request_username(&self) -> &[u8] {
+        &self.ice_username
+    }
+
+    /// All packets except for ICE binding responses should be sent to this address,
+    /// if there is one.
+    #[inline(always)]
+    pub fn outgoing_addr(&self) -> Option<SocketLocator> {
+        self.inner.read().outgoing_addr()
+    }
+
+    #[inline(always)]
+    pub fn outgoing_addr_type(&self) -> Option<AddressType> {
+        self.inner.read().outgoing_addr_type()
+    }
+
+    /// Returns true if at least one candidate was ever selected.
+    pub fn had_selected_candidate(&self) -> bool {
+        self.inner.read().had_selected_candidate()
+    }
+
+    #[inline(always)]
+    pub fn handle_ice_binding_request(
+        &self,
+        sender_addr: SocketLocator,
+        binding_request: ice::BindingRequest,
+        now: Instant,
+    ) -> Result<Vec<(PacketToSend, SocketLocator)>, Error> {
+        self.inner
+            .write()
+            .handle_ice_binding_request(sender_addr, binding_request, now)
+    }
+
+    #[inline(always)]
+    pub fn handle_ice_binding_response(
+        &self,
+        sender_addr: SocketLocator,
+        binding_response: ice::BindingResponse,
+        now: Instant,
+    ) -> Result<(), Error> {
+        self.inner
+            .write()
+            .handle_ice_binding_response(sender_addr, binding_response, now)
+    }
+
+    // This effectively overrides the DHE, which is more convenient for tests.
+    #[cfg(test)]
+    fn set_srtp_keys(&self, decrypt: rtp::KeysAndSalts, encrypt: rtp::KeysAndSalts, now: Instant) {
+        self.inner.write().set_srtp_keys(decrypt, encrypt, now);
+    }
+
+    /// Decrypts an incoming RTP packet and returns it.
+    /// Also remembers that we may need to send ACKs and NACKs
+    /// at the next call to tick().
+    #[inline(always)]
+    pub fn handle_rtp_packet<'packet>(
+        &self,
+        incoming_packet: &'packet mut [u8],
+        now: Instant,
+    ) -> Result<Option<rtp::Packet<&'packet mut [u8]>>, Error> {
+        self.inner.write().handle_rtp_packet(incoming_packet, now)
+    }
+
+    /// Decrypts an incoming RTCP packet and processes it.
+    /// Returns 3 things, all or none of which could happen at once
+    /// (because RTCP packets can be "compound"):
+    /// 1. Key frame requests contained in the RTCP packet
+    /// 2. RTX packets triggered by NACKs in the RTCP packet,
+    ///    which should be sent to the Connection::outgoing_addr().
+    /// 3. A new target send rate calculated from ACKs in the RTCP packet.
+    #[inline(always)]
+    pub fn handle_rtcp_packet(
+        &self,
+        incoming_packet: &mut [u8],
+        now: Instant,
+    ) -> Result<HandleRtcpResult, Error> {
+        self.inner.write().handle_rtcp_packet(incoming_packet, now)
+    }
+
+    /// This must be called regularly (at least every 100ms, preferably more often) to
+    /// keep ACKs and NACKs being sent to the client.
+    // It would make more sense to return a Vec of packets, since the outgoing address is fixed,
+    // but that actually makes it more difficult for sfu.rs to aggregate the
+    // results of calling this across many connections.
+    // So we use (packet, addr) for convenience.
+    #[inline(always)]
+    pub fn tick(&self, packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>, now: Instant) {
+        self.inner.write().tick(packets_to_send, now);
+    }
+
+    #[inline(always)]
+    pub fn inactive(&self, now: Instant) -> bool {
+        self.inner.read().inactive(now)
+    }
+
+    /// Encrypts the outgoing RTP.
+    /// Sends nothing if there is no outgoing address.
+    /// Packets may be queued instead of returned here, so make sure
+    /// to call dequeue() frequently.
+    #[inline(always)]
+    pub fn send_or_enqueue_rtp(
+        &self,
+        outgoing_rtp: rtp::Packet<Vec<u8>>,
+        // It would make more sense to return a Vec of packets, since the outgoing address is fixed,
+        // but that actually makes it more difficult for sfu.rs to aggregate the
+        // results of calling this across many connections.
+        // So we use this vec of (packet, addr) for convenience.
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
+        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
+        now: Instant,
+    ) {
+        self.inner.write().send_or_enqueue_rtp(
+            outgoing_rtp,
+            packets_to_send,
+            dequeues_to_schedule,
+            now,
+        );
+    }
+
+    /// Dequeues previously encrypted outgoing RTP (if possible)
+    /// or generates padding (if necessary).
+    #[inline(always)]
+    pub fn dequeue_outgoing_rtp(
+        &self,
+        now: Instant,
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
+        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
+    ) -> bool {
+        self.inner
+            .write()
+            .dequeue_outgoing_rtp(now, packets_to_send, dequeues_to_schedule)
+    }
+
+    /// Creates an encrypted key frame request to be sent to
+    /// Connection::outgoing_addr().
+    /// Will return None if SRTCP encryption fails.
+    // TODO: Use Result instead of Option
+    #[inline(always)]
+    pub fn send_key_frame_request(
+        &self,
+        key_frame_request: rtp::KeyFrameRequest,
+        now: Instant,
+        // It would make more sense to return Option<Packet>, since the outgoing address is fixed,
+        // but that actually makes it more difficult for sfu.rs to aggregate the
+        // results of calling this across many connections.
+        // So we use (packet, addr) for convenience.
+    ) -> Option<(PacketToSend, SocketLocator)> {
+        self.inner
+            .write()
+            .send_key_frame_request(key_frame_request, now)
+    }
+
+    #[inline(always)]
+    pub fn outgoing_queue_size(&self) -> DataSize {
+        self.inner.read().outgoing_queue_size()
+    }
+
+    #[inline(always)]
+    pub fn outgoing_queue_delay(&self, now: Instant) -> Option<Duration> {
+        self.inner.read().outgoing_queue_delay(now)
+    }
+
+    #[inline(always)]
+    pub fn rtp_endpoint_stats(&self, now: Instant) -> rtp::EndpointStats {
+        self.inner.write().rtp_endpoint_stats(now)
+    }
+
+    #[inline(always)]
+    pub fn configure_congestion_control(
+        &self,
+        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
+        googcc_request: googcc::Request,
+        pacer_config: pacer::Config,
+        now: Instant,
+    ) {
+        self.inner.write().configure_congestion_control(
+            dequeues_to_schedule,
+            googcc_request,
+            pacer_config,
+            now,
+        );
+    }
+
+    #[inline(always)]
+    pub fn rtt(&mut self, now: Instant) -> Duration {
+        self.inner.write().rtt(now)
+    }
+
+    #[inline(always)]
+    pub fn stun_rtt(&self) -> Option<Duration> {
+        self.inner.read().stun_rtt()
+    }
+
+    #[inline(always)]
+    pub fn rtts(&self, now: Instant) -> (Duration, Option<Duration>) {
+        let mut inner = self.inner.write();
+        (inner.rtt(now), inner.stun_rtt())
+    }
+
+    #[inline(always)]
+    pub fn region_relation(&self) -> RegionRelation {
+        self.region_relation
+    }
+
+    #[inline(always)]
+    pub fn user_agent(&self) -> SignalUserAgent {
+        self.user_agent
+    }
+
+    #[inline(always)]
+    pub fn current_rates(&self, now: Instant) -> ConnectionRates {
+        self.inner.write().current_rates(now)
+    }
 }
 
 struct Rtp {
@@ -102,15 +415,33 @@ struct CongestionControl {
 
 pub type DhePublicKey = [u8; 32];
 
-impl Connection {
+/// The state of a connection to a client.
+/// Combines the ICE and SRTP/SRTCP state.
+/// Takes care of transport auth, crypto, ACKs, NACKs,
+/// retransmissions, congestion control, and IP mobility.
+struct ConnectionInner {
+    rtp: Rtp,
+    congestion_control: CongestionControl,
+    candidate_selector: CandidateSelector,
+    video_rate: DataRateTracker,
+    audio_rate: DataRateTracker,
+    rtx_rate: DataRateTracker,
+    padding_rate: DataRateTracker,
+    non_media_rate: DataRateTracker,
+    incoming_audio_rate: DataRateTracker,
+    incoming_rtx_rate: DataRateTracker,
+    incoming_padding_rate: DataRateTracker,
+    incoming_non_media_rate: DataRateTracker,
+    incoming_discard_rate: DataRateTracker,
+}
+
+impl ConnectionInner {
     #[cfg(test)]
     pub fn with_candidate_selector_config(
         candidate_selector_config: candidate_selector::Config,
         srtp_master_key_material: rtp::MasterKeyMaterial,
         ack_ssrc: rtp::Ssrc,
         googcc_config: googcc::Config,
-        region_relation: RegionRelation,
-        user_agent: SignalUserAgent,
         now: Instant,
     ) -> Self {
         let (decrypt, encrypt) =
@@ -121,9 +452,6 @@ impl Connection {
         let rtp_endpoint = rtp::Endpoint::new(decrypt, encrypt, now, RTCP_SENDER_SSRC, ack_ssrc);
 
         Self {
-            region_relation,
-            user_agent,
-
             rtp: Rtp {
                 ack_ssrc,
                 endpoint: rtp_endpoint,
@@ -155,7 +483,7 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new(
         config: &'static Config,
         connection_id: &ConnectionId,
         ice_server_username: Vec<u8>,
@@ -165,8 +493,6 @@ impl Connection {
         srtp_master_key_material: rtp::MasterKeyMaterial,
         ack_ssrc: rtp::Ssrc,
         googcc_config: googcc::Config,
-        region_relation: RegionRelation,
-        user_agent: SignalUserAgent,
         now: Instant,
     ) -> Self {
         let (decrypt, encrypt) =
@@ -204,8 +530,6 @@ impl Connection {
         );
 
         Self {
-            region_relation,
-            user_agent,
             rtp: Rtp {
                 ack_ssrc,
                 endpoint: rtp_endpoint,
@@ -227,7 +551,6 @@ impl Connection {
             rtx_rate: DataRateTracker::default(),
             padding_rate: DataRateTracker::default(),
             non_media_rate: DataRateTracker::default(),
-
             incoming_audio_rate: DataRateTracker::default(),
             incoming_rtx_rate: DataRateTracker::default(),
             incoming_padding_rate: DataRateTracker::default(),
@@ -236,41 +559,20 @@ impl Connection {
         }
     }
 
-    // This is a convenience for the SFU to be able to iterate over Connections
-    // and remove them from a table of username => Connection if the Connection is inactive.
-    pub fn ice_request_username(&self) -> &[u8] {
-        let ice_credentials = self.candidate_selector.ice_credentials();
-        &ice_credentials.server_username
-    }
-
-    pub fn ice_response_username(&self) -> &[u8] {
-        let ice_credentials = self.candidate_selector.ice_credentials();
-        &ice_credentials.client_username
-    }
-
-    /// All packets except for ICE binding responses should be sent to this address,
-    /// if there is one.
-    pub fn outgoing_addr(&self) -> Option<SocketLocator> {
+    fn outgoing_addr(&self) -> Option<SocketLocator> {
         self.candidate_selector.outbound_address()
     }
 
-    pub fn outgoing_addr_type(&self) -> Option<AddressType> {
+    fn outgoing_addr_type(&self) -> Option<AddressType> {
         self.candidate_selector.outbound_address_type()
     }
 
     /// Returns true if at least one candidate was ever selected.
-    pub fn had_selected_candidate(&self) -> bool {
+    fn had_selected_candidate(&self) -> bool {
         self.candidate_selector.had_selected_candidate()
     }
 
-    /// ICE password. This is exposed so that the calling code can validate ICE requests
-    /// before submitting them to the connection for further processing.
-    pub fn ice_pwd(&self) -> &[u8] {
-        let ice_credentials = self.candidate_selector.ice_credentials();
-        &ice_credentials.server_pwd
-    }
-
-    pub fn handle_ice_binding_request(
+    fn handle_ice_binding_request(
         &mut self,
         sender_addr: SocketLocator,
         binding_request: ice::BindingRequest,
@@ -316,7 +618,7 @@ impl Connection {
         Ok(packets_to_send)
     }
 
-    pub fn handle_ice_binding_response(
+    fn handle_ice_binding_response(
         &mut self,
         sender_addr: SocketLocator,
         binding_response: ice::BindingResponse,
@@ -354,10 +656,7 @@ impl Connection {
             rtp::Endpoint::new(decrypt, encrypt, now, RTCP_SENDER_SSRC, self.rtp.ack_ssrc);
     }
 
-    /// Decrypts an incoming RTP packet and returns it.
-    /// Also remembers that we may need to send ACKs and NACKs
-    /// at the next call to tick().
-    pub fn handle_rtp_packet<'packet>(
+    fn handle_rtp_packet<'packet>(
         &mut self,
         incoming_packet: &'packet mut [u8],
         now: Instant,
@@ -392,14 +691,7 @@ impl Connection {
         }
     }
 
-    /// Decrypts an incoming RTCP packet and processes it.
-    /// Returns 3 things, all or none of which could happen at once
-    /// (because RTCP packets can be "compound"):
-    /// 1. Key frame requests contained in the RTCP packet
-    /// 2. RTX packets triggered by NACKs in the RTCP packet,
-    ///    which should be sent to the Connection::outgoing_addr().
-    /// 3. A new target send rate calculated from ACKs in the RTCP packet.
-    pub fn handle_rtcp_packet(
+    fn handle_rtcp_packet(
         &mut self,
         incoming_packet: &mut [u8],
         now: Instant,
@@ -470,28 +762,18 @@ impl Connection {
         });
     }
 
-    /// This must be called regularly (at least every 100ms, preferably more often) to
-    /// keep ACKs and NACKs being sent to the client.
-    // It would make more sense to return a Vec of packets, since the outgoing address is fixed,
-    // but that actually makes it more difficult for sfu.rs to aggregate the
-    // results of calling this across many connections.
-    // So we use (packet, addr) for convenience.
-    pub fn tick(&mut self, packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>, now: Instant) {
+    fn tick(&mut self, packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>, now: Instant) {
         self.send_acks_if_its_been_too_long(packets_to_send, now);
         self.send_nacks_if_its_been_too_long(packets_to_send, now);
         self.send_rtcp_report_if_its_been_too_long(packets_to_send, now);
         self.candidate_selector_tick(packets_to_send, now);
     }
 
-    pub fn inactive(&self, now: Instant) -> bool {
+    fn inactive(&self, now: Instant) -> bool {
         self.candidate_selector.inactive(now)
     }
 
-    /// Encrypts the outgoing RTP.
-    /// Sends nothing if there is no outgoing address.
-    /// Packets may be queued instead of returned here, so make sure
-    /// to call dequeue() frequently.
-    pub fn send_or_enqueue_rtp(
+    fn send_or_enqueue_rtp(
         &mut self,
         outgoing_rtp: rtp::Packet<Vec<u8>>,
         // It would make more sense to return a Vec of packets, since the outgoing address is fixed,
@@ -547,9 +829,7 @@ impl Connection {
         }
     }
 
-    /// Dequeues previously encrypted outgoing RTP (if possible)
-    /// or generates padding (if necessary).
-    pub fn dequeue_outgoing_rtp(
+    fn dequeue_outgoing_rtp(
         &mut self,
         now: Instant,
         packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
@@ -601,11 +881,7 @@ impl Connection {
         }
     }
 
-    /// Creates an encrypted key frame request to be sent to
-    /// Connection::outgoing_addr().
-    /// Will return None if SRTCP encryption fails.
-    // TODO: Use Result instead of Option
-    pub fn send_key_frame_request(
+    fn send_key_frame_request(
         &mut self,
         key_frame_request: rtp::KeyFrameRequest,
         now: Instant,
@@ -706,19 +982,19 @@ impl Connection {
         }
     }
 
-    pub fn outgoing_queue_size(&self) -> DataSize {
+    fn outgoing_queue_size(&self) -> DataSize {
         self.congestion_control.pacer.queued_size()
     }
 
-    pub fn outgoing_queue_delay(&self, now: Instant) -> Option<Duration> {
+    fn outgoing_queue_delay(&self, now: Instant) -> Option<Duration> {
         self.congestion_control.pacer.queue_delay(now)
     }
 
-    pub fn rtp_endpoint_stats(&mut self, now: Instant) -> &rtp::EndpointStats {
-        self.rtp.endpoint.update_stats(now)
+    fn rtp_endpoint_stats(&mut self, now: Instant) -> rtp::EndpointStats {
+        *(self.rtp.endpoint.update_stats(now))
     }
 
-    pub fn configure_congestion_control(
+    fn configure_congestion_control(
         &mut self,
         dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
         googcc_request: googcc::Request,
@@ -733,7 +1009,7 @@ impl Connection {
         }
     }
 
-    pub fn rtt(&mut self, now: Instant) -> Duration {
+    fn rtt(&mut self, now: Instant) -> Duration {
         // Congestion Controller RTT tends to be higher and more reactive, switch when delta is large
         const RTCP_RTT_LAG_THRESHOLD: Duration = Duration::from_millis(250);
 
@@ -747,19 +1023,11 @@ impl Connection {
         cc_rtt
     }
 
-    pub fn stun_rtt(&self) -> Option<Duration> {
+    fn stun_rtt(&self) -> Option<Duration> {
         self.candidate_selector.rtt()
     }
 
-    pub fn region_relation(&self) -> RegionRelation {
-        self.region_relation
-    }
-
-    pub fn user_agent(&self) -> SignalUserAgent {
-        self.user_agent
-    }
-
-    pub fn current_rates(&mut self, now: Instant) -> ConnectionRates {
+    fn current_rates(&mut self, now: Instant) -> ConnectionRates {
         self.video_rate.update(now);
         self.audio_rate.update(now);
         self.rtx_rate.update(now);
@@ -891,6 +1159,7 @@ mod connection_tests {
             },
         };
         Connection::with_candidate_selector_config(
+            ConnectionId::null(),
             candidate_selector_config,
             zeroize::Zeroizing::new([0u8; 56]),
             ack_ssrc,
@@ -902,13 +1171,13 @@ mod connection_tests {
     }
 
     fn handle_ice_binding_request(
-        connection: &mut Connection,
+        connection: &Connection,
         client_addr: SocketLocator,
         transaction_id: u128,
         nominated: bool,
         now: Instant,
     ) -> Vec<(PacketToSend, SocketLocator)> {
-        let ice_credentials = connection.candidate_selector.ice_credentials().clone();
+        let ice_credentials = connection.ice_credentials();
         let request_packet = {
             if nominated {
                 ice::StunPacketBuilder::new_binding_request(&transaction_id.into())
@@ -930,33 +1199,21 @@ mod connection_tests {
             .expect("ice binding request handled")
     }
 
-    fn generate_ice_ping_responses(
-        connection: &mut Connection,
-        mut packets: Vec<(PacketToSend, SocketLocator)>,
-        now: Instant,
-    ) -> Vec<(PacketToSend, SocketLocator)> {
-        packets.retain(|(packet, addr)| {
+    fn establish_outbound_address(connection: &Connection, addr: SocketLocator, now: Instant) {
+        let ice_credentials = connection.ice_credentials();
+        let packets = handle_ice_binding_request(connection, addr, 1u128, true, now);
+        packets.into_iter().for_each(|(packet, addr)| {
+            let packet = &packet;
             if let Some(req) = ice::BindingRequest::try_from_buffer(packet).expect("sane") {
-                let ice_credentials = connection.candidate_selector.ice_credentials();
-                let ice_pwd = ice_credentials.client_pwd.clone();
                 let buffer = ice::StunPacketBuilder::new_binding_response(&req.transaction_id())
                     .set_xor_mapped_address(&"1.1.1.1:10".parse().unwrap())
-                    .build(&ice_pwd);
+                    .build(&ice_credentials.client_pwd);
                 let res = ice::BindingResponse::from_buffer_without_sanity_check(&buffer);
                 connection
-                    .handle_ice_binding_response(*addr, res, now)
+                    .handle_ice_binding_response(addr, res, now)
                     .expect("ice binding response handled");
-                false
-            } else {
-                true
             }
         });
-        packets
-    }
-
-    fn establish_outbound_address(connection: &mut Connection, addr: SocketLocator, now: Instant) {
-        let packets = handle_ice_binding_request(connection, addr, 1u128, true, now);
-        generate_ice_ping_responses(connection, packets, now);
     }
 
     fn new_encrypted_rtp(
@@ -1050,8 +1307,8 @@ mod connection_tests {
     fn test_ice_request() {
         let now = Instant::now();
 
-        let mut connection = new_connection(now);
-        let ice_credentials = connection.candidate_selector.ice_credentials();
+        let connection = new_connection(now);
+        let ice_credentials = connection.ice_credentials();
 
         let request = ice::StunPacketBuilder::new_binding_request(&0u128.into())
             .set_nomination()
@@ -1072,8 +1329,8 @@ mod connection_tests {
     fn test_ice_request_with_bad_hmac() {
         let now = Instant::now();
 
-        let mut connection = new_connection(now);
-        let ice_credentials = connection.candidate_selector.ice_credentials();
+        let connection = new_connection(now);
+        let ice_credentials = connection.ice_credentials();
 
         let request = ice::StunPacketBuilder::new_binding_request(&0u128.into())
             .set_nomination()
@@ -1095,8 +1352,8 @@ mod connection_tests {
     fn test_ice_request_with_bad_username() {
         let now = Instant::now();
 
-        let mut connection = new_connection(now);
-        let ice_credentials = connection.candidate_selector.ice_credentials();
+        let connection = new_connection(now);
+        let ice_credentials = connection.ice_credentials();
 
         let request = ice::StunPacketBuilder::new_binding_request(&0u128.into())
             .set_nomination()
@@ -1120,8 +1377,8 @@ mod connection_tests {
     fn test_ice_response() {
         let now = Instant::now();
 
-        let mut connection = new_connection(now);
-        let ice_credentials = connection.candidate_selector.ice_credentials();
+        let connection = new_connection(now);
+        let ice_credentials = connection.ice_credentials();
 
         let response = ice::StunPacketBuilder::new_binding_response(&0u128.into())
             .set_username(&ice_credentials.server_username)
@@ -1143,8 +1400,8 @@ mod connection_tests {
     fn test_ice_response_with_bad_hmac() {
         let now = Instant::now();
 
-        let mut connection = new_connection(now);
-        let ice_credentials = connection.candidate_selector.ice_credentials();
+        let connection = new_connection(now);
+        let ice_credentials = connection.ice_credentials();
 
         let request = ice::StunPacketBuilder::new_binding_response(&0u128.into())
             .set_username(&ice_credentials.server_username)
@@ -1164,7 +1421,7 @@ mod connection_tests {
     #[test]
     fn test_receive_srtp() {
         let now = Instant::now();
-        let mut connection = new_connection(now);
+        let connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt.clone(), encrypt.clone(), now);
 
@@ -1200,11 +1457,11 @@ mod connection_tests {
     #[test]
     fn test_send_srtp() {
         let now = Instant::now();
-        let mut connection = new_connection(now);
+        let connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt, encrypt.clone(), now);
 
-        let set_send_rate = |connection: &mut Connection, send_rate, now| {
+        let set_send_rate = |connection: &Connection, send_rate, now| {
             connection.configure_congestion_control(
                 &mut vec![],
                 googcc::Request {
@@ -1235,9 +1492,9 @@ mod connection_tests {
         assert_eq!(0, packets_to_send.len());
 
         let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
-        establish_outbound_address(&mut connection, client_addr, now);
+        establish_outbound_address(&connection, client_addr, now);
         // Packets without tcc seqnums skip the pacer queue and still go out even if the rate is 0.
-        set_send_rate(&mut connection, DataRate::from_kbps(0), now);
+        set_send_rate(&connection, DataRate::from_kbps(0), now);
         connection.send_or_enqueue_rtp(unencrypted_rtp, &mut packets_to_send, &mut vec![], now);
 
         assert_eq!(
@@ -1255,10 +1512,10 @@ mod connection_tests {
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt, encrypt, now);
         let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
-        establish_outbound_address(&mut connection, client_addr, now);
+        establish_outbound_address(&connection, client_addr, now);
 
         let set_padding_send_rate =
-            |connection: &mut Connection, padding_send_rate, padding_ssrc, now| {
+            |connection: &Connection, padding_send_rate, padding_ssrc, now| {
                 connection.configure_congestion_control(
                     &mut vec![],
                     googcc::Request {
@@ -1374,11 +1631,11 @@ mod connection_tests {
         let now = Instant::now();
         let at = |ms| now + Duration::from_millis(ms);
 
-        let mut connection = new_connection(now);
+        let connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt.clone(), encrypt.clone(), now);
         let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
-        establish_outbound_address(&mut connection, client_addr, now);
+        establish_outbound_address(&connection, client_addr, now);
 
         let encrypted_rtp = new_encrypted_rtp(1, None, &encrypt, at(20));
         let unencrypted_rtp = decrypt_rtp(&encrypted_rtp, &encrypt);
@@ -1477,7 +1734,7 @@ mod connection_tests {
         let now = Instant::now();
         let at = |ms| now + Duration::from_millis(ms);
 
-        let mut connection = new_connection(now);
+        let connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt.clone(), encrypt.clone(), now);
 
@@ -1504,7 +1761,7 @@ mod connection_tests {
         assert_eq!(0, packets_to_send.len());
 
         let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
-        establish_outbound_address(&mut connection, client_addr, at(5));
+        establish_outbound_address(&connection, client_addr, at(5));
         assert_eq!(Some(client_addr), connection.outgoing_addr());
 
         // Now we can send ACKs, NACKs, and receiver reports.
@@ -1556,11 +1813,11 @@ mod connection_tests {
     fn test_send_key_frame_requests() {
         let now = Instant::now();
 
-        let mut connection = new_connection(now);
+        let connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt, encrypt.clone(), now);
         let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
-        establish_outbound_address(&mut connection, client_addr, now);
+        establish_outbound_address(&connection, client_addr, now);
 
         let ssrc = 10;
         let (mut encrypted_rtcp, outgoing_addr) = connection
@@ -1581,7 +1838,7 @@ mod connection_tests {
     fn test_receive_key_frame_requests() {
         let now = Instant::now();
 
-        let mut connection = new_connection(now);
+        let connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt.clone(), encrypt, now);
 
@@ -1607,11 +1864,11 @@ mod connection_tests {
         let now = Instant::now();
         let at = |ms| now + Duration::from_millis(ms);
 
-        let mut connection = new_connection(now);
+        let connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt.clone(), encrypt.clone(), now);
         let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
-        establish_outbound_address(&mut connection, client_addr, now);
+        establish_outbound_address(&connection, client_addr, now);
 
         for seqnum in 1..=25 {
             let sent = at(10 * seqnum);

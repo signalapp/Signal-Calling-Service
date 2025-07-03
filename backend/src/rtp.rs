@@ -172,7 +172,7 @@ struct IncomingSsrcState {
     rtcp_report_sender: RtcpReportSender,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct EndpointStats {
     pub remembered_packet_count: usize,
     pub remembered_packet_bytes: usize,

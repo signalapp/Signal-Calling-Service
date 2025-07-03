@@ -19,7 +19,6 @@ use anyhow::Result;
 use log::*;
 #[cfg(all(feature = "epoll", target_os = "linux"))]
 use nix::sys::{time::TimeSpec, timer::Expiration::OneShot, timerfd::*};
-use parking_lot::RwLock;
 use rustls::ServerConfig;
 use tokio::sync::oneshot::Receiver;
 #[cfg(all(feature = "epoll", target_os = "linux"))]
@@ -115,7 +114,7 @@ impl fmt::Display for SocketLocator {
 pub async fn start(
     config: &'static config::Config,
     tls_config: Option<Arc<ServerConfig>>,
-    sfu: Arc<RwLock<Sfu>>,
+    sfu: Arc<Sfu>,
     packet_ender_rx: Receiver<()>,
     is_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -148,8 +147,7 @@ pub async fn start(
         local_addr_udp, local_addr_tcp, num_threads
     );
 
-    sfu.write()
-        .set_packet_server(Some(packet_handler_state_for_stats));
+    sfu.set_packet_server(Some(packet_handler_state_for_stats));
 
     // Spawn (blocking) threads for the packet server.
     let packet_handles = packet_handler_state.start_threads(&sfu);
@@ -163,7 +161,7 @@ pub async fn start(
             tokio::time::sleep(tick_interval.into()).await;
             time_scope_us!("calling.udp_server.tick.processing");
 
-            let tick_output = { Sfu::tick(&sfu_for_tick, Instant::now(), SystemTime::now()) };
+            let tick_output = sfu_for_tick.tick(Instant::now(), SystemTime::now());
 
             // Process outside the scope of the lock on the sfu.
             match packet_handler_state_for_tick.tick(tick_output) {
@@ -183,13 +181,13 @@ pub async fn start(
         _ = packet_ender_rx => {},
     );
 
-    sfu_for_cleanup.write().set_packet_server(None);
+    sfu_for_cleanup.set_packet_server(None);
     info!("packet_server shutdown");
     Ok(())
 }
 
 fn handle_packet(
-    sfu: &Arc<RwLock<Sfu>>,
+    sfu: &Arc<Sfu>,
     sender_address: SocketLocator,
     incoming_packet: &mut [u8],
 ) -> HandleOutput {
@@ -205,54 +203,57 @@ fn handle_packet(
         incoming_packet.len()
     });
 
-    Sfu::handle_packet(sfu, sender_address, incoming_packet).unwrap_or_else(|err| {
-        // Check for certain errors that can arise in normal conditions
-        // (say, because UDP packets arrive out of order).
-        // Note that we still use ".sfu" prefixes for these error events.
-        match &err {
-            SfuError::UnknownPacketType(_) => {
-                event!("calling.sfu.error.expected.unhandled");
-                trace!("handle_packet() failed: {}", err);
+    sfu.handle_packet(sender_address, incoming_packet)
+        .unwrap_or_else(|err| {
+            // Check for certain errors that can arise in normal conditions
+            // (say, because UDP packets arrive out of order).
+            // Note that we still use ".sfu" prefixes for these error events.
+            match &err {
+                SfuError::UnknownPacketType(_) => {
+                    event!("calling.sfu.error.expected.unhandled");
+                    trace!("handle_packet() failed: {}", err);
+                }
+                SfuError::IceBindingRequestUnknownUsername(_) => {
+                    event!("calling.sfu.error.expected.ice_binding_request_unknown_username");
+                    trace!("handle_packet() failed: {}", err);
+                }
+                SfuError::ParseIceBindingRequest(_) => {
+                    event!("calling.sfu.error.expected.ice_binding_request_parse_failure");
+                    trace!("handle_packet() failed: {}", err);
+                }
+                SfuError::IceBindingRequestHasNoUsername => {
+                    event!("calling.sfu.error.expected.ice_binding_request_no_username");
+                    trace!("handle_packet() failed: {}", err);
+                }
+                SfuError::ParseIceBindingResponse(_) => {
+                    event!("calling.sfu.error.expected.ice_binding_response_parse_failure");
+                    trace!("handle_packet() failed: {}", err);
+                }
+                SfuError::IceBindingInvalidTransactionId => {
+                    event!(
+                        "calling.sfu.error.expected.ice_binding_response_invalid_transaction_id"
+                    );
+                    trace!("handle_packet() failed: {}", err);
+                }
+                SfuError::UnknownAddress(_) => {
+                    event!("calling.sfu.error.expected.non_ice_from_unknown_address");
+                    trace!("handle_packet() failed: {}", err);
+                }
+                SfuError::MissingConnection(_, _) => {
+                    event!("calling.sfu.error.expected.missing_connection");
+                    trace!("handle_packet() failed: {}", err);
+                }
+                SfuError::MissingCall(_) => {
+                    event!("calling.sfu.error.expected.missing_call");
+                    trace!("handle_packet() failed: {}", err);
+                }
+                _ => {
+                    event!("calling.sfu.error.unexpected");
+                    debug!("handle_packet() failed: {}", err);
+                }
             }
-            SfuError::IceBindingRequestUnknownUsername(_) => {
-                event!("calling.sfu.error.expected.ice_binding_request_unknown_username");
-                trace!("handle_packet() failed: {}", err);
-            }
-            SfuError::ParseIceBindingRequest(_) => {
-                event!("calling.sfu.error.expected.ice_binding_request_parse_failure");
-                trace!("handle_packet() failed: {}", err);
-            }
-            SfuError::IceBindingRequestHasNoUsername => {
-                event!("calling.sfu.error.expected.ice_binding_request_no_username");
-                trace!("handle_packet() failed: {}", err);
-            }
-            SfuError::ParseIceBindingResponse(_) => {
-                event!("calling.sfu.error.expected.ice_binding_response_parse_failure");
-                trace!("handle_packet() failed: {}", err);
-            }
-            SfuError::IceBindingInvalidTransactionId => {
-                event!("calling.sfu.error.expected.ice_binding_response_invalid_transaction_id");
-                trace!("handle_packet() failed: {}", err);
-            }
-            SfuError::UnknownAddress(_) => {
-                event!("calling.sfu.error.expected.non_ice_from_unknown_address");
-                trace!("handle_packet() failed: {}", err);
-            }
-            SfuError::MissingConnection(_, _) => {
-                event!("calling.sfu.error.expected.missing_connection");
-                trace!("handle_packet() failed: {}", err);
-            }
-            SfuError::MissingCall(_) => {
-                event!("calling.sfu.error.expected.missing_call");
-                trace!("handle_packet() failed: {}", err);
-            }
-            _ => {
-                event!("calling.sfu.error.unexpected");
-                debug!("handle_packet() failed: {}", err);
-            }
-        }
-        Default::default()
-    })
+            Default::default()
+        })
 }
 
 struct ScheduledValue<T> {

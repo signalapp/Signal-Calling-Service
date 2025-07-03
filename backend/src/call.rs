@@ -402,6 +402,330 @@ pub enum CallActivity {
     Waiting,
 }
 
+pub struct Call {
+    inner: Mutex<CallInner>,
+    call_info: CallInfo,
+}
+
+struct CallInfo {
+    room_id: Option<RoomId>,
+    call_id: CallId,
+    loggable_call_id: LoggableCallId,
+    creator_id: UserId, // AKA the first user to join
+    call_type: CallType,
+    created: SystemTime, // For knowing how old the call is
+    new_clients_require_approval: bool,
+    persist_approval_for_all_users_who_join: bool,
+    initial_target_send_rate: DataRate,
+    default_requested_max_send_rate: DataRate,
+}
+
+pub struct CreateCallArgs {
+    pub call_id: CallId,
+    pub room_id: Option<RoomId>,
+    pub creator_id: UserId,
+    pub new_clients_require_approval: bool,
+    pub call_type: CallType,
+    pub now: Instant,
+    pub created: SystemTime,
+    pub approved_users: Option<Vec<UserId>>,
+    pub approved_users_persistence_url: Option<&'static Url>,
+    pub initial_target_send_rate: DataRate,
+    pub default_requested_max_send_rate: DataRate,
+    pub persist_approval_for_all_users_who_join: bool,
+    pub endorsement_issuer: Option<Arc<Mutex<EndorsementIssuer>>>,
+    pub drop_fragmentable_updates: bool,
+}
+
+impl Call {
+    pub fn new(create_args: CreateCallArgs) -> Self {
+        let CreateCallArgs {
+            call_id,
+            room_id,
+            creator_id,
+            new_clients_require_approval,
+            call_type,
+            now,
+            created,
+            approved_users,
+            approved_users_persistence_url,
+            initial_target_send_rate,
+            default_requested_max_send_rate,
+            persist_approval_for_all_users_who_join,
+            endorsement_issuer,
+            drop_fragmentable_updates,
+        } = create_args;
+
+        let loggable_call_id = LoggableCallId::from(&call_id);
+
+        info!("call: {} creating", loggable_call_id);
+
+        let approved_users = ApprovedUsers::new(
+            approved_users.unwrap_or_default(),
+            approved_users_persistence_url.zip(room_id.clone()),
+        );
+
+        let inner = Mutex::new(CallInner::new(CreateCallInnerArgs {
+            now,
+            approved_users,
+            endorsement_issuer,
+            drop_fragmentable_updates,
+        }));
+
+        let call_info = CallInfo {
+            room_id,
+            call_id,
+            loggable_call_id,
+            creator_id,
+            call_type,
+            created,
+            new_clients_require_approval,
+            persist_approval_for_all_users_who_join,
+            initial_target_send_rate,
+            default_requested_max_send_rate,
+        };
+
+        Self { inner, call_info }
+    }
+
+    pub fn room_id(&self) -> Option<&RoomId> {
+        self.call_info.room_id.as_ref()
+    }
+
+    pub fn call_id(&self) -> CallId {
+        self.call_info.call_id.clone()
+    }
+
+    pub fn call_type(&self) -> CallType {
+        self.call_info.call_type
+    }
+
+    pub fn loggable_call_id(&self) -> &LoggableCallId {
+        &self.call_info.loggable_call_id
+    }
+
+    pub fn creator_id(&self) -> &UserId {
+        &self.call_info.creator_id
+    }
+
+    pub fn size_bucket(&self) -> CallSizeBucket {
+        CallSizeBucket::from(self.size())
+    }
+
+    #[inline(always)]
+    pub fn size(&self) -> usize {
+        self.inner.lock().size()
+    }
+
+    #[inline(always)]
+    pub fn size_including_pending_clients(&self) -> usize {
+        self.inner.lock().size_including_pending_clients()
+    }
+
+    #[inline(always)]
+    pub fn is_approved_users_busy(&self) -> bool {
+        self.inner.lock().approved_users.is_busy()
+    }
+
+    #[inline(always)]
+    pub fn activity(&self, now: &Instant, inactivity_timeout: &Duration) -> CallActivity {
+        self.inner.lock().activity(now, inactivity_timeout)
+    }
+
+    #[inline(always)]
+    pub fn created(&self) -> SystemTime {
+        self.call_info.created
+    }
+
+    #[inline(always)]
+    pub fn peak_call_size(&self) -> usize {
+        self.inner.lock().peak_call_size()
+    }
+
+    #[inline(always)]
+    pub fn call_duration(&self) -> CallDurationStats {
+        self.inner.lock().call_duration()
+    }
+
+    #[inline(always)]
+    pub fn has_client(&self, demux_id: DemuxId) -> bool {
+        self.inner.lock().has_client(demux_id)
+    }
+
+    #[inline(always)]
+    pub fn is_admin(&self, user_id: &UserId) -> bool {
+        self.inner.lock().is_admin(user_id)
+    }
+
+    #[inline(always)]
+    pub fn add_client(
+        &self,
+        demux_id: DemuxId,
+        user_id: UserId,
+        is_admin: bool,
+        region_relation: RegionRelation,
+        user_agent: SignalUserAgent,
+        now: Instant,
+    ) -> ClientStatus {
+        self.inner.lock().add_client(
+            demux_id,
+            user_id,
+            is_admin,
+            region_relation,
+            user_agent,
+            &self.call_info,
+            now,
+        )
+    }
+
+    #[inline(always)]
+    pub fn drop_client(&self, demux_id: DemuxId, now: Instant) {
+        self.inner
+            .lock()
+            .drop_client(demux_id, &self.call_info, now);
+    }
+
+    #[inline(always)]
+    pub fn handle_rtp(
+        &self,
+        sender_demux_id: DemuxId,
+        incoming_rtp: rtp::Packet<&mut [u8]>,
+        now: Instant,
+    ) -> Result<Vec<RtpToSend>, Error> {
+        self.inner
+            .lock()
+            .handle_rtp(sender_demux_id, incoming_rtp, &self.call_info, now)
+    }
+
+    #[inline(always)]
+    pub fn tick(
+        &self,
+        now: Instant,
+        sys_now: SystemTime,
+    ) -> (Vec<RtpToSend>, Vec<KeyFrameRequestToSend>) {
+        self.inner.lock().tick(&self.call_info, now, sys_now)
+    }
+
+    #[inline(always)]
+    pub fn set_target_send_rate(
+        &self,
+        receiver_demux_id: DemuxId,
+        new_target_send_rate: DataRate,
+        now: Instant,
+    ) -> Result<(), Error> {
+        self.inner
+            .lock()
+            .set_target_send_rate(receiver_demux_id, new_target_send_rate, now)
+    }
+
+    #[inline(always)]
+    pub fn set_outgoing_queue_drain_rate(
+        &self,
+        receiver_demux_id: DemuxId,
+        outgoing_queue_drain_rate: DataRate,
+    ) -> Result<(), Error> {
+        self.inner
+            .lock()
+            .set_outgoing_queue_drain_rate(receiver_demux_id, outgoing_queue_drain_rate)
+    }
+
+    #[inline(always)]
+    pub fn set_connection_rates(
+        &self,
+        receiver_demux_id: DemuxId,
+        connection_rates: ConnectionRates,
+    ) -> Result<(), Error> {
+        self.inner
+            .lock()
+            .set_connection_rates(receiver_demux_id, connection_rates)
+    }
+
+    #[inline(always)]
+    pub fn get_send_rate_allocation_info(&self) -> Vec<SendRateAllocationInfo> {
+        self.inner.lock().get_send_rate_allocation_info()
+    }
+
+    #[inline(always)]
+    pub fn handle_key_frame_requests(
+        &self,
+        requester_id: DemuxId,
+        key_frame_requests: &[rtp::KeyFrameRequest],
+        now: Instant,
+    ) -> Vec<(DemuxId, rtp::KeyFrameRequest)> {
+        self.inner
+            .lock()
+            .handle_key_frame_requests(requester_id, key_frame_requests, now)
+    }
+
+    #[inline(always)]
+    pub fn get_signaling_info(&self, include_pending_user_ids: bool) -> CallSignalingInfo {
+        self.inner
+            .lock()
+            .get_signaling_info(&self.call_info, include_pending_user_ids)
+    }
+
+    #[inline(always)]
+    pub fn send_key_frame_requests_if_its_been_too_long(
+        &self,
+        now: Instant,
+    ) -> Vec<(DemuxId, rtp::KeyFrameRequest)> {
+        self.inner
+            .lock()
+            .send_key_frame_requests_if_its_been_too_long(now)
+    }
+
+    #[inline(always)]
+    pub fn get_client_ids(&self) -> Vec<(DemuxId, UserId)> {
+        self.inner.lock().get_client_ids()
+    }
+
+    #[inline(always)]
+    pub fn get_pending_client_ids(&self, include_user_ids: bool) -> Vec<(DemuxId, Option<UserId>)> {
+        self.inner.lock().get_pending_client_ids(include_user_ids)
+    }
+
+    #[inline(always)]
+    pub fn get_stats(&self) -> CallStatsReport {
+        self.inner.lock().get_stats(&self.call_info)
+    }
+
+    pub fn call_tags(&self) -> StaticStrTagsRef {
+        Self::call_tags_from(self.call_info.call_type, self.size())
+    }
+
+    pub fn call_tags_from(call_type: CallType, client_count: usize) -> StaticStrTagsRef {
+        CALL_TAG_VALUES.get(&(call_type, client_count.into()))
+    }
+
+    #[cfg(test)]
+    fn approve_pending_client(&self, demux_id: DemuxId, now: Instant) {
+        self.inner
+            .lock()
+            .approve_pending_client(demux_id, &self.call_info, now);
+    }
+
+    #[cfg(test)]
+    fn deny_pending_client(&self, demux_id: DemuxId, now: Instant) {
+        self.inner
+            .lock()
+            .deny_pending_client(demux_id, &self.call_info, now);
+    }
+
+    #[cfg(test)]
+    fn force_remove_client(&self, demux_id: DemuxId, now: Instant) {
+        self.inner
+            .lock()
+            .force_remove_client(demux_id, &self.call_info, now);
+    }
+
+    #[cfg(test)]
+    fn block_client(&self, demux_id: DemuxId, now: Instant) {
+        self.inner
+            .lock()
+            .block_client(demux_id, &self.call_info, now);
+    }
+}
+
 /// A collection of clients between which media is forwarded.
 /// Each client sends and receives media (audio, video, or data).
 /// Media is forwarded from every client to every other client.
@@ -409,19 +733,8 @@ pub enum CallActivity {
 /// Request for video key frames are also forwarded.
 /// Key frame requests may be generated when to allow for switching between
 /// different video spatial layers.
-pub struct Call {
+struct CallInner {
     // Immutable
-    room_id: Option<RoomId>,
-    call_id: CallId,
-    loggable_call_id: LoggableCallId,
-    creator_id: UserId, // AKA the first user to join
-    new_clients_require_approval: bool,
-    call_type: CallType,
-    persist_approval_for_all_users_who_join: bool,
-    created: SystemTime, // For knowing how old the call is
-    initial_target_send_rate: DataRate,
-    default_requested_max_send_rate: DataRate,
-
     /// Clients (AKA devices) that have joined the call
     clients: Vec<Client>,
     /// Clients that have yet to be approved by an admin
@@ -483,7 +796,7 @@ pub struct CallStats {
     pub call_duration: CallDurationStats,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct CallDurationStats {
     pub empty: Duration,
     pub solo: Duration,
@@ -509,37 +822,24 @@ pub struct RaisedHand {
     pub raise: bool,
 }
 
-impl Call {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        call_id: CallId,
-        room_id: Option<RoomId>,
-        creator_id: UserId,
-        new_clients_require_approval: bool,
-        call_type: CallType,
-        persist_approval_for_all_users_who_join: bool,
-        initial_target_send_rate: DataRate,
-        default_requested_max_send_rate: DataRate,
-        now: Instant,
-        system_now: SystemTime,
-        approved_users: Option<Vec<UserId>>,
-        approved_users_persistence_url: Option<&'static Url>,
-        endorsement_issuer: Option<Arc<Mutex<EndorsementIssuer>>>,
-        drop_fragmentable_updates: bool,
-    ) -> Self {
-        let loggable_call_id = LoggableCallId::from(&call_id);
-        info!("call: {} creating", loggable_call_id);
+struct CreateCallInnerArgs {
+    now: Instant,
+    approved_users: ApprovedUsers,
+    endorsement_issuer: Option<Arc<Mutex<EndorsementIssuer>>>,
+    drop_fragmentable_updates: bool,
+}
+
+impl CallInner {
+    pub fn new(args: CreateCallInnerArgs) -> Self {
+        let CreateCallInnerArgs {
+            now,
+            approved_users,
+            endorsement_issuer,
+            drop_fragmentable_updates,
+        } = args;
+
         Self {
-            room_id: room_id.clone(),
-            loggable_call_id,
-            call_id,
-            creator_id,
-            new_clients_require_approval,
-            call_type,
-            persist_approval_for_all_users_who_join,
-            created: system_now,
-            initial_target_send_rate,
-            default_requested_max_send_rate,
+            approved_users,
 
             clients: Vec::new(),
             pending_clients: Vec::new(),
@@ -549,10 +849,6 @@ impl Call {
 
             endorsement_issuer: endorsement_issuer.map(CallEndorsementIssuer::new),
 
-            approved_users: ApprovedUsers::new(
-                approved_users.unwrap_or_default(),
-                approved_users_persistence_url.zip(room_id),
-            ),
             denied_users: HashSet::new(),
             blocked_users: HashSet::new(),
 
@@ -574,43 +870,23 @@ impl Call {
         }
     }
 
-    fn is_adhoc_call(&self) -> bool {
-        self.call_type == CallType::Adhoc
-    }
-
-    pub fn room_id(&self) -> Option<&RoomId> {
-        self.room_id.as_ref()
-    }
-
-    pub fn call_id(&self) -> CallId {
-        self.call_id.clone()
-    }
-
-    pub fn call_type(&self) -> CallType {
-        self.call_type
-    }
-
-    pub fn loggable_call_id(&self) -> &LoggableCallId {
-        &self.loggable_call_id
-    }
-
-    pub fn creator_id(&self) -> &UserId {
-        &self.creator_id
-    }
-
-    pub fn size(&self) -> usize {
+    fn size(&self) -> usize {
         self.clients.len()
     }
 
-    pub fn size_including_pending_clients(&self) -> usize {
+    fn size_including_pending_clients(&self) -> usize {
         self.clients.len() + self.pending_clients.len()
     }
 
-    pub fn size_bucket(&self) -> CallSizeBucket {
-        CallSizeBucket::from(self.size())
+    pub fn peak_call_size(&self) -> usize {
+        self.call_stats.peak_call_size
     }
 
-    pub fn activity(&mut self, now: &Instant, inactivity_timeout: &Duration) -> CallActivity {
+    pub fn call_duration(&self) -> CallDurationStats {
+        self.call_stats.call_duration
+    }
+
+    fn activity(&mut self, now: &Instant, inactivity_timeout: &Duration) -> CallActivity {
         if !self.clients.is_empty()
             || !self.pending_clients.is_empty()
             || !self.removed_clients.is_empty()
@@ -628,27 +904,11 @@ impl Call {
         }
     }
 
-    pub fn is_approved_users_busy(&self) -> bool {
-        self.approved_users.is_busy()
-    }
-
-    pub fn created(&self) -> SystemTime {
-        self.created
-    }
-
-    pub fn peak_call_size(&self) -> usize {
-        self.call_stats.peak_call_size
-    }
-
-    pub fn call_duration(&self) -> &CallDurationStats {
-        &self.call_stats.call_duration
-    }
-
-    pub fn call_duration_mut(&mut self) -> &mut CallDurationStats {
+    fn call_duration_mut(&mut self) -> &mut CallDurationStats {
         &mut self.call_stats.call_duration
     }
 
-    pub fn has_client(&self, demux_id: DemuxId) -> bool {
+    fn has_client(&self, demux_id: DemuxId) -> bool {
         self.clients
             .iter()
             .any(|client| client.demux_id == demux_id)
@@ -662,7 +922,7 @@ impl Call {
                 .any(|client| client.demux_id == demux_id)
     }
 
-    pub fn is_admin(&self, user_id: &UserId) -> bool {
+    fn is_admin(&self, user_id: &UserId) -> bool {
         self.clients
             .iter()
             .any(|client| client.is_admin && &client.user_id == user_id)
@@ -673,13 +933,15 @@ impl Call {
         now > self.active_speaker_calculated + ACTIVE_SPEAKER_CALCULATION_INTERVAL
     }
 
-    pub fn add_client(
+    #[allow(clippy::too_many_arguments)]
+    fn add_client(
         &mut self,
         demux_id: DemuxId,
         user_id: UserId,
         is_admin: bool,
         region_relation: RegionRelation,
         user_agent: SignalUserAgent,
+        call_info: &CallInfo,
         now: Instant,
     ) -> ClientStatus {
         let member_ciphertext = (&user_id).try_into().ok();
@@ -696,29 +958,29 @@ impl Call {
         if self.blocked_users.contains(&pending_client.user_id) {
             debug!(
                 "call: {} auto-denying blocked user {}",
-                self.loggable_call_id(),
+                call_info.loggable_call_id,
                 demux_id.as_u32()
             );
             self.removed_clients.push(pending_client);
             ClientStatus::Blocked
         } else if is_admin
-            || !self.new_clients_require_approval
+            || !call_info.new_clients_require_approval
             || self.approved_users.contains(&pending_client.user_id)
         {
             debug!(
                 "call: {} adding client {}",
-                self.loggable_call_id(),
+                call_info.loggable_call_id,
                 demux_id.as_u32()
             );
-            if self.persist_approval_for_all_users_who_join {
+            if call_info.persist_approval_for_all_users_who_join {
                 self.approved_users.insert(pending_client.user_id.clone());
             }
-            self.promote_client(pending_client, now);
+            self.promote_client(call_info, pending_client, now);
             ClientStatus::Active
         } else {
             debug!(
                 "call: {} client {} requesting to join",
-                self.loggable_call_id(),
+                call_info.loggable_call_id,
                 demux_id.as_u32()
             );
             // We use the same event to inform clients about changes in the pending list.
@@ -740,7 +1002,12 @@ impl Call {
         self.client_added_or_removed = now;
     }
 
-    fn promote_client(&mut self, pending_client: NonParticipantClient, now: Instant) {
+    fn promote_client(
+        &mut self,
+        call_info: &CallInfo,
+        pending_client: NonParticipantClient,
+        now: Instant,
+    ) {
         time_scope_us!("calling.call.promote_client");
 
         self.will_add_or_remove_client(now);
@@ -751,14 +1018,14 @@ impl Call {
         let demux_id = pending_client.demux_id;
         self.clients.push(Client::new(
             pending_client,
-            self.initial_target_send_rate,
-            self.default_requested_max_send_rate,
+            call_info.initial_target_send_rate,
+            call_info.default_requested_max_send_rate,
             now,
         ));
         self.allocate_video_layers(
             demux_id,
-            self.initial_target_send_rate,
-            self.initial_target_send_rate,
+            call_info.initial_target_send_rate,
+            call_info.initial_target_send_rate,
             now,
         );
         // We may have to update the padding SSRCs because there can't be any padding SSRCs until two people join
@@ -766,7 +1033,7 @@ impl Call {
         self.call_stats.peak_call_size = max(self.call_stats.peak_call_size, self.size());
     }
 
-    fn approve_pending_client(&mut self, demux_id: DemuxId, now: Instant) {
+    fn approve_pending_client(&mut self, demux_id: DemuxId, call_info: &CallInfo, now: Instant) {
         if let Some(user_id) = self
             .pending_clients
             .iter()
@@ -782,17 +1049,17 @@ impl Call {
             for pending_client in matching_pending_clients {
                 debug!(
                     "call: {} approving {}",
-                    self.loggable_call_id(),
+                    call_info.loggable_call_id,
                     demux_id.as_u32()
                 );
-                self.promote_client(pending_client, now);
+                self.promote_client(call_info, pending_client, now);
             }
             self.denied_users.remove(&user_id);
             self.approved_users.insert(user_id);
         }
     }
 
-    fn deny_pending_client(&mut self, demux_id: DemuxId, now: Instant) {
+    fn deny_pending_client(&mut self, demux_id: DemuxId, call_info: &CallInfo, now: Instant) {
         if let Some(user_id) = self
             .pending_clients
             .iter()
@@ -806,7 +1073,7 @@ impl Call {
                     if client.user_id == user_id {
                         debug!(
                             "call: {} denying {}",
-                            &self.loggable_call_id,
+                            call_info.loggable_call_id,
                             demux_id.as_u32()
                         );
                         true
@@ -821,7 +1088,7 @@ impl Call {
                 // spamming the call.
                 debug!(
                     "call: {} repeated deny elevated to block",
-                    self.loggable_call_id(),
+                    call_info.loggable_call_id,
                 );
                 self.blocked_users.insert(user_id);
             }
@@ -860,13 +1127,13 @@ impl Call {
         }
     }
 
-    pub fn drop_client(&mut self, demux_id: DemuxId, now: Instant) {
+    fn drop_client(&mut self, demux_id: DemuxId, call_info: &CallInfo, now: Instant) {
         time_scope_us!("calling.call.drop_client");
 
         if self.remove_client(demux_id, now).is_some() {
             debug!(
                 "call: {} dropping client {}",
-                self.loggable_call_id(),
+                call_info.loggable_call_id,
                 demux_id.as_u32()
             );
         } else if let Some(index) = self
@@ -876,7 +1143,7 @@ impl Call {
         {
             debug!(
                 "call: {} dropping pending client {}",
-                self.loggable_call_id(),
+                call_info.loggable_call_id,
                 demux_id.as_u32()
             );
             self.will_add_or_remove_client(now);
@@ -888,7 +1155,7 @@ impl Call {
         {
             debug!(
                 "call: {} dropping removed client {}",
-                self.loggable_call_id(),
+                call_info.loggable_call_id,
                 demux_id.as_u32()
             );
             self.removed_clients.swap_remove(index);
@@ -897,11 +1164,11 @@ impl Call {
     }
 
     // Like `drop_client`, but keeps the client around in the `removed_clients` list until they leave.
-    fn force_remove_client(&mut self, demux_id: DemuxId, now: Instant) {
+    fn force_remove_client(&mut self, demux_id: DemuxId, call_info: &CallInfo, now: Instant) {
         if let Some(client) = self.remove_client(demux_id, now) {
             debug!(
                 "call: {} removing client {}",
-                self.loggable_call_id(),
+                call_info.loggable_call_id,
                 demux_id.as_u32()
             );
             if !self
@@ -914,7 +1181,7 @@ impl Call {
                 // user has both a pending and an active client.
                 debug!(
                     "call: {} approval revoked for {}",
-                    self.loggable_call_id(),
+                    call_info.loggable_call_id,
                     demux_id.as_u32()
                 );
                 self.approved_users.remove(&client.user_id);
@@ -940,7 +1207,7 @@ impl Call {
         self.raised_hands_sent = now - RAISED_HANDS_MESSAGE_INTERVAL;
     }
 
-    fn block_client(&mut self, demux_id: DemuxId, now: Instant) {
+    fn block_client(&mut self, demux_id: DemuxId, call_info: &CallInfo, now: Instant) {
         if let Some(user_id) = self
             .clients
             .iter()
@@ -954,7 +1221,7 @@ impl Call {
             for removed_client in removed_clients {
                 debug!(
                     "call: {} removing blocked {}",
-                    &self.loggable_call_id,
+                    call_info.loggable_call_id,
                     demux_id.as_u32()
                 );
                 removed_demux_ids.push(removed_client.demux_id);
@@ -1049,10 +1316,11 @@ impl Call {
     /// added and removed.  If the SSRC of the packet doesn't match the DemuxId,
     /// a UnauthorizedRtpSsrc error will be returned.
     /// If the DemuxId is unknown, an UnknownDemuxId error will be returned.
-    pub fn handle_rtp(
+    fn handle_rtp(
         &mut self,
         sender_demux_id: DemuxId,
         incoming_rtp: rtp::Packet<&mut [u8]>,
+        call_info: &CallInfo,
         now: Instant,
     ) -> Result<Vec<RtpToSend>, Error> {
         if incoming_rtp.ssrc() == CLIENT_SERVER_DATA_SSRC
@@ -1061,7 +1329,7 @@ impl Call {
             time_scope_us!("calling.call.handle_rtp.client_to_server_data");
             let proto = protos::DeviceToSfu::decode(incoming_rtp.payload())
                 .map_err(|_| Error::InvalidClientToServerProtobuf)?;
-            self.handle_device_to_sfu(proto, sender_demux_id, now)
+            self.handle_device_to_sfu(proto, sender_demux_id, call_info, now)
         } else {
             self.handle_media_rtp(sender_demux_id, incoming_rtp, now)
         }
@@ -1071,6 +1339,7 @@ impl Call {
         &mut self,
         proto: protos::DeviceToSfu,
         sender_demux_id: DemuxId,
+        call_info: &CallInfo,
         now: Instant,
     ) -> Result<Vec<RtpToSend>, Error> {
         // Check for "Leave" before requiring that the demux ID is valid. We allow it for
@@ -1080,10 +1349,10 @@ impl Call {
             // "Leave" is the only message we allow from pending and removed clients.
             info!(
                 "call: {} removing client: {} (via RTP)",
-                self.loggable_call_id(),
+                call_info.loggable_call_id,
                 sender_demux_id.as_u32()
             );
-            self.drop_client(sender_demux_id, now);
+            self.drop_client(sender_demux_id, call_info, now);
             return Err(Error::Leave);
         }
 
@@ -1106,7 +1375,7 @@ impl Call {
         };
 
         // Snapshot this so we can get a mutable reference to the sender.
-        let default_requested_max_send_rate = self.default_requested_max_send_rate;
+        let default_requested_max_send_rate = call_info.default_requested_max_send_rate;
 
         for proto in ready_protos {
             let sender = self
@@ -1170,7 +1439,7 @@ impl Call {
                             .target_demux_id
                             .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
                         {
-                            self.approve_pending_client(demux_id, now);
+                            self.approve_pending_client(demux_id, call_info, now);
                         } else {
                             record_malformed_admin_action();
                         }
@@ -1181,7 +1450,7 @@ impl Call {
                             .target_demux_id
                             .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
                         {
-                            self.deny_pending_client(demux_id, now);
+                            self.deny_pending_client(demux_id, call_info, now);
                         } else {
                             record_malformed_admin_action();
                         }
@@ -1192,7 +1461,7 @@ impl Call {
                             .target_demux_id
                             .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
                         {
-                            self.force_remove_client(demux_id, now);
+                            self.force_remove_client(demux_id, call_info, now);
                         } else {
                             record_malformed_admin_action();
                         }
@@ -1203,7 +1472,7 @@ impl Call {
                             .target_demux_id
                             .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
                         {
-                            self.block_client(demux_id, now);
+                            self.block_client(demux_id, call_info, now);
                         } else {
                             record_malformed_admin_action();
                         }
@@ -1295,8 +1564,9 @@ impl Call {
     /// incoming data rates, send rate allocations, and the active speaker.
     /// Send packets to clients that should either be delayed or be sent regularly,
     /// such as key frame requests and active speaker changes.
-    pub fn tick(
+    fn tick(
         &mut self,
+        call_info: &CallInfo,
         now: Instant,
         sys_now: SystemTime,
     ) -> (Vec<RtpToSend>, Vec<KeyFrameRequestToSend>) {
@@ -1315,17 +1585,17 @@ impl Call {
                 self.clients_update_sent = now;
                 (
                     Some(DeviceJoinedOrLeft {
-                        peek_info: Some(self.get_signaling_info(true).into()),
+                        peek_info: Some(self.get_signaling_info(call_info, true).into()),
                     }),
                     Some(DeviceJoinedOrLeft {
-                        peek_info: Some(self.get_signaling_info(false).into()),
+                        peek_info: Some(self.get_signaling_info(call_info, false).into()),
                     }),
                 )
             } else {
                 (None, None)
             };
-        let endorsements = if self.is_adhoc_call() {
-            self.check_for_endorsement_updates(sys_now)
+        let endorsements = if matches!(call_info.call_type, CallType::Adhoc) {
+            self.check_for_endorsement_updates(call_info, sys_now)
         } else {
             None
         };
@@ -1362,6 +1632,7 @@ impl Call {
             speaker_update,
             endorsements,
             &mut rtp_to_send,
+            call_info,
             now,
         );
         self.send_update_proto_to_pending_clients(
@@ -1374,7 +1645,7 @@ impl Call {
 
         // Reallocation can change what key frames to send, so we should do this after reallocating.
 
-        self.send_mrp_updates(&mut rtp_to_send, now);
+        self.send_mrp_updates(&mut rtp_to_send, call_info, now);
 
         (rtp_to_send, key_frame_requests_to_send)
     }
@@ -1429,7 +1700,7 @@ impl Call {
 
     /// Adjust the target send rate for the given client according to what congestion control has
     /// calculated.
-    pub fn set_target_send_rate(
+    fn set_target_send_rate(
         &mut self,
         receiver_demux_id: DemuxId,
         new_target_send_rate: DataRate,
@@ -1452,7 +1723,7 @@ impl Call {
         Ok(())
     }
 
-    pub fn set_outgoing_queue_drain_rate(
+    fn set_outgoing_queue_drain_rate(
         &mut self,
         receiver_demux_id: DemuxId,
         outgoing_queue_drain_rate: DataRate,
@@ -1464,7 +1735,7 @@ impl Call {
         Ok(())
     }
 
-    pub fn set_connection_rates(
+    fn set_connection_rates(
         &mut self,
         receiver_demux_id: DemuxId,
         connection_rates: ConnectionRates,
@@ -1476,16 +1747,17 @@ impl Call {
         Ok(())
     }
 
-    pub fn get_send_rate_allocation_info(
-        &self,
-    ) -> impl Iterator<Item = SendRateAllocationInfo> + '_ {
-        self.clients.iter().map(|client| SendRateAllocationInfo {
-            demux_id: client.demux_id,
-            padding_ssrc: client.padding_ssrc,
-            target_send_rate: client.target_send_rate,
-            requested_base_rate: client.requested_base_rate,
-            ideal_send_rate: client.ideal_send_rate,
-        })
+    fn get_send_rate_allocation_info(&self) -> Vec<SendRateAllocationInfo> {
+        self.clients
+            .iter()
+            .map(|client| SendRateAllocationInfo {
+                demux_id: client.demux_id,
+                padding_ssrc: client.padding_ssrc,
+                target_send_rate: client.target_send_rate,
+                requested_base_rate: client.requested_base_rate,
+                ideal_send_rate: client.ideal_send_rate,
+            })
+            .collect()
     }
 
     fn reallocate_target_send_rates_if_its_been_too_long(&mut self, now: Instant) {
@@ -1650,7 +1922,7 @@ impl Call {
         receiver.send_rate_allocated = now;
     }
 
-    pub fn handle_key_frame_requests(
+    fn handle_key_frame_requests(
         &mut self,
         requester_id: DemuxId,
         key_frame_requests: &[rtp::KeyFrameRequest],
@@ -1689,6 +1961,7 @@ impl Call {
             .find(|client| client.demux_id == demux_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_update_proto_to_participating_clients(
         &mut self,
         admin_update_device_joined_or_left: Option<&DeviceJoinedOrLeft>,
@@ -1696,6 +1969,7 @@ impl Call {
         speaker: Option<Speaker>,
         call_send_endorsements: Option<CallSendEndorsements>,
         rtp_to_send: &mut Vec<RtpToSend>,
+        call_info: &CallInfo,
         now: Instant,
     ) {
         let should_send_stats = now >= self.stats_update_sent + STATS_MESSAGE_INTERVAL;
@@ -1799,7 +2073,7 @@ impl Call {
                     });
                 if admin_update_device_joined_or_left.is_some() || endorsements.is_some() {
                     let fragmentable_update = SfuToDevice {
-                        device_joined_or_left: if self.call_type != CallType::Adhoc
+                        device_joined_or_left: if call_info.call_type != CallType::Adhoc
                             || client.is_admin
                         {
                             admin_update_device_joined_or_left.cloned()
@@ -1935,21 +2209,30 @@ impl Call {
         }
     }
 
-    pub fn get_signaling_info(&self, include_pending_user_ids: bool) -> CallSignalingInfo {
+    fn get_signaling_info(
+        &self,
+        call_info: &CallInfo,
+        include_pending_user_ids: bool,
+    ) -> CallSignalingInfo {
         CallSignalingInfo {
-            era_id: Some(self.call_id.clone()),
+            era_id: Some(call_info.call_id.clone()),
             size: self.size(),
-            created: self.created(),
-            creator_id: self.creator_id().clone(),
+            created: call_info.created,
+            creator_id: call_info.creator_id.clone(),
             client_ids: self.get_client_ids(),
             pending_client_ids: self.get_pending_client_ids(include_pending_user_ids),
         }
     }
 
     /// Preps and appends MRP acks and retries to clients in the call
-    fn send_mrp_updates(&mut self, rtp_to_send: &mut Vec<RtpToSend>, now: Instant) {
+    fn send_mrp_updates(
+        &mut self,
+        rtp_to_send: &mut Vec<RtpToSend>,
+        call_info: &CallInfo,
+        now: Instant,
+    ) {
         let unwrapped_now = now.into();
-        let tags = self.call_tags();
+        let tags = self.call_tags(call_info);
         for client in &mut self.clients {
             let client_demux_id = client.demux_id;
             let _ = client.mrp_stream.try_send_ack(|header| {
@@ -2125,7 +2408,7 @@ impl Call {
     // - Receivers sending key frame requests (PLIs)
     // Rather than try to catch all those cases, just call this occasionally.
     // Plus, key frame requests can be dropped, so we need to resend them occasionally.
-    pub fn send_key_frame_requests_if_its_been_too_long(
+    fn send_key_frame_requests_if_its_been_too_long(
         &mut self,
         now: Instant,
     ) -> Vec<(DemuxId, rtp::KeyFrameRequest)> {
@@ -2230,8 +2513,9 @@ impl Call {
     }
 
     /// Checks if we need to send updated endorsements
-    pub fn check_for_endorsement_updates(
+    fn check_for_endorsement_updates(
         &mut self,
+        call_info: &CallInfo,
         now: SystemTime,
     ) -> Option<CallSendEndorsements> {
         let endorsement_issuer = self.endorsement_issuer.as_mut()?;
@@ -2259,8 +2543,7 @@ impl Call {
             Err(e) => {
                 error!(
                     "Failed to compute endorsements for call {} due to: {}",
-                    self.loggable_call_id(),
-                    e
+                    &call_info.loggable_call_id, e
                 );
                 None
             }
@@ -2269,18 +2552,18 @@ impl Call {
         result
     }
 
-    pub fn get_stats(&self) -> CallStatsReport {
+    fn get_stats(&self, call_info: &CallInfo) -> CallStatsReport {
         CallStatsReport {
-            loggable_call_id: self.loggable_call_id.clone(),
+            loggable_call_id: call_info.loggable_call_id.clone(),
             clients: self.clients.iter().map(Client::get_stats).collect(),
         }
     }
 
-    pub fn call_tags(&self) -> StaticStrTagsRef {
-        Self::call_tags_from(self.call_type, self.size())
+    fn call_tags(&self, call_info: &CallInfo) -> StaticStrTagsRef {
+        Self::call_tags_from(call_info.call_type, self.size())
     }
 
-    pub fn call_tags_from(call_type: CallType, client_count: usize) -> StaticStrTagsRef {
+    fn call_tags_from(call_type: CallType, client_count: usize) -> StaticStrTagsRef {
         CALL_TAG_VALUES.get(&(call_type, client_count.into()))
     }
 }
@@ -4519,48 +4802,53 @@ mod call_tests {
         );
     }
 
-    fn create_call(call_id: &[u8], now: Instant, system_now: SystemTime) -> Call {
+    fn create_call(
+        call_id: &[u8],
+        now: Instant,
+        created: SystemTime,
+        new_clients_require_approval: bool,
+    ) -> Call {
         let creator_id = UserId::from("creator_id".to_string());
         let initial_target_send_rate = DataRate::from_kbps(600);
         let default_requested_max_send_rate = DataRate::from_kbps(20000);
-        Call::new(
-            CallId::from(call_id.to_vec()),
-            None,
+        Call::new(CreateCallArgs {
+            call_id: CallId::from(call_id.to_vec()),
+            room_id: None,
             creator_id,
-            false,
-            CallType::GroupV2,
-            false,
+            new_clients_require_approval,
+            call_type: CallType::GroupV2,
+            now,
+            created,
+            approved_users: None,
+            approved_users_persistence_url: None,
             initial_target_send_rate,
             default_requested_max_send_rate,
-            now,
-            system_now,
-            None,
-            None,
-            None,
-            false,
-        )
+            persist_approval_for_all_users_who_join: false,
+            endorsement_issuer: None,
+            drop_fragmentable_updates: false,
+        })
     }
 
-    fn create_adhoc_call(call_id: &[u8], now: Instant, system_now: SystemTime) -> Call {
+    fn create_adhoc_call(call_id: &[u8], now: Instant, created: SystemTime) -> Call {
         let creator_id = UserId::from("creator_id".to_string());
         let initial_target_send_rate = DataRate::from_kbps(600);
         let default_requested_max_send_rate = DataRate::from_kbps(20000);
-        Call::new(
-            CallId::from(call_id.to_vec()),
-            None,
+        Call::new(CreateCallArgs {
+            call_id: CallId::from(call_id.to_vec()),
+            room_id: None,
             creator_id,
-            true,
-            CallType::Adhoc,
-            false,
+            new_clients_require_approval: true,
+            call_type: CallType::Adhoc,
+            now,
+            created,
+            approved_users: None,
+            approved_users_persistence_url: None,
             initial_target_send_rate,
             default_requested_max_send_rate,
-            now,
-            system_now,
-            None,
-            None,
-            None,
-            false,
-        )
+            persist_approval_for_all_users_who_join: false,
+            endorsement_issuer: None,
+            drop_fragmentable_updates: false,
+        })
     }
 
     fn demux_id_from_unshifted(demux_id_without_shifting: u32) -> DemuxId {
@@ -4696,13 +4984,14 @@ mod call_tests {
     }
 
     fn ack_all_mrp(call: &mut Call) {
+        let mut call = call.inner.lock();
         for i in 0..call.clients.len() {
             let demux_id = call.clients.get(i).unwrap().demux_id;
-            ack_latest_mrp(demux_id, call);
+            ack_latest_mrp(demux_id, &mut call);
         }
     }
 
-    fn ack_latest_mrp(demux_id: DemuxId, call: &mut Call) {
+    fn ack_latest_mrp(demux_id: DemuxId, call: &mut CallInner) {
         let Some(client) = call.clients.iter_mut().find(|c| c.demux_id == demux_id) else {
             return;
         };
@@ -4994,7 +5283,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
 
         let sender_demux_id = demux_id_from_unshifted(1);
         let mut rtp1 = create_data_rtp(sender_demux_id, 1);
@@ -5048,7 +5337,7 @@ mod call_tests {
         let now = Instant::now();
         let system_now = SystemTime::now();
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
 
         let sender_demux_id = demux_id_from_unshifted(1);
         let mut rtp1 = create_audio_rtp(sender_demux_id, 1);
@@ -5138,7 +5427,7 @@ mod call_tests {
         let at = |millis| now + Duration::from_millis(millis);
         let sys_at = |millis| system_now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
 
         let sender_demux_id = demux_id_from_unshifted(1);
         let mut frame_number = 101;
@@ -5185,11 +5474,11 @@ mod call_tests {
         call.tick(at(501), sys_at(501));
         assert_eq!(
             Some(DataRate::from_bps(40320)),
-            call.clients[0].incoming_video[0].rate()
+            call.inner.lock().clients[0].incoming_video[0].rate()
         );
         assert_eq!(
             Some(VideoHeight::from(size.height)),
-            call.clients[0].incoming_video[0].height
+            call.inner.lock().clients[0].incoming_video[0].height
         );
 
         let receiver1_demux_id = add_client(&mut call, "receiver1", 2, at(502));
@@ -5312,11 +5601,11 @@ mod call_tests {
         call.tick(at(2500), sys_at(2500));
         assert_eq!(
             Some(DataRate::from_bps(60480)),
-            call.clients[0].incoming_video[1].rate()
+            call.inner.lock().clients[0].incoming_video[1].rate()
         );
         assert_eq!(
             Some(VideoHeight::from(size_layer1.height)),
-            call.clients[0].incoming_video[1].height
+            call.inner.lock().clients[0].incoming_video[1].height
         );
 
         let mut resolution_request = create_resolution_request_rtp(1, 480);
@@ -5337,7 +5626,7 @@ mod call_tests {
         );
         assert_eq!(
             Some(expected_key_frame_request_layer1.1.ssrc),
-            call.clients[1]
+            call.inner.lock().clients[1]
                 .video_forwarder_by_sender_demux_id
                 .get(&sender_demux_id)
                 .unwrap()
@@ -5437,14 +5726,17 @@ mod call_tests {
         }
 
         let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(5100), sys_at(5100));
-        dbg!(call.clients[0].incoming_video[1].rate().unwrap().as_bps());
+        dbg!(call.inner.lock().clients[0].incoming_video[1]
+            .rate()
+            .unwrap()
+            .as_bps());
         assert_eq!(
             Some(DataRate::from_bps(1043790)),
-            call.clients[0].incoming_video[1].rate()
+            call.inner.lock().clients[0].incoming_video[1].rate()
         );
         assert_eq!(
             Some(expected_key_frame_request.1.ssrc),
-            call.clients[1]
+            call.inner.lock().clients[1]
                 .video_forwarder_by_sender_demux_id
                 .get(&sender_demux_id)
                 .unwrap()
@@ -5479,7 +5771,7 @@ mod call_tests {
                     ideal_send_rate: DataRate::from_bps(34546),
                 }
             ],
-            call.get_send_rate_allocation_info().collect::<Vec<_>>()
+            call.get_send_rate_allocation_info()
         );
     }
 
@@ -5490,7 +5782,7 @@ mod call_tests {
         let at = |millis| now + Duration::from_millis(millis);
         let sys_at = |millis| system_now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
 
         // It's a little weird that you get updates for when you join, but it doesn't really do any harm and it's much easier to implement.
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
@@ -5802,13 +6094,12 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let _non_admin = add_client(&mut call, "1", 1, at(100));
-        assert_eq!(0, call.clients.len());
+        assert_eq!(0, call.inner.lock().clients.len());
         let admin = add_admin(&mut call, "2", 2, at(200));
-        assert_eq!(vec![admin], demux_ids(&call.clients));
+        assert_eq!(vec![admin], demux_ids(&call.inner.lock().clients));
     }
 
     #[test]
@@ -5817,27 +6108,33 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let client_device_1 = add_client(&mut call, "Them", 1, at(100));
         let other_device = add_client(&mut call, "Somebody Else", 2, at(200));
         let client_device_2 = add_client(&mut call, "Them", 3, at(300));
-        assert_eq!(
-            vec![client_device_1, other_device, client_device_2],
-            demux_ids(&call.pending_clients)
-        );
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(
+                vec![client_device_1, other_device, client_device_2],
+                demux_ids(&inner.pending_clients)
+            );
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+        }
 
         call.approve_pending_client(client_device_2, at(400));
 
-        assert_eq!(vec![other_device], demux_ids(&call.pending_clients));
-        assert_eq!(
-            vec![client_device_1, client_device_2],
-            demux_ids(&call.clients)
-        );
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![other_device], demux_ids(&inner.pending_clients));
+            assert_eq!(
+                vec![client_device_1, client_device_2],
+                demux_ids(&inner.clients)
+            );
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+        }
     }
 
     #[test]
@@ -5846,27 +6143,33 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let client_device_1 = add_client(&mut call, "Them", 1, at(100));
         let other_device = add_client(&mut call, "Somebody Else", 2, at(200));
         let client_device_2 = add_client(&mut call, "Them", 3, at(300));
-        assert_eq!(
-            vec![client_device_1, other_device, client_device_2],
-            demux_ids(&call.pending_clients)
-        );
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(
+                vec![client_device_1, other_device, client_device_2],
+                demux_ids(&inner.pending_clients)
+            );
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+        }
 
         call.deny_pending_client(client_device_2, at(400));
 
-        assert_eq!(vec![other_device], demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(
-            vec![client_device_1, client_device_2],
-            demux_ids(&call.removed_clients)
-        );
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![other_device], demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(
+                vec![client_device_1, client_device_2],
+                demux_ids(&inner.removed_clients)
+            );
+        }
     }
 
     #[test]
@@ -5875,19 +6178,26 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let non_admin = add_client(&mut call, "1", 1, at(100));
-        assert_eq!(vec![non_admin], demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![non_admin], demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+        }
 
         let result = call.handle_rtp(non_admin, create_leave_rtp().borrow_mut(), at(200));
-        assert_eq!(Error::Leave, result.unwrap_err());
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(Error::Leave, result.unwrap_err());
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+        }
     }
 
     #[test]
@@ -5896,23 +6206,35 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
 
         let non_admin = add_client(&mut call, "1", 1, at(100));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![non_admin], demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![non_admin], demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+        }
 
         call.force_remove_client(non_admin, at(200));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![non_admin], demux_ids(&call.removed_clients));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![non_admin], demux_ids(&inner.removed_clients));
+        }
 
         let result = call.handle_rtp(non_admin, create_leave_rtp().borrow_mut(), at(300));
-        assert_eq!(Error::Leave, result.unwrap_err());
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(Error::Leave, result.unwrap_err());
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+        }
     }
 
     #[test]
@@ -6066,66 +6388,84 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let alice_device_1 = add_client(&mut call, "Alice", 1, at(100));
         let alice_device_2 = add_client(&mut call, "Alice", 2, at(200));
         let bob_device_1 = add_client(&mut call, "Bob", 11, at(300));
         let bob_device_2 = add_client(&mut call, "Bob", 12, at(400));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2, bob_device_1, bob_device_2],
-            demux_ids(&call.pending_clients)
-        );
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(
+                vec![alice_device_1, alice_device_2, bob_device_1, bob_device_2],
+                demux_ids(&inner.pending_clients)
+            );
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+        }
 
         call.approve_pending_client(alice_device_1, at(500));
         call.approve_pending_client(bob_device_2, at(600));
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2, bob_device_1, bob_device_2],
-            demux_ids(&call.clients)
-        );
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2, bob_device_1, bob_device_2],
+                demux_ids(&inner.clients)
+            );
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+        }
 
         call.block_client(alice_device_1, at(700));
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![bob_device_1, bob_device_2], demux_ids(&call.clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2],
-            demux_ids(&call.removed_clients)
-        );
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![bob_device_1, bob_device_2], demux_ids(&inner.clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2],
+                demux_ids(&inner.removed_clients)
+            );
+        }
 
         let alice_device_3 = add_client(&mut call, "Alice", 3, at(800));
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![bob_device_1, bob_device_2], demux_ids(&call.clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2, alice_device_3],
-            demux_ids(&call.removed_clients)
-        );
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![bob_device_1, bob_device_2], demux_ids(&inner.clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2, alice_device_3],
+                demux_ids(&inner.removed_clients)
+            );
+        }
 
         // By contrast, regular removal is by device and allows re-adding.
         call.force_remove_client(bob_device_2, at(900));
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![bob_device_1], demux_ids(&call.clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2, alice_device_3, bob_device_2],
-            demux_ids(&call.removed_clients)
-        );
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![bob_device_1], demux_ids(&inner.clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2, alice_device_3, bob_device_2],
+                demux_ids(&inner.removed_clients)
+            );
+        }
 
         let bob_device_3 = add_client(&mut call, "Bob", 13, at(1000));
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![bob_device_1, bob_device_3], demux_ids(&call.clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2, alice_device_3, bob_device_2],
-            demux_ids(&call.removed_clients)
-        );
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![bob_device_1, bob_device_3], demux_ids(&inner.clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2, alice_device_3, bob_device_2],
+                demux_ids(&inner.removed_clients)
+            );
+        }
     }
 
     #[test]
@@ -6134,59 +6474,82 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let alice_user_id = UserId::from("Alice".to_string());
 
         let alice_device_1 = add_client(&mut call, alice_user_id.as_str(), 1, at(100));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
-        assert!(call.denied_users.is_empty());
-        assert!(call.blocked_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            assert!(inner.denied_users.is_empty());
+            assert!(inner.blocked_users.is_empty());
+        }
 
         call.deny_pending_client(alice_device_1, at(200));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
-        assert!(call.denied_users.contains(&alice_user_id));
-        assert!(call.blocked_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            assert!(inner.denied_users.contains(&alice_user_id));
+            assert!(inner.blocked_users.is_empty());
+        }
 
         // A second "deny" of the same demux ID does not count, because that device is no longer pending.
         call.deny_pending_client(alice_device_1, at(250));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
-        assert!(call.denied_users.contains(&alice_user_id));
-        assert!(call.blocked_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            assert!(inner.denied_users.contains(&alice_user_id));
+            assert!(inner.blocked_users.is_empty());
+        }
 
         let alice_device_2 = add_client(&mut call, alice_user_id.as_str(), 2, at(300));
-        assert_eq!(vec![alice_device_2], demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
-        assert!(call.denied_users.contains(&alice_user_id));
-        assert!(call.blocked_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![alice_device_2], demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            assert!(inner.denied_users.contains(&alice_user_id));
+            assert!(inner.blocked_users.is_empty());
+        }
 
         call.deny_pending_client(alice_device_2, at(400));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2],
-            demux_ids(&call.removed_clients)
-        );
-        assert!(call.denied_users.contains(&alice_user_id));
-        assert!(call.blocked_users.contains(&alice_user_id));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2],
+                demux_ids(&inner.removed_clients)
+            );
+            assert!(inner.denied_users.contains(&alice_user_id));
+            assert!(inner.blocked_users.contains(&alice_user_id));
+        }
 
         let alice_device_3 = add_client(&mut call, alice_user_id.as_str(), 3, at(500));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2, alice_device_3],
-            demux_ids(&call.removed_clients)
-        );
-        assert!(call.denied_users.contains(&alice_user_id));
-        assert!(call.blocked_users.contains(&alice_user_id));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2, alice_device_3],
+                demux_ids(&inner.removed_clients)
+            );
+            assert!(inner.denied_users.contains(&alice_user_id));
+            assert!(inner.blocked_users.contains(&alice_user_id));
+        }
     }
 
     #[test]
@@ -6195,34 +6558,49 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let alice_user_id = UserId::from("Alice".to_string());
 
         let alice_device_1 = add_client(&mut call, alice_user_id.as_str(), 1, at(100));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
-        assert!(call.approved_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.is_empty());
+        }
 
         call.approve_pending_client(alice_device_1, at(200));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
-        assert!(call.approved_users.contains(&alice_user_id));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.contains(&alice_user_id));
+        }
 
         call.force_remove_client(alice_device_1, at(300));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
-        assert!(call.approved_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.is_empty());
+        }
 
         let alice_device_2 = add_client(&mut call, alice_user_id.as_str(), 2, at(400));
-        assert_eq!(vec![alice_device_2], demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
-        assert!(call.approved_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![alice_device_2], demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.is_empty());
+        }
     }
 
     #[test]
@@ -6231,49 +6609,68 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let alice_user_id = UserId::from("Alice".to_string());
 
         let alice_device_1 = add_client(&mut call, alice_user_id.as_str(), 1, at(100));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
-        assert!(call.approved_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.is_empty());
+        }
 
         let alice_device_2 = add_client(&mut call, alice_user_id.as_str(), 2, at(200));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2],
-            demux_ids(&call.pending_clients)
-        );
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
-        assert!(call.approved_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(
+                vec![alice_device_1, alice_device_2],
+                demux_ids(&inner.pending_clients)
+            );
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.is_empty());
+        }
 
         call.approve_pending_client(alice_device_1, at(300));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2],
-            demux_ids(&call.clients)
-        );
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
-        assert!(call.approved_users.contains(&alice_user_id));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2],
+                demux_ids(&inner.clients)
+            );
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.contains(&alice_user_id));
+        }
 
         call.force_remove_client(alice_device_1, at(400));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_2], demux_ids(&call.clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
-        assert!(call.approved_users.contains(&alice_user_id));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![alice_device_2], demux_ids(&inner.clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.contains(&alice_user_id));
+        }
 
         let alice_device_3 = add_client(&mut call, alice_user_id.as_str(), 3, at(500));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(
-            vec![alice_device_2, alice_device_3],
-            demux_ids(&call.clients)
-        );
-        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
-        assert!(call.approved_users.contains(&alice_user_id));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(
+                vec![alice_device_2, alice_device_3],
+                demux_ids(&inner.clients)
+            );
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.contains(&alice_user_id));
+        }
     }
 
     #[test]
@@ -6282,37 +6679,52 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let alice_user_id = UserId::from("Alice".to_string());
 
         let alice_device_1 = add_client(&mut call, alice_user_id.as_str(), 1, at(100));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
-        assert!(call.approved_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.is_empty());
+        }
 
         call.approve_pending_client(alice_device_1, at(200));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
-        assert!(call.approved_users.contains(&alice_user_id));
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.contains(&alice_user_id));
+        }
 
         call.block_client(alice_device_1, at(300));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
-        assert!(call.approved_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.is_empty());
+        }
 
         let alice_device_2 = add_client(&mut call, alice_user_id.as_str(), 2, at(400));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2],
-            demux_ids(&call.removed_clients)
-        );
-        assert!(call.approved_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2],
+                demux_ids(&inner.removed_clients)
+            );
+            assert!(inner.approved_users.is_empty());
+        }
     }
 
     #[test]
@@ -6321,75 +6733,102 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let alice_user_id = UserId::from("Alice".to_string());
 
         let alice_device_1 = add_client(&mut call, alice_user_id.as_str(), 1, at(100));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
-        assert!(call.approved_users.is_empty());
-        assert!(call.denied_users.is_empty());
-        assert!(call.blocked_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.is_empty());
+            assert!(inner.denied_users.is_empty());
+            assert!(inner.blocked_users.is_empty());
+        }
 
         call.deny_pending_client(alice_device_1, at(200));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
-        assert!(call.approved_users.is_empty());
-        assert!(call.denied_users.contains(&alice_user_id));
-        assert!(call.blocked_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.is_empty());
+            assert!(inner.denied_users.contains(&alice_user_id));
+            assert!(inner.blocked_users.is_empty());
+        }
 
         let alice_device_2 = add_client(&mut call, alice_user_id.as_str(), 2, at(300));
-        assert_eq!(vec![alice_device_2], demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
-        assert!(call.approved_users.is_empty());
-        assert!(call.denied_users.contains(&alice_user_id));
-        assert!(call.blocked_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![alice_device_2], demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.is_empty());
+            assert!(inner.denied_users.contains(&alice_user_id));
+            assert!(inner.blocked_users.is_empty());
+        }
 
         call.approve_pending_client(alice_device_2, at(400));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_2], demux_ids(&call.clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.removed_clients));
-        assert!(call.approved_users.contains(&alice_user_id));
-        assert!(call.denied_users.is_empty());
-        assert!(call.blocked_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![alice_device_2], demux_ids(&inner.clients));
+            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            assert!(inner.approved_users.contains(&alice_user_id));
+            assert!(inner.denied_users.is_empty());
+            assert!(inner.blocked_users.is_empty());
+        }
 
         call.force_remove_client(alice_device_2, at(500));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2],
-            demux_ids(&call.removed_clients)
-        );
-        assert!(call.approved_users.is_empty());
-        assert!(call.denied_users.is_empty());
-        assert!(call.blocked_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2],
+                demux_ids(&inner.removed_clients)
+            );
+            assert!(inner.approved_users.is_empty());
+            assert!(inner.denied_users.is_empty());
+            assert!(inner.blocked_users.is_empty());
+        }
 
         let alice_device_3 = add_client(&mut call, alice_user_id.as_str(), 3, at(500));
-        assert_eq!(vec![alice_device_3], demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2],
-            demux_ids(&call.removed_clients)
-        );
-        assert!(call.approved_users.is_empty());
-        assert!(call.denied_users.is_empty());
-        assert!(call.blocked_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![alice_device_3], demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2],
+                demux_ids(&inner.removed_clients)
+            );
+            assert!(inner.approved_users.is_empty());
+            assert!(inner.denied_users.is_empty());
+            assert!(inner.blocked_users.is_empty());
+        }
 
         call.deny_pending_client(alice_device_3, at(600));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.clients));
-        assert_eq!(
-            vec![alice_device_1, alice_device_2, alice_device_3],
-            demux_ids(&call.removed_clients)
-        );
-        assert!(call.approved_users.is_empty());
-        assert!(call.denied_users.contains(&alice_user_id));
-        assert!(call.blocked_users.is_empty());
+
+        {
+            let inner = call.inner.lock();
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
+            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(
+                vec![alice_device_1, alice_device_2, alice_device_3],
+                demux_ids(&inner.removed_clients)
+            );
+            assert!(inner.approved_users.is_empty());
+            assert!(inner.denied_users.contains(&alice_user_id));
+            assert!(inner.blocked_users.is_empty());
+        }
     }
 
     #[test]
@@ -6399,7 +6838,7 @@ mod call_tests {
         let at = |millis| now + Duration::from_millis(millis);
         let sys_at = |millis| system_now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         // If there is no audio activity from anyone, we choose the first client as the active speaker
@@ -6414,7 +6853,7 @@ mod call_tests {
             &[],
         )
         .encode_collection();
-        assert_eq!(Some(demux_id1), call.active_speaker_id);
+        assert_eq!(Some(demux_id1), call.inner.lock().active_speaker_id);
         assert_eq!(
             to_rtp_to_send(vec![
                 (
@@ -6447,7 +6886,7 @@ mod call_tests {
             &[],
         )
         .encode_collection();
-        assert_eq!(Some(demux_id2), call.active_speaker_id);
+        assert_eq!(Some(demux_id2), call.inner.lock().active_speaker_id);
         assert_eq!(
             to_rtp_to_send(vec![
                 (
@@ -6484,7 +6923,7 @@ mod call_tests {
             &[],
         )
         .encode_collection();
-        assert_eq!(Some(demux_id1), call.active_speaker_id);
+        assert_eq!(Some(demux_id1), call.inner.lock().active_speaker_id);
         assert_eq!(
             to_rtp_to_send(vec![
                 (
@@ -6564,13 +7003,13 @@ mod call_tests {
         let at = |millis| now + Duration::from_millis(millis);
         let sys_at = |millis| system_now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         // If there is no audio activity from anyone, we choose the first client as the active speaker
         let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(301), sys_at(301));
 
-        assert_eq!(Some(demux_id1), call.active_speaker_id);
+        assert_eq!(Some(demux_id1), call.inner.lock().active_speaker_id);
 
         // There are no outgoing key frame requests when the active speaker changed because the
         // active speaker height hasn't been specified by any clients.
@@ -6605,7 +7044,7 @@ mod call_tests {
         }
         let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(603), sys_at(603));
 
-        assert_eq!(Some(demux_id2), call.active_speaker_id);
+        assert_eq!(Some(demux_id2), call.inner.lock().active_speaker_id);
 
         // Request key frames from demux_id2 since they're now the active speaker, and demux_id1
         // will start viewing them in a larger view soon.
@@ -6660,7 +7099,7 @@ mod call_tests {
         }
         let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(906), sys_at(906));
 
-        assert_eq!(Some(demux_id1), call.active_speaker_id);
+        assert_eq!(Some(demux_id1), call.inner.lock().active_speaker_id);
 
         // The lowest layer is good enough for demux_id2 already, so no key frame requests are sent
         // there. demux_id1 isn't sent any key frame requests either despite having a larger active
@@ -6690,7 +7129,7 @@ mod call_tests {
                 Some(demux_ids)
             };
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         let demux_id3 = add_client(&mut call, "3", 3, at(3));
@@ -6812,7 +7251,7 @@ mod call_tests {
             Some(demux_ids_and_heights)
         };
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
 
@@ -6935,11 +7374,11 @@ mod call_tests {
         let at = |millis| now + Duration::from_millis(millis);
         let sys_at = |millis| system_now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
 
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
-        assert_eq!(2, call.clients.len());
+        assert_eq!(2, call.inner.lock().clients.len());
 
         // Clear out updates.
         let (_rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300), sys_at(300));
@@ -6948,7 +7387,7 @@ mod call_tests {
             call.handle_rtp(demux_id1, create_leave_rtp().borrow_mut(), at(400)),
             Err(Error::Leave)
         );
-        assert_eq!(1, call.clients.len());
+        assert_eq!(1, call.inner.lock().clients.len());
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400), sys_at(400));
         let expected_update_payload = create_sfu_to_device(
@@ -6975,11 +7414,11 @@ mod call_tests {
         let at = |millis| now + Duration::from_millis(millis);
         let sys_at = |millis| system_now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
 
         let demux_id1 = add_client(&mut call, "1", 1, at(99));
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
-        assert_eq!(2, call.clients.len());
+        assert_eq!(2, call.inner.lock().clients.len());
 
         // Clear out updates.
         let (_rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300), sys_at(300));
@@ -6989,7 +7428,7 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(2, call.clients.len());
+        assert_eq!(2, call.inner.lock().clients.len());
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400), sys_at(400));
 
@@ -7043,14 +7482,19 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let alice_device_1 = add_admin(&mut call, "Alice", 1, at(100));
         let bob_device_1 = add_client(&mut call, "Bob", 2, at(200));
-        assert_eq!(vec![bob_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+        assert_eq!(
+            vec![bob_device_1],
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().removed_clients)
+        );
 
         // Alice: Approve Bob
         let rtp_to_send = call
@@ -7072,9 +7516,18 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(
+            vec![alice_device_1, bob_device_1],
+            demux_ids(&call.inner.lock().clients)
+        );
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().removed_clients)
+        );
 
         // Alice: Remove Bob
         let rtp_to_send = call
@@ -7096,14 +7549,26 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
-        assert_eq!(vec![bob_device_1], demux_ids(&call.removed_clients));
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
+        assert_eq!(
+            vec![bob_device_1],
+            demux_ids(&call.inner.lock().removed_clients)
+        );
 
         let carol_device_1 = add_client(&mut call, "Carol", 3, at(500));
-        assert_eq!(vec![carol_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
-        assert_eq!(vec![bob_device_1], demux_ids(&call.removed_clients));
+        assert_eq!(
+            vec![carol_device_1],
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
+        assert_eq!(
+            vec![bob_device_1],
+            demux_ids(&call.inner.lock().removed_clients)
+        );
 
         // Alice: Deny Carol
         let rtp_to_send = call
@@ -7125,22 +7590,28 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
         assert_eq!(
             vec![bob_device_1, carol_device_1],
-            demux_ids(&call.removed_clients)
+            demux_ids(&call.inner.lock().removed_clients)
         );
 
         let damien_device_1 = add_admin(&mut call, "Damien", 4, at(700));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().pending_clients)
+        );
         assert_eq!(
             vec![alice_device_1, damien_device_1],
-            demux_ids(&call.clients)
+            demux_ids(&call.inner.lock().clients)
         );
         assert_eq!(
             vec![bob_device_1, carol_device_1],
-            demux_ids(&call.removed_clients)
+            demux_ids(&call.inner.lock().removed_clients)
         );
 
         // Alice: Block Damien
@@ -7163,15 +7634,20 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
         assert_eq!(
             vec![bob_device_1, carol_device_1, damien_device_1],
-            demux_ids(&call.removed_clients)
+            demux_ids(&call.inner.lock().removed_clients)
         );
         assert_eq!(
             vec!["Damien"],
-            call.blocked_users
+            call.inner
+                .lock()
+                .blocked_users
                 .iter()
                 .map(UserId::as_str)
                 .collect::<Vec<_>>(),
@@ -7184,14 +7660,19 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
-        call.new_clients_require_approval = true;
+        let mut call = create_call(CALL_ID, now, system_now, true);
 
         let alice_device_1 = add_admin(&mut call, "Alice", 1, at(100));
         let bob_device_1 = add_client(&mut call, "Bob", 2, at(200));
-        assert_eq!(vec![bob_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.removed_clients));
+        assert_eq!(
+            vec![bob_device_1],
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().removed_clients)
+        );
 
         fn mrp_header_with_seqnum(seqnum: u64) -> Option<protos::MrpHeader> {
             Some(protos::MrpHeader {
@@ -7229,11 +7710,11 @@ mod call_tests {
 
         assert_eq!(
             vec![bob_device_1] as Vec<DemuxId>,
-            demux_ids(&call.pending_clients)
+            demux_ids(&call.inner.lock().pending_clients)
         );
-        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
-        assert!(call.removed_clients.is_empty());
-        assert!(call.denied_users.is_empty());
+        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
+        assert!(call.inner.lock().removed_clients.is_empty());
+        assert!(call.inner.lock().denied_users.is_empty());
 
         // Alice: Approve Bob, processes both the Approve then the Deny. Deny is then ignored
         let rtp_to_send = call
@@ -7245,10 +7726,16 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
-        assert!(call.removed_clients.is_empty());
-        assert!(call.denied_users.is_empty());
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(
+            vec![alice_device_1, bob_device_1],
+            demux_ids(&call.inner.lock().clients)
+        );
+        assert!(call.inner.lock().removed_clients.is_empty());
+        assert!(call.inner.lock().denied_users.is_empty());
 
         // Alice: Retransmits first approval, ignored, nothing changes
         let rtp_to_send = call
@@ -7260,10 +7747,16 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
-        assert!(call.removed_clients.is_empty());
-        assert!(call.denied_users.is_empty());
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(
+            vec![alice_device_1, bob_device_1],
+            demux_ids(&call.inner.lock().clients)
+        );
+        assert!(call.inner.lock().removed_clients.is_empty());
+        assert!(call.inner.lock().denied_users.is_empty());
 
         // Alice: Retransmits deny, ignored, nothing changes
         let rtp_to_send = call
@@ -7275,18 +7768,30 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
-        assert!(call.removed_clients.is_empty());
-        assert!(call.denied_users.is_empty());
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(
+            vec![alice_device_1, bob_device_1],
+            demux_ids(&call.inner.lock().clients)
+        );
+        assert!(call.inner.lock().removed_clients.is_empty());
+        assert!(call.inner.lock().denied_users.is_empty());
 
         // Carol: Joins
         let carol_device_1 = add_client(&mut call, "Carol", 3, at(500));
         let carol_user_id = UserId::from("Carol".to_string());
-        assert_eq!(vec![carol_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
-        assert!(call.removed_clients.is_empty());
-        assert!(call.denied_users.is_empty());
+        assert_eq!(
+            vec![carol_device_1],
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(
+            vec![alice_device_1, bob_device_1],
+            demux_ids(&call.inner.lock().clients)
+        );
+        assert!(call.inner.lock().removed_clients.is_empty());
+        assert!(call.inner.lock().denied_users.is_empty());
 
         let third_deny = &protos::DeviceToSfu {
             deny: vec![protos::device_to_sfu::GenericAdminAction {
@@ -7316,10 +7821,16 @@ mod call_tests {
             )
             .unwrap();
         assert!(rtp_to_send.is_empty());
-        assert_eq!(vec![carol_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
-        assert!(call.removed_clients.is_empty());
-        assert!(call.denied_users.is_empty());
+        assert_eq!(
+            vec![carol_device_1],
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(
+            vec![alice_device_1, bob_device_1],
+            demux_ids(&call.inner.lock().clients)
+        );
+        assert!(call.inner.lock().removed_clients.is_empty());
+        assert!(call.inner.lock().denied_users.is_empty());
 
         // then receive the deny - results in being denied
         let rtp_to_send = call
@@ -7330,10 +7841,16 @@ mod call_tests {
             )
             .unwrap();
         assert!(rtp_to_send.is_empty());
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
-        assert!(carol_user_id == call.removed_clients[0].user_id);
-        assert!(HashSet::from([carol_user_id.clone()]) == call.denied_users);
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(
+            vec![alice_device_1, bob_device_1],
+            demux_ids(&call.inner.lock().clients)
+        );
+        assert!(carol_user_id == call.inner.lock().removed_clients[0].user_id);
+        assert!(HashSet::from([carol_user_id.clone()]) == call.inner.lock().denied_users);
 
         // retransmitted deny - discarded, avoiding the accidental block
         let rtp_to_send = call
@@ -7344,10 +7861,16 @@ mod call_tests {
             )
             .unwrap();
         assert!(rtp_to_send.is_empty());
-        assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1, bob_device_1], demux_ids(&call.clients));
-        assert!(carol_user_id == call.removed_clients[0].user_id);
-        assert!(HashSet::from([carol_user_id.clone()]) == call.denied_users);
+        assert_eq!(
+            vec![] as Vec<DemuxId>,
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(
+            vec![alice_device_1, bob_device_1],
+            demux_ids(&call.inner.lock().clients)
+        );
+        assert!(carol_user_id == call.inner.lock().removed_clients[0].user_id);
+        assert!(HashSet::from([carol_user_id.clone()]) == call.inner.lock().denied_users);
     }
 
     #[test]
@@ -7356,15 +7879,18 @@ mod call_tests {
         let system_now = SystemTime::now();
         let at = |millis| now + Duration::from_millis(millis);
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
 
         let alice_device_1 = add_client(&mut call, "Alice", 1, at(100));
 
-        call.new_clients_require_approval = true;
+        call.call_info.new_clients_require_approval = true;
 
         let bob_device_1 = add_client(&mut call, "Bob", 2, at(200));
-        assert_eq!(vec![bob_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
+        assert_eq!(
+            vec![bob_device_1],
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
 
         let rtp_to_send = call
             .handle_rtp(
@@ -7386,8 +7912,11 @@ mod call_tests {
         assert!(rtp_to_send.is_empty());
 
         // No change
-        assert_eq!(vec![bob_device_1], demux_ids(&call.pending_clients));
-        assert_eq!(vec![alice_device_1], demux_ids(&call.clients));
+        assert_eq!(
+            vec![bob_device_1],
+            demux_ids(&call.inner.lock().pending_clients)
+        );
+        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
     }
 
     #[test]
@@ -7414,7 +7943,7 @@ mod call_tests {
                 Some(demux_ids)
             };
 
-        let mut call = create_call(CALL_ID, now, system_now);
+        let mut call = create_call(CALL_ID, now, system_now, false);
         let demux_id1 = add_client(&mut call, "1", 1, at(1));
         let demux_id2 = add_client(&mut call, "2", 2, at(2));
         let demux_id3 = add_client(&mut call, "3", 3, at(3));

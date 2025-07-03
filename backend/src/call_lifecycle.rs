@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use log::*;
 use metrics::event;
-use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot::Receiver};
 
 use crate::{
@@ -26,31 +25,30 @@ const CALL_REMOVAL_QUEUE_CAPACITY: usize = 2048;
 /// On failure, we issue error metrics and discard the call keys.
 pub async fn start(
     config: &'static config::Config,
-    sfu: Arc<RwLock<Sfu>>,
+    sfu: Arc<Sfu>,
     shutdown_signal_rx: Receiver<()>,
 ) -> anyhow::Result<()> {
     let (call_removal_queue_tx, mut call_removal_queue_rx) =
         mpsc::channel(CALL_REMOVAL_QUEUE_CAPACITY);
     let frontend_client = FrontendHttpClient::from_config(config);
 
-    sfu.write()
-        .set_call_ended_handler(Box::new(move |call_id, call| {
-            if call.room_id().is_none() {
-                event!("hangup with no room_id, leaving for cleaner");
-                return Ok(());
-            }
+    sfu.set_call_ended_handler(Box::new(move |call_id, call| {
+        if call.room_id().is_none() {
+            event!("hangup with no room_id, leaving for cleaner");
+            return Ok(());
+        }
 
-            let key = CallKey {
-                room_id: call.room_id().unwrap().clone(),
-                call_id: call_id.clone(),
-            };
+        let key = CallKey {
+            room_id: call.room_id().unwrap().clone(),
+            call_id: call_id.clone(),
+        };
 
-            if let Err(err) = call_removal_queue_tx.try_send(key) {
-                error!("Failed to send call removal to queue: {}", err);
-            }
-            info!("call: {} queued for delete", LoggableCallId::from(call_id));
-            Ok(())
-        }));
+        if let Err(err) = call_removal_queue_tx.try_send(key) {
+            error!("Failed to send call removal to queue: {}", err);
+        }
+        info!("call: {} queued for delete", LoggableCallId::from(call_id));
+        Ok(())
+    }));
 
     // Yield until there are calls in removal queue. Collect call keys into
     // buffer. Attempt to delete them in batches. On batch failure, issue

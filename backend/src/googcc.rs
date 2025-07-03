@@ -80,9 +80,9 @@ pub struct CongestionController {
     acks_sender1: Sender<Vec<Ack>>,
     acks_sender2: Sender<Vec<Ack>>,
     acks_sender3: Sender<Vec<Ack>>,
-    feedback_rtts: Pin<Box<dyn Stream<Item = Duration> + Send>>,
-    acked_rates: Pin<Box<dyn Stream<Item = DataRate> + Send>>,
-    delay_directions: Pin<Box<dyn Stream<Item = (Instant, DelayDirection)> + Send>>,
+    feedback_rtts: Pin<Box<dyn Stream<Item = Duration> + Send + Sync>>,
+    acked_rates: Pin<Box<dyn Stream<Item = DataRate> + Send + Sync>>,
+    delay_directions: Pin<Box<dyn Stream<Item = (Instant, DelayDirection)> + Send + Sync>>,
     calculator: TargetCalculator,
 }
 

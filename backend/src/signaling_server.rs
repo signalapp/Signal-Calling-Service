@@ -37,7 +37,6 @@ use calling_common::{CallType, DemuxId, RoomId, SignalUserAgent};
 use hex::{FromHex, ToHex};
 use hyper::http::{HeaderName, HeaderValue};
 use log::*;
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tokio::sync::oneshot::{self, Receiver};
@@ -199,24 +198,16 @@ pub fn validate_room_id(room_id: &Option<RoomId>) -> Result<()> {
 }
 /// Return a health response after accessing the SFU and obtaining basic information.
 async fn get_health(
-    State(sfu): State<Arc<RwLock<Sfu>>>,
+    State(sfu): State<Arc<Sfu>>,
     Extension(is_healthy): Extension<Arc<AtomicBool>>,
     Extension(cpu_idle_pct): Extension<Arc<AtomicU8>>,
 ) -> Result<impl IntoResponse, StatusCode> {
     trace!("get_health():");
 
     if is_healthy.load(Ordering::Relaxed) {
-        let calls = sfu.read().get_calls_snapshot(); // SFU lock released here.
+        let calls = sfu.get_calls_snapshot();
 
-        let client_count = calls
-            .iter()
-            .map(|call| {
-                // We can take this call lock after closing the SFU lock because we are treating
-                // it as read-only and can accommodate stale data.
-                let call = call.lock();
-                call.size()
-            })
-            .sum();
+        let client_count = calls.iter().map(|call| call.size()).sum();
 
         let response = HealthResponse {
             call_count: calls.len(),
@@ -255,7 +246,7 @@ async fn get_info(
 /// the call does not exist or an empty list if there are no clients
 /// currently in the call.
 async fn get_clients(
-    State(sfu): State<Arc<RwLock<Sfu>>>,
+    State(sfu): State<Arc<Sfu>>,
     Path(call_id): Path<String>,
     requesting_user: Option<TypedHeader<sfu::UserId>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -264,7 +255,6 @@ async fn get_clients(
     let call_id =
         call_id_from_hex(&call_id).map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let sfu = sfu.read();
     if let Some(signaling) =
         sfu.get_call_signaling_info(call_id, requesting_user.as_ref().map(|header| &header.0))
     {
@@ -295,7 +285,7 @@ async fn get_clients(
 
 /// Handles a request for a client to join a call.
 async fn join(
-    State(sfu): State<Arc<RwLock<Sfu>>>,
+    State(sfu): State<Arc<Sfu>>,
     Path((call_id, demux_id)): Path<(String, u32)>,
     Extension(config): Extension<&'static config::Config>,
     Json(request): Json<JoinRequest>,
@@ -335,7 +325,6 @@ async fn join(
         Region::Unset
     };
 
-    let mut sfu = sfu.write();
     match sfu.get_or_create_call_and_add_client(
         call_id,
         request.room_id,
@@ -399,7 +388,7 @@ async fn join(
 /// The overall signaling api combined as a Router for the server and testing.
 pub fn signaling_api(
     config: &'static config::Config,
-    sfu: Arc<RwLock<Sfu>>,
+    sfu: Arc<Sfu>,
     is_healthy: Arc<AtomicBool>,
     cpu_idle_pct: Arc<AtomicU8>,
 ) -> Router {
@@ -434,7 +423,7 @@ pub fn signaling_api(
 
 pub async fn start(
     config: &'static config::Config,
-    sfu: Arc<RwLock<Sfu>>,
+    sfu: Arc<Sfu>,
     ender_rx: Receiver<()>,
     is_healthy: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -532,14 +521,12 @@ mod signaling_server_tests {
         config
     });
 
-    fn new_sfu(now: Instant, config: &'static config::Config) -> Arc<RwLock<Sfu>> {
-        Arc::new(RwLock::new(
-            Sfu::new(now, config).expect("Sfu::new should work"),
-        ))
+    fn new_sfu(now: Instant, config: &'static config::Config) -> Arc<Sfu> {
+        Arc::new(Sfu::new(now, config).expect("Sfu::new should work"))
     }
 
     fn add_client_to_sfu(
-        sfu: Arc<RwLock<Sfu>>,
+        sfu: Arc<Sfu>,
         call_id: &str,
         user_id: &str,
         demux_id: DemuxId,
@@ -551,7 +538,6 @@ mod signaling_server_tests {
         let user_id = validate_user_id(user_id).unwrap();
 
         let _ = sfu
-            .write()
             .get_or_create_call_and_add_client(
                 call_id,
                 None,
@@ -574,7 +560,7 @@ mod signaling_server_tests {
     }
 
     fn add_admin_to_sfu(
-        sfu: Arc<RwLock<Sfu>>,
+        sfu: Arc<Sfu>,
         call_id: &str,
         user_id: &str,
         demux_id: DemuxId,
@@ -586,7 +572,6 @@ mod signaling_server_tests {
         let user_id = validate_user_id(user_id).unwrap();
 
         let _ = sfu
-            .write()
             .get_or_create_call_and_add_client(
                 call_id,
                 None,
@@ -608,23 +593,20 @@ mod signaling_server_tests {
             .unwrap();
     }
 
-    fn remove_client_from_sfu(sfu: Arc<RwLock<Sfu>>, call_id: &str, demux_id: DemuxId) {
+    fn remove_client_from_sfu(sfu: Arc<Sfu>, call_id: &str, demux_id: DemuxId) {
         let call_id = call_id_from_hex(call_id).unwrap();
 
-        sfu.write()
-            .remove_client_from_call(Instant::now(), call_id, demux_id);
+        sfu.remove_client_from_call(Instant::now(), call_id, demux_id);
     }
 
-    fn check_call_exists_in_sfu(sfu: Arc<RwLock<Sfu>>, call_id: &str) -> bool {
-        sfu.read()
-            .get_call_signaling_info(call_id_from_hex(call_id).unwrap(), None)
+    fn check_call_exists_in_sfu(sfu: Arc<Sfu>, call_id: &str) -> bool {
+        sfu.get_call_signaling_info(call_id_from_hex(call_id).unwrap(), None)
             .is_some()
     }
 
-    fn get_client_count_in_call_from_sfu(sfu: Arc<RwLock<Sfu>>, call_id: &str) -> usize {
-        if let Some(signaling) = sfu
-            .read()
-            .get_call_signaling_info(call_id_from_hex(call_id).unwrap(), None)
+    fn get_client_count_in_call_from_sfu(sfu: Arc<Sfu>, call_id: &str) -> usize {
+        if let Some(signaling) =
+            sfu.get_call_signaling_info(call_id_from_hex(call_id).unwrap(), None)
         {
             signaling.size
         } else {
