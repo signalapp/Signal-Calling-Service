@@ -899,6 +899,7 @@ impl Sfu {
                 ) {
                     Ok(outgoing_rtp) => outgoing_rtp,
                     Err(call::Error::Leave) => {
+                        event!("calling.sfu.close_connection.rtp");
                         self.connections.remove_connection(incoming_connection_id);
                         return Ok(Default::default());
                     }
