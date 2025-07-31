@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use std::sync::Arc;
+
 use calling_common::{DataRate, DataRateTracker, DataSize, Duration, Instant, SignalUserAgent};
 use log::*;
 use metrics::event;
@@ -12,6 +14,7 @@ use thiserror::Error;
 #[cfg(test)]
 use crate::candidate_selector::IceCredentials;
 use crate::{
+    call::Call,
     candidate_selector::{self, CandidateSelector},
     config::Config,
     googcc,
@@ -61,6 +64,7 @@ pub enum Error {
 pub struct Connection {
     inner: RwLock<ConnectionInner>,
     id: ConnectionId,
+    call: Arc<Call>,
     ice_username: Vec<u8>,
     region_relation: RegionRelation,
     user_agent: SignalUserAgent,
@@ -69,6 +73,7 @@ pub struct Connection {
 pub struct CreateConnectionArgs<'a> {
     pub config: &'static Config,
     pub connection_id: &'a ConnectionId,
+    pub call: Arc<Call>,
     pub ice_server_username: Vec<u8>,
     pub ice_client_username: Vec<u8>,
     pub ice_server_pwd: Vec<u8>,
@@ -86,6 +91,7 @@ impl Connection {
     #[allow(clippy::too_many_arguments)]
     pub fn with_candidate_selector_config(
         id: ConnectionId,
+        call: Arc<Call>,
         candidate_selector_config: candidate_selector::Config,
         srtp_master_key_material: rtp::MasterKeyMaterial,
         ack_ssrc: rtp::Ssrc,
@@ -109,6 +115,7 @@ impl Connection {
 
         Self {
             id,
+            call,
             inner,
             ice_username,
             region_relation,
@@ -129,6 +136,7 @@ impl Connection {
         let CreateConnectionArgs {
             config,
             connection_id,
+            call,
             ice_server_username,
             ice_client_username,
             ice_server_pwd,
@@ -160,6 +168,7 @@ impl Connection {
 
         Self {
             inner,
+            call,
             id,
             ice_username,
             region_relation,
@@ -170,6 +179,11 @@ impl Connection {
     #[inline(always)]
     pub fn id(&self) -> &ConnectionId {
         &self.id
+    }
+
+    #[inline(always)]
+    pub fn call(&self) -> &Arc<Call> {
+        &self.call
     }
 
     // This is a convenience for the SFU to be able to iterate over Connections
@@ -1118,12 +1132,43 @@ impl ConnectionRates {
 mod connection_tests {
     use std::borrow::Borrow;
 
-    use calling_common::Writer;
+    use calling_common::{CallType, SystemTime, Writer};
     use candidate_selector::ScoringValues;
     use rtp::new_srtp_keys;
 
     use super::*;
-    use crate::transportcc as tcc;
+    use crate::{
+        call::CreateCallArgs,
+        sfu::{CallId, UserId},
+        transportcc as tcc,
+    };
+
+    fn new_call(
+        call_id: &[u8],
+        now: Instant,
+        created: SystemTime,
+        new_clients_require_approval: bool,
+    ) -> Call {
+        let creator_id = UserId::from("creator_id".to_string());
+        let initial_target_send_rate = DataRate::from_kbps(600);
+        let default_requested_max_send_rate = DataRate::from_kbps(20000);
+        Call::new(CreateCallArgs {
+            call_id: CallId::from(call_id.to_vec()),
+            room_id: None,
+            creator_id,
+            new_clients_require_approval,
+            call_type: CallType::GroupV2,
+            now,
+            created,
+            approved_users: None,
+            approved_users_persistence_url: None,
+            initial_target_send_rate,
+            default_requested_max_send_rate,
+            persist_approval_for_all_users_who_join: false,
+            endorsement_issuer: None,
+            drop_fragmentable_updates: false,
+        })
+    }
 
     fn new_connection(now: Instant) -> Connection {
         let ice_server_username = b"server:client";
@@ -1158,8 +1203,10 @@ mod connection_tests {
                 client_pwd: ice_client_pwd.to_vec(),
             },
         };
+        let call = Arc::new(new_call(b"dummy-call-id", now, SystemTime::now(), false));
         Connection::with_candidate_selector_config(
             ConnectionId::null(),
+            call,
             candidate_selector_config,
             zeroize::Zeroizing::new([0u8; 56]),
             ack_ssrc,

@@ -268,7 +268,7 @@ impl Calls {
 
     /// Retrieves a call instance identified by the given call ID, if it exists. If no such
     /// call exists, it is created and associated with the given call ID.
-    fn get_call_or_insert<F>(&self, call_id: &CallId, default: F) -> Arc<Call>
+    fn get_or_insert_call<F>(&self, call_id: &CallId, default: F) -> Arc<Call>
     where
         F: FnOnce() -> Call,
     {
@@ -715,7 +715,7 @@ impl Sfu {
         let connection_id = ConnectionId::from_call_id_and_demux_id(call_id.clone(), demux_id);
         let region_relation = self.get_region_relation(region);
 
-        let call = self.calls.get_call_or_insert(&call_id.clone(), || {
+        let call = self.calls.get_or_insert_call(&call_id.clone(), || {
             Call::new(CreateCallArgs {
                 call_id,
                 room_id,
@@ -793,6 +793,7 @@ impl Sfu {
         self.connections.create_connection(CreateConnectionArgs {
             config: self.config,
             connection_id: &connection_id,
+            call,
             ice_server_username,
             ice_client_username,
             ice_server_pwd,
@@ -885,10 +886,7 @@ impl Sfu {
             trace!("  ssrc: {}", incoming_rtp.ssrc());
             trace!("  seqnum: {}", incoming_rtp.seqnum());
 
-            let call = self
-                .calls
-                .get_call_from_id(&incoming_connection_id.call_id)
-                .ok_or_else(|| SfuError::MissingCall(incoming_connection_id.call_id.clone()))?;
+            let call = incoming_connection.call();
 
             let outgoing_rtp = {
                 time_scope_us!("calling.sfu.handle_packet.rtp.in_call_lock");
@@ -958,10 +956,7 @@ impl Sfu {
                     .map_err(SfuError::ConnectionError)?
             };
 
-            let call = self
-                .calls
-                .get_call_from_id(&incoming_connection_id.call_id)
-                .ok_or_else(|| SfuError::MissingCall(incoming_connection_id.call_id.clone()))?;
+            let call = incoming_connection.call();
 
             let outgoing_key_frame_requests = {
                 time_scope_us!("calling.sfu.handle_packet.rtcp.in_call_lock");
@@ -1202,7 +1197,6 @@ impl Sfu {
 
         let remove_inactive_calls_timer = start_timer_us!("calling.sfu.tick.remove_inactive_calls");
 
-        let mut expired_demux_ids_by_call_id: HashMap<CallId, Vec<DemuxId>> = HashMap::new();
         let mut outgoing_queue_sizes_by_call_id: HashMap<CallId, Vec<(DemuxId, DataSize)>> =
             HashMap::new();
         let mut connection_rates_by_call_id: HashMap<CallId, Vec<(DemuxId, ConnectionRates)>> =
@@ -1213,10 +1207,8 @@ impl Sfu {
             if check_for_inactivity && connection.inactive(now) {
                 info!("dropping connection: {}", connection_id);
 
-                expired_demux_ids_by_call_id
-                    .entry(connection_id.call_id.clone())
-                    .or_default()
-                    .push(connection_id.demux_id);
+                let call = connection.call();
+                call.drop_client(connection_id.demux_id, now);
 
                 if connection.had_selected_candidate() {
                     event!("calling.sfu.close_connection.inactive");
@@ -1247,12 +1239,6 @@ impl Sfu {
             Duration::from_millis(self.config.outgoing_queue_drain_ms);
 
         for call in self.calls.get_calls_snapshot() {
-            if let Some(expired_demux_ids) = expired_demux_ids_by_call_id.get(&call.call_id()) {
-                for expired_demux_id in expired_demux_ids {
-                    call.drop_client(*expired_demux_id, now);
-                }
-            }
-
             match call.activity(&now, &inactivity_timeout) {
                 CallActivity::Inactive => {
                     // If the call hasn't had any activity recently, remove it.
