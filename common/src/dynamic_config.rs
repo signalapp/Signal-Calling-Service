@@ -203,7 +203,7 @@ impl<T> Subscription<T> {
 
     /// Like any synchronized values, caller should hold returned reference since it can be
     /// expensive to get, but release it when done using and before calling async code
-    pub fn get(&self) -> SubscriptionGuard<T> {
+    pub fn get(&self) -> SubscriptionGuard<'_, T> {
         // we borrow the value but never mark it seen
         SubscriptionGuard(self.0.borrow())
     }

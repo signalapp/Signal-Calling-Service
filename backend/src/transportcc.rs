@@ -397,7 +397,7 @@ impl IntoIterator for PacketStatusChunk {
     fn into_iter(self) -> Self::IntoIter {
         match self {
             Self::RunLength { status, len, .. } => {
-                Box::new(std::iter::repeat(Some(status)).take(len as usize))
+                Box::new(std::iter::repeat_n(Some(status), len as usize))
             }
             Self::Vector1 { len, bits } => Box::new(
                 (2..=15)

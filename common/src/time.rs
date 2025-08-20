@@ -126,7 +126,6 @@ impl SystemTime {
                     SystemTime::UNIX_EPOCH + rounded_epoch
                 }
             })
-            .map(Into::into)
     }
 
     pub fn saturating_duration_since_epoch(&self) -> Duration {

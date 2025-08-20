@@ -39,13 +39,13 @@ pub use time::*;
 // TODO: Change to Result
 pub type ReadOption<'a, T> = Option<(T, &'a [u8])>;
 
-pub fn read_u16(input: &[u8]) -> ReadOption<u16> {
+pub fn read_u16(input: &[u8]) -> ReadOption<'_, u16> {
     let (bytes, rest) = read_bytes(input, 2)?;
     Some((parse_u16(bytes), rest))
 }
 
 // Returns (read, rest)
-pub fn read_bytes(input: &[u8], len: usize) -> ReadOption<&[u8]> {
+pub fn read_bytes(input: &[u8], len: usize) -> ReadOption<'_, &[u8]> {
     let bytes = input.get(0..len)?;
     let rest = &input[len..];
     Some((bytes, rest))

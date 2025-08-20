@@ -1240,7 +1240,7 @@ enum SocketStream {
 }
 
 impl AsFd for SocketStream {
-    fn as_fd(&self) -> BorrowedFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
         match self {
             SocketStream::Tcp(s) => s.as_fd(),
             SocketStream::Tls(b) => {
@@ -1333,7 +1333,7 @@ impl AsRawFd for ConnectedSocket {
 }
 
 impl AsFd for ConnectedSocket {
-    fn as_fd(&self) -> BorrowedFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
         match &self.socket {
             Socket::Udp(s) => s.as_fd(),
             Socket::Tcp(m) => {

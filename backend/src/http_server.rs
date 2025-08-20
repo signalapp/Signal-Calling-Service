@@ -372,7 +372,7 @@ async fn join_conference(
             Ok(Json(response).into_response())
         }
         Err(err) => {
-            error!("client failed to join call {}", err.to_string());
+            error!("client failed to join call {}", err);
             let status_code = match err {
                 SfuError::TooManyClients => StatusCode::PAYLOAD_TOO_LARGE,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,

@@ -202,7 +202,9 @@ impl Authenticator {
     }
 
     /// Helper function to parse an authorization header using the Basic or Bearer authentication scheme.
-    pub fn parse_authorization_header(header: &str) -> Result<ParsedHeader, AuthenticatorError> {
+    pub fn parse_authorization_header(
+        header: &str,
+    ) -> Result<ParsedHeader<'_>, AuthenticatorError> {
         // Get the credentials from the Bearer authorization header.
         match header.split_once(' ') {
             Some((scheme, token)) if scheme.eq_ignore_ascii_case("Basic") => {

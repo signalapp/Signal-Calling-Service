@@ -752,7 +752,7 @@ impl Endpoint {
 
     /// returns
     /// - a buffer that can hold all the reports that are ready, SRTP Tag, and SRTP Footer.
-    ///     There is NO possibility of padding since the sizes are all multiples of four.
+    ///   There is NO possibility of padding since the sizes are all multiples of four.
     /// - the number of reports to serialize
     fn create_buffer_for_rtcp_reports(&self) -> Option<Vec<u8>> {
         const RECEIVER_REPORT_MIN_LENGTH: usize = ReceiverReport::MIN_LENGTH + ReportBlock::LENGTH;

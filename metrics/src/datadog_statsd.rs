@@ -298,7 +298,7 @@ impl<E: EventSink> Client<E> {
 
     /// Get a pipeline struct that allows optimizes the number of UDP
     /// packets used to send multiple metrics.
-    pub fn pipeline(&mut self) -> Client<PipelineSink<E>> {
+    pub fn pipeline(&mut self) -> Client<PipelineSink<'_, E>> {
         Client {
             sink: PipelineSink::new(&mut self.sink),
             prefix: self.prefix.clone(),
@@ -306,7 +306,7 @@ impl<E: EventSink> Client<E> {
         }
     }
 
-    pub fn pipeline_client_of_size(&mut self, max_udp_size: usize) -> Client<PipelineSink<E>> {
+    pub fn pipeline_client_of_size(&mut self, max_udp_size: usize) -> Client<PipelineSink<'_, E>> {
         Client {
             sink: PipelineSink::new_with_size(&mut self.sink, max_udp_size),
             prefix: self.prefix.clone(),
