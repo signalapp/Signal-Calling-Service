@@ -8,7 +8,7 @@ on: # rebuild any PRs and main branch changes
 
 jobs:
   ci:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest-4-cores
     steps:
     - name: Install protoc
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
