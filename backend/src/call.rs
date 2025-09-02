@@ -1514,7 +1514,7 @@ impl CallInner {
         let incoming_rtp = incoming_rtp.borrow();
         if let Some(audio_level) = incoming_rtp.audio_level {
             time_scope_us!("calling.call.handle_rtp.audio_level");
-            sender.incoming_audio_levels.push(audio_level);
+            sender.incoming_audio_levels.push(audio_level, now);
             // Active speaker is recalculated in tick()
             if audio_level == 0 {
                 return Ok(vec![]);
@@ -2373,18 +2373,21 @@ impl CallInner {
     fn calculate_active_speaker(&mut self, now: Instant) -> Option<DemuxId> {
         self.active_speaker_calculated = now;
         let first = self.clients.first()?;
+        let mut newly_most_active_since = now;
         let mut most_active = self
             .active_speaker_id
             .and_then(|demux_id| self.find_client(demux_id))
             .unwrap_or(first);
 
         for contender in &self.clients {
-            if contender.demux_id != most_active.demux_id
-                && contender
+            if contender.demux_id != most_active.demux_id {
+                let (is_more_active, since_when) = contender
                     .incoming_audio_levels
-                    .more_active_than_most_active(&most_active.incoming_audio_levels)
-            {
-                most_active = contender;
+                    .more_active_than_most_active(&most_active.incoming_audio_levels, now);
+                if is_more_active {
+                    most_active = contender;
+                    newly_most_active_since = since_when;
+                }
             }
         }
 
@@ -2394,6 +2397,11 @@ impl CallInner {
                 .unwrap()
                 .became_active_speaker = Some(now);
             self.active_speaker_id = Some(most_active_demux_id);
+            value_histogram!(
+                "calling.media.audio.dominant_speaker.update_delay",
+                now.saturating_duration_since(newly_most_active_since)
+                    .as_millis() as usize
+            );
             Some(most_active_demux_id)
         } else {
             None

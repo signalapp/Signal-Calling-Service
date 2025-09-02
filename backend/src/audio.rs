@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::{cmp::min, default::Default};
+use std::{cmp::min, collections::VecDeque, default::Default};
 
-use calling_common::{count_in_chunks_exact, Duration, RingBuffer};
+use calling_common::{Duration, Instant, RingBuffer};
+use itertools::{FoldWhile, Itertools};
 use log::*;
 
 // Higher is louder
@@ -92,7 +93,8 @@ impl LevelFloorTracker {
 // at least for the range of audio levels 0-127.
 pub struct LevelsTracker {
     floor: LevelFloorTracker,
-    levels: RingBuffer<Level>,
+    // tracks the level and time the sample was received
+    levels: RingBuffer<(Level, Instant)>,
 }
 
 impl Default for LevelsTracker {
@@ -105,7 +107,7 @@ impl Default for LevelsTracker {
 }
 
 impl LevelsTracker {
-    pub fn push(&mut self, mut sample: Level) {
+    pub fn push(&mut self, mut sample: Level, ts: Instant) {
         self.floor = self.floor.update(sample);
         let threshold = self.floor.get().unwrap_or(0) + 10;
         // Treat anything near the floor as 0
@@ -114,39 +116,58 @@ impl LevelsTracker {
         if sample <= threshold {
             sample = 0;
         }
-        self.levels.push(sample);
+        self.levels.push((sample, ts));
     }
 
-    fn iter_latest_first(&self) -> impl Iterator<Item = Level> + '_ {
+    fn iter_latest_first(&self) -> impl Iterator<Item = (Level, Instant)> + '_ {
         self.levels.iter().rev().copied()
     }
 
     fn latest(&self) -> Option<Level> {
-        self.iter_latest_first().next()
+        self.iter_latest_first().next().map(|(level, _)| level)
     }
 
     fn count_latest_chunk_above_threshold(&self, n: usize, threshold: Level) -> usize {
         self.iter_latest_first()
             .take(n)
-            .filter(|level| *level > threshold)
+            .filter(|(level, _)| *level > threshold)
             .count()
     }
 
-    fn count_chunks_above_threshold(&self, chunk_size: usize, threshold: Level) -> usize {
-        // Here is how it would read if we could group iterators or copy:
-        // self.iter_latest_first().collect::<Vec<_>>()
-        //     .chunks_exact(chunk_size)
-        //     .filter(|chunk| chunk.iter().all(|level| *level > threshold))
-        //     .count()
-        count_in_chunks_exact(
-            self.iter_latest_first().map(|level| level > threshold),
-            chunk_size,
-        )
-        .filter(|high_count| *high_count == chunk_size)
-        .count()
+    /// returns a vector of whether the chunk was above the threshold and the timestamp of the first
+    /// sample in each chunk
+    fn map_chunks_above_threshold(
+        &self,
+        chunk_size: usize,
+        threshold: Level,
+    ) -> (usize, Vec<(bool, Instant)>) {
+        let (active_count, chunks_ratings) = self
+            .iter_latest_first()
+            .chunks(chunk_size)
+            .into_iter()
+            .map(|chunk| chunk.collect_vec())
+            .filter(|chunk| chunk.len() == chunk_size)
+            .map(|chunk| {
+                (
+                    chunk.iter().all(|(level, _)| *level > threshold),
+                    chunk.last().unwrap_or(&(0, Instant::now())).1,
+                )
+            })
+            .fold((0, VecDeque::new()), |(active_count, mut acc), element| {
+                let is_active = element.0;
+                acc.push_front(element);
+                (active_count + is_active as usize, acc)
+            });
+        (active_count, chunks_ratings.into())
     }
 
-    pub fn more_active_than_most_active(&self, most_active: &LevelsTracker) -> bool {
+    /// returns whether more active than the specified most active. If true, returns the timestamp
+    /// of the first chunk when this tracker became more active
+    pub fn more_active_than_most_active(
+        &self,
+        most_active: &LevelsTracker,
+        now: Instant,
+    ) -> (bool, Instant) {
         const HIGH: Level = 70;
         const LOW: Level = 40;
         const CHUNK_SIZE: usize = 5;
@@ -156,20 +177,12 @@ impl LevelsTracker {
                 "The contender isn't active enough (latest sample = {:?})",
                 self.latest()
             );
-            return false;
+            return (false, now);
         }
 
         if most_active.latest().unwrap_or(0) >= LOW {
             trace!("The most active is still active (latest sample)");
-            return false;
-        }
-
-        let self_first_chunk = self.count_latest_chunk_above_threshold(CHUNK_SIZE, HIGH);
-
-        if self_first_chunk < CHUNK_SIZE {
-            trace!("The contender isn't active enough (latest chunk)");
-            // We're not active enough.
-            return false;
+            return (false, now);
         }
 
         let most_active_first_chunk =
@@ -178,24 +191,67 @@ impl LevelsTracker {
         if most_active_first_chunk > 0 {
             trace!("The most active is still active (latest chunk)");
             // The most active is too active.
-            return false;
+            return (false, now);
         }
 
-        if self_first_chunk < most_active_first_chunk {
-            trace!("The most active is more active (first chunk)");
-            // We can't compete with the most active
-            return false;
+        let self_first_chunk = self.count_latest_chunk_above_threshold(CHUNK_SIZE, HIGH);
+
+        if self_first_chunk < CHUNK_SIZE {
+            trace!("The contender isn't active enough (latest chunk)");
+            // We're not active enough.
+            return (false, now);
         }
 
-        let self_high_chunks = self.count_chunks_above_threshold(CHUNK_SIZE, HIGH);
-        let most_active_high_chunks = most_active.count_chunks_above_threshold(CHUNK_SIZE, HIGH);
+        let (self_high_chunk_count, self_high_chunks) =
+            self.map_chunks_above_threshold(CHUNK_SIZE, HIGH);
+        let (most_active_high_chunks_count, most_active_high_chunks) =
+            most_active.map_chunks_above_threshold(CHUNK_SIZE, HIGH);
 
-        if self_high_chunks <= most_active_high_chunks {
+        if self_high_chunk_count <= most_active_high_chunks_count {
             trace!("The most active is more active (number of active chunk)");
-            return false;
+            return (false, now);
         }
 
-        true
+        // We know that self has been active for the latest chunk, that the self active chunk count
+        // is higher than most_active, and that most_active either is inactive or has no samples.
+        // There are a few possibilities at this point:
+        // 1. If most_active has no samples, then return true and the first timestamp of the first
+        //    active chunk in self
+        // 2. most_active has samples, then find the contiguous inactive chunks for most active.
+        //    Given the timestamp of the first inactive chunk MAI_TS, return the lowest self chunk
+        //    timestamp >= MAI_ts when self was active or the timestamp of the latest chunk
+
+        // Case 1: most_active has no samples, return the first active timestamp of self
+        if most_active_high_chunks_count == 0 {
+            let ts = self_high_chunks
+                .iter()
+                .find(|(is_active, _)| *is_active)
+                .cloned()
+                .unwrap_or((true, now))
+                .1;
+            return (true, ts);
+        }
+
+        // Case 2: Find the timestamp of the first chunk in the contiguous inactive period of most_active.
+        // Then return the timestamp of the first active chunk in self or the latest chunk's timestamp
+        let most_active_became_inactive_ts: Instant = most_active_high_chunks
+            .iter()
+            .fold_while(now, |acc, (is_active, ts)| {
+                if *is_active {
+                    FoldWhile::Continue(*ts)
+                } else {
+                    FoldWhile::Done(acc)
+                }
+            })
+            .into_inner();
+        let self_became_more_active_ts: Instant = self_high_chunks
+            .iter()
+            .find_or_last(|(_, ts)| *ts >= most_active_became_inactive_ts)
+            .cloned()
+            .unwrap_or((true, now))
+            .1;
+
+        (true, self_became_more_active_ts)
     }
 }
 
@@ -240,68 +296,69 @@ mod test {
 
         let mut most_active = LevelsTracker::default();
         let mut contender = LevelsTracker::default();
+        let now = Instant::now();
 
-        assert!(!contender.more_active_than_most_active(&most_active));
+        assert!(!contender.more_active_than_most_active(&most_active, now).0);
 
         // Establishes the noise floor
-        contender.push(60);
+        contender.push(60, now);
         // Shows activity
         for _ in 0..4 {
-            contender.push(80);
+            contender.push(80, now);
         }
         // Not quite active enough yet
-        assert!(!contender.more_active_than_most_active(&most_active));
+        assert!(!contender.more_active_than_most_active(&most_active, now).0);
 
         // OK, now we have enough
-        contender.push(80);
-        assert!(contender.more_active_than_most_active(&most_active));
+        contender.push(80, now);
+        assert!(contender.more_active_than_most_active(&most_active, now).0);
 
         // Not any more, though
-        contender.push(70);
-        assert!(!contender.more_active_than_most_active(&most_active));
+        contender.push(70, now);
+        assert!(!contender.more_active_than_most_active(&most_active, now).0);
 
         // OK, active enough again
         for _ in 0..5 {
-            contender.push(80);
+            contender.push(80, now);
         }
-        assert!(contender.more_active_than_most_active(&most_active));
+        assert!(contender.more_active_than_most_active(&most_active, now).0);
 
         // But not if the most active is active again
-        most_active.push(50); // Establishes noise floor
-        assert!(contender.more_active_than_most_active(&most_active));
-        most_active.push(60); // Not yet above noise floor
-        assert!(contender.more_active_than_most_active(&most_active));
-        most_active.push(80); // Now it is
-        assert!(!contender.more_active_than_most_active(&most_active));
+        most_active.push(50, now); // Establishes noise floor
+        assert!(contender.more_active_than_most_active(&most_active, now).0);
+        most_active.push(60, now); // Not yet above noise floor
+        assert!(contender.more_active_than_most_active(&most_active, now).0);
+        most_active.push(80, now); // Now it is
+        assert!(!contender.more_active_than_most_active(&most_active, now).0);
 
         // If it goes inactive a little, that's not enough.
-        most_active.push(50);
-        assert!(!contender.more_active_than_most_active(&most_active));
+        most_active.push(50, now);
+        assert!(!contender.more_active_than_most_active(&most_active, now).0);
 
         // But if it's inactive a long time, we win.
         for _ in 0..4 {
-            most_active.push(50);
+            most_active.push(50, now);
         }
-        assert!(contender.more_active_than_most_active(&most_active));
+        assert!(contender.more_active_than_most_active(&most_active, now).0);
 
         // Unless it was also active even longer ago.  Then it's harder to dislodge.
         for _ in 0..5 {
-            most_active.push(80);
+            most_active.push(80, now);
         }
         for _ in 0..5 {
-            most_active.push(50);
+            most_active.push(50, now);
         }
-        assert!(!contender.more_active_than_most_active(&most_active));
+        assert!(!contender.more_active_than_most_active(&most_active, now).0);
 
-        assert_eq!(1, most_active.count_chunks_above_threshold(5, 70));
-        assert_eq!(1, contender.count_chunks_above_threshold(5, 70));
+        assert_eq!(1, most_active.map_chunks_above_threshold(5, 70).0);
+        assert_eq!(1, contender.map_chunks_above_threshold(5, 70).0);
 
         // But it is possible with enough activity
         for _ in 0..5 {
-            contender.push(80);
+            contender.push(80, now);
         }
-        assert_eq!(1, most_active.count_chunks_above_threshold(5, 70));
-        assert_eq!(2, contender.count_chunks_above_threshold(5, 70));
-        assert!(contender.more_active_than_most_active(&most_active));
+        assert_eq!(1, most_active.map_chunks_above_threshold(5, 70).0);
+        assert_eq!(2, contender.map_chunks_above_threshold(5, 70).0);
+        assert!(contender.more_active_than_most_active(&most_active, now).0);
     }
 }
