@@ -5,7 +5,6 @@
 
 use std::{
     array::TryFromSliceError,
-    collections::HashMap,
     fmt::Display,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::{Deref, Range},
@@ -18,12 +17,8 @@ use calling_common::{
 use crc::{Crc, CRC_32_ISO_HDLC};
 use hmac::{Hmac, Mac};
 use log::*;
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 use sha1::Sha1;
 use thiserror::Error;
-
-use crate::{packet_server::SocketLocator, sfu::ConnectionId};
 
 const HEADER_LEN: usize = 20;
 const HMAC_LEN: usize = 20;
@@ -1029,49 +1024,6 @@ impl<'a> Deref for BindingRequest<'a> {
 impl Display for BindingRequest<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "BindingRequest {}", self.packet)
-    }
-}
-
-// The one and only ICE/STUN transaction table.
-static ICE_TRANSACTION_TABLE: Lazy<Mutex<HashMap<(SocketLocator, TransactionId), ConnectionId>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
-/// Provides access to the global ICE/STUN transaction table. The table is used to associate
-/// ICE/STUN transactions with connections (via [sfu::ConnectionId]).
-pub struct IceTransactionTable;
-
-impl IceTransactionTable {
-    pub fn put(
-        address: SocketLocator,
-        transaction_id: &TransactionId,
-        connection_id: &ConnectionId,
-    ) {
-        ICE_TRANSACTION_TABLE
-            .lock()
-            .insert((address, transaction_id.clone()), connection_id.clone());
-    }
-
-    pub fn claim(address: SocketLocator, transaction_id: &TransactionId) -> Option<ConnectionId> {
-        ICE_TRANSACTION_TABLE
-            .lock()
-            .remove(&(address, transaction_id.clone()))
-    }
-
-    pub fn remove(address: SocketLocator, transaction_id: &TransactionId) {
-        ICE_TRANSACTION_TABLE
-            .lock()
-            .remove(&(address, transaction_id.clone()));
-    }
-
-    pub fn remove_all_for_connection(connection_id: &ConnectionId) {
-        ICE_TRANSACTION_TABLE
-            .lock()
-            .retain(|_, c| c != connection_id);
-    }
-
-    #[cfg(test)]
-    pub fn is_empty() -> bool {
-        ICE_TRANSACTION_TABLE.lock().is_empty()
     }
 }
 

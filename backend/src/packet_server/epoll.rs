@@ -40,8 +40,9 @@ use rustls::{ServerConfig, ServerConnection};
 use unique_id::{sequence::SequenceGenerator, Generator};
 
 use crate::{
+    connection::Connection,
     packet_server::{self, SocketLocator, TimerHeap, TimerHeapNextResult},
-    sfu::{self, HandleOutput, Sfu, SfuStats},
+    sfu::{self, HandleOutput, HandleUnconnectedOutput, Sfu, SfuError, SfuStats},
 };
 
 /// Controls number of sockets a particular thread will handle without going back to epoll.
@@ -99,11 +100,11 @@ pub struct PacketServerState {
     local_addr_tcp: SocketAddr,
     local_addr_tls: Option<SocketAddr>,
     tls_config: Option<Arc<ServerConfig>>,
-    all_connections: RwLock<ConnectionMap>,
+    all_connections: RwLock<ConnectionMap<ConnectedSocket>>,
     tick_interval: Duration,
     tick_number: AtomicU64, // u64 will never rollover
     tcp_id_generator: Arc<SequenceGenerator>,
-    timer_heaps: Vec<Mutex<TimerHeap<SocketLocator>>>,
+    timer_heaps: Vec<Mutex<TimerHeap<Arc<Connection>>>>,
     num_threads: usize,
 }
 
@@ -145,20 +146,27 @@ impl PacketServerState {
     fn open_socket_with_reusable_port(
         local_addr: &SocketAddr,
         core: Option<&CoreId>,
-    ) -> Result<(Socket, RawFd)> {
+    ) -> Result<(ConnectedSocket, RawFd)> {
         let socket = Self::open_socket_impl(local_addr, core)?;
         let raw_fd = socket.as_raw_fd();
-        Ok((Socket::Udp(socket), raw_fd))
+        Ok((ConnectedSocket::unconnected(Socket::Udp(socket)), raw_fd))
     }
 
     fn connect_udp_socket(
         local_addr: &SocketAddr,
         remote_addr: &SocketAddr,
-    ) -> Result<(Socket, RawFd)> {
+        connection: Arc<Connection>,
+    ) -> Result<(ConnectedSocket, RawFd)> {
         let socket = Self::open_socket_impl(local_addr, None)?;
         socket.connect(remote_addr)?;
         let raw_fd = socket.as_raw_fd();
-        Ok((Socket::Udp(socket), raw_fd))
+        Ok((
+            ConnectedSocket {
+                socket: Socket::Udp(socket),
+                connection: Some(connection),
+            },
+            raw_fd,
+        ))
     }
 
     fn open_socket_impl(local_addr: &SocketAddr, core: Option<&CoreId>) -> Result<UdpSocket> {
@@ -273,7 +281,7 @@ impl PacketServerState {
         futures::future::select_all(all_handles)
     }
 
-    /// Runs a single listener on the current thread, polling `epoll_fd`.
+    /// Runs on the current thread, polling `epoll_fd`.
     ///
     /// See [`PacketServerState::start_threads`].
     fn run(&self, sfu: &Arc<Sfu>, thread_num: usize, core: CoreId) -> Result<()> {
@@ -372,346 +380,458 @@ impl PacketServerState {
                 });
             for event in &current_events[..num_events] {
                 let socket_fd = event.data() as i32;
-                let connections_lock = self.all_connections.read();
-                let socket = if socket_fd == new_client_socket_fd {
-                    if unpinned_recv.is_none_or(|instant| {
-                        Instant::now().saturating_duration_since(instant) > UNPINNED_LOG_INTERVAL
-                    }) {
-                        error!(
-                            "packet delivered to unpinned UDP socket on core {}; check cpu pinning",
-                            core.id
-                        );
-                        unpinned_recv = Some(Instant::now());
-                    }
-                    &new_client_socket
+                if socket_fd == new_client_socket_fd {
+                    warn_unpinned(&mut unpinned_recv, "UDP");
+                    self.read_unconnected(&mut bufs[0], sfu, &epoll, &new_client_socket);
                 } else if socket_fd == new_pinned_client_socket_fd {
-                    &new_pinned_client_socket
-                } else if socket_fd == new_tcp_socket_fd
-                    || socket_fd == new_pinned_tcp_socket_fd
-                    || socket_fd == new_tls_socket_fd
-                    || socket_fd == new_pinned_tls_socket_fd
-                {
-                    drop(connections_lock);
-
-                    let (accepted, tls_config) = if socket_fd == new_tcp_socket_fd {
-                        if unpinned_recv.is_none_or(|instant| {
-                            Instant::now().saturating_duration_since(instant)
-                                > UNPINNED_LOG_INTERVAL
-                        }) {
-                            error!(
-                                "packet delivered to unpinned TCP socket on core {}; check cpu pinning",
-                                core.id
-                            );
-                            unpinned_recv = Some(Instant::now());
-                        }
-
-                        (new_tcp_socket.accept(), None)
-                    } else if socket_fd == new_pinned_tcp_socket_fd {
-                        (new_pinned_tcp_socket.accept(), None)
-                    } else if socket_fd == new_tls_socket_fd {
-                        if unpinned_recv.is_none_or(|instant| {
-                            Instant::now().saturating_duration_since(instant)
-                                > UNPINNED_LOG_INTERVAL
-                        }) {
-                            error!(
-                                "packet delivered to unpinned TLS socket on core {}; check cpu pinning",
-                                core.id
-                            );
-                            unpinned_recv = Some(Instant::now());
-                        }
-
-                        (
-                            new_tls_socket
-                                .as_ref()
-                                .expect("tls socket must exist if we got an event on it")
-                                .accept(),
-                            Some(
-                                self.tls_config
-                                    .as_ref()
-                                    .expect("tls config must exist if we got a tls accept")
-                                    .clone(),
-                            ),
-                        )
-                    } else {
-                        (
-                            new_pinned_tls_socket
-                                .as_ref()
-                                .expect("tls socket must exist if we got an event on it")
-                                .accept(),
-                            Some(
-                                self.tls_config
-                                    .as_ref()
-                                    .expect("tls config must exist if we got a tls accept")
-                                    .clone(),
-                            ),
-                        )
-                    };
-
-                    match accepted {
-                        Ok((client_socket, addr)) => {
-                            // TODO: explore TCP_CORK instead of/in addition to TCP_NODELAY
-                            let _ = client_socket.set_nodelay(true); // fail quietly
-                            client_socket
-                                .set_nonblocking(true)
-                                .expect("Cannot set non-blocking");
-
-                            let is_ipv6 = match addr.ip() {
-                                V4(_) => false,
-                                V6(addr) => addr.to_ipv4_mapped().is_none(),
-                            };
-                            let id = self.tcp_id_generator.next_id();
-                            let is_tls = tls_config.is_some();
-                            if let Ok(client_socket) =
-                                Socket::new_tcp(client_socket, id, is_ipv6, tls_config)
-                            {
-                                let mut write_lock = self.all_connections.write();
-                                if epoll
-                                    .add(
-                                        &client_socket,
-                                        EpollEvent::new(
-                                            EpollFlags::EPOLLIN,
-                                            client_socket.as_raw_fd() as u64,
-                                        ),
-                                    )
-                                    .is_ok()
-                                {
-                                    write_lock.get_or_insert_connected(
-                                        client_socket,
-                                        SocketLocator::Tcp {
-                                            id,
-                                            is_ipv6,
-                                            is_tls,
-                                        },
-                                        Some(self.tick_number.load(AtomicOrdering::Relaxed)),
-                                    );
-                                }
-                            }
-                        }
-                        Err(err) => match err.kind() {
-                            io::ErrorKind::WouldBlock => {}
-                            err => {
-                                event!("calling.udp.epoll.accept_error");
-                                warn!("accept error: {}", err);
-                            }
-                        },
-                    }
-                    continue;
+                    self.read_unconnected(&mut bufs[0], sfu, &epoll, &new_pinned_client_socket);
+                } else if socket_fd == new_tcp_socket_fd {
+                    warn_unpinned(&mut unpinned_recv, "TCP");
+                    self.accept_tcp(&new_tcp_socket, &epoll, false);
+                } else if socket_fd == new_pinned_tcp_socket_fd {
+                    self.accept_tcp(&new_pinned_tcp_socket, &epoll, false);
+                } else if socket_fd == new_tls_socket_fd {
+                    warn_unpinned(&mut unpinned_recv, "TLS");
+                    let socket = new_tls_socket.as_ref().expect("socket must exist");
+                    self.accept_tcp(socket, &epoll, true);
+                } else if socket_fd == new_pinned_tls_socket_fd {
+                    let socket = new_pinned_tls_socket.as_ref().expect("socket must exist");
+                    self.accept_tcp(socket, &epoll, true);
                 } else if socket_fd == timer_fd {
-                    let _ = timer
-                        .as_ref()
-                        .expect("timer must exist if it epolled")
-                        .wait();
-                    continue;
+                    let _ = timer.as_ref().expect("timer must exist").wait();
                 } else {
-                    match connections_lock.get_by_fd(socket_fd) {
-                        Some(socket) => socket,
-                        None => {
-                            // By the time we got to this event the socket was closed.
-                            continue;
-                        }
-                    }
-                };
+                    // Not a special fd, must be a client fd
+                    let is_error = event.events().contains(EpollFlags::EPOLLERR);
+                    let input_ready = event.events().contains(EpollFlags::EPOLLIN);
 
-                if event.events().contains(EpollFlags::EPOLLERR) {
-                    match socket.take_error() {
-                        Err(err) => {
-                            warn!("take_error() failed: {}", err);
-                            event!("calling.udp.epoll.take_error_failure");
-                            // Hopefully this is a transient failure. Just skip this socket for now.
-                            continue;
-                        }
-                        Ok(None) => {
-                            // Assume another thread got here first.
-                            continue;
-                        }
-                        Ok(Some(err)) => {
-                            match err.kind() {
-                                io::ErrorKind::ConnectionRefused | io::ErrorKind::BrokenPipe => {
-                                    // This can happen when someone leaves a call
-                                    // because e.g. their router stops forwarding packets.
-                                    // This is normal with UDP; technically this error happened
-                                    // with the *previous* packet and we're just finding out now.
-                                    trace!("socket error: {}", err);
-
-                                    match socket.peer_addr() {
-                                        Err(err) => {
-                                            warn!(
-                                                "peer_addr() failed while handling an error: {}",
-                                                err
-                                            );
-                                        }
-                                        Ok(addr) => {
-                                            // Drop the read lock...
-                                            drop(connections_lock);
-                                            // ...and connect with a write lock...
-                                            let mut write_lock = self.all_connections.write();
-                                            // ...and mark the connection as closed.
-                                            // If we changed state (such as already going to Closed)
-                                            // in between the locks, mark_closed is still safe to call:
-                                            // - If the connection is still open, we want to close it.
-                                            // - If the connection is closed, closing it again doesn't hurt.
-                                            // - If the connection has been removed entirely, closing it does nothing.
-                                            // - If the connection has been removed and the address gets reused,
-                                            // we'll close a connection that doesn't belong here anymore.
-                                            // That's very unlikely because it means we've had at least two ticks,
-                                            // and it'll (hopefully) heal itself in another two.
-                                            write_lock.mark_closed(&addr, Instant::now());
-                                            // No need to read more from this socket.
-                                            continue;
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    Self::socket_error(&err);
-                                }
-                            }
-                        }
-                    }
+                    self.read_connected(
+                        &mut bufs,
+                        timer_heap,
+                        sfu,
+                        socket_fd,
+                        is_error,
+                        input_ready,
+                    );
                 }
+            }
 
-                // We ignore all other events but EPOLLIN; hangups will be handled by tick()
-                // expiring the connection.
-                if !event.events().contains(EpollFlags::EPOLLIN) {
-                    continue;
+            poll_timeout_ms = self.process_timer(timer_heap, &timer, sfu);
+        }
+    }
+
+    fn read_unconnected(
+        &self,
+        buf: &mut PacketBuffer,
+        sfu: &Arc<Sfu>,
+        epoll: &Epoll,
+        socket: &ConnectedSocket,
+    ) {
+        let sender_addr = match buf.recv_from(socket) {
+            Err(err) => {
+                Self::socket_error(&err);
+                return;
+            }
+            Ok(sender_addr) => sender_addr,
+        };
+
+        let HandleUnconnectedOutput {
+            packets_to_send,
+            connection,
+        } = match packet_server::handle_packet_unconnected(sfu, sender_addr, buf.as_mut()) {
+            Some(output) => output,
+            None => return,
+        };
+
+        {
+            let mut write_lock = self.all_connections.write();
+            match write_lock.get_by_addr(&sender_addr) {
+                ConnectionState::New(_) => {
+                    write_lock.mark_as_active(&sender_addr, |s| s.connection = Some(connection));
                 }
-
-                // We only read one packet for each socket that's ready. This isn't as efficient
-                // as it could be; if one socket has many packets ready, we have to go back into
-                // the epoll loop to find that out. On the other hand, this does ensure that we
-                // don't get stuck reading from one socket and ignore all others.
-                //
-                // Note that this relies on using epoll in level-triggered mode rather than
-                // edge-triggered.
-                //
-                // We loop here, to allow reading multiple RTP packets from TLS connections;
-                // it's possible that the TLS layer will have read all data from the socket and
-                // there are multiple RTP packets within that data. If we only read one RTP
-                // packet, the next packet will remain buffered in the TLS layer, but epoll will
-                // not find the socket ready for read, until a future packet arrives.
-
-                let mut index = 0;
-                let mut sender_addr = None;
-                loop {
-                    match bufs[index].recv_from(socket) {
-                        Err(err) => {
-                            match err.kind() {
-                                io::ErrorKind::TimedOut
-                                | io::ErrorKind::WouldBlock
-                                | io::ErrorKind::Interrupted => {}
-                                io::ErrorKind::ConnectionRefused => {
-                                    // This can happen when someone leaves a call
-                                    // because e.g. their router stops forwarding packets.
-                                    // This is normal with UDP; technically this error happened
-                                    // with the previous *sent* packet and we're just finding out now.
-                                    trace!("recv_from() failed: {}", err);
-                                }
-                                io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData => {
-                                    // got invalid data, so drop the connection
-                                    if let Ok(peer_addr) = socket.peer_addr() {
-                                        // Drop the read lock...
-                                        drop(connections_lock);
-                                        // ...and connect with a write lock...
-                                        let mut write_lock = self.all_connections.write();
-                                        write_lock.mark_closed(&peer_addr, Instant::now());
-                                        break;
-                                    }
-                                }
-                                _ => {
-                                    Self::socket_error(&err);
-                                }
-                            };
-                            drop(connections_lock);
-                            break;
-                        }
-                        Ok(s_a) => {
-                            sender_addr = Some(s_a);
-                        }
-                    };
-                    index += 1;
-                    if socket.has_pending_data() {
-                        if bufs.len() <= index {
-                            bufs.push(PacketBuffer::new());
+                ConnectionState::Connected(socket) => {
+                    if let Some(socket_connection) = &socket.connection {
+                        if socket_connection.id() != connection.id() {
+                            error!(
+                                "connection changed! addr {} id {} -> id {}",
+                                sender_addr,
+                                socket_connection.id(),
+                                connection.id()
+                            );
                         }
                     } else {
-                        drop(connections_lock);
-                        break;
+                        error!(
+                            "sender_addr marked connected without Connection {}",
+                            sender_addr
+                        );
                     }
                 }
-
-                if let Some(sender_addr) = sender_addr {
-                    for inbuf in bufs.iter_mut().take(index) {
-                        let HandleOutput {
-                            packets_to_send,
-                            dequeues_to_schedule,
-                        } = packet_server::handle_packet(sfu, sender_addr, inbuf.as_mut());
-
-                        for (buf, addr) in packets_to_send {
-                            self.send_packet(&epoll, &buf, addr)
-                        }
-
-                        if !dequeues_to_schedule.is_empty() {
-                            let mut timer_heap = timer_heap.lock();
-                            for (time, addr) in dequeues_to_schedule {
-                                timer_heap.schedule(time, addr);
+                ConnectionState::Closed(_) => {
+                    error!("connection closed in read_unconnected");
+                }
+                ConnectionState::NotYetConnected => {
+                    trace!("connecting to {:?}", sender_addr);
+                    match sender_addr {
+                        SocketLocator::Udp(udp_addr) => {
+                            match try_scoped(|| {
+                                // TODO: socket.local address?
+                                let (client_socket, client_socket_fd) = Self::connect_udp_socket(
+                                    &self.local_addr_udp,
+                                    &udp_addr,
+                                    connection,
+                                )?;
+                                epoll.add(
+                                    &client_socket,
+                                    EpollEvent::new(EpollFlags::EPOLLIN, client_socket_fd as u64),
+                                )?;
+                                write_lock.get_or_insert_connected(
+                                    client_socket,
+                                    sender_addr,
+                                    None,
+                                );
+                                Ok(())
+                            }) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    error!("failed to connect to peer: {}", e);
+                                }
                             }
+                        }
+                        SocketLocator::Tcp { .. } => {
+                            error!("should not handle tcp connections in read_unconnected");
+                        }
+                    }
+                }
+            }
+        }
+
+        for (buf, addr) in packets_to_send {
+            self.send_packet(&buf, addr)
+        }
+    }
+
+    fn read_connected(
+        &self,
+        bufs: &mut Vec<PacketBuffer>,
+        timer_heap: &Mutex<TimerHeap<Arc<Connection>>>,
+        sfu: &Arc<Sfu>,
+        socket_fd: i32,
+        is_error: bool,
+        input_ready: bool,
+    ) {
+        let connections_lock = self.all_connections.read();
+
+        let socket = match connections_lock.get_by_fd(socket_fd) {
+            Some(socket) => socket,
+            // By the time we got to this event the socket was closed.
+            None => {
+                return;
+            }
+        };
+
+        if is_error {
+            match socket.take_error() {
+                Err(err) => {
+                    warn!("take_error() failed: {}", err);
+                    event!("calling.udp.epoll.take_error_failure");
+                    // Hopefully this is a transient failure. Just skip this socket for now.
+                    return;
+                }
+                Ok(None) => {
+                    // Assume another thread got here first.
+                    return;
+                }
+                Ok(Some(err)) => {
+                    match err.kind() {
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::BrokenPipe => {
+                            // This can happen when someone leaves a call
+                            // because e.g. their router stops forwarding packets.
+                            // This is normal with UDP; technically this error happened
+                            // with the *previous* packet and we're just finding out now.
+                            trace!("socket error: {}", err);
+
+                            match socket.peer_addr() {
+                                Err(err) => {
+                                    warn!("peer_addr() failed while handling an error: {}", err);
+                                }
+                                Ok(addr) => {
+                                    let connection = socket.connection.clone();
+                                    // Drop the read lock...
+                                    drop(connections_lock);
+                                    // ...and connect with a write lock...
+                                    let mut write_lock = self.all_connections.write();
+                                    // ...and mark the connection as closed.
+                                    // If we changed state (such as already going to Closed)
+                                    // in between the locks, mark_closed is still safe to call:
+                                    // - If the connection is still open, we want to close it.
+                                    // - If the connection is closed, closing it again doesn't hurt.
+                                    // - If the connection has been removed entirely, closing it does nothing.
+                                    // - If the connection has been removed and the address gets reused,
+                                    // we'll close a connection that doesn't belong here anymore.
+                                    // That's very unlikely because it means we've had at least two ticks,
+                                    // and it'll (hopefully) heal itself in another two.
+                                    write_lock.mark_closed(&addr, Instant::now());
+                                    if let Some(connection) = connection {
+                                        connection.remove_candidate(addr);
+                                    }
+                                    // No need to read more from this socket.
+                                    return;
+                                }
+                            }
+                        }
+                        _ => {
+                            Self::socket_error(&err);
                         }
                     }
                 }
             }
+        }
 
-            let mut dequeues_left = MAX_EPOLL_EVENTS;
-            let mut packets_to_send = vec![];
-            let mut dequeues_to_schedule = vec![];
-            while dequeues_left > 0 {
-                let now = Instant::now();
-                let mut timer_heap = timer_heap.lock();
-                match timer_heap.next(now) {
-                    TimerHeapNextResult::Value(addr) => {
-                        if Sfu::handle_dequeue(
-                            sfu,
-                            addr,
-                            now,
-                            &mut packets_to_send,
-                            &mut dequeues_to_schedule,
-                        ) {
-                            dequeues_left -= 1;
+        // We ignore all other events but EPOLLIN; hangups will be handled by tick()
+        // expiring the connection.
+        if !input_ready {
+            return;
+        }
+
+        // We only read one packet for each socket that's ready. This isn't as efficient
+        // as it could be; if one socket has many packets ready, we have to go back into
+        // the epoll loop to find that out. On the other hand, this does ensure that we
+        // don't get stuck reading from one socket and ignore all others.
+        //
+        // Note that this relies on using epoll in level-triggered mode rather than
+        // edge-triggered.
+        //
+        // We loop here, to allow reading multiple RTP packets from TLS connections;
+        // it's possible that the TLS layer will have read all data from the socket and
+        // there are multiple RTP packets within that data. If we only read one RTP
+        // packet, the next packet will remain buffered in the TLS layer, but epoll will
+        // not find the socket ready for read, until a future packet arrives.
+
+        let mut index = 0;
+        let mut sender_addr = None;
+        let mut connection = None;
+        loop {
+            match bufs[index].recv_from(socket) {
+                Err(err) => {
+                    match err.kind() {
+                        io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted => {}
+                        io::ErrorKind::ConnectionRefused => {
+                            // This can happen when someone leaves a call
+                            // because e.g. their router stops forwarding packets.
+                            // This is normal with UDP; technically this error happened
+                            // with the previous *sent* packet and we're just finding out now.
+                            trace!("recv_from() failed: {}", err);
                         }
-                    }
-                    TimerHeapNextResult::Wait(_timeout) => {
-                        if !dequeues_to_schedule.is_empty() {
-                            for (time, addr) in &dequeues_to_schedule {
-                                timer_heap.schedule(*time, *addr);
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData => {
+                            // got invalid data, so drop the connection
+                            if let Ok(peer_addr) = socket.peer_addr() {
+                                let connection = socket.connection.clone();
+                                // Drop the read lock...
+                                drop(connections_lock);
+                                // ...and connect with a write lock...
+                                let mut write_lock = self.all_connections.write();
+                                write_lock.mark_closed(&peer_addr, Instant::now());
+                                if let Some(connection) = connection {
+                                    connection.remove_candidate(peer_addr);
+                                }
+                                break;
                             }
-                            dequeues_to_schedule.clear();
-                        } else {
-                            if let Some(timer) = &timer {
-                                timer_heap.set_timer(timer, now);
-                            }
-                            break;
                         }
-                    }
-                    TimerHeapNextResult::WaitForever => {
-                        break;
-                    }
+                        _ => {
+                            Self::socket_error(&err);
+                        }
+                    };
+                    drop(connections_lock);
+                    break;
                 }
+                Ok(s_a) => {
+                    sender_addr = Some(s_a);
+                    connection = socket.connection.clone();
+                }
+            };
+            index += 1;
+            if socket.has_pending_data() {
+                if bufs.len() <= index {
+                    bufs.push(PacketBuffer::new());
+                }
+            } else {
+                drop(connections_lock);
+                break;
             }
+        }
+
+        let sender_addr = match sender_addr {
+            Some(sender_addr) => sender_addr,
+            None => return,
+        };
+
+        for inbuf in bufs.iter_mut().take(index) {
+            let (packets_to_send, dequeues_to_schedule) = if let Some(connection) = &connection {
+                match packet_server::handle_packet_connected(
+                    sfu,
+                    connection,
+                    sender_addr,
+                    inbuf.as_mut(),
+                ) {
+                    Ok(HandleOutput {
+                        packets_to_send,
+                        dequeues_to_schedule,
+                    }) => (packets_to_send, dequeues_to_schedule),
+                    Err(SfuError::Leave) => {
+                        self.remove_connection(connection, Instant::now());
+                        // end processing after a Leave
+                        return;
+                    }
+                    Err(_) => (vec![], vec![]),
+                }
+            } else if let Some(HandleUnconnectedOutput {
+                packets_to_send,
+                connection: new_connection,
+            }) =
+                packet_server::handle_packet_unconnected(sfu, sender_addr, inbuf.as_mut())
+            {
+                connection = Some(new_connection.clone());
+                self.all_connections
+                    .write()
+                    .mark_as_active(&sender_addr, |s| s.connection = Some(new_connection));
+                (packets_to_send, vec![])
+            } else {
+                self.all_connections
+                    .write()
+                    .mark_closed(&sender_addr, Instant::now());
+                return;
+            };
 
             for (buf, addr) in packets_to_send {
-                self.send_packet(&epoll, &buf, addr)
+                self.send_packet(&buf, addr)
             }
 
             if !dequeues_to_schedule.is_empty() {
                 let mut timer_heap = timer_heap.lock();
-                for (time, addr) in dequeues_to_schedule {
-                    timer_heap.schedule(time, addr);
+                for (time, connection) in dequeues_to_schedule {
+                    timer_heap.schedule(time, connection);
                 }
             }
+        }
+    }
 
-            if dequeues_left == 0 {
-                poll_timeout_ms = 0; // busy loop
-            } else {
-                poll_timeout_ms = EPOLL_WAIT_TIMEOUT_MS;
+    fn accept_tcp(&self, socket: &TcpListener, epoll: &Epoll, use_tls: bool) {
+        let accepted = socket.accept();
+        let tls_config = if use_tls {
+            Some(
+                self.tls_config
+                    .as_ref()
+                    .expect("tls config must exist if we got a tls accept")
+                    .clone(),
+            )
+        } else {
+            None
+        };
+
+        match accepted {
+            Ok((client_socket, addr)) => {
+                let _ = client_socket.set_nodelay(true); // fail quietly
+                client_socket
+                    .set_nonblocking(true)
+                    .expect("Cannot set non-blocking");
+
+                let is_ipv6 = match addr.ip() {
+                    V4(_) => false,
+                    V6(addr) => addr.to_ipv4_mapped().is_none(),
+                };
+                let id = self.tcp_id_generator.next_id();
+                let is_tls = tls_config.is_some();
+                if let Ok(client_socket) =
+                    ConnectedSocket::new_tcp(client_socket, id, is_ipv6, tls_config)
+                {
+                    let mut write_lock = self.all_connections.write();
+                    if epoll
+                        .add(
+                            &client_socket,
+                            EpollEvent::new(EpollFlags::EPOLLIN, client_socket.as_raw_fd() as u64),
+                        )
+                        .is_ok()
+                    {
+                        write_lock.get_or_insert_connected(
+                            client_socket,
+                            SocketLocator::Tcp {
+                                id,
+                                is_ipv6,
+                                is_tls,
+                            },
+                            Some(self.tick_number.load(AtomicOrdering::Relaxed)),
+                        );
+                    }
+                }
             }
+            Err(err) => match err.kind() {
+                io::ErrorKind::WouldBlock => {}
+                err => {
+                    event!("calling.udp.epoll.accept_error");
+                    warn!("accept error: {}", err);
+                }
+            },
+        }
+    }
+
+    fn process_timer(
+        &self,
+        timer_heap: &Mutex<TimerHeap<Arc<Connection>>>,
+        timer: &Option<TimerFd>,
+        sfu: &Arc<Sfu>,
+    ) -> isize {
+        let mut dequeues_left = MAX_EPOLL_EVENTS;
+        let mut packets_to_send = vec![];
+        let mut dequeues_to_schedule = vec![];
+        while dequeues_left > 0 {
+            let now = Instant::now();
+            let mut timer_heap = timer_heap.lock();
+            match timer_heap.next(now) {
+                TimerHeapNextResult::Value(connection) => {
+                    let (did_dequeue, dequeue_time) =
+                        Sfu::handle_dequeue(sfu, &connection, now, &mut packets_to_send);
+
+                    if did_dequeue {
+                        dequeues_left -= 1;
+                    }
+                    if let Some(dequeue_time) = dequeue_time {
+                        dequeues_to_schedule.push((dequeue_time, connection));
+                    }
+                }
+                TimerHeapNextResult::Wait(_timeout) => {
+                    if !dequeues_to_schedule.is_empty() {
+                        for (time, connection) in dequeues_to_schedule.drain(..) {
+                            timer_heap.schedule(time, connection);
+                        }
+                    } else {
+                        if let Some(timer) = &timer {
+                            timer_heap.set_timer(timer, now);
+                        }
+                        break;
+                    }
+                }
+                TimerHeapNextResult::WaitForever => {
+                    break;
+                }
+            }
+        }
+
+        for (buf, addr) in packets_to_send {
+            self.send_packet(&buf, addr)
+        }
+
+        if !dequeues_to_schedule.is_empty() {
+            let mut timer_heap = timer_heap.lock();
+            for (time, connection) in dequeues_to_schedule {
+                timer_heap.schedule(time, connection);
+            }
+        }
+
+        if dequeues_left == 0 {
+            0 // busy loop
+        } else {
+            EPOLL_WAIT_TIMEOUT_MS
         }
     }
 
@@ -756,7 +876,7 @@ impl PacketServerState {
 
     /// Sends socket and returns true if socket is still good, or false if
     /// it should be closed.
-    fn send_and_keep(socket: &Socket, buf: &[u8]) -> bool {
+    fn send_and_keep(socket: &ConnectedSocket, buf: &[u8]) -> bool {
         if let Err(err) = socket.send(buf) {
             match err.kind() {
                 io::ErrorKind::ConnectionRefused | io::ErrorKind::BrokenPipe => {
@@ -776,7 +896,7 @@ impl PacketServerState {
         true
     }
 
-    pub fn send_packet(&self, epoll: &Epoll, buf: &[u8], addr: SocketLocator) {
+    pub fn send_packet(&self, buf: &[u8], addr: SocketLocator) {
         trace!("sending packet of {} bytes to {}", buf.len(), addr);
         time_scope!(
             "calling.udp.epoll.send_packet",
@@ -788,6 +908,7 @@ impl PacketServerState {
         match connections_lock.get_by_addr(&addr) {
             ConnectionState::Connected(socket) => {
                 if !Self::send_and_keep(socket, buf) {
+                    let connection = socket.connection.clone();
                     // Drop the read lock...
                     drop(connections_lock);
                     // ...and connect with a write lock...
@@ -803,83 +924,19 @@ impl PacketServerState {
                     // That's very unlikely because it means we've had at least two ticks,
                     // and it'll (hopefully) heal itself in another two.
                     write_lock.mark_closed(&addr, Instant::now());
+                    if let Some(connection) = connection {
+                        connection.remove_candidate(addr);
+                    }
                 }
             }
-            ConnectionState::New(socket) => {
-                if Self::send_and_keep(socket, buf) {
-                    drop(connections_lock);
-                    let mut write_lock = self.all_connections.write();
-                    write_lock.mark_as_active(&addr);
-                } else {
-                    drop(connections_lock);
-                    let mut write_lock = self.all_connections.write();
-                    write_lock.mark_closed(&addr, Instant::now());
-                }
+            ConnectionState::New(_) => {
+                error!("connection state new in send_packet, addr {:?}", addr);
             }
             ConnectionState::Closed(_) => {
                 trace!("dropping packet (connection already closed)")
             }
             ConnectionState::NotYetConnected => {
-                // Drop the read lock...
-                drop(connections_lock);
-                // ...and connect with a write lock...
-                let mut write_lock = self.all_connections.write();
-
-                // ...and check if another thread beat us to it.
-                match write_lock.get_by_addr(&addr) {
-                    ConnectionState::New(socket) => {
-                        warn!("shouldn't find new TCP socket in send_packet after NotYetConnected");
-                        if Self::send_and_keep(socket, buf) {
-                            write_lock.mark_as_active(&addr);
-                        } else {
-                            write_lock.mark_closed(&addr, Instant::now());
-                        }
-                    }
-                    ConnectionState::Connected(socket) => {
-                        if !Self::send_and_keep(socket, buf) {
-                            write_lock.mark_closed(&addr, Instant::now());
-                        }
-                    }
-                    ConnectionState::Closed(_) => {
-                        trace!("dropping packet (connection already closed)")
-                    }
-                    ConnectionState::NotYetConnected => {
-                        trace!("connecting to {:?}", addr);
-                        match addr {
-                            SocketLocator::Udp(udp_addr) => {
-                                let result = try_scoped(|| {
-                                    let (client_socket, client_socket_fd) =
-                                        Self::connect_udp_socket(&self.local_addr_udp, &udp_addr)?;
-                                    epoll.add(
-                                        &client_socket,
-                                        EpollEvent::new(
-                                            EpollFlags::EPOLLIN,
-                                            client_socket_fd as u64,
-                                        ),
-                                    )?;
-                                    let client_socket = write_lock.get_or_insert_connected(
-                                        client_socket,
-                                        addr,
-                                        None,
-                                    );
-                                    if !Self::send_and_keep(client_socket, buf) {
-                                        write_lock.mark_closed(&addr, Instant::now());
-                                    }
-                                    Ok(())
-                                });
-                                match result {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        error!("failed to connect to peer: {}", e);
-                                    }
-                                }
-                            }
-                            SocketLocator::Tcp { .. } => {
-                                event!("calling.udp.epoll.tcp_use_after_close");
-                            }
-                        }
-                    }
-                }
+                error!("unknown connection in send_packet, addr {:?}", addr);
             }
         }
     }
@@ -888,7 +945,7 @@ impl PacketServerState {
     ///
     /// This includes cleaning up connections for clients that have left or the quiet ones that
     /// reached ttl without having passed any data.
-    pub fn tick(&self, mut tick_update: sfu::TickOutput) -> Result<()> {
+    pub fn tick(&self, tick_update: sfu::TickOutput) -> Result<()> {
         let tick_number = self.tick_number.fetch_add(1, AtomicOrdering::Relaxed);
         time_scope_us!("calling.packet_server.tick");
 
@@ -899,19 +956,19 @@ impl PacketServerState {
 
                 let connections_lock = self.all_connections.read();
                 match connections_lock.get_by_addr(&addr) {
-                    ConnectionState::New(socket) => {
-                        if !Self::send_and_keep(socket, &buf) {
-                            warn!("shouldn't find new TCP socket in tick, closing");
-                            // This will call mark_closed below
-                            tick_update.expired_client_addrs.push(addr)
-                        } else {
-                            warn!("shouldn't find new TCP socket in tick, unable to mark active");
-                        }
+                    ConnectionState::New(_) => {
+                        warn!("shouldn't find new TCP socket in tick");
                     }
                     ConnectionState::Connected(socket) => {
                         if !Self::send_and_keep(socket, &buf) {
-                            // This will call mark_closed below
-                            tick_update.expired_client_addrs.push(addr)
+                            let connection = socket.connection.clone();
+                            drop(connections_lock);
+                            // ...and connect with a write lock...
+                            let mut write_lock = self.all_connections.write();
+                            write_lock.mark_closed(&addr, Instant::now());
+                            if let Some(connection) = connection {
+                                connection.remove_candidate(addr);
+                            }
                         }
                     }
                     ConnectionState::Closed(_) => {
@@ -926,27 +983,16 @@ impl PacketServerState {
 
         {
             time_scope_us!("calling.packet_server.tick.dequeue_scheduling");
-            if !tick_update.dequeues_to_schedule.is_empty() {
-                // Round robin through the timer heaps
-                let mut counter = self.timer_heaps.len() - 1;
-                for (time, addr) in tick_update.dequeues_to_schedule {
-                    self.timer_heaps[counter].lock().schedule(time, addr);
-                    if counter > 0 {
-                        counter -= 1;
-                    } else {
-                        counter = self.timer_heaps.len() - 1;
-                    }
+            // Round robin through the timer heaps
+            let mut counter = self.timer_heaps.len() - 1;
+            for (time, connection) in tick_update.dequeues_to_schedule {
+                self.timer_heaps[counter].lock().schedule(time, connection);
+                if counter > 0 {
+                    counter -= 1;
+                } else {
+                    counter = self.timer_heaps.len() - 1;
                 }
             }
-        }
-
-        {
-            time_scope_us!("calling.packet_server.tick.inactive_sender");
-            self.all_connections
-                .read()
-                .for_each_inactive_sender(tick_number, |locator| {
-                    tick_update.expired_client_addrs.push(*locator)
-                });
         }
 
         // Collect the addresses of any sockets that have been closed for several ticks.
@@ -966,9 +1012,9 @@ impl PacketServerState {
         }
 
         {
-            time_scope_us!("calling.packet_server.tick.cleanup_expired_clients");
-            // Clean up any clients that have already left.
-            if !tick_update.expired_client_addrs.is_empty() || !expired_socket_addrs.is_empty() {
+            time_scope_us!("calling.packet_server.tick.cleanup_expired_sockets");
+            // Clean up any sockets that have disconnected.
+            if !expired_socket_addrs.is_empty() {
                 match self
                     .all_connections
                     .try_write_for(self.tick_interval.into())
@@ -990,16 +1036,43 @@ impl PacketServerState {
                         for addr in expired_socket_addrs.iter() {
                             socket_lock.remove_closed(addr);
                         }
-
-                        // Mark clients to be cleaned up next tick.
-                        for addr in tick_update.expired_client_addrs.iter() {
-                            socket_lock.mark_closed(addr, now);
-                        }
                     }
                 }
             }
         }
+
+        {
+            time_scope_us!("calling.packet_server.tick.inactive_tcp");
+            let read_lock = self.all_connections.read();
+            let inactive_tcp_connections = read_lock.inactive_tcp(tick_number);
+            drop(read_lock);
+
+            for locator in inactive_tcp_connections {
+                self.all_connections.write().mark_closed(&locator, now);
+            }
+        }
+
         Ok(())
+    }
+
+    pub fn remove_connection(&self, connection: &Arc<Connection>, now: Instant) {
+        for locator in connection.all_addrs().iter() {
+            self.remove_candidate(connection, locator, now);
+        }
+    }
+
+    pub fn remove_candidate(
+        &self,
+        connection: &Arc<Connection>,
+        locator: &SocketLocator,
+        now: Instant,
+    ) {
+        let mut write_lock = self.all_connections.write();
+        if connection.has_candidate(*locator) {
+            warn!("candidate came back during tick processing");
+        } else {
+            write_lock.mark_closed_if(locator, now, |s| s.connection.as_ref() == Some(connection));
+        }
     }
 
     pub fn get_stats(&self) -> SfuStats {
@@ -1024,6 +1097,18 @@ impl PacketServerState {
     }
 }
 
+fn warn_unpinned(unpinned_recv: &mut Option<Instant>, message: &str) {
+    if unpinned_recv.is_none_or(|instant| {
+        Instant::now().saturating_duration_since(instant) > UNPINNED_LOG_INTERVAL
+    }) {
+        error!(
+            "packet delivered to unpinned {} socket; check cpu pinning",
+            message
+        );
+        *unpinned_recv = Some(Instant::now());
+    }
+}
+
 struct PacketBuffer {
     buf: [u8; MAX_RTP_LENGTH],
     size: usize,
@@ -1037,7 +1122,7 @@ impl PacketBuffer {
         }
     }
 
-    fn recv_from(&mut self, socket: &Socket) -> io::Result<SocketLocator> {
+    fn recv_from(&mut self, socket: &ConnectedSocket) -> io::Result<SocketLocator> {
         self.size = 0;
         socket.recv_from(&mut self.buf).map(|(size, sender_addr)| {
             self.size = size;
@@ -1213,38 +1298,6 @@ impl TcpState {
     }
 }
 
-enum Socket {
-    Udp(UdpSocket),
-    Tcp(Box<Mutex<TcpState>>),
-}
-
-impl AsRawFd for Socket {
-    fn as_raw_fd(&self) -> RawFd {
-        match self {
-            Socket::Udp(s) => s.as_raw_fd(),
-            Socket::Tcp(m) => m.lock().stream.as_raw_fd(),
-        }
-    }
-}
-
-impl AsFd for Socket {
-    fn as_fd(&self) -> BorrowedFd {
-        match self {
-            Socket::Udp(s) => s.as_fd(),
-            Socket::Tcp(m) => {
-                let lock = m.lock();
-                let fd = lock.stream.as_fd();
-                // SAFETY: we're using this value immediately with nix::sys::epoll::Epoll::add.
-                // epoll gracefully handles closed FDs
-                unsafe {
-                    let laundered_fd = BorrowedFd::borrow_raw(fd.as_raw_fd());
-                    laundered_fd
-                }
-            }
-        }
-    }
-}
-
 enum SocketStream {
     Tcp(TcpStream),
     Tls(Box<(ServerConnection, TcpStream)>),
@@ -1324,7 +1377,44 @@ impl SocketStream {
     }
 }
 
-impl Socket {
+enum Socket {
+    Udp(UdpSocket),
+    Tcp(Box<Mutex<TcpState>>),
+}
+
+struct ConnectedSocket {
+    connection: Option<Arc<Connection>>,
+    socket: Socket,
+}
+
+impl AsRawFd for ConnectedSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        match &self.socket {
+            Socket::Udp(s) => s.as_raw_fd(),
+            Socket::Tcp(m) => m.lock().stream.as_raw_fd(),
+        }
+    }
+}
+
+impl AsFd for ConnectedSocket {
+    fn as_fd(&self) -> BorrowedFd {
+        match &self.socket {
+            Socket::Udp(s) => s.as_fd(),
+            Socket::Tcp(m) => {
+                let lock = m.lock();
+                let fd = lock.stream.as_fd();
+                // SAFETY: we're using this value immediately with nix::sys::epoll::Epoll::add.
+                // epoll gracefully handles closed FDs
+                unsafe {
+                    let laundered_fd = BorrowedFd::borrow_raw(fd.as_raw_fd());
+                    laundered_fd
+                }
+            }
+        }
+    }
+}
+
+impl ConnectedSocket {
     fn new_tcp(
         s: TcpStream,
         id: i64,
@@ -1337,20 +1427,30 @@ impl Socket {
         } else {
             (SocketStream::Tcp(s), false)
         };
-        Ok(Socket::Tcp(Box::new(Mutex::new(TcpState {
-            stream,
-            size: 0,
-            pos: 0,
-            buf: [0u8; MAX_RTP_LENGTH],
-            outq: VecDeque::new(),
-            id,
-            is_ipv6,
-            is_tls,
-        }))))
+        Ok(Self {
+            connection: None,
+            socket: Socket::Tcp(Box::new(Mutex::new(TcpState {
+                stream,
+                size: 0,
+                pos: 0,
+                buf: [0u8; MAX_RTP_LENGTH],
+                outq: VecDeque::new(),
+                id,
+                is_ipv6,
+                is_tls,
+            }))),
+        })
+    }
+
+    fn unconnected(s: Socket) -> Self {
+        Self {
+            connection: None,
+            socket: s,
+        }
     }
 
     fn send(&self, buf: &[u8]) -> io::Result<()> {
-        match self {
+        match &self.socket {
             Socket::Udp(s) => {
                 let ret = s.send(buf).map(|_| ());
                 if let Err(ref err) = ret {
@@ -1365,7 +1465,7 @@ impl Socket {
     }
 
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketLocator)> {
-        match self {
+        match &self.socket {
             Socket::Udp(s) => s
                 .recv_from(buf)
                 .map(|(size, addr)| (size, SocketLocator::Udp(addr))),
@@ -1374,7 +1474,7 @@ impl Socket {
     }
 
     fn peer_addr(&self) -> io::Result<SocketLocator> {
-        match self {
+        match &self.socket {
             Socket::Udp(s) => s.peer_addr().map(SocketLocator::Udp),
             Socket::Tcp(m) => {
                 let state = m.lock();
@@ -1388,14 +1488,14 @@ impl Socket {
     }
 
     fn take_error(&self) -> io::Result<Option<io::Error>> {
-        match self {
+        match &self.socket {
             Socket::Udp(s) => s.take_error(),
             Socket::Tcp(m) => m.lock().stream.take_error(),
         }
     }
 
     fn has_pending_data(&self) -> bool {
-        match self {
+        match &self.socket {
             Socket::Udp(_) => false,
             Socket::Tcp(m) => m.lock().stream.has_pending_data(),
         }
@@ -1411,7 +1511,7 @@ impl Socket {
 /// the two parts of this two-phase cleanup.
 ///
 /// The map is generic to support unit testing, but isn't intended for storing anything else.
-struct ConnectionMap<T = Socket> {
+struct ConnectionMap<T> {
     /// The primary map from file descriptors to sockets.
     ///
     /// The use of file descriptors is largely arbitrary; it's a value *already* uniquely associated
@@ -1553,6 +1653,24 @@ impl<T: AsRawFd> ConnectionMap<T> {
         }
     }
 
+    /// Marks the connection for `peer_addr` as closed, if it matches the connection id passed.
+    fn mark_closed_if(
+        &mut self,
+        peer_addr: &SocketLocator,
+        now: Instant,
+        f: impl FnOnce(&T) -> bool,
+    ) {
+        if let Some(entry) = self.by_peer_addr.get_mut(peer_addr) {
+            if let ConnectionState::Connected(fd) = entry {
+                let socket = &self.by_fd[fd];
+                if f(socket) {
+                    self.by_fd.remove(fd);
+                    *entry = ConnectionState::Closed(now);
+                }
+            }
+        }
+    }
+
     /// Returns an iterator over the closed connections only.
     fn closed_connection_iter(&self) -> impl Iterator<Item = (&SocketLocator, &Instant)> {
         self.by_peer_addr
@@ -1597,10 +1715,14 @@ impl<T: AsRawFd> ConnectionMap<T> {
 
     /// Removes the connection information from inactive_ttls effectively marking it as active and
     /// healthy
-    fn mark_as_active(&mut self, peer_addr: &SocketLocator) {
+    fn mark_as_active(&mut self, peer_addr: &SocketLocator, f: impl FnOnce(&mut T)) {
         self.inactive_ttls.remove(peer_addr);
         if let Some(entry) = self.by_peer_addr.get_mut(peer_addr) {
             if let ConnectionState::New(fd) = entry {
+                f(self
+                    .by_fd
+                    .get_mut(fd)
+                    .expect("fd in by_peer_addr should be in by_fd"));
                 *entry = ConnectionState::Connected(*fd);
             }
         }
@@ -1608,15 +1730,17 @@ impl<T: AsRawFd> ConnectionMap<T> {
 
     /// Decrements the TTL for each of the inactive candidates, invoking a callback
     /// for all connections that reached end of life and removing them
-    fn for_each_inactive_sender<F>(&self, current_tick: u64, mut f: F)
-    where
-        F: FnMut(&SocketLocator),
-    {
-        for (locator, ttl) in self.inactive_ttls.iter() {
-            if current_tick >= *ttl {
-                f(locator);
-            }
-        }
+    fn inactive_tcp(&self, current_tick: u64) -> Vec<SocketLocator> {
+        self.inactive_ttls
+            .iter()
+            .filter_map(move |(locator, ttl)| {
+                if current_tick >= *ttl {
+                    Some(*locator)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -1789,13 +1913,10 @@ mod tests {
         *map.inactive_ttls
             .get_mut(&addr)
             .expect("entry should exist") = 1;
-        let mut is_callback_invoked = false;
-        map.for_each_inactive_sender(TCP_INACTIVE_CONNECTION_TTL_TICKS, |_| {
-            is_callback_invoked = true
-        });
         assert!(
-            is_callback_invoked,
-            "Callback should have been called for an inactive"
+            !map.inactive_tcp(TCP_INACTIVE_CONNECTION_TTL_TICKS)
+                .is_empty(),
+            "There should be some inactive tcp connections"
         );
     }
 
@@ -1819,7 +1940,7 @@ mod tests {
             HashMap::from([(addr, TCP_INACTIVE_CONNECTION_TTL_TICKS)])
         );
 
-        map.mark_as_active(&addr);
+        map.mark_as_active(&addr, |_| {});
         assert!(
             map.inactive_ttls.is_empty(),
             "The only connections should have been removed"

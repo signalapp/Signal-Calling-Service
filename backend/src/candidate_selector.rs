@@ -10,10 +10,9 @@ use log::{trace, warn};
 use metrics::event;
 
 use crate::{
-    connection::PacketToSend,
-    ice::{BindingRequest, BindingResponse, IceTransactionTable, StunPacketBuilder, TransactionId},
+    connection::{Error, PacketToSend},
+    ice::{BindingRequest, BindingResponse, StunPacketBuilder, TransactionId},
     packet_server::{AddressType, SocketLocator},
-    sfu::ConnectionId,
 };
 
 // ADJUSTED_PRIORITY_MAXIMUM specifies the upper bound for the adjusted priority.
@@ -32,8 +31,7 @@ const PENALTY_LAG: f32 = 5.0;
 const PING_RTO: Duration = Duration::from_millis(500);
 // The final timeout value is the product of the initial RTO and PING_RTO_RM.
 const PING_RTO_RM: u32 = 16;
-// Maximum number of ping retransmits before transitioning a candidate into
-// the Dead state.
+// Maximum number of ping retransmits before removing a candidate
 const PING_MAX_RETRANSMITS: u32 = 6;
 
 #[derive(Debug)]
@@ -45,7 +43,6 @@ pub struct Config {
     pub inactivity_timeout: Duration,
     pub scoring_values: ScoringValues,
     pub ice_credentials: IceCredentials,
-    pub connection_id: ConnectionId,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -111,10 +108,6 @@ impl<const N: usize> RttEstimatorBase<N> {
         }
     }
 
-    fn reset(&mut self) {
-        self.len = 0;
-    }
-
     fn rtt(&self) -> Option<Duration> {
         if self.len > 0 {
             let average = self.buffer.iter().sum::<u32>() / (self.len as u32);
@@ -144,13 +137,12 @@ type RttEstimator = RttEstimatorBase<10>;
 pub enum State {
     New,
     Active,
-    Dead,
 }
 
 enum Action {
     SendPing(TransactionId),
-    ForgetTransaction(TransactionId),
     None,
+    Remove,
 }
 
 #[derive(Debug, Clone)]
@@ -217,20 +209,6 @@ impl Candidate {
         self.base_score + adjusted_remote_priority - rtt_penalty
     }
 
-    fn maybe_resurrect(&mut self, now: Instant) -> Action {
-        match self.state {
-            State::Dead => {
-                trace!("{}: resurrected", self.address);
-                self.state = State::New;
-                self.remote_priority = 0;
-                self.last_update_time = now;
-                self.rtt_estimator.reset();
-                self.will_transmit_ping(now)
-            }
-            _ => Action::None,
-        }
-    }
-
     fn will_transmit_ping(&mut self, now: Instant) -> Action {
         trace!("{}: will send ICE ping", self.address);
 
@@ -268,7 +246,7 @@ impl Candidate {
     }
 
     fn tick(&mut self, now: Instant) -> Action {
-        if matches!(self.state, State::Dead) || self.ping_next_send_time > now {
+        if self.ping_next_send_time > now {
             return Action::None;
         }
 
@@ -279,12 +257,7 @@ impl Candidate {
             self.will_transmit_ping(now)
         } else if self.ping_retransmit_count == PING_MAX_RETRANSMITS {
             trace!("{}: timed out", self.address);
-            self.state = State::Dead;
-            Action::ForgetTransaction(
-                self.ping_transaction_id
-                    .take()
-                    .expect("must have transaction id"),
-            )
+            Action::Remove
         } else {
             // We haven't received a response yet, but we'll do an RTT update
             // in order to degrade the candidate score.
@@ -294,9 +267,17 @@ impl Candidate {
         }
     }
 
-    fn maybe_handle_ping_response(&mut self, now: Instant) {
-        if matches!(self.state, State::Dead) {
-            return;
+    fn maybe_handle_ping_response(
+        &mut self,
+        transaction_id: TransactionId,
+        now: Instant,
+    ) -> Result<(), Error> {
+        match &self.ping_transaction_id {
+            None => return Err(Error::ReceivedUnexpectedResponse),
+            Some(tid) if *tid != transaction_id => {
+                return Err(Error::ReceivedResponseWithInvalidTransactionId)
+            }
+            _ => (),
         }
         // Transition into the Active state if this is a response to the first ping.
         if matches!(self.state, State::New) {
@@ -322,12 +303,13 @@ impl Candidate {
         } else {
             self.ping_next_send_time = now + self.ping_period - rtt;
         }
+        Ok(())
     }
 }
 
 #[derive(Debug)]
 pub struct CandidateSelector {
-    initialization_timeout: Option<Instant>,
+    inactivity_time: Instant,
     candidates: Vec<Candidate>,
     selected_candidate: Option<usize>,
     nominated_candidate: Option<usize>,
@@ -338,7 +320,7 @@ pub struct CandidateSelector {
 impl CandidateSelector {
     pub fn new(now: Instant, config: Config) -> Self {
         Self {
-            initialization_timeout: Some(now + config.inactivity_timeout),
+            inactivity_time: now + config.inactivity_timeout,
             candidates: vec![],
             config,
             selected_candidate: None,
@@ -431,23 +413,9 @@ impl CandidateSelector {
         &self.candidates
     }
 
-    /// Returns `true` if the candidate selector is currently inactive. A candidate
-    /// selector is deemed *inactive* if:
-    ///
-    /// - The initialization timeout is set and has been reached
-    /// - The initialization timeout is not set, but all of the candidates
-    ///   are in the dead state.
-    ///
+    /// Returns `true` if the candidate selector's inactivity time has passed. The inactive time is reset on every successful ping response.
     pub fn inactive(&self, now: Instant) -> bool {
-        self.initialization_timeout.map_or_else(
-            || {
-                !self
-                    .candidates
-                    .iter()
-                    .any(|c| !matches!(c.state, State::Dead))
-            },
-            |timeout| timeout < now,
-        )
+        self.inactivity_time < now
     }
 
     fn selected_candidate(&self) -> Option<&Candidate> {
@@ -470,6 +438,10 @@ impl CandidateSelector {
         self.selected_candidate().map(|c| c.address_type)
     }
 
+    pub fn all_addrs(&self) -> Vec<SocketLocator> {
+        self.candidates.iter().map(|c| c.address).collect()
+    }
+
     /// Returns the estimated rtt of the currently selected remote candidate, if one is available.
     pub fn rtt(&self) -> Option<Duration> {
         self.selected_candidate().map(|c| c.rtt_estimator.rtt())?
@@ -481,8 +453,7 @@ impl CandidateSelector {
         now: Instant,
     ) -> (Action, usize) {
         if let Some(index) = self.get_candidate_index_from_addr(source_addr) {
-            let action = self.candidates[index].maybe_resurrect(now);
-            (action, index)
+            (Action::None, index)
         } else {
             trace!("{}: new candidate", source_addr);
             let base_score = self.config.scoring_values.for_address(source_addr) as f32;
@@ -511,21 +482,9 @@ impl CandidateSelector {
 
         let (action, candidate_index) = self.get_or_create_candidate(source_addr, now);
 
-        // We transition the selector out of the initialization state if the candidate
-        // has been accepted (the action is to send a ping) and the selector's
-        // initialization timeout is still set.
-        self.initialization_timeout
-            .take_if(|_| matches!(action, Action::SendPing(_)));
-
-        let candidate = &mut self.candidates[candidate_index];
-
-        Self::execute_candidate_action(
-            action,
-            candidate,
-            &self.config.connection_id,
-            &self.config.ice_credentials,
-            packets_to_send,
-        );
+        if let Action::SendPing(transaction_id) = action {
+            self.send_ping(transaction_id, candidate_index, packets_to_send);
+        }
 
         if request.nominated() {
             trace!("nominated: {}", source_addr);
@@ -538,6 +497,7 @@ impl CandidateSelector {
         // is not in the Active state as it will not be considered during
         // the selection process anyway.
         let priority = request.priority().unwrap_or_default();
+        let candidate = &mut self.candidates[candidate_index];
         let priority_updated = candidate.maybe_update_priority(priority);
         if request.nominated() || (priority_updated && matches!(candidate.state, State::Active)) {
             self.make_candidate_selection(now);
@@ -579,25 +539,37 @@ impl CandidateSelector {
         packets_to_send.push((response, source_addr));
     }
 
-    pub fn tick(&mut self, packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>, now: Instant) {
-        for candidate in &mut self.candidates {
-            let action = candidate.tick(now);
-            Self::execute_candidate_action(
-                action,
-                candidate,
-                &self.config.connection_id,
-                &self.config.ice_credentials,
-                packets_to_send,
-            );
-        }
-
-        // If the currently selected candidate transitions into the Dead state then
-        // we no longer have a selected candidate.
-        if let Some(selected_candidate) = self.selected_candidate() {
-            if matches!(selected_candidate.state, State::Dead) {
-                self.make_candidate_selection(now);
+    pub fn tick(
+        &mut self,
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
+        now: Instant,
+    ) -> Vec<SocketLocator> {
+        let had_selection = self.selected_candidate.is_some();
+        let mut dead_candidates = vec![];
+        let mut index = 0;
+        while index < self.candidates.len() {
+            let candidate = &mut self.candidates[index];
+            match candidate.tick(now) {
+                Action::Remove => {
+                    dead_candidates.push(candidate.address);
+                    self.remove_candidate_by_index(index);
+                }
+                Action::SendPing(transaction_id) => {
+                    self.send_ping(transaction_id, index, packets_to_send);
+                    index += 1;
+                }
+                Action::None => {
+                    index += 1;
+                }
             }
         }
+
+        // If the selected candidate was removed, select a new one.
+        if had_selection && self.selected_candidate.is_none() {
+            self.make_candidate_selection(now);
+        }
+
+        dead_candidates
     }
 
     pub fn handle_ping_response(
@@ -605,7 +577,7 @@ impl CandidateSelector {
         source_addr: SocketLocator,
         response: BindingResponse,
         now: Instant,
-    ) {
+    ) -> Result<(), Error> {
         trace!(
             "received STUN ping response from {}: {}",
             source_addr,
@@ -614,7 +586,7 @@ impl CandidateSelector {
 
         if let Some(error_code) = response.error_code() {
             warn!("received error {} from {}", source_addr, error_code);
-            return;
+            return Err(Error::ReceivedResponseWithErrorCode);
         }
 
         if response.xor_mapped_address().is_none() && response.mapped_address().is_none() {
@@ -622,51 +594,61 @@ impl CandidateSelector {
                 "no XOR-MAPPED-ADDRESS/MAPPED-ADDRESS in response from {}",
                 source_addr
             );
-            return;
+            return Err(Error::ReceivedResponseWithoutMappedAddress);
         }
 
         if let Some(index) = self.get_candidate_index_from_addr(source_addr) {
-            self.candidates[index].maybe_handle_ping_response(now);
+            self.candidates[index].maybe_handle_ping_response(response.transaction_id(), now)?;
             self.make_candidate_selection(now);
+            self.inactivity_time = now + self.config.inactivity_timeout;
+            Ok(())
+        } else {
+            Err(Error::ReceivedResponseFromUnknownAddress)
         }
     }
 
-    fn execute_candidate_action(
-        action: Action,
-        candidate: &Candidate,
-        connection_id: &ConnectionId,
-        ice_credentials: &IceCredentials,
+    fn send_ping(
+        &self,
+        transaction_id: TransactionId,
+        candidate_index: usize,
         packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
     ) {
-        match action {
-            Action::ForgetTransaction(transaction_id) => {
-                trace!("forgetting transaction {}", transaction_id);
-                IceTransactionTable::remove(candidate.address, &transaction_id);
-            }
-            Action::SendPing(transaction_id) => {
-                trace!("sending STUN ping request to {}", candidate.address);
-                IceTransactionTable::put(candidate.address, &transaction_id, connection_id);
-                let request = StunPacketBuilder::new_binding_request(&transaction_id)
-                    .set_username(&ice_credentials.client_username)
-                    .build(&ice_credentials.client_pwd);
-                packets_to_send.push((request, candidate.address));
-            }
-            Action::None => {
-                // No action
-            }
+        let ice_credentials = &self.config.ice_credentials;
+        let request = StunPacketBuilder::new_binding_request(&transaction_id)
+            .set_username(&ice_credentials.client_username)
+            .build(&ice_credentials.client_pwd);
+        let candidate = &self.candidates[candidate_index];
+        trace!("sending STUN ping request to {}", candidate.address);
+        packets_to_send.push((request, candidate.address));
+    }
+
+    pub fn remove_candidate(&mut self, addr: SocketLocator) {
+        trace!("removing candidate {}", addr);
+        if let Some(index) = self.get_candidate_index_from_addr(addr) {
+            trace!("index {}", index);
+            self.remove_candidate_by_index(index);
         }
     }
-}
 
-// A candidate selector will be dropped whenever its parent connection is dropeed. We must clear
-// out any lingering transaction identifiers from the global transaction lookup table.
-impl Drop for CandidateSelector {
-    fn drop(&mut self) {
-        trace!(
-            "clearing transaction IDs for connection {}",
-            self.config.connection_id
-        );
-        IceTransactionTable::remove_all_for_connection(&self.config.connection_id);
+    fn remove_candidate_by_index(&mut self, index: usize) {
+        self.candidates.swap_remove(index);
+        let last_index = self.candidates.len();
+        if self.nominated_candidate == Some(index) {
+            self.nominated_candidate = None;
+        } else if self.nominated_candidate == Some(last_index) {
+            self.nominated_candidate = Some(index);
+        }
+
+        if self.selected_candidate == Some(index) {
+            self.selected_candidate = None;
+            self.make_candidate_selection(Instant::now());
+        } else if self.selected_candidate == Some(last_index) {
+            self.nominated_candidate = Some(index);
+        }
+    }
+
+    pub fn has_candidate(&mut self, addr: SocketLocator) -> bool {
+        self.get_candidate_index_from_addr(addr).is_some()
     }
 }
 
@@ -688,7 +670,6 @@ mod tests {
         connection::PacketToSend,
         ice::{BindingRequest, BindingResponse, StunPacketBuilder, TransactionId},
         packet_server::SocketLocator,
-        sfu::ConnectionId,
     };
 
     fn create_candidate_selector(now: Instant, ping_period: Duration) -> CandidateSelector {
@@ -713,7 +694,6 @@ mod tests {
                 server_pwd: b"some server ice pwd".to_vec(),
                 client_pwd: b"some client ice pwd".to_vec(),
             },
-            connection_id: ConnectionId::null(),
         };
         CandidateSelector::new(now, config)
     }
@@ -728,7 +708,7 @@ mod tests {
     fn create_ping_response(req: BindingRequest, selector: &CandidateSelector) -> Vec<u8> {
         let transaction_id = req.transaction_id();
         StunPacketBuilder::new_binding_response(&transaction_id)
-            .set_xor_mapped_address(&"1.1.1.1:10".parse().unwrap())
+            .set_xor_mapped_address(&"203.0.113.1:10".parse().unwrap())
             .build(&selector.config.ice_credentials.server_pwd)
     }
 
@@ -828,7 +808,7 @@ mod tests {
                     let mut selector = self.selector.borrow_mut();
                     let res = create_ping_response(req, &selector);
                     let res = BindingResponse::from_buffer_without_sanity_check(&res);
-                    selector.handle_ping_response(self.address, res, now);
+                    let _ = selector.handle_ping_response(self.address, res, now);
                 }
             }
         }
@@ -1020,7 +1000,7 @@ mod tests {
         let req = BindingRequest::from_buffer_without_sanity_check(&req);
         let res = create_ping_response(req, &selector);
         let res = BindingResponse::from_buffer_without_sanity_check(&res);
-        selector.handle_ping_response(client_addr1, res, now);
+        let _ = selector.handle_ping_response(client_addr1, res, now);
 
         // Perform 1000 ticks, during which we'll receive pings every 1000ms.
         // Since there is only one candidate, the only packet that will ever be
@@ -1034,7 +1014,7 @@ mod tests {
                 let req = BindingRequest::from_buffer_without_sanity_check(&req);
                 let res = create_ping_response(req, &selector);
                 let res = BindingResponse::from_buffer_without_sanity_check(&res);
-                selector.handle_ping_response(client_addr1, res, now);
+                let _ = selector.handle_ping_response(client_addr1, res, now);
                 // Update stats.
                 let delta = now.saturating_duration_since(last_ping_time);
                 total_delta += delta;
@@ -1235,22 +1215,21 @@ mod tests {
         // Set the packet loss for the candidate to 100% and run the simulator for 42
         // seconds. With the default parameters, this should result in the candidate
         // not responding to any pings, and therefore, timing out. There should be no
-        // selected candidate, and the selector should declare itself as "inactive".
+        // selected candidate and the selector should declare itself as "inactive".
         simulator.update_packet_loss_percentage(client_addr1, 1.0);
         let time = simulator.run(Duration::from_secs(42), time);
-        assert_eq!(selector.borrow().candidates.len(), 1);
-        assert_eq!(selector.borrow().candidates[0].state, State::Dead);
+        assert_eq!(selector.borrow().candidates.len(), 0);
         assert!(selector.borrow().selected_candidate().is_none());
         assert!(selector.borrow().inactive(time));
 
         // Now send another ping from the candidate. The candidate should be resurrected,
         // and, therefore, transition into the New state. No candidates should yet be
-        // selected, but the selector should declare itself as "active".
+        // selected and the selector is not yet active, because no ping responses have arrived.
         simulator.send_ping_request_with_nomination(client_addr1, time, 32);
         assert_eq!(selector.borrow().candidates.len(), 1);
         assert_eq!(selector.borrow().candidates[0].state, State::New);
         assert!(selector.borrow().selected_candidate.is_none());
-        assert!(!selector.borrow().inactive(time));
+        assert!(selector.borrow().inactive(time));
 
         // Set packet loss to 0% and run the simulator for some time. The candidate
         // should transition into the Active state and it should be selected.
@@ -1259,6 +1238,7 @@ mod tests {
         assert_eq!(selector.borrow().candidates.len(), 1);
         assert_eq!(selector.borrow().candidates[0].state, State::Active);
         assert!(matches!(selector.borrow().selected_candidate, Some(0)));
+        assert!(!selector.borrow().inactive(time));
     }
 
     #[test]

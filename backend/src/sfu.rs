@@ -15,7 +15,7 @@ use anyhow::Result;
 use base64::Engine;
 use calling_common::{
     CallType, ClientStatus, DataRate, DataSize, DemuxId, Duration, Instant, RoomId,
-    SignalUserAgent, SystemTime, TwoGenerationCacheWithManualRemoveOld, DUMMY_DEMUX_ID,
+    SignalUserAgent, SystemTime, DUMMY_DEMUX_ID,
 };
 use hkdf::Hkdf;
 use log::*;
@@ -39,7 +39,7 @@ use crate::{
     },
     endorsements::EndorsementIssuer,
     googcc,
-    ice::{self, BindingRequest, BindingResponse, IceTransactionTable},
+    ice::{self, BindingRequest, BindingResponse},
     pacer,
     packet_server::{AddressType, PacketServerState, SocketLocator},
     region::{Region, RegionRelation},
@@ -74,14 +74,14 @@ pub enum SfuError {
     IceBindingRequestUnknownUsername(Vec<u8>),
     #[error("ICE binding request has no username")]
     IceBindingRequestHasNoUsername,
-    #[error("ICE binding response has an invalid transaction ID")]
-    IceBindingInvalidTransactionId,
     #[error("connection error: {0}")]
     ConnectionError(connection::Error),
     #[error("call error: {0}")]
     CallError(call::Error),
     #[error("too many clients")]
     TooManyClients,
+    #[error("client left call")]
+    Leave,
 }
 
 impl std::fmt::Debug for SfuError {
@@ -143,7 +143,6 @@ impl std::fmt::Debug for ConnectionId {
 /// Manages access to connection instances.
 struct Connections {
     synchronized_maps: RwLock<SynchronizedConnectionMaps>,
-    cache: RwLock<TwoGenerationCacheWithManualRemoveOld<SocketLocator, Arc<Connection>>>,
 }
 
 #[derive(Default)]
@@ -153,13 +152,9 @@ struct SynchronizedConnectionMaps {
 }
 
 impl Connections {
-    fn new(generation_lifetime: Duration, now: Instant) -> Self {
+    fn new() -> Self {
         Self {
             synchronized_maps: RwLock::new(SynchronizedConnectionMaps::default()),
-            cache: RwLock::new(TwoGenerationCacheWithManualRemoveOld::new(
-                generation_lifetime,
-                now,
-            )),
         }
     }
 
@@ -196,18 +191,6 @@ impl Connections {
             .map(Arc::clone)
     }
 
-    /// Retrieves a connection from the connection cache that is associated with the given address.
-    /// The connection cache keeps connections alive only for a certain period of time, after which
-    /// they're removed from the cache. In order for a connection to remain alive for a longer
-    /// period of time, it needs to be refreshed via `update_connection_cache`.
-    ///
-    /// Even though a `Connection` instance may exist and be retrievable via the ICE username or
-    /// connection ID based lookups, it will not be retrievable via this method until an association
-    /// created via `update_connection_cache`.
-    fn get_connection_from_address(&self, address: &SocketLocator) -> Option<Arc<Connection>> {
-        self.cache.read().get(address).map(Arc::clone)
-    }
-
     /// Retrieves a connection using an ICE request user name as the lookup key.
     fn get_connection_from_ice_request_username(
         &self,
@@ -223,8 +206,6 @@ impl Connections {
     /// Removes a connection identified by the given connection ID. The removed connection is
     /// returned, if it exists. After a connection is removed, it is no longer possible to
     /// retrieve it using neither the connection identifier nor the associated ICE username.
-    /// It is, however, possible to retrieve it via an address lookup, until it ages out and
-    /// is purged from the address cache.
     fn remove_connection(&self, connection_id: &ConnectionId) -> Option<Arc<Connection>> {
         let mut maps = self.synchronized_maps.write();
         match maps.by_id.remove(connection_id) {
@@ -235,22 +216,6 @@ impl Connections {
             }
             None => None,
         }
-    }
-
-    /// Associates a connection with the given address. Any previous associations that the given
-    /// Connection instance may have with other addresses remain unchanged.
-    fn update_connection_cache(&self, address: SocketLocator, connection: &Arc<Connection>) {
-        self.cache
-            .write()
-            .insert_without_removing_old(address, Arc::clone(connection));
-    }
-
-    /// Purges the stale connections from the connection cache. Returns a vector of connections
-    /// that were purged. This method ages out the connections and affects the behavior of
-    /// connection lookups by address. Lookups via ICE username and connection ID are
-    /// unaffected.
-    fn purge_stale_connections_from_cache(&self, now: Instant) -> Vec<SocketLocator> {
-        self.cache.write().remove_old(now)
     }
 }
 
@@ -312,8 +277,6 @@ pub struct Sfu {
     calls: Calls,
     /// Endorsement Issuer, reference given to each Call
     endorsement_issuer: Option<Arc<Mutex<EndorsementIssuer>>>,
-    /// The last time activity was checked.
-    activity_checked: Mutex<Instant>,
     /// The last time diagnostics were logged.
     diagnostics_logged: Mutex<Instant>,
     /// A reference to the packet server state.
@@ -327,14 +290,19 @@ pub struct Sfu {
 /// See [Sfu::tick].
 pub struct TickOutput {
     pub packets_to_send: Vec<(PacketToSend, SocketLocator)>,
-    pub dequeues_to_schedule: Vec<(Instant, SocketLocator)>,
-    pub expired_client_addrs: Vec<SocketLocator>,
+    pub dequeues_to_schedule: Vec<(Instant, Arc<Connection>)>,
 }
 
-#[derive(Debug, PartialEq, Eq, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct HandleOutput {
     pub packets_to_send: Vec<(PacketToSend, SocketLocator)>,
-    pub dequeues_to_schedule: Vec<(Instant, SocketLocator)>,
+    pub dequeues_to_schedule: Vec<(Instant, Arc<Connection>)>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct HandleUnconnectedOutput {
+    pub packets_to_send: Vec<(PacketToSend, SocketLocator)>,
+    pub connection: Arc<Connection>,
 }
 
 pub struct SfuStats {
@@ -344,7 +312,6 @@ pub struct SfuStats {
 
 impl Sfu {
     const ENDORSEMENT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
-    const CONNECTION_CACHE_GENERATION_LIFETIME: Duration = Duration::from_secs(30);
 
     pub fn new(now: Instant, config: &'static config::Config) -> Result<Self> {
         let endorsement_issuer = if let Some(secret) = config.endorsement_secret.as_ref() {
@@ -364,9 +331,8 @@ impl Sfu {
         Ok(Self {
             config,
             call_end_handler: Mutex::new(None),
-            connections: Connections::new(Self::CONNECTION_CACHE_GENERATION_LIFETIME, now),
+            connections: Connections::new(),
             calls: Calls::new(),
-            activity_checked: Mutex::new(now),
             diagnostics_logged: Mutex::new(now),
             packet_server: Mutex::new(None),
             endorsement_issuer,
@@ -849,22 +815,18 @@ impl Sfu {
         }
     }
 
-    pub fn handle_packet(
+    pub fn handle_packet_connected(
         &self,
+        incoming_connection: &Arc<Connection>,
         sender_addr: SocketLocator,
         incoming_packet: &mut [u8],
     ) -> Result<HandleOutput, SfuError> {
-        trace!("handle_packet():");
+        trace!("handle_packet_connected():");
 
         // RTP should go first because it's by far the most common.
         if rtp::looks_like_rtp(incoming_packet) {
             trace!("looks like rtp");
             time_scope_us!("calling.sfu.handle_packet.rtp");
-
-            let incoming_connection = self
-                .connections
-                .get_connection_from_address(&sender_addr)
-                .ok_or(SfuError::UnknownAddress(sender_addr))?;
 
             let incoming_rtp = {
                 time_scope_us!("calling.sfu.handle_packet.rtp.in_incoming_connection_lock");
@@ -897,9 +859,10 @@ impl Sfu {
                 ) {
                     Ok(outgoing_rtp) => outgoing_rtp,
                     Err(call::Error::Leave) => {
+                        incoming_connection.close();
                         event!("calling.sfu.close_connection.rtp");
                         self.connections.remove_connection(incoming_connection_id);
-                        return Ok(Default::default());
+                        return Err(SfuError::Leave);
                     }
                     Err(e) => return Err(SfuError::CallError(e)),
                 }
@@ -916,12 +879,13 @@ impl Sfu {
                     .get_connection_from_id(&outgoing_connection_id)
                 {
                     time_scope_us!("calling.sfu.handle_packet.rtp.in_outgoing_connection_lock");
-                    outgoing_connection.send_or_enqueue_rtp(
+                    if let Some(dequeue_time) = outgoing_connection.send_or_enqueue_rtp(
                         outgoing_rtp,
                         &mut packets_to_send,
-                        &mut dequeues_to_schedule,
                         Instant::now(),
-                    );
+                    ) {
+                        dequeues_to_schedule.push((dequeue_time, outgoing_connection));
+                    }
                 }
             }
 
@@ -935,11 +899,6 @@ impl Sfu {
             trace!("looks like rtcp");
             time_scope_us!("calling.sfu.handle_packet.rtcp");
 
-            let incoming_connection = self
-                .connections
-                .get_connection_from_address(&sender_addr)
-                .ok_or(SfuError::UnknownAddress(sender_addr))?;
-
             let incoming_connection_id = incoming_connection.id();
 
             let rtcp_now = Instant::now();
@@ -947,13 +906,18 @@ impl Sfu {
             let HandleRtcpResult {
                 incoming_key_frame_requests,
                 mut packets_to_send,
-                dequeues_to_schedule,
+                dequeue_time,
                 new_target_send_rate,
             } = {
                 time_scope_us!("calling.sfu.handle_packet.rtcp.in_incoming_connection_lock");
                 incoming_connection
                     .handle_rtcp_packet(incoming_packet, rtcp_now)
                     .map_err(SfuError::ConnectionError)?
+            };
+            let dequeues_to_schedule = if let Some(dequeue_time) = dequeue_time {
+                vec![(dequeue_time, incoming_connection.clone())]
+            } else {
+                vec![]
             };
 
             let call = incoming_connection.call();
@@ -1006,41 +970,15 @@ impl Sfu {
             trace!("looks like ice binding request");
             time_scope_us!("calling.sfu.handle_packet.ice");
 
-            let username = ice_binding_request
-                .username()
-                .ok_or(SfuError::IceBindingRequestHasNoUsername)?;
-
-            let incoming_connection = self
-                .connections
-                .get_connection_from_ice_request_username(username)
-                .ok_or_else(|| SfuError::IceBindingRequestUnknownUsername(username.to_vec()))?;
-
-            time_scope_us!("calling.sfu.handle_packet.ice.in_locks");
-
             let now = Instant::now();
 
-            let mut packets_to_send = incoming_connection
+            let packets_to_send = incoming_connection
                 .handle_ice_binding_request(sender_addr, ice_binding_request, now)
                 .map_err(SfuError::ConnectionError)?;
 
-            let mut dequeues_to_schedule = vec![];
-
-            // TODO: Remove when all clients allow server to do active
-            // ICE; We should dequeue on ICE response, but without
-            // server active ICE there are no ICE responses.
-            incoming_connection.dequeue_outgoing_rtp(
-                now,
-                &mut packets_to_send,
-                &mut dequeues_to_schedule,
-            );
-
-            // Removal of old addresses is done in tick().
-            self.connections
-                .update_connection_cache(sender_addr, &incoming_connection);
-
             return Ok(HandleOutput {
                 packets_to_send,
-                dequeues_to_schedule,
+                dequeues_to_schedule: vec![],
             });
         }
 
@@ -1051,32 +989,18 @@ impl Sfu {
             trace!("looks like ice binding response");
             time_scope_us!("calling.sfu.handle_packet.ice.response");
 
-            let incoming_connection_id =
-                IceTransactionTable::claim(sender_addr, &ice_binding_response.transaction_id())
-                    .ok_or(SfuError::IceBindingInvalidTransactionId)?;
-            let incoming_connection = self
-                .connections
-                .get_connection_from_id(&incoming_connection_id)
-                .ok_or_else(|| {
-                    SfuError::MissingConnection(
-                        incoming_connection_id.call_id.clone(),
-                        incoming_connection_id.demux_id,
-                    )
-                })?;
-
-            time_scope_us!("calling.sfu.handle_packet.ice.response.in_locks");
             let now = Instant::now();
             incoming_connection
                 .handle_ice_binding_response(sender_addr, ice_binding_response, Instant::now())
                 .map_err(SfuError::ConnectionError)?;
 
-            let mut dequeues_to_schedule = vec![];
             let mut packets_to_send = vec![];
-            incoming_connection.dequeue_outgoing_rtp(
-                now,
-                &mut packets_to_send,
-                &mut dequeues_to_schedule,
-            );
+
+            let dequeues_to_schedule =
+                match incoming_connection.dequeue_outgoing_rtp(now, &mut packets_to_send) {
+                    (_, Some(dequeue_time)) => vec![(dequeue_time, incoming_connection.clone())],
+                    (_, None) => vec![],
+                };
 
             return Ok(HandleOutput {
                 packets_to_send,
@@ -1087,23 +1011,73 @@ impl Sfu {
         Err(SfuError::UnknownPacketType(sender_addr))
     }
 
+    pub fn handle_packet_unconnected(
+        &self,
+        sender_addr: SocketLocator,
+        incoming_packet: &mut [u8],
+    ) -> Result<HandleUnconnectedOutput, SfuError> {
+        trace!("handle_packet_unconnected():");
+
+        // ICE request check
+        if let Some(ice_binding_request) = BindingRequest::try_from_buffer(incoming_packet)
+            .map_err(SfuError::ParseIceBindingRequest)?
+        {
+            trace!("looks like ice binding request");
+            time_scope_us!("calling.sfu.handle_packet.unconnected_ice");
+
+            let username = ice_binding_request
+                .username()
+                .ok_or(SfuError::IceBindingRequestHasNoUsername)?;
+
+            let incoming_connection = self
+                .connections
+                .get_connection_from_ice_request_username(username)
+                .ok_or_else(|| SfuError::IceBindingRequestUnknownUsername(username.to_vec()))?;
+
+            time_scope_us!("calling.sfu.handle_packet.unconnected_ice.in_locks");
+
+            let now = Instant::now();
+
+            let packets_to_send = incoming_connection
+                .handle_ice_binding_request(sender_addr, ice_binding_request, now)
+                .map_err(SfuError::ConnectionError)?;
+
+            return Ok(HandleUnconnectedOutput {
+                packets_to_send,
+                connection: incoming_connection,
+            });
+        }
+
+        if rtp::looks_like_rtp(incoming_packet) {
+            trace!("looks like rtp");
+            event!("calling.sfu.handle_packet.unconnected_rtp");
+        }
+
+        if rtp::looks_like_rtcp(incoming_packet) {
+            trace!("looks like rtcp");
+            event!("calling.sfu.handle_packet.unconnected_rtcp");
+        }
+
+        // ICE response check
+        if let Some(_ice_binding_response) = BindingResponse::try_from_buffer(incoming_packet)
+            .map_err(SfuError::ParseIceBindingResponse)?
+        {
+            trace!("looks like ice binding response");
+            event!("calling.sfu.handle_packet.ice.unconnected_response");
+        }
+
+        Err(SfuError::UnknownAddress(sender_addr))
+    }
+
     pub fn handle_dequeue(
         &self,
-        addr: SocketLocator,
+        connection: &Arc<Connection>,
         now: Instant,
         packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
-        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
-    ) -> bool {
+    ) -> (bool, Option<Instant>) {
         trace!("handle_dequeue():");
-
         time_scope_us!("calling.sfu.handle_dequeue");
-
-        if let Some(connection) = self.connections.get_connection_from_address(&addr) {
-            time_scope_us!("calling.sfu.handle_dequeue.connection_lock");
-            connection.dequeue_outgoing_rtp(now, packets_to_send, dequeues_to_schedule)
-        } else {
-            false
-        }
+        connection.dequeue_outgoing_rtp(now, packets_to_send)
     }
 
     /// Handle the periodic tick, which could be fired every 100ms in production.
@@ -1182,52 +1156,52 @@ impl Sfu {
             }
         }
 
-        // Set a flag if we need to check for inactivity while we iterate.
-        let check_for_inactivity = {
-            let mut activity_checked = self.activity_checked.lock();
-            if now >= *activity_checked + Duration::from_secs(config.inactivity_check_interval_secs)
-            {
-                trace!("tick: checking for inactivity");
-                *activity_checked = now;
-                true
-            } else {
-                false
-            }
-        };
-
-        let remove_inactive_calls_timer = start_timer_us!("calling.sfu.tick.remove_inactive_calls");
-
         let mut outgoing_queue_sizes_by_call_id: HashMap<CallId, Vec<(DemuxId, DataSize)>> =
             HashMap::new();
         let mut connection_rates_by_call_id: HashMap<CallId, Vec<(DemuxId, ConnectionRates)>> =
             HashMap::new();
 
-        for connection in self.connections.get_connections_snapshot() {
-            let connection_id = connection.id();
-            if check_for_inactivity && connection.inactive(now) {
-                info!("dropping connection: {}", connection_id);
+        {
+            time_scope_us!("calling.sfu.tick.connections");
+            for connection in self.connections.get_connections_snapshot() {
+                let connection_id = connection.id();
+                match connection.tick(&mut packets_to_send, now) {
+                    connection::TickOutput::Inactive => {
+                        info!("dropping connection: {}", connection_id);
 
-                let call = connection.call();
-                call.drop_client(connection_id.demux_id, now);
+                        let call = connection.call();
+                        call.drop_client(connection_id.demux_id, now);
 
-                if connection.had_selected_candidate() {
-                    event!("calling.sfu.close_connection.inactive");
-                } else {
-                    event!("calling.sfu.close_connection.no_nominee");
+                        if connection.had_selected_candidate() {
+                            event!("calling.sfu.close_connection.inactive");
+                        } else {
+                            event!("calling.sfu.close_connection.no_nominee");
+                        }
+
+                        self.connections.remove_connection(connection_id);
+                        connection.close();
+                        if let Some(packet_server) = self.packet_server.lock().as_ref() {
+                            packet_server.remove_connection(&connection, now);
+                        }
+                    }
+                    connection::TickOutput::Active(dead_candidates) => {
+                        // Don't remove the connection; it's still active!
+                        for candidate in dead_candidates {
+                            if let Some(packet_server) = self.packet_server.lock().as_ref() {
+                                packet_server.remove_candidate(&connection, &candidate, now)
+                            }
+                        }
+
+                        outgoing_queue_sizes_by_call_id
+                            .entry(connection_id.call_id.clone())
+                            .or_default()
+                            .push((connection_id.demux_id, connection.outgoing_queue_size()));
+                        connection_rates_by_call_id
+                            .entry(connection_id.call_id.clone())
+                            .or_default()
+                            .push((connection_id.demux_id, connection.current_rates(now)));
+                    }
                 }
-
-                self.connections.remove_connection(connection_id);
-            } else {
-                // Don't remove the connection; it's still active!
-                connection.tick(&mut packets_to_send, now);
-                outgoing_queue_sizes_by_call_id
-                    .entry(connection_id.call_id.clone())
-                    .or_default()
-                    .push((connection_id.demux_id, connection.outgoing_queue_size()));
-                connection_rates_by_call_id
-                    .entry(connection_id.call_id.clone())
-                    .or_default()
-                    .push((connection_id.demux_id, connection.current_rates(now)));
             }
         }
 
@@ -1238,6 +1212,7 @@ impl Sfu {
         let outgoing_queue_drain_duration =
             Duration::from_millis(self.config.outgoing_queue_drain_ms);
 
+        let remove_inactive_calls_timer = start_timer_us!("calling.sfu.tick.remove_inactive_calls");
         for call in self.calls.get_calls_snapshot() {
             match call.activity(&now, &inactivity_timeout) {
                 CallActivity::Inactive => {
@@ -1376,8 +1351,7 @@ impl Sfu {
                     .connections
                     .get_connection_from_id(&outgoing_connection_id)
                 {
-                    connection.configure_congestion_control(
-                        &mut dequeues_to_schedule,
+                    if let Some(dequeue_time) = connection.configure_congestion_control(
                         googcc::Request {
                             base: send_rate_allocation_info.requested_base_rate,
                             ideal: send_rate_allocation_info.ideal_send_rate,
@@ -1391,7 +1365,9 @@ impl Sfu {
                             padding_ssrc: send_rate_allocation_info.padding_ssrc,
                         },
                         now,
-                    );
+                    ) {
+                        dequeues_to_schedule.push((dequeue_time, connection));
+                    }
                 }
             }
 
@@ -1417,25 +1393,20 @@ impl Sfu {
                     .connections
                     .get_connection_from_id(&outgoing_connection_id)
                 {
-                    outgoing_connection.send_or_enqueue_rtp(
+                    if let Some(dequeue_time) = outgoing_connection.send_or_enqueue_rtp(
                         outgoing_rtp,
                         &mut packets_to_send,
-                        &mut dequeues_to_schedule,
                         now,
-                    );
+                    ) {
+                        dequeues_to_schedule.push((dequeue_time, outgoing_connection));
+                    }
                 }
             }
         }
 
-        let expired_client_addrs = {
-            time_scope_us!("calling.sfu.tick.remove_inactive_client_addresses");
-            self.connections.purge_stale_connections_from_cache(now)
-        };
-
         TickOutput {
             packets_to_send,
             dequeues_to_schedule,
-            expired_client_addrs,
         }
     }
 }
@@ -1950,7 +1921,7 @@ mod sfu_tests {
     }
 
     #[tokio::test]
-    async fn test_handle_packet_generic() {
+    async fn test_handle_packet_generic_unconnected() {
         let sfu = new_sfu(Instant::now(), &DEFAULT_CONFIG);
 
         let mut buf = [0u8; 1500];
@@ -1959,7 +1930,40 @@ mod sfu_tests {
             20000,
         ));
 
-        let result = sfu.handle_packet(sender_addr, &mut buf);
+        let result = sfu.handle_packet_unconnected(sender_addr, &mut buf);
+        assert_eq!(result, Err(SfuError::UnknownAddress(sender_addr)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_packet_generic_connected() {
+        let sfu = new_sfu(Instant::now(), &DEFAULT_CONFIG);
+
+        let call_id = random_call_id();
+        let user_id = random_user_id();
+        let demux_id = 123392.try_into().unwrap();
+
+        let _ = add_test_client(
+            &sfu,
+            &call_id,
+            &user_id,
+            demux_id,
+            "1".to_string(),
+            "1".to_string(),
+            [0; 32],
+        );
+
+        let connection = sfu
+            .connections
+            .get_connection_from_id(&ConnectionId { call_id, demux_id })
+            .unwrap();
+
+        let mut buf = [0u8; 1500];
+        let sender_addr = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::from_str("127.0.0.1").unwrap(),
+            20000,
+        ));
+
+        let result = sfu.handle_packet_connected(&connection, sender_addr, &mut buf);
         assert_eq!(result, Err(SfuError::UnknownPacketType(sender_addr)));
     }
 

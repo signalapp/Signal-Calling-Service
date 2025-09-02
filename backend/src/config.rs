@@ -94,11 +94,6 @@ pub struct Config {
     #[arg(long)]
     pub diagnostics_interval_secs: Option<u64>,
 
-    /// Inactivity check interval (seconds). The amount of time to wait between
-    /// iterating structures for inactive calls and clients.
-    #[arg(long, default_value = "5")]
-    pub inactivity_check_interval_secs: u64,
-
     /// Amount of time to wait before dropping a call or client due to inactivity (seconds).
     #[arg(long, default_value = "30")]
     pub inactivity_timeout_secs: u64,
@@ -286,7 +281,6 @@ pub(crate) fn default_test_config() -> Config {
         tick_interval_ms: 100,
         outgoing_queue_drain_ms: 500,
         diagnostics_interval_secs: None,
-        inactivity_check_interval_secs: 5,
         inactivity_timeout_secs: 30,
         new_clients_require_approval: false,
         approved_users_persistence_url: Default::default(),

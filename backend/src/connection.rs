@@ -59,6 +59,23 @@ pub enum Error {
     ReceivedInvalidRtp,
     #[error("received invalid RTCP packet")]
     ReceivedInvalidRtcp,
+    #[error("received packet after Connection was ended")]
+    ReceivedPacketWhileClosed,
+    #[error("received ping response with error code")]
+    ReceivedResponseWithErrorCode,
+    #[error("received ping response without mapped address field")]
+    ReceivedResponseWithoutMappedAddress,
+    #[error("received ping response from unknown address")]
+    ReceivedResponseFromUnknownAddress,
+    #[error("received ping response when no transaction was outstanding")]
+    ReceivedUnexpectedResponse,
+    #[error("received ping response with non-matching transaction id")]
+    ReceivedResponseWithInvalidTransactionId,
+}
+
+pub enum TickOutput {
+    Inactive,
+    Active(Vec<SocketLocator>),
 }
 
 pub struct Connection {
@@ -84,6 +101,20 @@ pub struct CreateConnectionArgs<'a> {
     pub region_relation: RegionRelation,
     pub user_agent: SignalUserAgent,
     pub now: Instant,
+}
+
+impl PartialEq for Connection {
+    /// Two connections are equal if the inner data pointer is the same.
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.data_ptr() == other.inner.data_ptr()
+    }
+}
+impl Eq for Connection {}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Connection{:?}", self.id)
+    }
 }
 
 impl Connection {
@@ -153,7 +184,6 @@ impl Connection {
 
         let inner = RwLock::new(ConnectionInner::new(
             config,
-            connection_id,
             ice_server_username,
             ice_client_username,
             ice_server_pwd,
@@ -203,6 +233,11 @@ impl Connection {
     #[inline(always)]
     pub fn outgoing_addr_type(&self) -> Option<AddressType> {
         self.inner.read().outgoing_addr_type()
+    }
+
+    #[inline(always)]
+    pub fn all_addrs(&self) -> Vec<SocketLocator> {
+        self.inner.read().all_addrs()
     }
 
     /// Returns true if at least one candidate was ever selected.
@@ -275,13 +310,12 @@ impl Connection {
     // results of calling this across many connections.
     // So we use (packet, addr) for convenience.
     #[inline(always)]
-    pub fn tick(&self, packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>, now: Instant) {
-        self.inner.write().tick(packets_to_send, now);
-    }
-
-    #[inline(always)]
-    pub fn inactive(&self, now: Instant) -> bool {
-        self.inner.read().inactive(now)
+    pub fn tick(
+        &self,
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
+        now: Instant,
+    ) -> TickOutput {
+        self.inner.write().tick(packets_to_send, now)
     }
 
     /// Encrypts the outgoing RTP.
@@ -297,15 +331,11 @@ impl Connection {
         // results of calling this across many connections.
         // So we use this vec of (packet, addr) for convenience.
         packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
-        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
         now: Instant,
-    ) {
-        self.inner.write().send_or_enqueue_rtp(
-            outgoing_rtp,
-            packets_to_send,
-            dequeues_to_schedule,
-            now,
-        );
+    ) -> Option<Instant> {
+        self.inner
+            .write()
+            .send_or_enqueue_rtp(outgoing_rtp, packets_to_send, now)
     }
 
     /// Dequeues previously encrypted outgoing RTP (if possible)
@@ -315,11 +345,10 @@ impl Connection {
         &self,
         now: Instant,
         packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
-        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
-    ) -> bool {
+    ) -> (bool, Option<Instant>) {
         self.inner
             .write()
-            .dequeue_outgoing_rtp(now, packets_to_send, dequeues_to_schedule)
+            .dequeue_outgoing_rtp(now, packets_to_send)
     }
 
     /// Creates an encrypted key frame request to be sent to
@@ -359,21 +388,17 @@ impl Connection {
     #[inline(always)]
     pub fn configure_congestion_control(
         &self,
-        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
         googcc_request: googcc::Request,
         pacer_config: pacer::Config,
         now: Instant,
-    ) {
-        self.inner.write().configure_congestion_control(
-            dequeues_to_schedule,
-            googcc_request,
-            pacer_config,
-            now,
-        );
+    ) -> Option<Instant> {
+        self.inner
+            .write()
+            .configure_congestion_control(googcc_request, pacer_config, now)
     }
 
     #[inline(always)]
-    pub fn rtt(&mut self, now: Instant) -> Duration {
+    pub fn rtt(&self, now: Instant) -> Duration {
         self.inner.write().rtt(now)
     }
 
@@ -401,6 +426,22 @@ impl Connection {
     #[inline(always)]
     pub fn current_rates(&self, now: Instant) -> ConnectionRates {
         self.inner.write().current_rates(now)
+    }
+
+    /// Mark the Connection as closed
+    #[inline(always)]
+    pub fn close(&self) {
+        self.inner.write().close()
+    }
+
+    #[inline(always)]
+    pub fn remove_candidate(&self, sender_addr: SocketLocator) {
+        self.inner.write().remove_candidate(sender_addr)
+    }
+
+    #[inline(always)]
+    pub fn has_candidate(&self, sender_addr: SocketLocator) -> bool {
+        self.inner.write().has_candidate(sender_addr)
     }
 }
 
@@ -434,6 +475,7 @@ pub type DhePublicKey = [u8; 32];
 /// Takes care of transport auth, crypto, ACKs, NACKs,
 /// retransmissions, congestion control, and IP mobility.
 struct ConnectionInner {
+    closed: bool,
     rtp: Rtp,
     congestion_control: CongestionControl,
     candidate_selector: CandidateSelector,
@@ -466,6 +508,7 @@ impl ConnectionInner {
         let rtp_endpoint = rtp::Endpoint::new(decrypt, encrypt, now, RTCP_SENDER_SSRC, ack_ssrc);
 
         Self {
+            closed: false,
             rtp: Rtp {
                 ack_ssrc,
                 endpoint: rtp_endpoint,
@@ -499,7 +542,6 @@ impl ConnectionInner {
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: &'static Config,
-        connection_id: &ConnectionId,
         ice_server_username: Vec<u8>,
         ice_client_username: Vec<u8>,
         ice_server_pwd: Vec<u8>,
@@ -519,7 +561,6 @@ impl ConnectionInner {
         let candidate_selector = CandidateSelector::new(
             now,
             candidate_selector::Config {
-                connection_id: connection_id.clone(),
                 inactivity_timeout: Duration::from_secs(config.inactivity_timeout_secs),
                 ping_period: Duration::from_millis(config.candidate_selector_options.ping_period),
                 rtt_sensitivity: config.candidate_selector_options.rtt_sensitivity,
@@ -544,6 +585,7 @@ impl ConnectionInner {
         );
 
         Self {
+            closed: false,
             rtp: Rtp {
                 ack_ssrc,
                 endpoint: rtp_endpoint,
@@ -581,6 +623,10 @@ impl ConnectionInner {
         self.candidate_selector.outbound_address_type()
     }
 
+    fn all_addrs(&self) -> Vec<SocketLocator> {
+        self.candidate_selector.all_addrs()
+    }
+
     /// Returns true if at least one candidate was ever selected.
     fn had_selected_candidate(&self) -> bool {
         self.candidate_selector.had_selected_candidate()
@@ -592,6 +638,10 @@ impl ConnectionInner {
         binding_request: ice::BindingRequest,
         now: Instant,
     ) -> Result<Vec<(PacketToSend, SocketLocator)>, Error> {
+        if self.closed {
+            return Err(Error::ReceivedPacketWhileClosed);
+        }
+
         self.push_incoming_non_media_bytes(binding_request.len(), now);
 
         let ice_credentials = self.candidate_selector.ice_credentials();
@@ -638,6 +688,10 @@ impl ConnectionInner {
         binding_response: ice::BindingResponse,
         now: Instant,
     ) -> Result<(), Error> {
+        if self.closed {
+            return Err(Error::ReceivedPacketWhileClosed);
+        }
+
         self.push_incoming_non_media_bytes(binding_response.len(), now);
 
         let ice_credentials = self.candidate_selector.ice_credentials();
@@ -653,9 +707,7 @@ impl ConnectionInner {
             })?;
 
         self.candidate_selector
-            .handle_ping_response(sender_addr, binding_response, now);
-
-        Ok(())
+            .handle_ping_response(sender_addr, binding_response, now)
     }
 
     // This effectively overrides the DHE, which is more convenient for tests.
@@ -675,6 +727,10 @@ impl ConnectionInner {
         incoming_packet: &'packet mut [u8],
         now: Instant,
     ) -> Result<Option<rtp::Packet<&'packet mut [u8]>>, Error> {
+        if self.closed {
+            return Err(Error::ReceivedPacketWhileClosed);
+        }
+
         let rtp_endpoint = &mut self.rtp.endpoint;
         let size = incoming_packet.len();
         match rtp_endpoint.receive_rtp(incoming_packet, now) {
@@ -710,6 +766,10 @@ impl ConnectionInner {
         incoming_packet: &mut [u8],
         now: Instant,
     ) -> Result<HandleRtcpResult, Error> {
+        if self.closed {
+            return Err(Error::ReceivedPacketWhileClosed);
+        }
+
         self.push_incoming_non_media_bytes(incoming_packet.len(), now);
 
         let rtp_endpoint = &mut self.rtp.endpoint;
@@ -729,12 +789,12 @@ impl ConnectionInner {
         // TCC feedback size of 68 bytes (including IP, UDP, SRTP, and RTCP overhead).
 
         let mut packets_to_send = vec![];
-        let mut dequeues_to_schedule = vec![];
+        let mut dequeue_time = None;
         if let Some(outgoing_addr) = self.candidate_selector.outbound_address() {
             for rtp::Nack { ssrc, seqnums } in rtcp.nacks {
                 for seqnum in seqnums {
                     if let Some(rtx) = rtp_endpoint.resend_rtp(ssrc, seqnum, now) {
-                        let (outgoing_rtp, dequeue_time) =
+                        let (outgoing_rtp, new_dequeue_time) =
                             self.congestion_control.pacer.enqueue(rtx, now);
                         if let Some(outgoing_rtp) = outgoing_rtp {
                             rtp_endpoint.remember_sent(&outgoing_rtp, now);
@@ -745,8 +805,8 @@ impl ConnectionInner {
                             rtp_endpoint.mark_as_sent(ssrc, seqnum);
                         }
                         // if more than one packet requests a scheduled dequeue, only the most recent time requested is scheduled
-                        if let Some(dequeue_time) = dequeue_time {
-                            dequeues_to_schedule = vec![(dequeue_time, outgoing_addr)];
+                        if new_dequeue_time.is_some() {
+                            dequeue_time = new_dequeue_time;
                         }
                     } else {
                         debug!("Ignoring NACK for (SSRC, seqnum) that is either too old or invalid: ({}, {})", ssrc, seqnum);
@@ -758,7 +818,7 @@ impl ConnectionInner {
         Ok(HandleRtcpResult {
             incoming_key_frame_requests: rtcp.key_frame_requests,
             packets_to_send,
-            dequeues_to_schedule,
+            dequeue_time,
             new_target_send_rate,
         })
     }
@@ -767,24 +827,32 @@ impl ConnectionInner {
         &mut self,
         packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
         now: Instant,
-    ) {
+    ) -> Vec<SocketLocator> {
         let mut outbound_packets = vec![];
-        self.candidate_selector.tick(&mut outbound_packets, now);
+        let ret = self.candidate_selector.tick(&mut outbound_packets, now);
         outbound_packets.into_iter().for_each(|packet| {
             self.push_outgoing_non_media_bytes(packet.0.len(), now);
             packets_to_send.push(packet);
         });
+        ret
     }
 
-    fn tick(&mut self, packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>, now: Instant) {
+    fn tick(
+        &mut self,
+        packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
+        now: Instant,
+    ) -> TickOutput {
+        if self.inactive(now) {
+            return TickOutput::Inactive;
+        }
         self.send_acks_if_its_been_too_long(packets_to_send, now);
         self.send_nacks_if_its_been_too_long(packets_to_send, now);
         self.send_rtcp_report_if_its_been_too_long(packets_to_send, now);
-        self.candidate_selector_tick(packets_to_send, now);
+        TickOutput::Active(self.candidate_selector_tick(packets_to_send, now))
     }
 
     fn inactive(&self, now: Instant) -> bool {
-        self.candidate_selector.inactive(now)
+        self.closed || self.candidate_selector.inactive(now)
     }
 
     fn send_or_enqueue_rtp(
@@ -795,9 +863,12 @@ impl ConnectionInner {
         // results of calling this across many connections.
         // So we use this vec of (packet, addr) for convenience.
         packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
-        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
         now: Instant,
-    ) {
+    ) -> Option<Instant> {
+        if self.closed {
+            return None;
+        }
+        let mut dequeue_time = None;
         let rtp_endpoint = &mut self.rtp.endpoint;
         if let Some(outgoing_addr) = self.candidate_selector.outbound_address() {
             if let Some(outgoing_rtp) = rtp_endpoint.send_rtp(outgoing_rtp, now) {
@@ -805,15 +876,13 @@ impl ConnectionInner {
                     if !outgoing_rtp.is_video() {
                         warn!("forwarding non-video congestion controlled packet");
                     }
-                    let (outgoing_rtp, dequeue_time) =
+                    let new_outgoing_rtp;
+                    (new_outgoing_rtp, dequeue_time) =
                         self.congestion_control.pacer.enqueue(outgoing_rtp, now);
-                    if let Some(outgoing_rtp) = outgoing_rtp {
+                    if let Some(outgoing_rtp) = new_outgoing_rtp {
                         rtp_endpoint.remember_sent(&outgoing_rtp, now);
                         self.push_outgoing_video(outgoing_rtp.size(), now);
                         packets_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
-                    }
-                    if let Some(dequeue_time) = dequeue_time {
-                        dequeues_to_schedule.push((dequeue_time, outgoing_addr));
                     }
                 } else {
                     rtp_endpoint.remember_sent_for_reports(&outgoing_rtp, now);
@@ -841,19 +910,22 @@ impl ConnectionInner {
             // Queue outgoing video packets, even if there's no nominated connection.
             self.congestion_control.pacer.force_enqueue(outgoing_rtp);
         }
+        dequeue_time
     }
 
     fn dequeue_outgoing_rtp(
         &mut self,
         now: Instant,
         packets_to_send: &mut Vec<(PacketToSend, SocketLocator)>,
-        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
-    ) -> bool {
+    ) -> (bool, Option<Instant>) {
+        if self.closed {
+            return (false, None);
+        }
         let rtp_endpoint = &mut self.rtp.endpoint;
         let generate_padding = |padding_ssrc| rtp_endpoint.send_padding(padding_ssrc, now);
         let outgoing_addr = match self.candidate_selector.outbound_address() {
             Some(addr) => addr,
-            None => return false,
+            None => return (false, None),
         };
 
         let (outgoing_rtp, dequeue_time) =
@@ -883,15 +955,9 @@ impl ConnectionInner {
             }
 
             packets_to_send.push((outgoing_rtp.into_serialized(), outgoing_addr));
-            if let Some(dequeue_time) = dequeue_time {
-                dequeues_to_schedule.push((dequeue_time, outgoing_addr));
-            }
-            true
-        } else if let Some(dequeue_time) = dequeue_time {
-            dequeues_to_schedule.push((dequeue_time, outgoing_addr));
-            false
+            (true, dequeue_time)
         } else {
-            false
+            (false, dequeue_time)
         }
     }
 
@@ -1010,17 +1076,12 @@ impl ConnectionInner {
 
     fn configure_congestion_control(
         &mut self,
-        dequeues_to_schedule: &mut Vec<(Instant, SocketLocator)>,
         googcc_request: googcc::Request,
         pacer_config: pacer::Config,
         now: Instant,
-    ) {
+    ) -> Option<Instant> {
         self.congestion_control.controller.request(googcc_request);
-        if let Some(dequeue_time) = self.congestion_control.pacer.set_config(pacer_config, now) {
-            if let Some(outgoing_addr) = self.candidate_selector.outbound_address() {
-                dequeues_to_schedule.push((dequeue_time, outgoing_addr));
-            }
-        }
+        self.congestion_control.pacer.set_config(pacer_config, now)
     }
 
     fn rtt(&mut self, now: Instant) -> Duration {
@@ -1096,6 +1157,18 @@ impl ConnectionInner {
             size.as_bytes() as usize
         );
     }
+
+    fn close(&mut self) {
+        self.closed = true;
+    }
+
+    fn remove_candidate(&mut self, sender_addr: SocketLocator) {
+        self.candidate_selector.remove_candidate(sender_addr)
+    }
+
+    fn has_candidate(&mut self, sender_addr: SocketLocator) -> bool {
+        !self.closed && self.candidate_selector.has_candidate(sender_addr)
+    }
 }
 
 /// Result of Connection::handle_rtcp_packet().
@@ -1103,7 +1176,7 @@ impl ConnectionInner {
 pub struct HandleRtcpResult {
     pub incoming_key_frame_requests: Vec<rtp::KeyFrameRequest>,
     pub packets_to_send: Vec<(PacketToSend, SocketLocator)>,
-    pub dequeues_to_schedule: Vec<(Instant, SocketLocator)>,
+    pub dequeue_time: Option<Instant>,
     pub new_target_send_rate: Option<DataRate>,
 }
 
@@ -1136,7 +1209,7 @@ mod connection_tests {
     use candidate_selector::ScoringValues;
     use rtp::new_srtp_keys;
 
-    use super::*;
+    use super::{Error::*, *};
     use crate::{
         call::CreateCallArgs,
         sfu::{CallId, UserId},
@@ -1181,7 +1254,6 @@ mod connection_tests {
             ..Default::default()
         };
         let candidate_selector_config = candidate_selector::Config {
-            connection_id: ConnectionId::null(),
             inactivity_timeout: Duration::from_secs(30),
             ping_period: Duration::from_millis(1000),
             rtt_sensitivity: 0.2,
@@ -1249,18 +1321,21 @@ mod connection_tests {
     fn establish_outbound_address(connection: &Connection, addr: SocketLocator, now: Instant) {
         let ice_credentials = connection.ice_credentials();
         let packets = handle_ice_binding_request(connection, addr, 1u128, true, now);
+        let mut binding_response_sent = false;
         packets.into_iter().for_each(|(packet, addr)| {
             let packet = &packet;
             if let Some(req) = ice::BindingRequest::try_from_buffer(packet).expect("sane") {
                 let buffer = ice::StunPacketBuilder::new_binding_response(&req.transaction_id())
-                    .set_xor_mapped_address(&"1.1.1.1:10".parse().unwrap())
+                    .set_xor_mapped_address(&"203.0.113.1:10".parse().unwrap())
                     .build(&ice_credentials.client_pwd);
                 let res = ice::BindingResponse::from_buffer_without_sanity_check(&buffer);
                 connection
                     .handle_ice_binding_response(addr, res, now)
                     .expect("ice binding response handled");
+                binding_response_sent = true;
             }
         });
+        assert!(binding_response_sent);
     }
 
     fn new_encrypted_rtp(
@@ -1420,8 +1495,9 @@ mod connection_tests {
         );
     }
 
+    // Solicited ice response tested in establish_outbound_address
     #[test]
-    fn test_ice_response() {
+    fn test_unsolicited_ice_response() {
         let now = Instant::now();
 
         let connection = new_connection(now);
@@ -1429,7 +1505,7 @@ mod connection_tests {
 
         let response = ice::StunPacketBuilder::new_binding_response(&0u128.into())
             .set_username(&ice_credentials.server_username)
-            .set_xor_mapped_address(&"1.1.1.1:1".parse().unwrap())
+            .set_xor_mapped_address(&"203.0.113.1:1".parse().unwrap())
             .build(&ice_credentials.client_pwd);
 
         let sender_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
@@ -1439,7 +1515,7 @@ mod connection_tests {
                 ice::BindingResponse::from_buffer_without_sanity_check(&response),
                 now,
             ),
-            Ok(())
+            Err(ReceivedResponseFromUnknownAddress)
         );
     }
 
@@ -1510,7 +1586,6 @@ mod connection_tests {
 
         let set_send_rate = |connection: &Connection, send_rate, now| {
             connection.configure_congestion_control(
-                &mut vec![],
                 googcc::Request {
                     base: send_rate,
                     ideal: send_rate,
@@ -1528,12 +1603,7 @@ mod connection_tests {
         let unencrypted_rtp = decrypt_rtp(&encrypted_rtp, &encrypt);
 
         let mut packets_to_send = vec![];
-        connection.send_or_enqueue_rtp(
-            unencrypted_rtp.clone(),
-            &mut packets_to_send,
-            &mut vec![],
-            now,
-        );
+        connection.send_or_enqueue_rtp(unencrypted_rtp.clone(), &mut packets_to_send, now);
 
         // Can't send yet because there is no outgoing address.
         assert_eq!(0, packets_to_send.len());
@@ -1542,7 +1612,7 @@ mod connection_tests {
         establish_outbound_address(&connection, client_addr, now);
         // Packets without tcc seqnums skip the pacer queue and still go out even if the rate is 0.
         set_send_rate(&connection, DataRate::from_kbps(0), now);
-        connection.send_or_enqueue_rtp(unencrypted_rtp, &mut packets_to_send, &mut vec![], now);
+        connection.send_or_enqueue_rtp(unencrypted_rtp, &mut packets_to_send, now);
 
         assert_eq!(
             vec![(encrypted_rtp.into_serialized(), client_addr)],
@@ -1564,7 +1634,6 @@ mod connection_tests {
         let set_padding_send_rate =
             |connection: &Connection, padding_send_rate, padding_ssrc, now| {
                 connection.configure_congestion_control(
-                    &mut vec![],
                     googcc::Request {
                         base: padding_send_rate,
                         ideal: padding_send_rate,
@@ -1589,16 +1658,9 @@ mod connection_tests {
         // 500kbps * 20ms = 1250 bytes, just enough for a padding packet of around 1200 bytes
 
         let mut packets_to_send = vec![];
-        let mut dequeues_to_schedule = vec![];
 
-        assert!(
-            connection.dequeue_outgoing_rtp(
-                at(20),
-                &mut packets_to_send,
-                &mut dequeues_to_schedule
-            ),
-            "sent padding"
-        );
+        let (sent, _) = connection.dequeue_outgoing_rtp(at(20), &mut packets_to_send);
+        assert!(sent, "sent padding");
         assert_eq!(1, packets_to_send.len(), "has padding");
         let (buf, _addr) = &packets_to_send[0];
 
@@ -1617,15 +1679,8 @@ mod connection_tests {
         );
 
         let mut packets_to_send = vec![];
-        let mut dequeues_to_schedule = vec![];
-        assert!(
-            !connection.dequeue_outgoing_rtp(
-                at(40),
-                &mut packets_to_send,
-                &mut dequeues_to_schedule
-            ),
-            "sent nothing"
-        );
+        let (sent, _) = connection.dequeue_outgoing_rtp(at(40), &mut packets_to_send);
+        assert!(!sent, "sent nothing");
 
         assert!(packets_to_send.is_empty());
 
@@ -1633,16 +1688,10 @@ mod connection_tests {
         set_padding_send_rate(&mut connection, DataRate::from_kbps(500), None, at(40));
 
         let mut packets_to_send = vec![];
-        let mut dequeues_to_schedule = vec![];
 
-        assert!(
-            !connection.dequeue_outgoing_rtp(
-                at(40),
-                &mut packets_to_send,
-                &mut dequeues_to_schedule
-            ),
-            "sent nothing"
-        );
+        let (sent, _) = connection.dequeue_outgoing_rtp(at(40), &mut packets_to_send);
+
+        assert!(!sent, "sent nothing");
         assert!(packets_to_send.is_empty());
 
         // Can still send some more
@@ -1654,15 +1703,9 @@ mod connection_tests {
         );
 
         let mut packets_to_send = vec![];
-        let mut dequeues_to_schedule = vec![];
-        assert!(
-            connection.dequeue_outgoing_rtp(
-                at(60),
-                &mut packets_to_send,
-                &mut dequeues_to_schedule
-            ),
-            "sent padding"
-        );
+        let (sent, _) = connection.dequeue_outgoing_rtp(at(60), &mut packets_to_send);
+
+        assert!(sent, "sent padding");
         assert_eq!(1, packets_to_send.len(), "has padding");
         let (buf, _addr) = &packets_to_send[0];
 
@@ -1687,12 +1730,7 @@ mod connection_tests {
         let encrypted_rtp = new_encrypted_rtp(1, None, &encrypt, at(20));
         let unencrypted_rtp = decrypt_rtp(&encrypted_rtp, &encrypt);
         let mut packets_to_send = vec![];
-        connection.send_or_enqueue_rtp(
-            unencrypted_rtp.clone(),
-            &mut packets_to_send,
-            &mut vec![],
-            at(20),
-        );
+        connection.send_or_enqueue_rtp(unencrypted_rtp.clone(), &mut packets_to_send, at(20));
         assert_eq!(
             vec![(encrypted_rtp.clone().into_serialized(), client_addr)],
             packets_to_send
@@ -1722,12 +1760,7 @@ mod connection_tests {
         let encrypted_rtp2 = new_encrypted_rtp(2, None, &encrypt, at(40));
         let unencrypted_rtp2 = decrypt_rtp(&encrypted_rtp2, &encrypt);
         let mut packets_to_send = vec![];
-        connection.send_or_enqueue_rtp(
-            unencrypted_rtp2.clone(),
-            &mut packets_to_send,
-            &mut vec![],
-            at(40),
-        );
+        connection.send_or_enqueue_rtp(unencrypted_rtp2.clone(), &mut packets_to_send, at(40));
         assert_eq!(
             vec![(encrypted_rtp2.clone().into_serialized(), client_addr)],
             packets_to_send
@@ -1761,15 +1794,9 @@ mod connection_tests {
             .unwrap();
 
         let mut packets_to_send = vec![];
-        let mut dequeues_to_schedule = vec![];
-        assert!(
-            connection.dequeue_outgoing_rtp(
-                at(60),
-                &mut packets_to_send,
-                &mut dequeues_to_schedule
-            ),
-            "sent padding"
-        );
+        let (sent, _) = connection.dequeue_outgoing_rtp(at(60), &mut packets_to_send);
+
+        assert!(sent, "sent padding");
         assert_eq!(1, packets_to_send.len(), "has padding");
         let (buf, addr) = &packets_to_send[0];
         assert_eq!(client_addr, *addr);
@@ -1923,7 +1950,7 @@ mod connection_tests {
 
             let encrypted_rtp = new_encrypted_rtp(seqnum, Some(seqnum), &encrypt, sent);
             let unencrypted_rtp = decrypt_rtp(&encrypted_rtp, &encrypt);
-            connection.send_or_enqueue_rtp(unencrypted_rtp, &mut vec![], &mut vec![], sent);
+            connection.send_or_enqueue_rtp(unencrypted_rtp, &mut vec![], sent);
 
             let mut acks = rtp::ControlPacket::serialize_and_encrypt_acks(
                 RTCP_SENDER_SSRC,
