@@ -643,7 +643,7 @@ impl CandidateSelector {
             self.selected_candidate = None;
             self.make_candidate_selection(Instant::now());
         } else if self.selected_candidate == Some(last_index) {
-            self.nominated_candidate = Some(index);
+            self.selected_candidate = Some(index);
         }
     }
 
@@ -1374,5 +1374,284 @@ mod tests {
             selector.borrow().selected_candidate().unwrap().address,
             client_addr2
         );
+    }
+
+    #[test]
+    fn test_remove_candidate_single_selected() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
+        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            8000,
+        ));
+
+        let time = Instant::now();
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
+
+        let mut endpoints = vec![SimulatedEndpoint::new(
+            Rc::clone(&selector),
+            client_addr1,
+            50..90,
+            0.0,
+        )];
+
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
+
+        // Send the initial ping for the first candidate. We expect the candidate to
+        // transition into the Active state and be selected.
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
+        let _ = simulator.run(Duration::from_secs(10), time);
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().selected_candidate, Some(0));
+        assert_eq!(selector.borrow().nominated_candidate, Some(0));
+        assert_eq!(selector.borrow().outbound_address(), Some(client_addr1));
+
+        selector.borrow_mut().remove_candidate(client_addr1);
+        assert_eq!(selector.borrow().selected_candidate, None);
+        assert_eq!(selector.borrow().nominated_candidate, None);
+        assert_eq!(selector.borrow().outbound_address(), None);
+    }
+
+    #[test]
+    fn test_remove_candidate_single_not_selected() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
+        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            8000,
+        ));
+
+        let time = Instant::now();
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
+
+        let mut endpoints = vec![SimulatedEndpoint::new(
+            Rc::clone(&selector),
+            client_addr1,
+            50..90,
+            0.0,
+        )];
+
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
+
+        // Send the initial ping for the first candidate. We expect the candidate to
+        // transition into the Active state and be selected.
+        simulator.send_ping_request_with_nomination(client_addr1, time, 0);
+        assert_eq!(selector.borrow().candidates[0].state, State::New);
+        assert_eq!(selector.borrow().selected_candidate, None);
+        assert_eq!(selector.borrow().nominated_candidate, Some(0));
+        assert_eq!(selector.borrow().outbound_address(), None);
+
+        selector.borrow_mut().remove_candidate(client_addr1);
+        assert_eq!(selector.borrow().selected_candidate, None);
+        assert_eq!(selector.borrow().nominated_candidate, None);
+        assert_eq!(selector.borrow().outbound_address(), None);
+    }
+
+    #[test]
+    fn test_remove_candidate_selected_front() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
+        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            8000,
+        ));
+        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            8001,
+        ));
+
+        let time = Instant::now();
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
+
+        let mut endpoints = vec![
+            SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0),
+            SimulatedEndpoint::new(Rc::clone(&selector), client_addr2, 50..90, 0.0),
+        ];
+
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
+
+        // Send the initial ping for the first candidate. We expect the candidate to
+        // transition into the Active state and be selected.
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
+        let time = simulator.run(Duration::from_secs(10), time);
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().selected_candidate, Some(0));
+
+        // Send the initial ping for the second candidate. We expect the candidate to
+        // transition into the Active state and be selected.
+        simulator.send_ping_request_with_nomination(client_addr2, time, 32);
+        let time = simulator.run(Duration::from_secs(10), time);
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().candidates[1].state, State::Active);
+        assert_eq!(selector.borrow().selected_candidate, Some(1));
+
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
+        let _ = simulator.run(Duration::from_secs(10), time);
+        assert_eq!(selector.borrow().selected_candidate, Some(0));
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().candidates[1].state, State::Active);
+        assert_eq!(selector.borrow().outbound_address(), Some(client_addr1));
+        assert_eq!(selector.borrow().nominated_candidate, Some(0));
+
+        selector.borrow_mut().remove_candidate(client_addr1);
+        assert_eq!(selector.borrow().selected_candidate, Some(0));
+        assert_eq!(selector.borrow().outbound_address(), Some(client_addr2));
+        // Actually, we did nominate client_addr2, but client_addr1 was nominated afterward
+        assert_eq!(selector.borrow().nominated_candidate, None);
+    }
+
+    #[test]
+    fn test_remove_candidate_selected_back() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
+        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            8000,
+        ));
+        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            8001,
+        ));
+
+        let time = Instant::now();
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
+
+        let mut endpoints = vec![
+            SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0),
+            SimulatedEndpoint::new(Rc::clone(&selector), client_addr2, 50..90, 0.0),
+        ];
+
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
+
+        // Send the initial ping for the first candidate. We expect the candidate to
+        // transition into the Active state and be selected.
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
+        let time = simulator.run(Duration::from_secs(10), time);
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().selected_candidate, Some(0));
+
+        // Send the initial ping for the second candidate. We expect the candidate to
+        // transition into the Active state and be selected.
+        simulator.send_ping_request_with_nomination(client_addr2, time, 32);
+        let _ = simulator.run(Duration::from_secs(10), time);
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().candidates[1].state, State::Active);
+        assert_eq!(selector.borrow().selected_candidate, Some(1));
+        assert_eq!(selector.borrow().outbound_address(), Some(client_addr2));
+        assert_eq!(selector.borrow().nominated_candidate, Some(1));
+
+        selector.borrow_mut().remove_candidate(client_addr2);
+        assert_eq!(selector.borrow().selected_candidate, Some(0));
+        assert_eq!(selector.borrow().outbound_address(), Some(client_addr1));
+        // Actually, we did nominate client_addr1, but client_addr2 was nominated afterward
+        assert_eq!(selector.borrow().nominated_candidate, None);
+    }
+
+    #[test]
+    fn test_remove_candidate_unselected_front() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
+        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            8000,
+        ));
+        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            8001,
+        ));
+
+        let time = Instant::now();
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
+
+        let mut endpoints = vec![
+            SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0),
+            SimulatedEndpoint::new(Rc::clone(&selector), client_addr2, 50..90, 0.0),
+        ];
+
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
+
+        // Send the initial ping for the first candidate. We expect the candidate to
+        // transition into the Active state and be selected.
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
+        let time = simulator.run(Duration::from_secs(10), time);
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().selected_candidate, Some(0));
+
+        // Send the initial ping for the second candidate. We expect the candidate to
+        // transition into the Active state and be selected.
+        simulator.send_ping_request_with_nomination(client_addr2, time, 32);
+        let _ = simulator.run(Duration::from_secs(10), time);
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().candidates[1].state, State::Active);
+        assert_eq!(selector.borrow().selected_candidate, Some(1));
+
+        assert_eq!(selector.borrow().selected_candidate, Some(1));
+        assert_eq!(selector.borrow().outbound_address(), Some(client_addr2));
+        assert_eq!(selector.borrow().nominated_candidate, Some(1));
+
+        selector.borrow_mut().remove_candidate(client_addr1);
+        assert_eq!(selector.borrow().selected_candidate, Some(0));
+        assert_eq!(selector.borrow().outbound_address(), Some(client_addr2));
+        assert_eq!(selector.borrow().nominated_candidate, Some(0));
+    }
+
+    #[test]
+    fn test_remove_candidate_unselected_back() {
+        const PING_PERIOD: Duration = Duration::from_secs(1);
+        const TICK_PERIOD: Duration = Duration::from_millis(100);
+
+        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            8000,
+        ));
+        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            8001,
+        ));
+
+        let time = Instant::now();
+        let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
+
+        let mut endpoints = vec![
+            SimulatedEndpoint::new(Rc::clone(&selector), client_addr1, 50..90, 0.0),
+            SimulatedEndpoint::new(Rc::clone(&selector), client_addr2, 50..90, 0.0),
+        ];
+
+        let mut simulator = Simulator::new(Rc::clone(&selector), &mut endpoints, TICK_PERIOD);
+
+        // Send the initial ping for the first candidate. We expect the candidate to
+        // transition into the Active state and be selected.
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
+        let time = simulator.run(Duration::from_secs(10), time);
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().selected_candidate, Some(0));
+
+        // Send the initial ping for the second candidate. We expect the candidate to
+        // transition into the Active state and be selected.
+        simulator.send_ping_request_with_nomination(client_addr2, time, 32);
+        let time = simulator.run(Duration::from_secs(10), time);
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().candidates[1].state, State::Active);
+        assert_eq!(selector.borrow().selected_candidate, Some(1));
+
+        simulator.send_ping_request_with_nomination(client_addr1, time, 32);
+        let _ = simulator.run(Duration::from_secs(10), time);
+        assert_eq!(selector.borrow().selected_candidate, Some(0));
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().candidates[1].state, State::Active);
+        assert_eq!(selector.borrow().outbound_address(), Some(client_addr1));
+        assert_eq!(selector.borrow().nominated_candidate, Some(0));
+
+        selector.borrow_mut().remove_candidate(client_addr2);
+
+        assert_eq!(selector.borrow().selected_candidate, Some(0));
+        assert_eq!(selector.borrow().candidates[0].state, State::Active);
+        assert_eq!(selector.borrow().outbound_address(), Some(client_addr1));
+        assert_eq!(selector.borrow().nominated_candidate, Some(0));
     }
 }
