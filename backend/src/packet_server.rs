@@ -136,7 +136,6 @@ pub async fn start(
         local_addr_tls,
         tls_config,
         num_threads,
-        tick_interval,
     )?;
     let packet_handler_state_for_tick = packet_handler_state.clone();
     let packet_handler_state_for_stats = packet_handler_state.clone();

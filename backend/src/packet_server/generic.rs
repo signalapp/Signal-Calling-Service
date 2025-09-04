@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::Result;
-use calling_common::{Duration, Instant};
+use calling_common::Instant;
 use core_affinity::CoreId;
 use log::*;
 use metrics::{metric_config::TimingOptions, *};
@@ -45,7 +45,6 @@ impl PacketServerState {
         _local_addr_tls: Option<SocketAddr>,
         _tls_config: Option<Arc<ServerConfig>>,
         num_threads: usize,
-        _tick_interval: Duration,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             socket: UdpSocket::bind(local_addr_udp)?,
@@ -111,7 +110,7 @@ impl PacketServerState {
                             Err(SfuError::Leave) => {
                                 let connection = connection.clone();
                                 drop(read_lock);
-                                self.remove_connection(&connection, Instant::now());
+                                self.remove_connection(&connection);
                                 (vec![], vec![])
                             }
                             Err(_) => (vec![], vec![]),
@@ -219,18 +218,13 @@ impl PacketServerState {
         Ok(())
     }
 
-    pub fn remove_connection(&self, connection: &Arc<Connection>, now: Instant) {
+    pub fn remove_connection(&self, connection: &Arc<Connection>) {
         for locator in connection.all_addrs().iter() {
-            self.remove_candidate(connection, locator, now);
+            self.remove_candidate(connection, locator);
         }
     }
 
-    pub fn remove_candidate(
-        &self,
-        connection: &Arc<Connection>,
-        locator: &SocketLocator,
-        _now: Instant,
-    ) {
+    pub fn remove_candidate(&self, connection: &Arc<Connection>, locator: &SocketLocator) {
         let mut write_lock = self.connection_map.write();
         if connection.has_candidate(*locator) {
             warn!("candidate came back during tick processing");

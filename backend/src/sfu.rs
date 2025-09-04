@@ -1181,14 +1181,14 @@ impl Sfu {
                         self.connections.remove_connection(connection_id);
                         connection.close();
                         if let Some(packet_server) = self.packet_server.lock().as_ref() {
-                            packet_server.remove_connection(&connection, now);
+                            packet_server.remove_connection(&connection);
                         }
                     }
                     connection::TickOutput::Active(dead_candidates) => {
                         // Don't remove the connection; it's still active!
                         for candidate in dead_candidates {
                             if let Some(packet_server) = self.packet_server.lock().as_ref() {
-                                packet_server.remove_candidate(&connection, &candidate, now)
+                                packet_server.remove_candidate(&connection, &candidate)
                             }
                         }
 
