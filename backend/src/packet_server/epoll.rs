@@ -924,7 +924,7 @@ impl PacketServerState {
                 error!("connection state new in send_packet, addr {:?}", addr);
             }
             ConnectionState::NotYetConnected => {
-                error!("unknown connection in send_packet, addr {:?}", addr);
+                event!("calling.epoll.socket_error.write_to_unknown_addr");
             }
         }
     }
