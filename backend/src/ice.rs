@@ -1142,7 +1142,7 @@ mod tests {
     #[test]
     fn test_response_creation_and_parsing() {
         let pwd = b"some interesting password";
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8080);
         let response = StunPacketBuilder::new_binding_response(&TransactionId::new())
             .set_xor_mapped_address(&addr)
             .set_mapped_address(&addr)

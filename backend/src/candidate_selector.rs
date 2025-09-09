@@ -936,7 +936,7 @@ mod tests {
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             8000,
         ));
 
@@ -977,7 +977,7 @@ mod tests {
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             8000,
         ));
 
@@ -1043,7 +1043,7 @@ mod tests {
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             8000,
         ));
 
@@ -1081,11 +1081,11 @@ mod tests {
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             8000,
         ));
         let client_addr2 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
             8000,
         ));
 
@@ -1136,11 +1136,11 @@ mod tests {
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             8000,
         ));
         let client_addr2 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
             8000,
         ));
 
@@ -1189,7 +1189,7 @@ mod tests {
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             8000,
         ));
 
@@ -1270,11 +1270,11 @@ mod tests {
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
         let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             8000,
         ));
         let client_addr2 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             8001,
         ));
 
