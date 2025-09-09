@@ -662,7 +662,7 @@ mod tests {
     };
 
     use calling_common::{Duration, Instant};
-    use rand::Rng;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
 
     use super::{CandidateSelector, Config, RttEstimator, ScoringValues, PING_MAX_RETRANSMITS};
     use crate::{
@@ -720,6 +720,7 @@ mod tests {
         packet_loss_percentage: f64,
         current_ping: Option<PacketToSend>,
         current_ping_response_time: Option<Instant>,
+        rnd: StdRng,
     }
 
     impl SimulatedEndpoint {
@@ -739,11 +740,12 @@ mod tests {
                 packet_loss_percentage,
                 current_ping: None,
                 current_ping_response_time: None,
+                rnd: StdRng::seed_from_u64(42),
             }
         }
 
-        fn should_drop_packet(&self) -> bool {
-            rand::thread_rng().gen_bool(self.packet_loss_percentage)
+        fn should_drop_packet(&mut self) -> bool {
+            self.rnd.gen_bool(self.packet_loss_percentage)
         }
 
         fn generate_rtt(&self) -> Duration {
