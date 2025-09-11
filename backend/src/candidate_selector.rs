@@ -394,12 +394,12 @@ impl CandidateSelector {
                 score,
                 self.candidates.len(),
             );
-            if selected.is_none() {
-                event!("calling.sfu.candidate_selector.no_output_address");
-            } else if self.had_selected_candidate {
-                event!("calling.sfu.ice.outgoing_addr_switch");
-            } else {
-                self.had_selected_candidate = true;
+            if selected.is_some() {
+                if self.had_selected_candidate {
+                    event!("calling.sfu.ice.outgoing_addr_switch");
+                } else {
+                    self.had_selected_candidate = true;
+                }
             }
         }
     }
@@ -642,6 +642,9 @@ impl CandidateSelector {
         if self.selected_candidate == Some(index) {
             self.selected_candidate = None;
             self.make_candidate_selection(Instant::now());
+            if self.selected_candidate.is_none() {
+                event!("calling.sfu.candidate_selector.no_output_address");
+            }
         } else if self.selected_candidate == Some(last_index) {
             self.selected_candidate = Some(index);
         }
