@@ -14,6 +14,7 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
     - uses: actions/checkout@v4
     - run: rustup toolchain install $(cat rust-toolchain) --profile minimal --component clippy
+    - run: rustup toolchain install stable --profile minimal --component clippy
     - run: rustup toolchain install nightly --profile minimal --component rustfmt
     - run: shellcheck **/*.sh
     - name: Environment
