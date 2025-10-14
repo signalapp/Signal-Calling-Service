@@ -201,10 +201,6 @@ fn handle_packet_connected(
         sender_address
     );
 
-    sampling_histogram!("calling.udp_server.incoming_packet.size_bytes", || {
-        incoming_packet.len()
-    });
-
     let result = sfu.handle_packet_connected(connection, sender_address, incoming_packet);
 
     match result {
@@ -265,11 +261,6 @@ fn handle_packet_unconnected(
         "received packet of {} bytes from {}",
         incoming_packet.len(),
         sender_address
-    );
-
-    sampling_histogram!(
-        "calling.udp_server.incoming_packet.unconnected.size_bytes",
-        || { incoming_packet.len() }
     );
 
     match sfu.handle_packet_unconnected(sender_address, incoming_packet) {

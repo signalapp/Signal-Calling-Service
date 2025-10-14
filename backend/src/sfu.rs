@@ -404,7 +404,6 @@ impl Sfu {
         let mut calls_persisting_approved_users = ValueMap::with_capacity(CALL_TAG_VALUES.len());
 
         let mut call_size = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
-        let mut call_size_squared = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
         let mut call_age_minutes = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
         let mut call_size_above_one = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
         let mut call_size_squared_above_one = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
@@ -428,10 +427,6 @@ impl Sfu {
                 .or_default()
                 .add_assign(clients as f32);
             call_size.entry(tags).or_default().push(clients);
-            call_size_squared
-                .entry(tags)
-                .or_default()
-                .push(clients_squared);
             call_age_minutes
                 .entry(tags)
                 .or_default()
@@ -464,7 +459,6 @@ impl Sfu {
             }
         }
         histograms.insert("calling.sfu.call_size", call_size);
-        histograms.insert("calling.sfu.call_size.squared", call_size_squared);
         histograms.insert("calling.sfu.call_age_minutes", call_age_minutes);
         histograms.insert("calling.sfu.call_size.above_one", call_size_above_one);
         histograms.insert(

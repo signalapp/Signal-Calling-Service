@@ -231,40 +231,6 @@ impl<E: EventSink> Client<E> {
         self.send(data);
     }
 
-    /// Send a timer value.
-    pub fn timer(&mut self, metric: &str, milliseconds: f64) {
-        self.timer_with_tags::<&str>(metric, milliseconds, None);
-    }
-
-    /// Send a timer value.
-    pub fn timer_with_tags<T: AsRef<str>>(
-        &mut self,
-        metric: &str,
-        milliseconds: f64,
-        tags: TagsRef<T>,
-    ) {
-        let data = self.prepare_with_tags(format!("{}:{}|ms", metric, milliseconds), tags);
-        self.send(data);
-    }
-
-    /// Send a timer value at a specified sample rate in 0..1 range.
-    pub fn timer_at_rate(&mut self, metric: &str, milliseconds: f64, rate: f64) {
-        self.timer_at_rate_with_tags::<&str>(metric, milliseconds, rate, None);
-    }
-
-    /// Send a timer value at a specified sample rate in 0..1 range.
-    pub fn timer_at_rate_with_tags<T: AsRef<str>>(
-        &mut self,
-        metric: &str,
-        milliseconds: f64,
-        rate: f64,
-        tags: TagsRef<T>,
-    ) {
-        let data =
-            self.prepare_with_tags(format!("{}:{}|ms|@{}", metric, milliseconds, rate), tags);
-        self.send(data);
-    }
-
     fn prepare<T: AsRef<str>>(&self, data: T) -> String {
         if self.prefix.is_empty() {
             data.as_ref().to_string()
@@ -312,34 +278,6 @@ impl<E: EventSink> Client<E> {
             prefix: self.prefix.clone(),
             constant_tags: self.constant_tags.clone(),
         }
-    }
-
-    /// Send a histogram value.
-    pub fn histogram(&mut self, metric: &str, value: f64) {
-        self.histogram_with_tags::<&str>(metric, value, None);
-    }
-
-    /// Send a histogram value.
-    pub fn histogram_with_tags<T: AsRef<str>>(
-        &mut self,
-        metric: &str,
-        value: f64,
-        tags: TagsRef<T>,
-    ) {
-        let data = self.prepare_with_tags(format!("{}:{}|h", metric, value), tags);
-        self.send(data);
-    }
-
-    /// Send a histogram value at a specified sample rate in 0..1 range.
-    pub fn histogram_at_rate<T: AsRef<str>>(
-        &mut self,
-        metric: &str,
-        value: f64,
-        rate: f64,
-        tags: TagsRef<T>,
-    ) {
-        let data = self.prepare_with_tags(format!("{}:{}|h|@{}", metric, value, rate), tags);
-        self.send(data);
     }
 
     /// Send a distribution value.
@@ -558,82 +496,6 @@ mod test {
     }
 
     #[test]
-    fn sending_timer() {
-        let mut server = MockServer::new();
-        let mut client = Client::new(server.new_port(), "myapp", None);
-
-        client.timer("metric", 21.39);
-
-        assert_eq!("myapp.metric:21.39|ms", server.read_packet());
-        server.expect_no_more_packets();
-    }
-
-    #[test]
-    fn sending_timer_at_rate() {
-        let mut server = MockServer::new();
-        let mut client = Client::new(server.new_port(), "myapp", None);
-
-        client.timer_at_rate("metric", 21.39, 0.123);
-
-        assert_eq!("myapp.metric:21.39|ms|@0.123", server.read_packet());
-        server.expect_no_more_packets();
-    }
-
-    #[test]
-    fn sending_histogram() {
-        let mut server = MockServer::new();
-        let mut client = Client::new(server.new_port(), "myapp", None);
-
-        // without tags
-        client.histogram("metric", 9.1);
-        assert_eq!("myapp.metric:9.1|h", server.read_packet());
-        server.expect_no_more_packets();
-
-        // with tags
-        client.histogram_at_rate("metric", 9.1, 0.2, Some(&vec!["tag1", "tag2:test"]));
-        assert_eq!(
-            "myapp.metric:9.1|h|@0.2|#tag1,tag2:test",
-            server.read_packet()
-        );
-        server.expect_no_more_packets();
-    }
-
-    #[test]
-    fn sending_histogram_with_constant_tags() {
-        let mut server = MockServer::new();
-        let mut client = Client::new(
-            server.new_port(),
-            "myapp",
-            Some(vec!["tag1common", "tag2common:test"]),
-        );
-
-        // without tags
-        client.histogram("metric", 9.1);
-        assert_eq!(
-            "myapp.metric:9.1|h|#tag1common,tag2common:test",
-            server.read_packet()
-        );
-        server.expect_no_more_packets();
-
-        // with tags
-        let tags = Some(vec!["tag1", "tag2:test"]);
-        client.histogram_with_tags("metric", 9.1, tags.as_ref());
-        assert_eq!(
-            "myapp.metric:9.1|h|#tag1common,tag2common:test,tag1,tag2:test",
-            server.read_packet()
-        );
-        server.expect_no_more_packets();
-
-        // repeat
-        client.histogram_at_rate("metric", 19.12, 0.2, tags.as_ref());
-        assert_eq!(
-            "myapp.metric:19.12|h|@0.2|#tag1common,tag2common:test,tag1,tag2:test",
-            server.read_packet()
-        );
-        server.expect_no_more_packets();
-    }
-
-    #[test]
     fn sending_distribution() {
         let mut server = MockServer::new();
         let mut client = Client::new(server.new_port(), "myapp", None);
@@ -698,18 +560,6 @@ mod test {
         drop(pipeline);
 
         assert_eq!("myapp.metric:9.1|g", server.read_packet());
-        server.expect_no_more_packets();
-    }
-
-    #[test]
-    fn pipeline_sending_histogram() {
-        let mut server = MockServer::new();
-        let mut client = Client::new(server.new_port(), "myapp", None);
-        let mut pipeline = client.pipeline();
-        pipeline.histogram("metric", 9.1);
-        drop(pipeline);
-
-        assert_eq!("myapp.metric:9.1|h", server.read_packet());
         server.expect_no_more_packets();
     }
 

@@ -254,7 +254,7 @@ impl Endpoint {
                     header.ssrc,
                     delta
                 );
-                sampling_histogram!("calling.srtp.seqnum_drop.old", || delta.try_into().unwrap());
+                event!("calling.srtp.seqnum_drop.old");
                 return None;
             }
             SequenceNumberReuse::NotUsedBefore => {

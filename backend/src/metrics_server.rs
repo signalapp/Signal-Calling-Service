@@ -208,12 +208,6 @@ impl DatadogPipeline<'_> {
         };
 
         for (value, frequency) in histogram_report.histogram.iter() {
-            self.timer_at_rate_with_tags(
-                name,
-                *value as f64 * factor,
-                1f64 / (*frequency as f64),
-                tags,
-            );
             self.distribution_at_rate(
                 name,
                 *value as f64 * factor,

@@ -128,72 +128,13 @@ async fn metrics(
     // Get the method, path, user_agent, and frontend here to avoid cloning the whole
     // request before next.run() consumes it.
     let method = req.method().clone();
-    let method_str = req.method().as_str().to_lowercase();
     let path = get_request_path(&req).to_owned();
     let user_agent = get_user_agent(&req)?.to_string();
     let call_type = guess_call_type(&req);
 
-    let tag = if path == "/v1/call-link" || path.starts_with("/v1/call-link/") {
-        "call_links.v1"
-    } else if path.starts_with("/v2/") {
-        "v2"
-    } else {
-        "unknown"
-    };
-
     let response = next.run(req).await;
 
     let latency = start.elapsed();
-
-    let mut api_metrics = frontend.api_metrics.lock();
-
-    let _ = api_metrics
-        .counts
-        .entry(format!("calling.frontend.api.{}.{}", tag, method_str))
-        .or_default()
-        .entry(None)
-        .and_modify(|value| *value = value.saturating_add(1))
-        .or_insert(1);
-
-    let _ = api_metrics
-        .counts
-        .entry(format!(
-            "calling.frontend.api.{}.{}.{}",
-            tag,
-            method_str,
-            response.status().as_str()
-        ))
-        .or_default()
-        .entry(None)
-        .and_modify(|value| *value = value.saturating_add(1))
-        .or_insert(1);
-
-    if method_str == "put" {
-        // We only collect user_agent metrics for PUT (i.e. join).
-        let _ = api_metrics
-            .counts
-            .entry(format!(
-                "calling.frontend.api.{}.{}.user_agent.{}",
-                tag,
-                method_str,
-                user_agent_event_string(&user_agent)
-            ))
-            .or_default()
-            .entry(None)
-            .and_modify(|value| *value = value.saturating_add(1))
-            .or_insert(1);
-    }
-
-    api_metrics
-        .latencies
-        .entry(format!(
-            "calling.frontend.api.{}.{}.latency",
-            tag, method_str
-        ))
-        .or_default()
-        .entry(None)
-        .or_default()
-        .push(latency.as_micros() as u64);
 
     let mut tags = vec![
         format!("http_path:{path}"),
@@ -206,6 +147,7 @@ async fn metrics(
     }
     let tags = Some(tags);
 
+    let mut api_metrics = frontend.api_metrics.lock();
     api_metrics
         .latencies
         .entry("calling.frontend.api.latency".to_owned())
