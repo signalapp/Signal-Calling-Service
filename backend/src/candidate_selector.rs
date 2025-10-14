@@ -155,6 +155,7 @@ pub struct Candidate {
     rtt_estimator: RttEstimator,
     state: State,
     ping_transaction_id: Option<TransactionId>,
+    ping_previous_transaction_id: Option<TransactionId>,
     ping_sent_time: Instant,
     ping_retransmit_count: u32,
     ping_next_send_time: Instant,
@@ -181,6 +182,7 @@ impl Candidate {
             state: State::New,
             remote_priority: 0,
             ping_transaction_id: None,
+            ping_previous_transaction_id: None,
             ping_sent_time: now,
             ping_retransmit_count: 0,
             ping_next_send_time: now,
@@ -272,6 +274,12 @@ impl Candidate {
         transaction_id: TransactionId,
         now: Instant,
     ) -> Result<(), Error> {
+        // Ignore responses to retransmits.
+        if let Some(tid) = self.ping_previous_transaction_id.as_ref() {
+            if *tid == transaction_id {
+                return Ok(());
+            }
+        }
         match &self.ping_transaction_id {
             None => return Err(Error::ReceivedUnexpectedResponse),
             Some(tid) if *tid != transaction_id => {
@@ -284,7 +292,7 @@ impl Candidate {
             self.state = State::Active;
         }
         // The transaction is over.
-        self.ping_transaction_id = None;
+        self.ping_previous_transaction_id = self.ping_transaction_id.take();
         self.last_update_time = now;
 
         // It is possible that this response is a response to a retransmit.
