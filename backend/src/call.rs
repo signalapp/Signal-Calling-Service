@@ -13,13 +13,15 @@ use std::{
 
 use bincode::Options;
 use calling_common::{
-    CallType, ClientStatus, DataRate, DataRateTracker, DemuxId, Duration, Instant, PixelSize,
-    RoomId, SignalUserAgent, SystemTime, VideoHeight,
+    rate_limit, CallType, ClientStatus, DataRate, DataRateTracker, DemuxId, Duration, Instant,
+    PixelSize, RoomId, SignalUserAgent, SystemTime, VideoHeight,
 };
+use governor::Quota;
 use hex::ToHex;
 use log::*;
 use metrics::metric_config::Timer;
 use mrp::{self, MrpReceiveError, MrpStream};
+use nonzero_ext::nonzero;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use prost::Message;
@@ -45,6 +47,7 @@ use metrics::{metric_config::StaticStrTagsRef, *};
 use crate::{
     endorsements::{CallEndorsementIssuer, CallSendEndorsements, EndorsementIssuer},
     protos::{
+        device_to_sfu,
         sfu_to_device::{DeviceJoinedOrLeft, Speaker},
         DeviceToSfu, SfuToDevice,
     },
@@ -1361,7 +1364,7 @@ impl CallInner {
             .ok_or(Error::UnknownDemuxId(sender_demux_id))?
             .mrp_stream;
         let ready_protos = if let Some(header) = proto.mrp_header.as_ref() {
-            match sender_mrp_stream.receive(&header.into(), proto) {
+            match sender_mrp_stream.receive_and_merge(&header.into(), proto) {
                 Ok(ready_protos) => ready_protos,
                 Err(e) => {
                     // received a malformed header, drop packet
@@ -1374,120 +1377,152 @@ impl CallInner {
             vec![proto]
         };
 
-        // Snapshot this so we can get a mutable reference to the sender.
-        let default_requested_max_send_rate = call_info.default_requested_max_send_rate;
-
+        let mut packets = vec![];
         for proto in ready_protos {
-            let sender = self
-                .find_client_mut(sender_demux_id)
-                .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
-            // And snapshot this so we can drop 'sender' after processing video requests.
-            let sender_is_admin = sender.is_admin;
-            // The client resends this periodically, so we don't want to do anything
-            // if it didn't change.
-            if proto.video_request != sender.video_request_proto {
-                if let Some(video_request_proto) = proto.video_request {
-                    sender.requested_height_by_demux_id = video_request_proto
-                        .requests
-                        .iter()
-                        .filter_map(|request| {
-                            let raw_height = request.height?;
-                            let height = VideoHeight::from(raw_height as u16);
-
-                            if let Some(raw_demux_id) = request.demux_id {
-                                let demux_id = DemuxId::try_from(raw_demux_id).ok()?;
-                                Some((demux_id, height))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    sender.requested_max_send_rate = video_request_proto
-                        .max_kbps
-                        .map(|kbps| DataRate::from_kbps(kbps as u64))
-                        .unwrap_or(default_requested_max_send_rate);
-                    sender.active_speaker_height = video_request_proto
-                        .active_speaker_height
-                        .map(|height| height as u16)
-                        .unwrap_or(0);
-                    sender.video_request_proto = Some(video_request_proto);
-                    // We reallocate immediately to make a more pleasant expereience for the user
-                    // (no extra delay for selecting a higher resolution or requesting a new max send rate)
-                    let target_send_rate = sender.target_send_rate;
-                    let min_target_send_rate = sender.min_target_send_rate();
-                    self.allocate_video_layers(
-                        sender_demux_id,
-                        target_send_rate,
-                        min_target_send_rate,
-                        now,
-                    );
-                }
-            }
-
-            if !proto.approve.is_empty()
-                || !proto.deny.is_empty()
-                || !proto.remove.is_empty()
-                || !proto.block.is_empty()
-            {
-                if sender_is_admin {
-                    fn record_malformed_admin_action() {
-                        event!("calling.call.handle_rtp.malformed_admin_action");
-                    }
-
-                    for action in proto.approve {
-                        if let Some(demux_id) = action
-                            .target_demux_id
-                            .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
-                        {
-                            self.approve_pending_client(demux_id, call_info, now);
-                        } else {
-                            record_malformed_admin_action();
-                        }
-                    }
-
-                    for action in proto.deny {
-                        if let Some(demux_id) = action
-                            .target_demux_id
-                            .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
-                        {
-                            self.deny_pending_client(demux_id, call_info, now);
-                        } else {
-                            record_malformed_admin_action();
-                        }
-                    }
-
-                    for action in proto.remove {
-                        if let Some(demux_id) = action
-                            .target_demux_id
-                            .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
-                        {
-                            self.force_remove_client(demux_id, call_info, now);
-                        } else {
-                            record_malformed_admin_action();
-                        }
-                    }
-
-                    for action in proto.block {
-                        if let Some(demux_id) = action
-                            .target_demux_id
-                            .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
-                        {
-                            self.block_client(demux_id, call_info, now);
-                        } else {
-                            record_malformed_admin_action();
-                        }
-                    }
-                } else {
-                    event!("calling.call.handle_rtp.non_admin_sent_admin_action");
-                }
-            }
-
-            if let Some(raise_hand) = proto.raise_hand {
-                self.handle_raise_hand(now, raise_hand, sender_demux_id);
+            if let Some(content) = proto.content {
+                let decoded = DeviceToSfu::decode(content.as_slice())
+                    .map_err(|_| Error::InvalidClientToServerProtobuf)?;
+                packets.extend(self.handle_device_to_sfu(
+                    decoded,
+                    sender_demux_id,
+                    call_info,
+                    now,
+                )?);
+            } else {
+                packets.extend(self.handle_device_to_sfu_inner(
+                    proto,
+                    sender_demux_id,
+                    call_info,
+                    now,
+                )?);
             }
         }
 
-        // There's nothing to forward
+        Ok(packets)
+    }
+
+    fn handle_device_to_sfu_inner(
+        &mut self,
+        proto: protos::DeviceToSfu,
+        sender_demux_id: DemuxId,
+        call_info: &CallInfo,
+        now: Instant,
+    ) -> Result<Vec<RtpToSend>, Error> {
+        // Snapshot this so we can get a mutable reference to the sender.
+        let default_requested_max_send_rate = call_info.default_requested_max_send_rate;
+
+        let sender = self
+            .find_client_mut(sender_demux_id)
+            .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
+        // And snapshot this so we can drop 'sender' after processing video requests.
+        let sender_is_admin = sender.is_admin;
+        // The client resends this periodically, so we don't want to do anything
+        // if it didn't change.
+        if proto.video_request != sender.video_request_proto {
+            if let Some(video_request_proto) = proto.video_request {
+                sender.requested_height_by_demux_id = video_request_proto
+                    .requests
+                    .iter()
+                    .filter_map(|request| {
+                        let raw_height = request.height?;
+                        let height = VideoHeight::from(raw_height as u16);
+
+                        if let Some(raw_demux_id) = request.demux_id {
+                            let demux_id = DemuxId::try_from(raw_demux_id).ok()?;
+                            Some((demux_id, height))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                sender.requested_max_send_rate = video_request_proto
+                    .max_kbps
+                    .map(|kbps| DataRate::from_kbps(kbps as u64))
+                    .unwrap_or(default_requested_max_send_rate);
+                sender.active_speaker_height = video_request_proto
+                    .active_speaker_height
+                    .map(|height| height as u16)
+                    .unwrap_or(0);
+                sender.video_request_proto = Some(video_request_proto);
+                // We reallocate immediately to make a more pleasant expereience for the user
+                // (no extra delay for selecting a higher resolution or requesting a new max send rate)
+                let target_send_rate = sender.target_send_rate;
+                let min_target_send_rate = sender.min_target_send_rate();
+                self.allocate_video_layers(
+                    sender_demux_id,
+                    target_send_rate,
+                    min_target_send_rate,
+                    now,
+                );
+            }
+        }
+
+        if !proto.approve.is_empty()
+            || !proto.deny.is_empty()
+            || !proto.remove.is_empty()
+            || !proto.block.is_empty()
+        {
+            if sender_is_admin {
+                fn record_malformed_admin_action() {
+                    event!("calling.call.handle_rtp.malformed_admin_action");
+                }
+
+                for action in proto.approve {
+                    if let Some(demux_id) = action
+                        .target_demux_id
+                        .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
+                    {
+                        self.approve_pending_client(demux_id, call_info, now);
+                    } else {
+                        record_malformed_admin_action();
+                    }
+                }
+
+                for action in proto.deny {
+                    if let Some(demux_id) = action
+                        .target_demux_id
+                        .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
+                    {
+                        self.deny_pending_client(demux_id, call_info, now);
+                    } else {
+                        record_malformed_admin_action();
+                    }
+                }
+
+                for action in proto.remove {
+                    if let Some(demux_id) = action
+                        .target_demux_id
+                        .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
+                    {
+                        self.force_remove_client(demux_id, call_info, now);
+                    } else {
+                        record_malformed_admin_action();
+                    }
+                }
+
+                for action in proto.block {
+                    if let Some(demux_id) = action
+                        .target_demux_id
+                        .and_then(|demux_id| DemuxId::try_from(demux_id).ok())
+                    {
+                        self.block_client(demux_id, call_info, now);
+                    } else {
+                        record_malformed_admin_action();
+                    }
+                }
+            } else {
+                event!("calling.call.handle_rtp.non_admin_sent_admin_action");
+            }
+        }
+
+        if let Some(raise_hand) = proto.raise_hand {
+            self.handle_raise_hand(now, raise_hand, sender_demux_id);
+        }
+
+        if let Some(stats_report) = proto.stats {
+            self.handle_stats_report(call_info, sender_demux_id, stats_report);
+        }
+
         Ok(vec![])
     }
 
@@ -1558,6 +1593,63 @@ impl CallInner {
             }
         }
         Ok(rtp_to_send)
+    }
+
+    fn handle_stats_report(
+        &self,
+        call_info: &CallInfo,
+        reporter_demux_id: DemuxId,
+        stats_report: device_to_sfu::StatsReport,
+    ) {
+        use device_to_sfu::client_error::{DecryptionError, Error};
+
+        value_histogram!(
+            "call.client.stats.errors.report_error_count",
+            stats_report.client_errors.len()
+        );
+
+        for client_error in &stats_report.client_errors {
+            let Some(client_error) = client_error.error else {
+                continue;
+            };
+
+            match client_error {
+                Error::Decryption(DecryptionError {
+                    sender_demux_id: Some(_),
+                    start_ts: Some(start_ts),
+                    last_ts: Some(last_ts),
+                    count: Some(count),
+                }) => {
+                    let count = count as usize;
+                    let duration = last_ts.saturating_sub(start_ts) as usize;
+                    let rate = count.checked_div(duration).unwrap_or(count);
+
+                    value_histogram!("call.client.stats.errors.decryption.packet_count", count);
+                    value_histogram!(
+                        "call.client.stats.errors.decryption.packet_count_rate",
+                        rate
+                    );
+                    value_histogram!("call.client.stats.errors.decryption.duration", duration);
+                }
+                _ => {
+                    // ignore invalid reports
+                    continue;
+                }
+            }
+        }
+
+        rate_limit!(Quota::per_minute(nonzero!(10u32)), {
+            if let Ok(report_json) = serde_json::to_value(stats_report) {
+                info!(
+                    "stats_report call_id: {}, reporter_demux_id: {}, {}",
+                    call_info.loggable_call_id,
+                    reporter_demux_id.as_u32(),
+                    report_json
+                );
+            } else {
+                event!("call.client.stats.bad_report");
+            }
+        });
     }
 
     /// Update state that only needs to be updated regularly, such as
@@ -2258,7 +2350,7 @@ impl CallInner {
                     &mut client.next_server_to_client_data_rtp_seqnum,
                 );
                 rtp_to_send.push((client_demux_id, update_rtp));
-                Ok(unwrapped_now + MRP_SEND_TIMEOUT_INTERVAL.into())
+                Ok((now + MRP_SEND_TIMEOUT_INTERVAL).into())
             });
             value_histogram!(
                 "calling.backend.client.sfu_to_device.send_buffer.size",
@@ -2278,7 +2370,6 @@ impl CallInner {
         mut update: protos::SfuToDevice,
         now: Instant,
     ) -> Vec<RtpToSend> {
-        let unwrapped_now: std::time::Instant = now.into();
         let serialized = update.encode_to_vec();
         if serialized.is_empty() {
             return vec![];
@@ -2294,7 +2385,7 @@ impl CallInner {
                 update.mrp_header = Some(header.into());
                 let update_rtp = Self::encode_reliable_sfu_to_device(&update, next_rtp_seqnum);
                 rtp_to_send.push((demux_id, update_rtp));
-                Ok((update, unwrapped_now + MRP_SEND_TIMEOUT_INTERVAL.into()))
+                Ok((update, (now + MRP_SEND_TIMEOUT_INTERVAL).into()))
             })
         } else {
             let mut fragments = serialized.chunks(MAX_MRP_FRAGMENT_BYTE_SIZE).enumerate();
@@ -2314,7 +2405,7 @@ impl CallInner {
                     };
                     let update_rtp = Self::encode_reliable_sfu_to_device(&update, next_rtp_seqnum);
                     rtp_to_send.push((demux_id, update_rtp));
-                    Ok((update, unwrapped_now + MRP_SEND_TIMEOUT_INTERVAL.into()))
+                    Ok((update, (now + MRP_SEND_TIMEOUT_INTERVAL).into()))
                 }) {
                     break Err(e);
                 }

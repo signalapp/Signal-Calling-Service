@@ -15,6 +15,8 @@ mod data_rate;
 pub mod dynamic_config;
 mod integers;
 mod math;
+#[macro_use]
+mod macros;
 mod serialize;
 mod slice;
 mod time;

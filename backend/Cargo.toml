@@ -12,12 +12,12 @@ description = "Media forwarding server for group calls."
 license = "AGPL-3.0-only"
 
 [dependencies]
-mrp = { git = "https://github.com/signalapp/ringrtc", tag = "v2.52.1" }
+mrp = { git = "https://github.com/signalapp/ringrtc", tag = "v2.59.1" }
 calling_common = { path = "../common" }
 metrics = { path = "../metrics" }
 
 # For error handling
-anyhow = "1.0.97"
+anyhow = "1.0.99"
 thiserror = "2.0.12"
 
 # For logging and command line operations
@@ -91,6 +91,10 @@ zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.73.3" }
 bincode = "1.3.3"
 itertools = "0.14.0"
 base64 = "0.22.1"
+
+# For rate limiting
+governor = "0.10.1"
+nonzero_ext = "0.3.0"
 
 [target.'cfg(target_os="linux")'.dependencies]
 # Only currently needed for metrics (won't build on mac, see https://github.com/rust-lang/rust/issues/115149).

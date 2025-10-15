@@ -5,7 +5,11 @@
 
 fn main() {
     let protos = ["protobuf/group_call.proto"];
-    prost_build::compile_protos(&protos, &["protobuf"]).expect("Protobufs are valid");
+    let mut prost_build = prost_build::Config::new();
+    prost_build.type_attribute(".", "#[derive(::serde::Serialize)]");
+    prost_build
+        .compile_protos(&protos, &["protobuf"])
+        .expect("Protobufs are valid");
     for proto in &protos {
         println!("cargo:rerun-if-changed={}", proto);
     }

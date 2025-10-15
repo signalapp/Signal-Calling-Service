@@ -7,7 +7,10 @@ include!(concat!(env!("OUT_DIR"), "/group_call.rs"));
 
 mod extensions {
     use crate::{
-        protos::sfu_to_device::{peek_info::PeekDeviceInfo, PeekInfo},
+        protos::{
+            sfu_to_device::{peek_info::PeekDeviceInfo, PeekInfo},
+            DeviceToSfu,
+        },
         sfu::CallSignalingInfo,
     };
 
@@ -64,6 +67,30 @@ mod extensions {
                     })
                     .collect(),
                 call_link_state: None,
+            }
+        }
+    }
+
+    impl DeviceToSfu {
+        fn is_extendable(&self) -> bool {
+            self.mrp_header
+                .map(|h| h.num_packets.is_some())
+                .unwrap_or(false)
+        }
+    }
+
+    impl Extend<DeviceToSfu> for DeviceToSfu {
+        fn extend<T: IntoIterator<Item = DeviceToSfu>>(&mut self, iter: T) {
+            if self.is_extendable() {
+                if self.content.is_none() {
+                    self.content = Some(Vec::new());
+                }
+                let content = self.content.as_mut().unwrap();
+                for message in iter {
+                    if let Some(other_content) = message.content {
+                        content.extend(other_content);
+                    }
+                }
             }
         }
     }
