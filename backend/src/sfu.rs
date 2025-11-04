@@ -388,6 +388,13 @@ impl Sfu {
                 .collect()
         });
 
+        static CALL_TAG_ZERO_GAUGE: Lazy<ValueMap> = Lazy::new(|| {
+            CALL_TAG_VALUES
+                .iter()
+                .map(|(&_, call_tags)| (Some(call_tags), 0.0))
+                .collect()
+        });
+
         let (mut histograms, mut values);
 
         if let Some(server) = &*self.packet_server.lock() {
@@ -397,11 +404,11 @@ impl Sfu {
             values = HashMap::new();
         }
 
-        let mut calls_count = ValueMap::with_capacity(CALL_TAG_VALUES.len());
-        let mut calls_above_one_count = ValueMap::with_capacity(CALL_TAG_VALUES.len());
-        let mut clients_in_call_count = ValueMap::with_capacity(CALL_TAG_VALUES.len());
-        let mut clients_in_calls_above_one = ValueMap::with_capacity(CALL_TAG_VALUES.len());
-        let mut calls_persisting_approved_users = ValueMap::with_capacity(CALL_TAG_VALUES.len());
+        let mut calls_count = CALL_TAG_ZERO_GAUGE.clone();
+        let mut calls_above_one_count = CALL_TAG_ZERO_GAUGE.clone();
+        let mut clients_in_call_count = CALL_TAG_ZERO_GAUGE.clone();
+        let mut clients_in_calls_above_one = CALL_TAG_ZERO_GAUGE.clone();
+        let mut calls_persisting_approved_users = CALL_TAG_ZERO_GAUGE.clone();
 
         let mut call_size = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
         let mut call_age_minutes = HistogramMap::with_capacity(CALL_TAG_VALUES.len());
@@ -490,14 +497,13 @@ impl Sfu {
         let mut connection_outgoing_data_rate =
             HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
 
-        let mut udp_v4_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
-        let mut udp_v6_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
-        let mut tcp_v4_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
-        let mut tcp_v6_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
-        let mut tls_v4_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
-        let mut tls_v6_connections = ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
-        let mut connections_with_video_available =
-            ValueMap::with_capacity(CONNECTION_TAG_VALUES.len());
+        let mut udp_v4_connections = ValueMap::with_capacity(1);
+        let mut udp_v6_connections = ValueMap::with_capacity(1);
+        let mut tcp_v4_connections = ValueMap::with_capacity(1);
+        let mut tcp_v6_connections = ValueMap::with_capacity(1);
+        let mut tls_v4_connections = ValueMap::with_capacity(1);
+        let mut tls_v6_connections = ValueMap::with_capacity(1);
+        let mut connections_with_video_available = CALL_TAG_ZERO_GAUGE.clone();
 
         let now = Instant::now();
 
@@ -551,7 +557,7 @@ impl Sfu {
                     AddressType::TlsV4 => &mut tls_v4_connections,
                     AddressType::TlsV6 => &mut tls_v6_connections,
                 }
-                .entry(tags)
+                .entry(None)
                 .or_default()
                 .add_assign(1f32);
             }
