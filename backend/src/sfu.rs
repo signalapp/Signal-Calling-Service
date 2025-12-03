@@ -497,12 +497,12 @@ impl Sfu {
         let mut connection_outgoing_data_rate =
             HistogramMap::with_capacity(CONNECTION_TAG_VALUES.len());
 
-        let mut udp_v4_connections = ValueMap::with_capacity(1);
-        let mut udp_v6_connections = ValueMap::with_capacity(1);
-        let mut tcp_v4_connections = ValueMap::with_capacity(1);
-        let mut tcp_v6_connections = ValueMap::with_capacity(1);
-        let mut tls_v4_connections = ValueMap::with_capacity(1);
-        let mut tls_v6_connections = ValueMap::with_capacity(1);
+        let mut udp_v4_connections = ValueMap::from([(None, 0f32)]);
+        let mut udp_v6_connections = ValueMap::from([(None, 0f32)]);
+        let mut tcp_v4_connections = ValueMap::from([(None, 0f32)]);
+        let mut tcp_v6_connections = ValueMap::from([(None, 0f32)]);
+        let mut tls_v4_connections = ValueMap::from([(None, 0f32)]);
+        let mut tls_v6_connections = ValueMap::from([(None, 0f32)]);
         let mut connections_with_video_available = CALL_TAG_ZERO_GAUGE.clone();
 
         let now = Instant::now();
