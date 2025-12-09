@@ -83,7 +83,6 @@ rlimit = "0.10.2"
 
 # For TLS sockets in epoll backend
 rustls = "0.23.23"
-rustls-pemfile = "2.2.0"
 
 # For endorsements
 libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.73.3" }

@@ -8,7 +8,6 @@ extern crate log;
 
 use std::{
     fs::File,
-    io::BufReader,
     sync::{atomic::AtomicBool, Arc},
 };
 
@@ -21,7 +20,12 @@ use clap::Parser;
 use env_logger::Env;
 use once_cell::sync::Lazy;
 use rlimit::increase_nofile_limit;
-use rustls::{server::NoServerSessionStorage, version::TLS13, ServerConfig};
+use rustls::{
+    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
+    server::NoServerSessionStorage,
+    version::TLS13,
+    ServerConfig,
+};
 use tokio::{
     runtime,
     signal::unix::{signal, SignalKind},
@@ -132,26 +136,27 @@ fn main() -> Result<()> {
         && config.certificate_file_path.is_some()
         && config.key_file_path.is_some()
     {
-        let certificates = rustls_pemfile::certs(&mut BufReader::new(&mut File::open(
+        let certificates = CertificateDer::pem_reader_iter(&mut File::open(
             config
                 .certificate_file_path
                 .as_ref()
                 .expect("must have a certificate file path"),
-        )?))
+        )?)
         .collect::<Result<Vec<_>, _>>()?;
-        let private_key = rustls_pemfile::private_key(&mut BufReader::new(&mut File::open(
+        let private_key = PrivateKeyDer::from_pem_reader(&mut File::open(
             config
                 .key_file_path
                 .as_ref()
                 .expect("must have a key file path"),
-        )?))?;
+        )?)
+        .expect("must have a private key");
 
         let mut tls_config = ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_protocol_versions(&[&TLS13])?
         .with_no_client_auth()
-        .with_single_cert(certificates, private_key.expect("must have a private key"))?;
+        .with_single_cert(certificates, private_key)?;
         // Explicitly disable TLS sessions and tickets, WebRTC does not use them, so don't waste bandwidth
         tls_config.session_storage = Arc::new(NoServerSessionStorage {});
         tls_config.max_early_data_size = 0;
