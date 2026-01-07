@@ -311,7 +311,7 @@ impl DynamoDb {
                 info!("Using endpoint for DynamodDB testing: {}", endpoint);
 
                 let aws_config = Config::builder()
-                    .behavior_version(BehaviorVersion::v2025_01_17())
+                    .behavior_version(BehaviorVersion::v2025_08_07())
                     .credentials_provider(Credentials::from_keys(KEY, PASSWORD, None))
                     .endpoint_url(endpoint)
                     .sleep_impl(sleep_impl)
@@ -337,7 +337,7 @@ impl DynamoDb {
                     .connect_timeout(core::time::Duration::from_millis(3100))
                     .build();
 
-                let aws_config = aws_config::defaults(BehaviorVersion::v2025_01_17())
+                let aws_config = aws_config::defaults(BehaviorVersion::v2025_08_07())
                     .sleep_impl(sleep_impl)
                     .retry_config(retry_config)
                     .timeout_config(timeout_config)

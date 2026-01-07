@@ -16,31 +16,31 @@ calling_common = { path = "../common" }
 metrics = { path = "../metrics" }
 
 # For error handling
-anyhow = "1.0.97"
-thiserror = "2.0.12"
+anyhow = "1.0.100"
+thiserror = "2.0.17"
 
 # For logging and command line operations
-log = "0.4.26"
-env_logger = "0.11.7"
-clap = { version = "4.5.31", features = ["derive"] }
+log = "0.4.29"
+env_logger = "0.11.8"
+clap = { version = "4.5.53", features = ["derive"] }
 
 # For runtime and threading
-tokio = { version = "1.44.0", features = ["rt-multi-thread", "signal", "macros"] }
-once_cell = "1.21.0"
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "signal", "macros"] }
+once_cell = "1.21.3"
 futures = "0.3.31"
-async-trait = "0.1.87"
+async-trait = "0.1.89"
 
 # For general conversions
 base64 = "0.22.1"
 hex = { version = "0.4.3", features = ["serde"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-serde_with = { version = "3.12.0", features = ["base64"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+serde_with = { version = "3.16.1", features = ["base64"] }
 urlencoding = "2.1.3"
 
 # For common and authentication
 rand = "0.8.5"
-sha2 = "0.10.8"
+sha2 = "0.10.9"
 hmac = "0.12.1"
 subtle = "2.6.1"
 
@@ -48,32 +48,32 @@ subtle = "2.6.1"
 axum = { version = "0.7.9" }
 axum-extra = { version = "0.9.6", default-features = false, features = ["typed-header", "tracing"] }
 tower = { version = "0.5.2" , features = ["util"]}
-reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.26", default-features = false, features = ["json", "rustls-tls"] }
 mime = "0.3.17"
-http = "1.2.0"
+http = "1.4.0"
 
 # For storage access to DynamoDB
-aws-types = "1.3.5"
-aws-credential-types = { version = "1.2.1", features = [
+aws-types = "1.3.11"
+aws-credential-types = { version = "1.2.11", features = [
   "hardcoded-credentials",
 ] }
-aws-smithy-types = "1.3.0"
-aws-smithy-async = "1.2.5"
-aws-config = "1.5.18"
-aws-sdk-dynamodb = "1.67.0"
-serde_dynamo = { version = "4.2.14", features = ["aws-sdk-dynamodb+1"] }
+aws-smithy-types = "1.3.5"
+aws-smithy-async = "1.2.7"
+aws-config = "1.8.12"
+aws-sdk-dynamodb = "1.101.0"
+serde_dynamo = { version = "4.3.0", features = ["aws-sdk-dynamodb+1"] }
 
 # For metrics
-parking_lot = "0.12.3"
+parking_lot = "0.12.5"
 psutil = { version = "3.3.0", default-features = false, features = ["process"] }
 rlimit = "0.10.2"
 
 # For the call link credentials
 bincode = "1.3.3"
-zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.73.3" }
+zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.86.7" }
 
 [dev-dependencies]
-libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.73.3" }
+libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.86.7" }
 mockall = "0.13.1"
 lazy_static = "1.5.0"
 
