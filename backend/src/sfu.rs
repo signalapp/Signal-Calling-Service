@@ -698,7 +698,6 @@ impl Sfu {
                     .config
                     .persist_approval_for_all_users_who_join,
                 endorsement_issuer: self.endorsement_issuer.clone(),
-                drop_fragmentable_updates: true,
             })
         });
 
