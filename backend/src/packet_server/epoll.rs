@@ -342,19 +342,16 @@ impl PacketServerState {
                     &timer,
                     EpollEvent::new(EpollFlags::EPOLLIN, timer_fd as u64),
                 ) {
-                    Ok(()) => (Some(timer), timer_fd),
+                    Ok(()) => (timer, timer_fd),
                     Err(e) => {
-                        error!("timerfd couldn't be added to epoll, {}, coercing timer waits to milliseconds", e);
-                        (None, -1)
+                        error!("timerfd couldn't be added to epoll, {}", e);
+                        return Err(e.into());
                     }
                 }
             }
             Err(e) => {
-                error!(
-                    "timerfd creation failed, {}, coercing timer waits to milliseconds",
-                    e
-                );
-                (None, -1)
+                error!("timerfd creation failed, {}", e);
+                return Err(e.into());
             }
         };
 
@@ -388,7 +385,7 @@ impl PacketServerState {
                     let socket = new_pinned_tls_socket.as_ref().expect("socket must exist");
                     self.accept_tcp(socket, &epoll, true);
                 } else if socket_fd == timer_fd {
-                    let _ = timer.as_ref().expect("timer must exist").wait();
+                    let _ = timer.wait();
                 } else {
                     // Not a special fd, must be a client fd
                     let is_error = event.events().contains(EpollFlags::EPOLLERR);
@@ -767,7 +764,7 @@ impl PacketServerState {
     fn process_timer(
         &self,
         timer_heap: &Mutex<TimerHeap<Arc<Connection>>>,
-        timer: &Option<TimerFd>,
+        timer: &TimerFd,
         sfu: &Arc<Sfu>,
     ) -> isize {
         let mut dequeues_left = MAX_EPOLL_EVENTS;
@@ -794,14 +791,17 @@ impl PacketServerState {
                             timer_heap.schedule(time, connection);
                         }
                     } else {
-                        if let Some(timer) = &timer {
-                            timer_heap.set_timer(timer, now);
-                        }
                         break;
                     }
                 }
                 TimerHeapNextResult::WaitForever => {
-                    break;
+                    if !dequeues_to_schedule.is_empty() {
+                        for (time, connection) in dequeues_to_schedule.drain(..) {
+                            timer_heap.schedule(time, connection);
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -810,11 +810,14 @@ impl PacketServerState {
             self.send_packet(&buf, addr)
         }
 
-        if !dequeues_to_schedule.is_empty() {
+        {
             let mut timer_heap = timer_heap.lock();
-            for (time, connection) in dequeues_to_schedule {
-                timer_heap.schedule(time, connection);
+            if !dequeues_to_schedule.is_empty() {
+                for (time, connection) in dequeues_to_schedule {
+                    timer_heap.schedule(time, connection);
+                }
             }
+            timer_heap.set_timer(timer, Instant::now());
         }
 
         if dequeues_left == 0 {
