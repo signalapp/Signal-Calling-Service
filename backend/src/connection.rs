@@ -1239,6 +1239,7 @@ mod connection_tests {
             default_requested_max_send_rate,
             persist_approval_for_all_users_who_join: false,
             endorsement_issuer: None,
+            drop_fragmentable_updates: false,
         })
     }
 
