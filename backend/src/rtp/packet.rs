@@ -41,6 +41,10 @@ const RTP_EXT_ID_DEPENDENCY_DESCRIPTOR: u8 = 6;
 const RTP_EXT_ID_VIDEO_LAYERS_ALLOCATION: u8 = 14;
 const RTP_DEPENDENCY_DESCRIPTOR_MIN_LEN: usize = 3;
 
+// Used when processing video layers allocation RTP extension data.
+// Limits the temporal layer rate to a sane value.
+const MAX_TEMPORAL_LAYER_RATE: DataRate = DataRate::from_kbps(10000);
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum HeaderExtensionsProfile {
     /// https://www.rfc-editor.org/rfc/rfc8285#section-4.2
@@ -540,7 +544,16 @@ fn read_video_layers_allocation(bytes: &[u8]) -> Result<Vec<RtpStreamAllocation>
     for allocation in allocations.iter_mut() {
         for spatial_layer in allocation.iter_mut() {
             for temporal_layer in &mut spatial_layer.temporal_layer_rates {
-                *temporal_layer = DataRate::from_kbps(data.read_leb128()?.try_into()?);
+                let rate_kbps = data.read_leb128()?;
+                if rate_kbps > MAX_TEMPORAL_LAYER_RATE.as_kbps() as u128 {
+                    event!("calling.rtp.video_layers_allocation.max_temporal_layer_rate");
+                    return Err(anyhow!(
+                        "temporal layer rate of {} Kbps exceeds {}",
+                        rate_kbps,
+                        MAX_TEMPORAL_LAYER_RATE
+                    ));
+                }
+                *temporal_layer = DataRate::from_kbps(rate_kbps.try_into()?);
             }
         }
     }
