@@ -107,6 +107,10 @@ impl Default for LevelsTracker {
 }
 
 impl LevelsTracker {
+    const HIGH: Level = 70;
+    const LOW: Level = 40;
+    const CHUNK_SIZE: usize = 5;
+
     pub fn push(&mut self, mut sample: Level, ts: Instant) {
         self.floor = self.floor.update(sample);
         let threshold = self.floor.get().unwrap_or(0) + 10;
@@ -123,14 +127,21 @@ impl LevelsTracker {
         self.levels.iter().rev().copied()
     }
 
-    fn latest(&self) -> Option<Level> {
-        self.iter_latest_first().next().map(|(level, _)| level)
+    fn latest(&self, now: Instant) -> Option<Level> {
+        self.iter_latest_first()
+            .next()
+            .map(|(level, ts)| Self::time_decay_level(level, ts, now))
     }
 
-    fn count_latest_chunk_above_threshold(&self, n: usize, threshold: Level) -> usize {
+    fn count_latest_chunk_above_threshold(
+        &self,
+        n: usize,
+        threshold: Level,
+        now: Instant,
+    ) -> usize {
         self.iter_latest_first()
             .take(n)
-            .filter(|(level, _)| *level > threshold)
+            .filter(|(level, ts)| Self::time_decay_level(*level, *ts, now) > threshold)
             .count()
     }
 
@@ -140,6 +151,7 @@ impl LevelsTracker {
         &self,
         chunk_size: usize,
         threshold: Level,
+        now: Instant,
     ) -> (usize, Vec<(bool, Instant)>) {
         let (active_count, chunks_ratings) = self
             .iter_latest_first()
@@ -149,7 +161,9 @@ impl LevelsTracker {
             .filter(|chunk| chunk.len() == chunk_size)
             .map(|chunk| {
                 (
-                    chunk.iter().all(|(level, _)| *level > threshold),
+                    chunk
+                        .iter()
+                        .all(|(level, ts)| Self::time_decay_level(*level, *ts, now) > threshold),
                     chunk.last().unwrap_or(&(0, Instant::now())).1,
                 )
             })
@@ -168,25 +182,21 @@ impl LevelsTracker {
         most_active: &LevelsTracker,
         now: Instant,
     ) -> (bool, Instant) {
-        const HIGH: Level = 70;
-        const LOW: Level = 40;
-        const CHUNK_SIZE: usize = 5;
-
-        if self.latest().unwrap_or(0) <= LOW {
+        if self.latest(now).unwrap_or(0) <= Self::LOW {
             trace!(
                 "The contender isn't active enough (latest sample = {:?})",
-                self.latest()
+                self.latest(now)
             );
             return (false, now);
         }
 
-        if most_active.latest().unwrap_or(0) >= LOW {
+        if most_active.latest(now).unwrap_or(0) >= Self::LOW {
             trace!("The most active is still active (latest sample)");
             return (false, now);
         }
 
         let most_active_first_chunk =
-            most_active.count_latest_chunk_above_threshold(CHUNK_SIZE, HIGH);
+            most_active.count_latest_chunk_above_threshold(Self::CHUNK_SIZE, Self::HIGH, now);
 
         if most_active_first_chunk > 0 {
             trace!("The most active is still active (latest chunk)");
@@ -194,18 +204,19 @@ impl LevelsTracker {
             return (false, now);
         }
 
-        let self_first_chunk = self.count_latest_chunk_above_threshold(CHUNK_SIZE, HIGH);
+        let self_first_chunk =
+            self.count_latest_chunk_above_threshold(Self::CHUNK_SIZE, Self::HIGH, now);
 
-        if self_first_chunk < CHUNK_SIZE {
+        if self_first_chunk < Self::CHUNK_SIZE {
             trace!("The contender isn't active enough (latest chunk)");
             // We're not active enough.
             return (false, now);
         }
 
         let (self_high_chunk_count, self_high_chunks) =
-            self.map_chunks_above_threshold(CHUNK_SIZE, HIGH);
+            self.map_chunks_above_threshold(Self::CHUNK_SIZE, Self::HIGH, now);
         let (most_active_high_chunks_count, most_active_high_chunks) =
-            most_active.map_chunks_above_threshold(CHUNK_SIZE, HIGH);
+            most_active.map_chunks_above_threshold(Self::CHUNK_SIZE, Self::HIGH, now);
 
         if self_high_chunk_count <= most_active_high_chunks_count {
             trace!("The most active is more active (number of active chunk)");
@@ -252,6 +263,25 @@ impl LevelsTracker {
             .1;
 
         (true, self_became_more_active_ts)
+    }
+
+    fn time_decay_level(level: u8, received_ts: Instant, now: Instant) -> u8 {
+        const MIN_WINDOW_MS: u32 = 1 << 10; // 1024
+        const MAX_WINDOW_MS: u32 = 1 << 12; // 4096
+        const MIN_WINDOW: Duration = Duration::from_millis(MIN_WINDOW_MS as u64);
+        const MAX_WINDOW: Duration = Duration::from_millis(MAX_WINDOW_MS as u64);
+
+        let elapsed = now.saturating_duration_since(received_ts);
+        if elapsed < MIN_WINDOW {
+            level
+        } else if elapsed > MAX_WINDOW {
+            0
+        } else {
+            let elapsed_ms = (1000u32
+                .saturating_mul(u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX)))
+                + elapsed.subsec_millis();
+            ((level as u32 * (MAX_WINDOW_MS - elapsed_ms)) >> 12) as u8
+        }
     }
 }
 
@@ -350,15 +380,94 @@ mod test {
         }
         assert!(!contender.more_active_than_most_active(&most_active, now).0);
 
-        assert_eq!(1, most_active.map_chunks_above_threshold(5, 70).0);
-        assert_eq!(1, contender.map_chunks_above_threshold(5, 70).0);
+        assert_eq!(1, most_active.map_chunks_above_threshold(5, 70, now).0);
+        assert_eq!(1, contender.map_chunks_above_threshold(5, 70, now).0);
 
         // But it is possible with enough activity
         for _ in 0..5 {
             contender.push(80, now);
         }
-        assert_eq!(1, most_active.map_chunks_above_threshold(5, 70).0);
-        assert_eq!(2, contender.map_chunks_above_threshold(5, 70).0);
+        assert_eq!(1, most_active.map_chunks_above_threshold(5, 70, now).0);
+        assert_eq!(2, contender.map_chunks_above_threshold(5, 70, now).0);
         assert!(contender.more_active_than_most_active(&most_active, now).0);
+
+        let no_decay = now + Duration::from_millis(1023);
+        assert_eq!(1, most_active.map_chunks_above_threshold(5, 70, no_decay).0);
+        assert_eq!(2, contender.map_chunks_above_threshold(5, 70, no_decay).0);
+        assert!(
+            contender
+                .more_active_than_most_active(&most_active, no_decay)
+                .0
+        );
+
+        let half_decayed = now + Duration::from_millis(2048);
+        assert_eq!(
+            0,
+            most_active
+                .map_chunks_above_threshold(5, 70, half_decayed)
+                .0
+        );
+        assert_eq!(
+            0,
+            contender.map_chunks_above_threshold(5, 70, half_decayed).0
+        );
+        assert!(
+            !contender
+                .more_active_than_most_active(&most_active, half_decayed)
+                .0
+        );
+
+        let full_decay = now + Duration::from_millis(4096);
+        assert_eq!(
+            0,
+            most_active.map_chunks_above_threshold(5, 70, full_decay).0
+        );
+        assert_eq!(0, contender.map_chunks_above_threshold(5, 70, full_decay).0);
+        assert!(
+            !contender
+                .more_active_than_most_active(&most_active, full_decay)
+                .0,
+            "all of contender's samples have decayed, most_active wins by default"
+        );
+
+        for _ in 0..5 {
+            most_active.push(80, full_decay);
+        }
+        assert!(
+            most_active
+                .more_active_than_most_active(&contender, full_decay)
+                .0,
+            "most_active has at least one chunk not decayed, contender is full decayed"
+        );
+    }
+
+    #[test]
+    fn test_decay_rounding_error() {
+        let now = Instant::now();
+        let elapsed = |delta: u64| now + Duration::from_millis(delta);
+
+        assert_eq!(
+            100,
+            LevelsTracker::time_decay_level(100, elapsed(0), elapsed(1023)),
+            "should not decay until 1024ms have elasped"
+        );
+
+        for level in (LevelsTracker::LOW..=127).step_by(5) {
+            let decayed = LevelsTracker::time_decay_level(level, elapsed(0), elapsed(1024));
+            let percent = decayed as f32 / level as f32;
+            assert!(
+                percent >= 0.73,
+                "ideal using floating point is 0.75, enforcing no more than 2% error"
+            );
+        }
+
+        for level in (LevelsTracker::LOW..=127).step_by(5) {
+            let decayed = LevelsTracker::time_decay_level(level, elapsed(0), elapsed(3700));
+            let percent = decayed as f32 / level as f32;
+            assert!(
+                percent >= 0.07,
+                "ideal using floating point is 0.10, enforcing no more than 3% error"
+            );
+        }
     }
 }

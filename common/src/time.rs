@@ -249,6 +249,10 @@ impl Duration {
         self.0.subsec_nanos()
     }
 
+    pub const fn subsec_millis(&self) -> u32 {
+        self.0.subsec_millis()
+    }
+
     pub fn checked_sub(&self, rhs: Duration) -> Option<Duration> {
         self.0.checked_sub(rhs.0).map(Duration)
     }
