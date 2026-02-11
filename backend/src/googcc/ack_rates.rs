@@ -5,7 +5,7 @@
 
 use std::cmp::max;
 
-use calling_common::{AbsDiff, DataRate, DataSize, Duration, Square};
+use calling_common::{DataRate, DataSize, Duration};
 
 use crate::transportcc::{Ack, RemoteInstant};
 
@@ -18,14 +18,14 @@ enum AckGroupSizeAccumulator {
     Some {
         accumulated_size: DataSize,
         accumulated_duration: Duration,
-        target_ack_group_duration: Duration,
         last_arrival: RemoteInstant,
     },
 }
 
 impl AckGroupSizeAccumulator {
-    const INITIAL_DURATION: Duration = Duration::from_millis(500);
-    const SUBSEQUENT_DURATION: Duration = Duration::from_millis(150);
+    const TARGET_DURATION: Duration = Duration::from_millis(50);
+    const MINIMUM_DURATION: Duration = Duration::from_millis(10);
+    const MAXIMUM_INTERPACKET_DURATION: Duration = Duration::from_millis(150);
 
     fn next(&mut self, ack: &Ack) -> Option<(DataSize, Duration)> {
         match self {
@@ -33,7 +33,6 @@ impl AckGroupSizeAccumulator {
                 *self = Self::Some {
                     accumulated_size: ack.size,
                     accumulated_duration: Duration::ZERO,
-                    target_ack_group_duration: Self::INITIAL_DURATION,
                     last_arrival: ack.arrival,
                 };
                 None
@@ -41,7 +40,6 @@ impl AckGroupSizeAccumulator {
             Self::Some {
                 accumulated_size,
                 accumulated_duration,
-                target_ack_group_duration,
                 last_arrival,
             } => {
                 let ret = if ack.arrival < *last_arrival {
@@ -52,24 +50,21 @@ impl AckGroupSizeAccumulator {
                 } else {
                     let arrival_delta = ack.arrival.saturating_duration_since(*last_arrival);
                     *accumulated_duration += arrival_delta;
-                    if arrival_delta > *target_ack_group_duration {
+                    if arrival_delta > Self::MAXIMUM_INTERPACKET_DURATION {
                         // Reset if it's been too long since we've received an ACK
                         *accumulated_size = DataSize::ZERO;
                         *accumulated_duration = Duration::from_micros(
                             accumulated_duration.as_micros() as u64
-                                % target_ack_group_duration.as_micros() as u64,
+                                % Self::TARGET_DURATION.as_micros() as u64,
                         );
                         None
-                    } else if accumulated_duration >= target_ack_group_duration {
-                        let ret = Some((*accumulated_size, *target_ack_group_duration));
+                    } else if *accumulated_duration >= Self::TARGET_DURATION {
+                        let ret = Some((*accumulated_size, Self::TARGET_DURATION));
 
                         // Use what's "left over" for the next group.
-                        *accumulated_size = Default::default();
+                        *accumulated_size = DataSize::ZERO;
                         *accumulated_duration =
-                            accumulated_duration.saturating_sub(*target_ack_group_duration);
-
-                        // Now that we have a group, we can use a smaller window.
-                        *target_ack_group_duration = Self::SUBSEQUENT_DURATION;
+                            accumulated_duration.saturating_sub(Self::TARGET_DURATION);
 
                         ret
                     } else {
@@ -82,6 +77,35 @@ impl AckGroupSizeAccumulator {
                 ret
             }
         }
+    }
+
+    fn residue(&mut self) -> Option<(DataSize, Duration)> {
+        match self {
+            Self::None => None,
+            Self::Some {
+                accumulated_size,
+                accumulated_duration,
+                ..
+            } => {
+                if *accumulated_duration > Self::MINIMUM_DURATION {
+                    let ret = Some((*accumulated_size, *accumulated_duration));
+
+                    *accumulated_size = DataSize::ZERO;
+                    *accumulated_duration = Duration::ZERO;
+                    ret
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn use_acks(&mut self, acks: &[Ack]) -> Vec<(DataSize, Duration)> {
+        let mut ret: Vec<_> = acks.iter().filter_map(|ack| self.next(ack)).collect();
+        if let Some(residue) = self.residue() {
+            ret.push(residue);
+        }
+        ret
     }
 }
 
@@ -120,7 +144,27 @@ mod accumulate_acked_sizes_tests {
         let ack_groups = ack_groups_from_arrival_durations(0..1000);
         assert_eq!(
             ack_groups,
-            [(5000, 500), (1500, 150), (1500, 150), (1500, 150)]
+            [
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50)
+            ]
         );
     }
 
@@ -130,16 +174,25 @@ mod accumulate_acked_sizes_tests {
         assert_eq!(
             ack_groups,
             [
-                (50, 500),
-                (20, 150),
-                (10, 150),
-                (20, 150),
-                (10, 150),
-                (20, 150),
-                (10, 150),
-                (20, 150),
-                (10, 150),
-                (20, 150)
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50),
+                (10, 50)
             ]
         );
     }
@@ -149,7 +202,27 @@ mod accumulate_acked_sizes_tests {
         let ack_groups = ack_groups_from_arrival_durations(1000..2000);
         assert_eq!(
             ack_groups,
-            [(5000, 500), (1500, 150), (1500, 150), (1500, 150)],
+            [
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50),
+                (500, 50)
+            ]
         );
     }
 
@@ -157,24 +230,23 @@ mod accumulate_acked_sizes_tests {
     fn reset_on_out_of_order() {
         let ack_groups = ack_groups_from_arrival_durations(vec![
             0, 1, // reset!
-            0, // first group
-            500, 600, // reset!
-            550, 600, 650, // second group
-            700, // force the second group to be emitted
+            0, 50, // first group
+            60, 65, // reset!
+            55, 60, 75,  // second group
+            105, // force the second group to be emitted
         ]);
-        assert_eq!(ack_groups, [(10, 500), (30, 150)]);
+        assert_eq!(ack_groups, [(10, 50), (30, 50)]);
     }
 
     #[test]
     fn reset_on_large_gap() {
         let ack_groups = ack_groups_from_arrival_durations(vec![
             0, // reset!
-            1001, 1500, // first group
+            1001, 1500, // reset!
             // reset!
-            1651, 1700, 1750, // second group
-            1800, // force the second group to be emitted
+            1651, 1700, // first group
         ]);
-        assert_eq!(ack_groups, [(10, 500), (30, 150)]);
+        assert_eq!(ack_groups, [(10, 50)]);
     }
 }
 
@@ -184,29 +256,25 @@ enum AckRateEstimator {
     None,
     Some {
         estimate: DataRate,
-        variance: f64,
     },
 }
 
 impl AckRateEstimator {
-    // TODO: Make initial variance and other variance numbers (10.0 and 5.0) below configurable
+    const WINDOW_SECONDS: f64 = 0.150;
+
     fn next(&mut self, size: DataSize, duration: Duration) -> DataRate {
         match self {
             Self::None => {
                 let estimate = calc_sample(size, duration);
-                *self = Self::Some {
-                    estimate,
-                    variance: 50.0,
-                };
+                *self = Self::Some { estimate };
                 estimate
             }
-            Self::Some { estimate, variance } => {
+            Self::Some { estimate } => {
                 let sample: DataRate = calc_sample(size, duration);
-                let sample_variance = ((sample.abs_diff(*estimate) / *estimate) * 10.0).square();
-                let pred_variance = *variance + 5.0;
-                *estimate = ((*estimate * sample_variance) + (sample * pred_variance))
-                    / (sample_variance + pred_variance);
-                *variance = (sample_variance * pred_variance) / (sample_variance + pred_variance);
+                let window_portion =
+                    (duration.as_secs_f64() / Self::WINDOW_SECONDS).clamp(0.0, 1.0);
+
+                *estimate = *estimate * (1.0 - window_portion) + sample * window_portion;
                 *estimate
             }
         }
@@ -225,6 +293,7 @@ fn calc_sample(size: DataSize, duration: Duration) -> DataRate {
 mod estimate_acked_rates_from_groups_tests {
     use std::cmp::Ordering;
 
+    use calling_common::AbsDiff;
     use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
 
     use super::*;
@@ -259,8 +328,7 @@ mod estimate_acked_rates_from_groups_tests {
         let s = estimate_acked_rates_from_groups(size_groups_from_bps(vec![
             500, 1000, 1000, 500, 2000, 2000, 2000, 2000, 2000,
         ]));
-        // These values came from running the test and seeing the output.
-        assert_eq!(s, [500, 677, 883, 687, 737, 813, 928, 1100, 1355]);
+        assert_eq!(s, [500, 1000, 1000, 500, 2000, 2000, 2000, 2000, 2000]);
     }
 
     #[test]
@@ -340,8 +408,9 @@ pub struct AckRatePipeline {
 
 impl AckRatePipeline {
     pub fn next(&mut self, acks: &[Ack]) -> Option<DataRate> {
-        acks.iter()
-            .filter_map(|ack| self.ack_group_sizes.next(ack))
+        self.ack_group_sizes
+            .use_acks(acks)
+            .into_iter()
             .map(|(data_size, duration)| self.acked_rate_estimator.next(data_size, duration))
             .last()
     }

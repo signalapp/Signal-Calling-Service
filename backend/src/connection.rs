@@ -1964,11 +1964,11 @@ mod connection_tests {
             let result = connection.handle_rtcp_packet(&mut acks, now).unwrap();
 
             let expected_new_target_send_rate = match seqnum {
-                3 => Some(501),
-                22 => Some(502),
-                23 => Some(503),
-                24 => Some(504),
-                25 => Some(505),
+                3 => Some(500),
+                22 => Some(500),
+                23 => Some(500),
+                24 => Some(500),
+                25 => Some(500),
                 _ => None,
             }
             .map(DataRate::from_kbps);
