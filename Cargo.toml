@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "130.0.0"
+version = "131.0.0"
 edition = "2021"
 
 [profile.release]
