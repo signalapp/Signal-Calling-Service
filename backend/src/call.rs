@@ -71,6 +71,9 @@ const HIGH_RES_KEY_FRAME_REQUEST_RESEND_INTERVAL: Duration = Duration::from_mill
 /// don't reallocate it more often than this.
 /// A lower value uses more CPU but makes layer switching more reactive.
 const SEND_RATE_REALLOCATION_INTERVAL: Duration = Duration::from_millis(1000);
+/// If the bandwidth estimate drops by significantly, reallocate immediately
+/// to avoid developing a large video queue
+const SEND_RATE_REALLOCATE_IMMEDIATELY_THRESHOLD: f64 = 0.9;
 /// This is how often we recaculate the active speaker.
 /// The lower the value, the more CPU we use but the more responsive
 /// active speaker switching becomes.
@@ -1821,6 +1824,19 @@ impl CallInner {
         } else if new_target_send_rate < receiver.current_generation_min_target_send_rate {
             receiver.current_generation_min_target_send_rate = new_target_send_rate;
         }
+
+        let min_target_send_rate = receiver.min_target_send_rate();
+        if receiver.allocated_send_rate * SEND_RATE_REALLOCATE_IMMEDIATELY_THRESHOLD
+            > new_target_send_rate
+        {
+            self.allocate_video_layers(
+                receiver_demux_id,
+                new_target_send_rate,
+                min_target_send_rate,
+                now,
+            );
+        }
+
         Ok(())
     }
 
