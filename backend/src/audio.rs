@@ -123,6 +123,10 @@ impl LevelsTracker {
         self.levels.push((sample, ts));
     }
 
+    pub fn iter_rev(&self) -> impl Iterator<Item = &(Level, Instant)> + '_ {
+        self.levels.iter().rev()
+    }
+
     fn iter_latest_first(&self) -> impl Iterator<Item = (Level, Instant)> + '_ {
         self.levels.iter().rev().copied()
     }

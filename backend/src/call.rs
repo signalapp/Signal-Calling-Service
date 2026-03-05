@@ -1551,8 +1551,29 @@ impl CallInner {
             time_scope_us!("calling.call.handle_rtp.audio_level");
             sender.incoming_audio_levels.push(audio_level, now);
             // Active speaker is recalculated in tick()
+            // Forward some silent packets for comfort noise and PLC before
+            // starting to drop them
             if audio_level == 0 {
-                return Ok(vec![]);
+                if sender.is_maybe_in_dtx {
+                    return Ok(vec![]);
+                }
+
+                // take an even number of packets to account for TOC + refresh
+                // check at least one second of DTX packets (>= 6) assuming two packets
+                // every 400ms interval.
+                const SILENT_PACKET_LIMIT: usize = 6;
+                let recent_audio_levels: u32 = sender
+                    .incoming_audio_levels
+                    .iter_rev()
+                    .take(SILENT_PACKET_LIMIT)
+                    .map(|(level, _)| *level as u32)
+                    .sum();
+                if recent_audio_levels == 0 {
+                    sender.is_maybe_in_dtx = true;
+                    return Ok(vec![]);
+                }
+            } else {
+                sender.is_maybe_in_dtx = false;
             }
         }
         let dependency_descriptor = if incoming_rtp.is_vp8() {
@@ -2765,6 +2786,7 @@ struct Client {
     // Updated by incoming audio packets
     incoming_audio_levels: audio::LevelsTracker,
     became_active_speaker: Option<Instant>,
+    is_maybe_in_dtx: bool,
 
     // Updated by incoming video requests
     video_request_proto: Option<protos::device_to_sfu::VideoRequestMessage>,
@@ -2856,6 +2878,7 @@ impl Client {
 
             incoming_audio_levels: audio::LevelsTracker::default(),
             became_active_speaker: None,
+            is_maybe_in_dtx: false,
 
             video_request_proto: None,
             requested_height_by_demux_id: HashMap::new(),
