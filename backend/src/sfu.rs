@@ -206,12 +206,17 @@ impl Connections {
     /// Removes a connection identified by the given connection ID. The removed connection is
     /// returned, if it exists. After a connection is removed, it is no longer possible to
     /// retrieve it using neither the connection identifier nor the associated ICE username.
-    fn remove_connection(&self, connection_id: &ConnectionId) -> Option<Arc<Connection>> {
+    fn remove_connection(
+        &self,
+        connection_id: &ConnectionId,
+        reason: &str,
+    ) -> Option<Arc<Connection>> {
         let mut maps = self.synchronized_maps.write();
         match maps.by_id.remove(connection_id) {
             Some(connection) => {
                 maps.by_ice_username
                     .remove(connection.ice_request_username());
+                info!("Removed connection {connection_id} ({reason})");
                 Some(connection)
             }
             None => None,
@@ -792,6 +797,7 @@ impl Sfu {
     }
 
     /// Remove a client from a call.
+    #[cfg(test)]
     pub fn remove_client_from_call(&self, now: Instant, call_id: CallId, demux_id: DemuxId) {
         let loggable_call_id = LoggableCallId::from(&call_id);
         let connection_id = ConnectionId::from_call_id_and_demux_id(call_id, demux_id);
@@ -807,10 +813,14 @@ impl Sfu {
                 demux_id.as_u32()
             );
 
-            call.drop_client(demux_id, now);
+            call.drop_client(demux_id, now, "Test Remove Client");
         }
 
-        if self.connections.remove_connection(&connection_id).is_some() {
+        if self
+            .connections
+            .remove_connection(&connection_id, "Test Remove Connection")
+            .is_some()
+        {
             event!("calling.sfu.close_connection.remove_client_from_call");
         }
     }
@@ -861,7 +871,8 @@ impl Sfu {
                     Err(call::Error::Leave) => {
                         incoming_connection.close();
                         event!("calling.sfu.close_connection.rtp");
-                        self.connections.remove_connection(incoming_connection_id);
+                        self.connections
+                            .remove_connection(incoming_connection_id, "RTP Leave");
                         return Err(SfuError::Leave);
                     }
                     Err(e) => return Err(SfuError::CallError(e)),
@@ -1167,10 +1178,10 @@ impl Sfu {
                 let connection_id = connection.id();
                 match connection.tick(&mut packets_to_send, now) {
                     connection::TickOutput::Inactive => {
-                        info!("dropping connection: {}", connection_id);
+                        info!("dropping inactive connection: {}", connection_id);
 
                         let call = connection.call();
-                        call.drop_client(connection_id.demux_id, now);
+                        call.drop_client(connection_id.demux_id, now, "Inactive");
 
                         if connection.had_selected_candidate() {
                             event!("calling.sfu.close_connection.inactive");
@@ -1178,7 +1189,8 @@ impl Sfu {
                             event!("calling.sfu.close_connection.no_nominee");
                         }
 
-                        self.connections.remove_connection(connection_id);
+                        self.connections
+                            .remove_connection(connection_id, "Inactive");
                         connection.close();
                         if let Some(packet_server) = self.packet_server.lock().as_ref() {
                             packet_server.remove_connection(&connection);

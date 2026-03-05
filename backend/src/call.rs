@@ -582,10 +582,10 @@ impl Call {
     }
 
     #[inline(always)]
-    pub fn drop_client(&self, demux_id: DemuxId, now: Instant) {
+    pub fn drop_client(&self, demux_id: DemuxId, now: Instant, reason: &str) {
         self.inner
             .lock()
-            .drop_client(demux_id, &self.call_info, now);
+            .drop_client(demux_id, &self.call_info, now, reason);
     }
 
     #[inline(always)]
@@ -1130,24 +1130,26 @@ impl CallInner {
         }
     }
 
-    fn drop_client(&mut self, demux_id: DemuxId, call_info: &CallInfo, now: Instant) {
+    fn drop_client(&mut self, demux_id: DemuxId, call_info: &CallInfo, now: Instant, reason: &str) {
         time_scope_us!("calling.call.drop_client");
 
         if self.remove_client(demux_id, now).is_some() {
-            debug!(
-                "call: {} dropping client {}",
+            info!(
+                "call: {} dropping client {} ({})",
                 call_info.loggable_call_id,
-                demux_id.as_u32()
+                demux_id.as_u32(),
+                reason,
             );
         } else if let Some(index) = self
             .pending_clients
             .iter()
             .position(|client| client.demux_id == demux_id)
         {
-            debug!(
-                "call: {} dropping pending client {}",
+            info!(
+                "call: {} dropping pending client {} ({})",
                 call_info.loggable_call_id,
-                demux_id.as_u32()
+                demux_id.as_u32(),
+                reason,
             );
             self.will_add_or_remove_client(now);
             self.pending_clients.swap_remove(index);
@@ -1157,9 +1159,10 @@ impl CallInner {
             .position(|client| client.demux_id == demux_id)
         {
             debug!(
-                "call: {} dropping removed client {}",
+                "call: {} dropping removed client {} ({})",
                 call_info.loggable_call_id,
-                demux_id.as_u32()
+                demux_id.as_u32(),
+                reason,
             );
             self.removed_clients.swap_remove(index);
         }
@@ -1169,8 +1172,8 @@ impl CallInner {
     // Like `drop_client`, but keeps the client around in the `removed_clients` list until they leave.
     fn force_remove_client(&mut self, demux_id: DemuxId, call_info: &CallInfo, now: Instant) {
         if let Some(client) = self.remove_client(demux_id, now) {
-            debug!(
-                "call: {} removing client {}",
+            info!(
+                "call: {} dropping client {} (Admin Remove)",
                 call_info.loggable_call_id,
                 demux_id.as_u32()
             );
@@ -1222,8 +1225,8 @@ impl CallInner {
                 calling_common::drain_filter(&mut self.clients, |client| client.user_id == user_id);
             let mut removed_demux_ids = Vec::new();
             for removed_client in removed_clients {
-                debug!(
-                    "call: {} removing blocked {}",
+                info!(
+                    "call: {} dropping client {} (Admin Block)",
                     call_info.loggable_call_id,
                     demux_id.as_u32()
                 );
@@ -1350,12 +1353,7 @@ impl CallInner {
         // and just closing the connection is safe.
         if proto.leave.is_some() {
             // "Leave" is the only message we allow from pending and removed clients.
-            info!(
-                "call: {} removing client: {} (via RTP)",
-                call_info.loggable_call_id,
-                sender_demux_id.as_u32()
-            );
-            self.drop_client(sender_demux_id, call_info, now);
+            self.drop_client(sender_demux_id, call_info, now, "RTP Leave");
             return Err(Error::Leave);
         }
 
@@ -5965,7 +5963,7 @@ mod call_tests {
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300), sys_at(300));
         assert_eq!(0, rtp_to_send.len());
 
-        call.drop_client(demux_id1, at(400));
+        call.drop_client(demux_id1, at(400), "test");
 
         let expected_update_payload_just_client2 = create_sfu_to_device(
             true,
@@ -6108,7 +6106,7 @@ mod call_tests {
             rtp_to_send
         );
 
-        call.drop_client(demux_id2, at(400));
+        call.drop_client(demux_id2, at(400), "test");
 
         let expected_update_payload_demux1 = create_sfu_to_device(
             true,
@@ -6460,7 +6458,7 @@ mod call_tests {
             rtp_to_send
         );
 
-        call.drop_client(demux_id2, at(400));
+        call.drop_client(demux_id2, at(400), "test");
 
         // Clients leaving the "removed" list don't count as participant changes,
         // so there's no update for client 1 at this tick.
