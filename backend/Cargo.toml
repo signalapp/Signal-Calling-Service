@@ -116,6 +116,7 @@ rand_distr = "0.4.3"
 [features]
 default = ["epoll"]
 epoll = ["nix"]
+load_test = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

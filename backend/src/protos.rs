@@ -9,7 +9,7 @@ mod extensions {
     use crate::{
         protos::{
             sfu_to_device::{peek_info::PeekDeviceInfo, PeekInfo},
-            DeviceToSfu,
+            DeviceToSfu, SfuToDevice,
         },
         sfu::CallSignalingInfo,
     };
@@ -81,6 +81,30 @@ mod extensions {
 
     impl Extend<DeviceToSfu> for DeviceToSfu {
         fn extend<T: IntoIterator<Item = DeviceToSfu>>(&mut self, iter: T) {
+            if self.is_extendable() {
+                if self.content.is_none() {
+                    self.content = Some(Vec::new());
+                }
+                let content = self.content.as_mut().unwrap();
+                for message in iter {
+                    if let Some(other_content) = message.content {
+                        content.extend(other_content);
+                    }
+                }
+            }
+        }
+    }
+
+    impl SfuToDevice {
+        fn is_extendable(&self) -> bool {
+            self.mrp_header
+                .map(|h| h.num_packets.is_some())
+                .unwrap_or(false)
+        }
+    }
+
+    impl Extend<SfuToDevice> for SfuToDevice {
+        fn extend<T: IntoIterator<Item = SfuToDevice>>(&mut self, iter: T) {
             if self.is_extendable() {
                 if self.content.is_none() {
                     self.content = Some(Vec::new());

@@ -22,8 +22,7 @@ use nack::*;
 pub use nack::{write_nack, Nack};
 use packet::*;
 pub use packet::{DependencyDescriptor, Header, Packet};
-use rtcp::*;
-pub use rtcp::{ControlPacket, KeyFrameRequest};
+pub use rtcp::{ControlPacket, KeyFrameRequest, *};
 pub use rtx::to_rtx_ssrc;
 use rtx::*;
 use srtp::*;
@@ -37,8 +36,8 @@ use crate::transportcc as tcc;
 const VERSION: u8 = 2;
 const PADDING_PAYLOAD_TYPE: PayloadType = 99;
 const CLIENT_SERVER_DATA_PAYLOAD_TYPE: PayloadType = 101;
-const OPUS_PAYLOAD_TYPE: PayloadType = 102;
-const VP8_PAYLOAD_TYPE: PayloadType = 108;
+pub const OPUS_PAYLOAD_TYPE: PayloadType = 102;
+pub const VP8_PAYLOAD_TYPE: PayloadType = 108;
 
 // Discard outgoing packets after this time.
 // 3 second lifetime matches WebRTC's RTX history
@@ -640,7 +639,7 @@ impl Endpoint {
 
     // Returns a new, encrypted RTCP packet.
     // TODO: Use Result instead of Option.
-    fn send_rtcp(
+    pub fn send_rtcp(
         &mut self,
         pt: u8,
         count_or_format: u8,

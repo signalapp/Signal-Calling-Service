@@ -75,6 +75,7 @@ pub struct JoinResponse {
     pub ice_pwd: String,
     pub dhe_public_key: String,
     pub conference_id: String,
+    pub call_creator: String,
     pub client_status: String,
 }
 
@@ -366,6 +367,7 @@ async fn join_conference(
                 ice_pwd: server_ice_pwd,
                 dhe_public_key: server_dhe_public_key.encode_hex(),
                 conference_id: conference_id_from_signaling_info(&signaling),
+                call_creator: signaling.creator_id.into(),
                 client_status: client_status.to_string(),
             };
 

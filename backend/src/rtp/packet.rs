@@ -277,6 +277,10 @@ impl Header {
             video_layers_allocation,
         })
     }
+
+    pub fn tcc_seqnum(&self) -> Option<tcc::TruncatedSequenceNumber> {
+        self.tcc_seqnum
+    }
 }
 
 #[derive(Debug)]
@@ -1037,7 +1041,7 @@ pub fn write_extension(id: u8, value: impl Writer) -> impl Writer {
     ([header], value)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "load_test"))]
 fn write_two_byte_extension(id: u8, value: impl Writer) -> impl Writer {
     assert_ne!(id, 0, "id must not be 0");
     let length = value.written_len();
@@ -1045,9 +1049,9 @@ fn write_two_byte_extension(id: u8, value: impl Writer) -> impl Writer {
     (header, value)
 }
 
-// Supports the subset of dependency descriptor features that the tests need.
-#[cfg(test)]
-fn write_dependency_descriptor(dependency_descriptor: DependencyDescriptor) -> Box<dyn Writer> {
+// Supports the subset of dependency descriptor features that the tests (and load_test) need.
+#[cfg(any(test, feature = "load_test"))]
+pub fn write_dependency_descriptor(dependency_descriptor: DependencyDescriptor) -> Box<dyn Writer> {
     let frame_number = dependency_descriptor.truncated_frame_number.to_be_bytes();
 
     if let Some(PixelSize { width, height }) = dependency_descriptor.resolution {
@@ -1244,6 +1248,88 @@ impl Packet<Vec<u8>> {
             video_layers_allocation: None,
             tcc_seqnum: None,
             tcc_seqnum_range: None,
+            payload_range_in_header: payload_range,
+            encrypted: false,
+            deadline: None,
+            padding_byte_count: 0,
+            is_max_seqnum: false,
+            serialized,
+        }
+    }
+
+    #[cfg(feature = "load_test")]
+    pub fn dummy_video(
+        seqnum: FullSequenceNumber,
+        ssrc: Ssrc,
+        truncated_frame_number: u16,
+        resolution: Option<PixelSize>,
+        is_key_frame: bool,
+        timestamp: TruncatedTimestamp,
+        payload: &[u8],
+    ) -> Packet<Vec<u8>> {
+        let marker = false;
+        let pt = VP8_PAYLOAD_TYPE;
+
+        let dependency_descriptor = DependencyDescriptor {
+            is_key_frame,
+            resolution: if is_key_frame { resolution } else { None },
+            truncated_frame_number,
+        };
+
+        let ((serialized, payload_range), tcc_seqnum_range) =
+            if dependency_descriptor.resolution.is_some() {
+                let extensions = (
+                    write_two_byte_extension(RTP_EXT_ID_TCC_SEQNUM, 0u16),
+                    write_dependency_descriptor(dependency_descriptor),
+                );
+
+                (
+                    Self::write_serialized(
+                        marker,
+                        pt,
+                        seqnum,
+                        timestamp,
+                        ssrc,
+                        extensions,
+                        HeaderExtensionsProfile::TwoByte,
+                        payload,
+                    ),
+                    16 + 2..16 + 2 + 2,
+                )
+            } else {
+                let extensions = (
+                    write_extension(RTP_EXT_ID_TCC_SEQNUM, 0u16),
+                    write_dependency_descriptor(dependency_descriptor),
+                );
+                (
+                    Self::write_serialized(
+                        marker,
+                        pt,
+                        seqnum,
+                        timestamp,
+                        ssrc,
+                        extensions,
+                        HeaderExtensionsProfile::OneByte,
+                        payload,
+                    ),
+                    16 + 1..16 + 1 + 2,
+                )
+            };
+
+        Self {
+            marker,
+            payload_type_in_header: pt,
+            ssrc_in_header: ssrc,
+            seqnum_in_header: seqnum,
+            seqnum_in_payload: None,
+            pending_retransmission: false,
+            timestamp,
+            video_rotation: None,
+            audio_level: None,
+            dependency_descriptor: None, // inaccurate, but this field won't be used
+            video_layers_allocation: None,
+            tcc_seqnum: Some(0),
+            tcc_seqnum_range: Some(tcc_seqnum_range),
             payload_range_in_header: payload_range,
             encrypted: false,
             deadline: None,

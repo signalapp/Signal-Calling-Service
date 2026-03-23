@@ -306,7 +306,7 @@ serde_with::serde_conv!(
     |value: String| -> Result<_, std::convert::Infallible> { Ok(value.into()) }
 );
 
-trait DemuxIdExt {
+pub trait DemuxIdExt {
     fn from_ssrc(ssrc: rtp::Ssrc) -> Self;
 }
 impl DemuxIdExt for DemuxId {
@@ -1335,7 +1335,8 @@ impl CallInner {
             time_scope_us!("calling.call.handle_rtp.client_to_server_data");
             let proto = protos::DeviceToSfu::decode(incoming_rtp.payload())
                 .map_err(|_| Error::InvalidClientToServerProtobuf)?;
-            self.handle_device_to_sfu(proto, sender_demux_id, call_info, now)
+            self.handle_device_to_sfu(proto, sender_demux_id, call_info, now)?;
+            Ok(vec![])
         } else {
             self.handle_media_rtp(sender_demux_id, incoming_rtp, now)
         }
@@ -1347,7 +1348,7 @@ impl CallInner {
         sender_demux_id: DemuxId,
         call_info: &CallInfo,
         now: Instant,
-    ) -> Result<Vec<RtpToSend>, Error> {
+    ) -> Result<(), Error> {
         // Check for "Leave" before requiring that the demux ID is valid. We allow it for
         // pending and removed clients as well, and for some random other demux ID ignoring it
         // and just closing the connection is safe.
@@ -1375,28 +1376,17 @@ impl CallInner {
             vec![proto]
         };
 
-        let mut packets = vec![];
         for proto in ready_protos {
             if let Some(content) = proto.content {
                 let decoded = DeviceToSfu::decode(content.as_slice())
                     .map_err(|_| Error::InvalidClientToServerProtobuf)?;
-                packets.extend(self.handle_device_to_sfu(
-                    decoded,
-                    sender_demux_id,
-                    call_info,
-                    now,
-                )?);
+                self.handle_device_to_sfu(decoded, sender_demux_id, call_info, now)?;
             } else {
-                packets.extend(self.handle_device_to_sfu_inner(
-                    proto,
-                    sender_demux_id,
-                    call_info,
-                    now,
-                )?);
+                self.handle_device_to_sfu_inner(proto, sender_demux_id, call_info, now)?;
             }
         }
 
-        Ok(packets)
+        Ok(())
     }
 
     fn handle_device_to_sfu_inner(
@@ -1405,7 +1395,7 @@ impl CallInner {
         sender_demux_id: DemuxId,
         call_info: &CallInfo,
         now: Instant,
-    ) -> Result<Vec<RtpToSend>, Error> {
+    ) -> Result<(), Error> {
         // Snapshot this so we can get a mutable reference to the sender.
         let default_requested_max_send_rate = call_info.default_requested_max_send_rate;
 
@@ -1521,7 +1511,7 @@ impl CallInner {
             self.handle_stats_report(call_info, sender_demux_id, stats_report);
         }
 
-        Ok(vec![])
+        Ok(())
     }
 
     fn handle_media_rtp(

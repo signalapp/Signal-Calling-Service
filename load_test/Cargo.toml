@@ -1,0 +1,32 @@
+#
+# Copyright 2019-2022 Signal Messenger, LLC
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+
+[package]
+name = "load_test"
+version.workspace = true
+authors = ["Calling Team <callingteam@signal.org>"]
+edition = "2021"
+description = "Load test for group call server."
+license = "AGPL-3.0-only"
+
+[dependencies]
+calling_backend = { path = "../backend", features = ["load_test"] }
+calling_common = { path = "../common" }
+calling_frontend = { path = "../frontend" }
+mrp = { git = "https://github.com/signalapp/ringrtc", tag = "v2.59.1" }
+
+anyhow = "1.0.97"
+hex = { version = "0.4.3", features = ["serde"] }
+log = "0.4.26"
+env_logger = "0.11.7"
+rand = "0.8.5"
+x25519-dalek = { version = "2.0.1" }
+reqwest = { version = "0.12.12", default-features = false, features =["json", "blocking"] }
+hkdf = "0.12.4"
+sha2 = "0.10.8"
+ctrlc = "3.4.7"
+prost = "0.14.1"
+byteorder = "1.5.0"
+itertools = "0.14.0"

@@ -4,7 +4,7 @@
 //
 
 pub mod call_links;
-mod v2;
+pub mod v2;
 
 use std::{
     collections::HashMap, fmt::Display, net::SocketAddr, ops::AddAssign, str::FromStr, sync::Arc,
