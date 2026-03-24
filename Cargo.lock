@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "calling_backend"
-version = "132.0.0"
+version = "133.0.0"
 dependencies = [
  "accounting-allocator",
  "aes",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "calling_frontend"
-version = "132.0.0"
+version = "133.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2380,7 +2380,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
 name = "load_test"
-version = "132.0.0"
+version = "133.0.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2454,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "132.0.0"
+version = "133.0.0"
 dependencies = [
  "http 1.4.0",
  "log",
