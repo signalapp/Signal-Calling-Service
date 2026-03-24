@@ -5,17 +5,9 @@
 
 //! Implementation of congestion control.
 
-use std::{
-    cmp::{max, min},
-    pin::Pin,
-    task::Poll,
-};
+use std::cmp::{max, min};
 
 use calling_common::{exponential_moving_average, DataRate, DataSize, Duration, Instant, Square};
-use futures::{
-    stream::{Stream, StreamExt},
-    FutureExt,
-};
 
 use crate::transportcc::Ack;
 
@@ -27,9 +19,6 @@ use delay_directions::*;
 
 mod feedback_rtts;
 use feedback_rtts::*;
-
-mod stream;
-use stream::StreamExt as OurStreamExt;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -77,12 +66,9 @@ pub struct Request {
 
 pub struct CongestionController {
     current_request: Option<Request>,
-    acks_sender1: Sender<Vec<Ack>>,
-    acks_sender2: Sender<Vec<Ack>>,
-    acks_sender3: Sender<Vec<Ack>>,
-    feedback_rtts: Pin<Box<dyn Stream<Item = Duration> + Send + Sync>>,
-    acked_rates: Pin<Box<dyn Stream<Item = DataRate> + Send + Sync>>,
-    delay_directions: Pin<Box<dyn Stream<Item = (Instant, DelayDirection)> + Send + Sync>>,
+    acked_rates: AckRatePipeline,
+    feedback_rtt: FeedbackRttEstimator,
+    delay_directions: DelayDirectionPipeline,
     calculator: TargetCalculator,
 }
 
@@ -113,24 +99,16 @@ impl CongestionController {
         //                        +----v----------v--------v----+                              |
         //                        | calculate_target_send_rates <------------------------------+
         //                        +-----------------------------+
-        let (acks_sender1, ack_reports1) = unbounded_channel_that_must_not_fail();
-        let (acks_sender2, ack_reports2) = unbounded_channel_that_must_not_fail();
-        let (acks_sender3, ack_reports3) = unbounded_channel_that_must_not_fail();
-        let feedback_rtts = estimate_feedback_rtts(ack_reports1).latest_only();
-        let acked_rates =
-            estimate_acked_rates(ack_reports2.flat_map(futures::stream::iter)).latest_only();
-        let delay_directions =
-            calculate_delay_directions(ack_reports3.flat_map(futures::stream::iter)).latest_only();
+        let feedback_rtt = FeedbackRttEstimator::new();
+        let acked_rates = AckRatePipeline::default();
+        let delay_directions = DelayDirectionPipeline::default();
         let calculator = TargetCalculator::new(config, now);
 
         Self {
             current_request: None,
-            acks_sender1,
-            acks_sender2,
-            acks_sender3,
-            feedback_rtts: Box::pin(feedback_rtts),
-            acked_rates: Box::pin(acked_rates),
-            delay_directions: Box::pin(delay_directions),
+            feedback_rtt,
+            acked_rates,
+            delay_directions,
             calculator,
         }
     }
@@ -144,28 +122,10 @@ impl CongestionController {
             return None;
         }
 
-        // TODO: See if we can get rid of these clones.
         acks.sort_by_key(|ack| ack.arrival);
-        self.acks_sender1.send(acks.clone());
-        self.acks_sender2.send(acks.clone());
-        self.acks_sender3.send(acks);
-
-        let rtt = self
-            .feedback_rtts
-            .next()
-            .now_or_never()
-            .map(|next| next.expect("stream should never end"));
-        let acked_rate = self
-            .acked_rates
-            .next()
-            .now_or_never()
-            .map(|next| next.expect("stream should never end"));
-
-        let delay_direction = self
-            .delay_directions
-            .next()
-            .now_or_never()
-            .map(|next| next.expect("stream should never end"));
+        let delay_direction = self.delay_directions.next(&acks);
+        let rtt = self.feedback_rtt.next(&acks);
+        let acked_rate = self.acked_rates.next(&acks);
 
         self.calculator
             .next(&mut self.current_request, delay_direction, rtt, acked_rate)
@@ -199,7 +159,7 @@ impl TargetCalculator {
                 // Basically uncapped until we receive a request.
                 ideal: config.max_target_send_rate,
             },
-            rtt: Duration::from_millis(100),
+            rtt: FEEDBACK_RTTS_DEFAULT,
             target_send_rate: config.initial_target_send_rate,
             target_send_rate_updated: start_time,
             config,
@@ -210,7 +170,7 @@ impl TargetCalculator {
         &mut self,
         request: &mut Option<Request>,
         delay_directions: Option<(Instant, DelayDirection)>,
-        rtt: Option<Duration>,
+        rtt: Duration,
         acked_rate: Option<DataRate>,
     ) -> Option<DataRate> {
         const MULTIPLICATIVE_INCREASE_PER_SECOND: f64 = 0.08;
@@ -222,9 +182,7 @@ impl TargetCalculator {
         const MAX_RTT_FOR_DECREASE: Duration = Duration::from_millis(200);
         const DECREASE_FROM_ACKED_RATE_MULTIPLIER: f64 = 0.85;
 
-        if let Some(rtt) = rtt {
-            self.rtt = rtt;
-        }
+        self.rtt = rtt;
 
         if let Some(acked_rate) = acked_rate {
             self.acked_rate = Some(acked_rate);
@@ -299,7 +257,7 @@ impl TargetCalculator {
                             self.target_send_rate * multiplier,
                         )
                     } else {
-                        let padded_rtt = self.rtt + ADDITIVE_INCREASE_RTT_PAD;
+                        let padded_rtt = rtt + ADDITIVE_INCREASE_RTT_PAD;
                         let increase_per_second = max(
                             MIN_ADDITIVE_INCREASE_PER_SECOND,
                             ADDITIVE_INCREASE_PER_RTT / padded_rtt,
@@ -322,7 +280,7 @@ impl TargetCalculator {
                         // We have an acked rate, so reduce based on that.
                         if (now
                             >= self.target_send_rate_updated
-                                + self.rtt.clamp(MIN_RTT_FOR_DECREASE, MAX_RTT_FOR_DECREASE))
+                                + rtt.clamp(MIN_RTT_FOR_DECREASE, MAX_RTT_FOR_DECREASE))
                             || (acked_rate <= self.target_send_rate * 0.5)
                         {
                             let mut decreased_rate =
@@ -372,61 +330,7 @@ impl TargetCalculator {
 
 #[cfg(test)]
 mod calculate_target_send_rates_tests {
-    use async_stream::stream;
-    use futures::{future::ready, pin_mut};
-    use unzip3::Unzip3;
-
     use super::*;
-
-    // stream based api was kept to retain tests, after otherwise refactoring into TargetCalculator::next()
-    fn calculate_target_send_rates(
-        config: Config,
-        start_time: Instant,
-        requests: impl Stream<Item = Request>,
-        feedback_rtts: impl Stream<Item = Duration>,
-        acked_rates: impl Stream<Item = DataRate>,
-        delay_directions: impl Stream<Item = (Instant, DelayDirection)>,
-    ) -> impl Stream<Item = DataRate> {
-        stream! {
-
-            pin_mut!(requests);
-            pin_mut!(feedback_rtts);
-            pin_mut!(acked_rates);
-            pin_mut!(delay_directions);
-
-            let mut calculator = TargetCalculator::new(config, start_time);
-
-            while let Some((now, direction)) = delay_directions.next().await {
-                let mut request = requests
-                    .next()
-                    .now_or_never()
-                    .flatten();
-
-                // Allow either of these streams to still be pending, in which case we use the
-                // value recorded from the last loop.
-                let rtt = feedback_rtts
-                    .next()
-                    .now_or_never()
-                    .map(|next| next.expect("stream should not end before delay_directions"));
-                let acked_rate = acked_rates
-                    .next()
-                    .now_or_never()
-                    .map(|next| next.expect("stream should not end before delay_directions"));
-
-                if let Some(target_send_rate) = calculator.next(&mut request, Some((now, direction)), rtt, acked_rate) {
-                    yield target_send_rate
-                }
-            }
-        }
-    }
-    fn instants_at_regular_intervals(
-        start: Instant,
-        interval: Duration,
-    ) -> impl Stream<Item = Instant> {
-        futures::stream::iter(std::iter::successors(Some(start), move |now| {
-            Some(*now + interval)
-        }))
-    }
 
     fn config() -> Config {
         Config {
@@ -445,34 +349,35 @@ mod calculate_target_send_rates_tests {
         let config = config();
         let start_time = Instant::now();
 
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(Duration::from_millis(100)),
-            futures::stream::repeat(config.initial_target_send_rate),
-            futures::stream::repeat((start_time, DelayDirection::Decreasing)).take(100),
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
 
-        assert_eq!(
-            &[] as &[DataRate],
-            &stream.collect::<Vec<_>>().now_or_never().unwrap()[..]
-        );
+        for _ in 0..100 {
+            assert_eq!(
+                None,
+                controller.calculator.next(
+                    &mut controller.current_request,
+                    Some((start_time, DelayDirection::Decreasing)),
+                    FEEDBACK_RTTS_DEFAULT,
+                    Some(config.initial_target_send_rate)
+                )
+            );
+        }
 
         // Try again without any acks.
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(Duration::from_millis(100)),
-            futures::stream::pending(),
-            futures::stream::repeat((start_time, DelayDirection::Decreasing)).take(100),
-        );
 
-        assert_eq!(
-            &[] as &[DataRate],
-            &stream.collect::<Vec<_>>().now_or_never().unwrap()[..]
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
+
+        for _ in 0..100 {
+            assert_eq!(
+                None,
+                controller.calculator.next(
+                    &mut controller.current_request,
+                    Some((start_time, DelayDirection::Decreasing)),
+                    FEEDBACK_RTTS_DEFAULT,
+                    None
+                )
+            );
+        }
     }
 
     #[test]
@@ -480,23 +385,27 @@ mod calculate_target_send_rates_tests {
         let config = config();
         let start_time = Instant::now();
 
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(Duration::from_millis(100)),
-            futures::stream::pending(),
-            futures::stream::repeat((start_time, DelayDirection::Increasing)).take(10),
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
 
-        assert_eq!(
-            &[50_000, 25_000, 12_500, 6_250, 5_000, 5_000, 5_000, 5_000, 5_000, 5_000],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
-        );
+        for expected in [
+            50_000, 25_000, 12_500, 6_250, 5_000, 5_000, 5_000, 5_000, 5_000, 5_000,
+        ]
+        .into_iter()
+        {
+            assert_eq!(
+                expected,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((start_time, DelayDirection::Increasing)),
+                        FEEDBACK_RTTS_DEFAULT,
+                        None
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
     }
 
     #[test]
@@ -504,20 +413,19 @@ mod calculate_target_send_rates_tests {
         let config = config();
         let start_time = Instant::now();
 
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(Duration::from_millis(100)),
-            futures::stream::repeat(config.initial_target_send_rate),
-            // "short intervals" in this case is "zero interval"
-            futures::stream::repeat((start_time, DelayDirection::Increasing)).take(5),
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
 
-        assert_eq!(
-            &[] as &[DataRate],
-            &stream.collect::<Vec<_>>().now_or_never().unwrap()[..]
-        );
+        for _ in 0..5 {
+            assert_eq!(
+                None,
+                controller.calculator.next(
+                    &mut controller.current_request,
+                    Some((start_time, DelayDirection::Increasing)),
+                    FEEDBACK_RTTS_DEFAULT,
+                    Some(config.initial_target_send_rate)
+                )
+            );
+        }
     }
 
     #[test]
@@ -526,25 +434,23 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::repeat(config.initial_target_send_rate),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(futures::stream::repeat(DelayDirection::Increasing))
-                .take(10),
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
 
-        assert_eq!(
-            &[85_000, 85_000, 85_000, 85_000, 85_000, 85_000, 85_000, 85_000, 85_000, 85_000],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
-        );
+        for i in 1..=10 {
+            assert_eq!(
+                85_000,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((start_time + i * interval, DelayDirection::Increasing)),
+                        interval,
+                        Some(config.initial_target_send_rate)
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
     }
 
     #[test]
@@ -553,22 +459,20 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::repeat(config.initial_target_send_rate / 2.0),
-            futures::stream::repeat((start_time, DelayDirection::Increasing)).take(5),
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
 
         assert_eq!(
-            &[42_500],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
+            42_500,
+            controller
+                .calculator
+                .next(
+                    &mut controller.current_request,
+                    Some((start_time, DelayDirection::Increasing)),
+                    interval,
+                    Some(config.initial_target_send_rate / 2.0)
+                )
+                .unwrap()
+                .as_bps()
         );
     }
 
@@ -578,27 +482,40 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::iter([10, 10, 10, 10, 100]).map(DataRate::from_kbps),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(futures::stream::repeat(DelayDirection::Increasing))
-                .take(5),
-        );
-
         // This isn't conclusive: it might be using the average rate,
         // or it might just be checking that the rate shouldn't increase.
         // Tests below mix "increasing" and "steady" feedback to check more precisely.
+
+        let mut controller = CongestionController::new(config.clone(), start_time);
+
+        for i in 1..=4 {
+            assert_eq!(
+                8_500,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((start_time + i * interval, DelayDirection::Increasing)),
+                        interval,
+                        Some(DataRate::from_kbps(10))
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
+
         assert_eq!(
-            &[8_500, 8_500, 8_500, 8_500, 8_500],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
+            8_500,
+            controller
+                .calculator
+                .next(
+                    &mut controller.current_request,
+                    Some((start_time + 5 * interval, DelayDirection::Increasing)),
+                    interval,
+                    Some(DataRate::from_kbps(100))
+                )
+                .unwrap()
+                .as_bps()
         );
     }
 
@@ -608,26 +525,23 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            // ...no matter how nonsense our acks are.
-            futures::stream::repeat(DataRate::from_kbps(1_000)),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(futures::stream::repeat(DelayDirection::Increasing))
-                .take(5),
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
 
-        assert_eq!(
-            &[100_000, 100_000, 100_000, 100_000, 100_000],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
-        );
+        for i in 1..=5 {
+            assert_eq!(
+                100_000,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((start_time + i * interval, DelayDirection::Increasing)),
+                        interval,
+                        Some(DataRate::from_kbps(1_000))
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
     }
 
     #[test]
@@ -636,79 +550,62 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::repeat(DataRate::from_kbps(100)),
-            futures::stream::once(ready((
-                start_time + interval - Duration::from_millis(1),
-                DelayDirection::Increasing,
-            ))),
+        let mut controller = CongestionController::new(config.clone(), start_time);
+
+        assert_eq!(
+            None,
+            controller.calculator.next(
+                &mut controller.current_request,
+                Some((
+                    start_time + interval - Duration::from_millis(1),
+                    DelayDirection::Increasing
+                )),
+                interval,
+                Some(DataRate::from_kbps(100))
+            )
         );
 
         assert_eq!(
-            &[] as &[DataRate],
-            &stream.collect::<Vec<_>>().now_or_never().unwrap()[..]
-        );
-
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval / 2),
-            futures::stream::repeat(DataRate::from_kbps(100)),
-            futures::stream::once(ready((
-                start_time + (interval / 2),
-                DelayDirection::Increasing,
-            ))),
-        );
-
-        assert_eq!(
-            &[85_000],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
+            85_000,
+            controller
+                .calculator
+                .next(
+                    &mut controller.current_request,
+                    Some((start_time + interval / 2, DelayDirection::Increasing)),
+                    interval / 2,
+                    Some(DataRate::from_kbps(100))
+                )
+                .unwrap()
+                .as_bps()
         );
 
         // There is a minimum, though...
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(Duration::ZERO),
-            futures::stream::repeat(DataRate::from_kbps(100)),
-            futures::stream::once(ready((start_time, DelayDirection::Increasing))),
-        );
-
         assert_eq!(
-            &[] as &[DataRate],
-            &stream.collect::<Vec<_>>().now_or_never().unwrap()[..]
+            None,
+            controller.calculator.next(
+                &mut controller.current_request,
+                Some((start_time, DelayDirection::Increasing)),
+                Duration::ZERO,
+                Some(DataRate::from_kbps(100))
+            )
         );
 
         // ...as well as a maximum.
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(Duration::from_secs(1)),
-            futures::stream::repeat(DataRate::from_kbps(100)),
-            futures::stream::once(ready((
-                start_time + Duration::from_millis(500),
-                DelayDirection::Increasing,
-            ))),
-        );
-
         assert_eq!(
-            &[85_000],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
+            85_000,
+            controller
+                .calculator
+                .next(
+                    &mut controller.current_request,
+                    Some((
+                        start_time + Duration::from_millis(500),
+                        DelayDirection::Increasing
+                    )),
+                    Duration::from_secs(1),
+                    Some(DataRate::from_kbps(100))
+                )
+                .unwrap()
+                .as_bps()
         );
     }
 
@@ -718,34 +615,30 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let (rates, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
+        let mut controller = CongestionController::new(config.clone(), start_time);
+
+        let conditions = [
             (100, DelayDirection::Increasing, 85_000), // cut based on current (no average)
             (85, DelayDirection::Steady, 85_000),      // hold steady for one interval
             (85, DelayDirection::Steady, 89_800),      // increase additively
             (110, DelayDirection::Increasing, 85_000), // cut based on prior ack average instead of current
-        ]
-        .iter()
-        .copied()
-        .unzip3();
+        ];
 
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::iter(rates).map(DataRate::from_kbps),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(futures::stream::iter(directions)),
-        );
-
-        assert_eq!(
-            &expected_bps,
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()
-        );
+        for (i, (rate, direction, expected_bps)) in conditions.into_iter().enumerate() {
+            assert_eq!(
+                expected_bps,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((start_time + interval * (i + 1) as u32, direction)),
+                        interval,
+                        Some(DataRate::from_kbps(rate))
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
     }
 
     #[test]
@@ -754,60 +647,72 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::pending(),
-            instants_at_regular_intervals(start_time + Duration::SECOND, Duration::SECOND)
-                .zip(futures::stream::repeat(DelayDirection::Steady))
-                .take(5),
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
 
-        assert_eq!(
-            // The first "Steady" is treated specially since we don't know how long
-            // it's been since it went steady. We get a default increase instead.
-            &[101_000, 109_080, 117_806, 127_230, 137_408],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
-        );
+        // The first "Steady" is treated specially since we don't know how long
+        // it's been since it went steady. We get a default increase instead.
+
+        for (i, expected) in [101_000, 109_080, 117_806, 127_230, 137_408]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                expected,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((
+                            start_time + Duration::SECOND * (i + 1) as u32,
+                            DelayDirection::Steady
+                        )),
+                        interval,
+                        None
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
     }
+
     #[test]
     fn steady_should_grow_aggressively_without_acks() {
         let config = config();
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::repeat(Request {
+        let mut controller = CongestionController::new(config.clone(), start_time);
+
+        // Increases at double the rate until exceeding 250_000, the base requested
+        for (i, expected) in [
+            101_000, 117_159, 135_904, 157_648, 182_871, 212_130, 246_070, 285_441, 308_276,
+            332_938,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            controller.request(Request {
                 base: DataRate::from_bps(250_000),
                 ideal: DataRate::from_bps(3_000_000),
-            }),
-            futures::stream::repeat(interval),
-            futures::stream::pending(),
-            instants_at_regular_intervals(start_time + Duration::SECOND, Duration::SECOND)
-                .zip(futures::stream::repeat(DelayDirection::Steady))
-                .take(10),
-        );
+            });
 
-        assert_eq!(
-            // Increases at double the rate until exceeding 250_000, the base requested
-            &[
-                101_000, 117_159, 135_904, 157_648, 182_871, 212_130, 246_070, 285_441, 308_276,
-                332_938
-            ],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
-        );
+            assert_eq!(
+                expected,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((
+                            start_time + Duration::SECOND * (i + 1) as u32,
+                            DelayDirection::Steady
+                        )),
+                        interval,
+                        None
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
     }
 
     #[test]
@@ -816,49 +721,53 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::repeat(DataRate::from_kbps(67)),
-            instants_at_regular_intervals(start_time + Duration::SECOND, Duration::SECOND)
-                .zip(futures::stream::repeat(DelayDirection::Steady))
-                .take(5),
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
 
-        assert_eq!(
-            // Can't go higher because of the ack rate.
-            &[101_000, 109_080, 110_500, 110_500, 110_500],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
-        );
+        // Can't go higher because of the ack rate.
+        for (i, expected) in [101_000, 109_080, 110_500, 110_500, 110_500]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                expected,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((
+                            start_time + Duration::SECOND * (i + 1) as u32,
+                            DelayDirection::Steady
+                        )),
+                        interval,
+                        Some(DataRate::from_kbps(67))
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
 
         // Try again with an even lower ack rate.
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::repeat(DataRate::from_kbps(50)),
-            instants_at_regular_intervals(start_time + Duration::SECOND, Duration::SECOND)
-                .zip(futures::stream::repeat(DelayDirection::Steady))
-                .take(5),
-        );
-
-        assert_eq!(
-            // Can't go higher because of the ack rate.
-            // Can't go lower than the start rate.
-            &[100_000, 100_000, 100_000, 100_000, 100_000],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
-        );
+        // Can't go higher because of the ack rate.
+        // Can't go lower than the start rate.
+        let mut controller = CongestionController::new(config.clone(), start_time);
+        for i in 0..5 {
+            assert_eq!(
+                100_000,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((
+                            start_time + Duration::SECOND * (i + 1) as u32,
+                            DelayDirection::Steady
+                        )),
+                        interval,
+                        Some(DataRate::from_kbps(50))
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
     }
 
     #[test]
@@ -867,39 +776,44 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::pending(),
-            instants_at_regular_intervals(start_time + Duration::SECOND, Duration::SECOND)
-                .zip(futures::stream::repeat(DelayDirection::Steady))
-                .take(10_000),
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
+        let mut prev = controller
+            .calculator
+            .next(
+                &mut controller.current_request,
+                Some((start_time + Duration::SECOND, DelayDirection::Steady)),
+                interval,
+                None,
+            )
+            .unwrap();
+        let mut has_stopped_increasing = false;
 
-        async move {
-            pin_mut!(stream);
-            let mut prev = stream.next().await.unwrap();
-            let mut has_stopped_increasing = false;
-            while let Some(next) = stream.next().await {
-                match prev.cmp(&next) {
-                    std::cmp::Ordering::Less => {
-                        assert!(!has_stopped_increasing, "rate should never increase again");
-                    }
-                    std::cmp::Ordering::Equal => {
-                        has_stopped_increasing = true;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        panic!("rate should never decrease")
-                    }
+        for i in 0..10_000 {
+            let next = controller
+                .calculator
+                .next(
+                    &mut controller.current_request,
+                    Some((
+                        start_time + Duration::SECOND * (i + 2) as u32,
+                        DelayDirection::Steady,
+                    )),
+                    interval,
+                    None,
+                )
+                .unwrap();
+            match prev.cmp(&next) {
+                std::cmp::Ordering::Less => {
+                    assert!(!has_stopped_increasing, "rate should never increase again");
                 }
-                prev = next;
+                std::cmp::Ordering::Equal => {
+                    has_stopped_increasing = true;
+                }
+                std::cmp::Ordering::Greater => {
+                    panic!("rate should never decrease")
+                }
             }
-            assert!(has_stopped_increasing);
+            prev = next;
         }
-        .now_or_never()
-        .unwrap();
     }
 
     #[test]
@@ -908,30 +822,45 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::repeat(config.initial_target_send_rate),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(
-                    futures::stream::once(ready(DelayDirection::Increasing))
-                        .chain(futures::stream::repeat(DelayDirection::Steady)),
+        let mut controller = CongestionController::new(config.clone(), start_time);
+
+        // Reduce for the first "Increasing".
+        assert_eq!(
+            85_000,
+            controller
+                .calculator
+                .next(
+                    &mut controller.current_request,
+                    Some((start_time + interval, DelayDirection::Increasing)),
+                    interval,
+                    Some(config.initial_target_send_rate)
                 )
-                .take(7),
+                .unwrap()
+                .as_bps()
         );
 
-        assert_eq!(
-            // Reduce for the first "Increasing", pause for the first "Steady",
-            // then increase additively from then on.
-            &[85_000, 85_000, 89_800, 94_600, 99_400, 104_200, 109_000],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
-        );
+        // Pause for the first "Steady", then increase additively from then on.
+        for (i, expected) in [85_000, 89_800, 94_600, 99_400, 104_200, 109_000]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                expected,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((
+                            start_time + interval * (i + 1) as u32,
+                            DelayDirection::Steady
+                        )),
+                        interval,
+                        Some(config.initial_target_send_rate)
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
     }
 
     #[test]
@@ -940,32 +869,44 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::from_millis(100);
 
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            // One proper RTT for the "Increasing" feedback, then some ridiculous RTT for "Steady"
-            futures::stream::once(ready(interval))
-                .chain(futures::stream::repeat(Duration::from_secs(10))),
-            futures::stream::repeat(config.initial_target_send_rate),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(
-                    futures::stream::once(ready(DelayDirection::Increasing))
-                        .chain(futures::stream::repeat(DelayDirection::Steady)),
+        let mut controller = CongestionController::new(config.clone(), start_time);
+        // Reduce for the first "Increasing".
+        assert_eq!(
+            85_000,
+            controller
+                .calculator
+                .next(
+                    &mut controller.current_request,
+                    Some((start_time + interval, DelayDirection::Increasing)),
+                    interval, // One proper RTT for the "Increasing" feedback
+                    Some(config.initial_target_send_rate)
                 )
-                .take(7),
+                .unwrap()
+                .as_bps()
         );
 
-        assert_eq!(
-            // Reduce for the first "Increasing", pause for the first "Steady",
-            // then increase additively from then on.
-            &[85_000, 85_000, 85_400, 85_800, 86_200, 86_600, 87_000],
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
-        );
+        // Pause for the first "Steady", then increase additively from then on.
+        for (i, expected) in [85_000, 85_400, 85_800, 86_200, 86_600, 87_000]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                expected,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((
+                            start_time + interval * (i + 2) as u32,
+                            DelayDirection::Steady
+                        )),
+                        Duration::from_secs(10), // some ridiculous RTT for "Steady"
+                        Some(config.initial_target_send_rate)
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
     }
 
     #[test]
@@ -974,97 +915,83 @@ mod calculate_target_send_rates_tests {
         let start_time = Instant::now();
         let interval = Duration::SECOND;
 
-        let (rates, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
+        let conditions = [
             (100, DelayDirection::Increasing, 85_000), // record an initial ack rate
             (0, DelayDirection::Steady, 85_000),       // hold steady for one interval
             (100, DelayDirection::Steady, 91_800), // increase multiplicatively due to ack rate outlier
             (100, DelayDirection::Steady, 99_144), // increase multiplicatively due to ack rate outlier
-        ]
-        .iter()
-        .copied()
-        .unzip3();
+        ];
 
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::iter(rates).map(DataRate::from_kbps),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(futures::stream::iter(directions)),
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
+        for (i, (rate, direction, expected_bps)) in conditions.into_iter().enumerate() {
+            assert_eq!(
+                expected_bps,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((start_time + interval * (i + 1) as u32, direction)),
+                        interval,
+                        Some(DataRate::from_kbps(rate))
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
 
-        assert_eq!(
-            &expected_bps,
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()
-        );
-
-        let (rates, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
+        let conditions = [
             (100, DelayDirection::Increasing, 85_000), // record an initial ack rate
             (100_000, DelayDirection::Steady, 86_000), // minimum multiplicative increase for the first interval
             (100, DelayDirection::Steady, 92_880), // increase multiplicatively due to ack rate outlier
             (100, DelayDirection::Steady, 100_310), // increase multiplicatively due to ack rate outlier
-        ]
-        .iter()
-        .copied()
-        .unzip3();
+        ];
 
-        let stream = calculate_target_send_rates(
-            config.clone(),
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::iter(rates).map(DataRate::from_kbps),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(futures::stream::iter(directions)),
-        );
-
-        assert_eq!(
-            &expected_bps,
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
+        for (i, (rate, direction, expected_bps)) in conditions.into_iter().enumerate() {
+            assert_eq!(
+                expected_bps,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((start_time + interval * (i + 1) as u32, direction)),
+                        interval,
+                        Some(DataRate::from_kbps(rate))
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
 
         // We can't (separately) test the case when the ack rate drops drastically while the delay
         // is still increasing because once it goes steady, a low ack rate will limit the growth,
         // and a high ack rate will count as an outlier again. But we can test the case where it
         // *jumps* drastically.
-        let (rates, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
+
+        let conditions = [
             (100, DelayDirection::Increasing, 85_000), // record an initial ack rate
             (100_000, DelayDirection::Increasing, 85_000), // ack rate went up so we don't actually decrease
             (100_000, DelayDirection::Steady, 85_000),     // hold steady for one interval
             (100_000, DelayDirection::Steady, 93_727), // ack rate was reset but it's still present
             (100_000, DelayDirection::Steady, 102_454), // so these increase additively
-        ]
-        .iter()
-        .copied()
-        .unzip3();
+        ];
 
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::pending(),
-            futures::stream::repeat(interval),
-            futures::stream::iter(rates).map(DataRate::from_kbps),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(futures::stream::iter(directions)),
-        );
-
-        assert_eq!(
-            &expected_bps,
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()
-        );
+        let mut controller = CongestionController::new(config.clone(), start_time);
+        for (i, (rate, direction, expected_bps)) in conditions.into_iter().enumerate() {
+            assert_eq!(
+                expected_bps,
+                controller
+                    .calculator
+                    .next(
+                        &mut controller.current_request,
+                        Some((start_time + interval * (i + 1) as u32, direction)),
+                        interval,
+                        Some(DataRate::from_kbps(rate))
+                    )
+                    .unwrap()
+                    .as_bps()
+            );
+        }
     }
 
     #[test]
@@ -1076,8 +1003,9 @@ mod calculate_target_send_rates_tests {
         };
         let start_time = Instant::now();
         let interval = Duration::from_millis(1000);
+        let mut controller = CongestionController::new(config.clone(), start_time);
 
-        let (ideal_send_rate_bps, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
+        let conditions = [
             // Ideal is tiny, but that doesn't prevent normal behavior
             (100_000, DelayDirection::Steady, Some(1_001_000)),
             (100_000, DelayDirection::Decreasing, None),
@@ -1090,36 +1018,26 @@ mod calculate_target_send_rates_tests {
             (10_000_000, DelayDirection::Steady, Some(1_081_080)),
             (10_000_000, DelayDirection::Decreasing, None),
             (10_000_000, DelayDirection::Increasing, Some(540_540)),
-        ]
-        .iter()
-        .copied()
-        .unzip3();
-        let requests = ideal_send_rate_bps
-            .into_iter()
-            .map(|ideal_send_rate_bps| Request {
+        ];
+
+        for (i, (ideal_send_rate_bps, direction, expected_bps)) in
+            conditions.into_iter().enumerate()
+        {
+            controller.request(Request {
                 base: DataRate::from_bps(1000),
                 ideal: DataRate::from_bps(ideal_send_rate_bps),
             });
 
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::iter(requests),
-            futures::stream::repeat(interval),
-            futures::stream::pending(),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(futures::stream::iter(directions)),
-        );
-        let expected_bps: Vec<u64> = expected_bps.into_iter().flatten().collect();
-
-        assert_eq!(
-            &expected_bps,
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()
-        );
+            assert_eq!(
+                expected_bps.map(DataRate::from_bps),
+                controller.calculator.next(
+                    &mut controller.current_request,
+                    Some((start_time + interval * (i + 1) as u32, direction)),
+                    interval,
+                    None
+                )
+            );
+        }
     }
 
     #[test]
@@ -1131,8 +1049,9 @@ mod calculate_target_send_rates_tests {
         };
         let start_time = Instant::now();
         let interval = Duration::from_millis(1000);
+        let mut controller = CongestionController::new(config.clone(), start_time);
 
-        let (ideal_send_rate_bps, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
+        let conditions = [
             // Ideal is tiny, but that doesn't prevent normal behavior
             (100_000, DelayDirection::Steady, Some(501_000)),
             (100_000, DelayDirection::Decreasing, None),
@@ -1145,36 +1064,26 @@ mod calculate_target_send_rates_tests {
             (10_000_000, DelayDirection::Steady, Some(508_727)),
             (10_000_000, DelayDirection::Decreasing, None),
             (10_000_000, DelayDirection::Increasing, Some(425_000)),
-        ]
-        .iter()
-        .copied()
-        .unzip3();
-        let requests = ideal_send_rate_bps
-            .into_iter()
-            .map(|ideal_send_rate_bps| Request {
+        ];
+
+        for (i, (ideal_send_rate_bps, direction, expected_bps)) in
+            conditions.into_iter().enumerate()
+        {
+            controller.request(Request {
                 base: DataRate::from_bps(1000),
                 ideal: DataRate::from_bps(ideal_send_rate_bps),
             });
 
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::iter(requests),
-            futures::stream::repeat(interval),
-            futures::stream::repeat(DataRate::from_kbps(500)),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(futures::stream::iter(directions)),
-        );
-        let expected_bps: Vec<u64> = expected_bps.into_iter().flatten().collect();
-
-        assert_eq!(
-            &expected_bps,
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()
-        );
+            assert_eq!(
+                expected_bps.map(DataRate::from_bps),
+                controller.calculator.next(
+                    &mut controller.current_request,
+                    Some((start_time + interval * (i + 1) as u32, direction)),
+                    interval,
+                    Some(DataRate::from_kbps(500)),
+                )
+            );
+        }
     }
 
     #[test]
@@ -1186,8 +1095,9 @@ mod calculate_target_send_rates_tests {
         };
         let start_time = Instant::now();
         let interval = Duration::from_millis(1000);
+        let mut controller = CongestionController::new(config.clone(), start_time);
 
-        let (ideal_send_rate_bps, directions, expected_bps): (Vec<_>, Vec<_>, Vec<_>) = [
+        let conditions = [
             // Ideal is tiny, but that doesn't prevent normal behavior
             (100_000, DelayDirection::Steady, Some(501_000)),
             (100_000, DelayDirection::Decreasing, None),
@@ -1200,36 +1110,26 @@ mod calculate_target_send_rates_tests {
             (10_000_000, DelayDirection::Steady, Some(1_741_159)),
             (10_000_000, DelayDirection::Decreasing, None),
             (10_000_000, DelayDirection::Increasing, Some(870_579)),
-        ]
-        .iter()
-        .copied()
-        .unzip3();
-        let requests = ideal_send_rate_bps
-            .into_iter()
-            .map(|ideal_send_rate_bps| Request {
+        ];
+
+        for (i, (ideal_send_rate_bps, direction, expected_bps)) in
+            conditions.into_iter().enumerate()
+        {
+            controller.request(Request {
                 base: DataRate::from_bps(3_000_000),
                 ideal: DataRate::from_bps(ideal_send_rate_bps),
             });
 
-        let stream = calculate_target_send_rates(
-            config,
-            start_time,
-            futures::stream::iter(requests),
-            futures::stream::repeat(interval),
-            futures::stream::pending(),
-            instants_at_regular_intervals(start_time + interval, interval)
-                .zip(futures::stream::iter(directions)),
-        );
-        let expected_bps: Vec<u64> = expected_bps.into_iter().flatten().collect();
-
-        assert_eq!(
-            &expected_bps,
-            &stream
-                .map(|rate| rate.as_bps())
-                .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()
-        );
+            assert_eq!(
+                expected_bps.map(DataRate::from_bps),
+                controller.calculator.next(
+                    &mut controller.current_request,
+                    Some((start_time + interval * (i + 1) as u32, direction)),
+                    interval,
+                    None
+                )
+            );
+        }
     }
 }
 
@@ -1358,33 +1258,5 @@ mod rate_averager_tests {
         assert!(averager.average().is_some());
         averager.reset_if_sample_out_of_bounds(DataRate::from_bps(100_000));
         assert_eq!(None, averager.average());
-    }
-}
-
-fn unbounded_channel_that_must_not_fail<T>() -> (Sender<T>, Receiver<T>) {
-    let (sender, receiver) = futures::channel::mpsc::unbounded();
-    (Sender(sender), Receiver(receiver))
-}
-
-struct Sender<T>(futures::channel::mpsc::UnboundedSender<T>);
-
-impl<T> Sender<T> {
-    fn send(&mut self, msg: T) {
-        self.0
-            .unbounded_send(msg)
-            .expect("channel closed (maybe the receiver was dropped)")
-    }
-}
-
-struct Receiver<T>(futures::channel::mpsc::UnboundedReceiver<T>);
-
-impl<T> Stream for Receiver<T> {
-    type Item = T;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        self.0.poll_next_unpin(cx)
     }
 }

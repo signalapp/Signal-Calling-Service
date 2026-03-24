@@ -5,9 +5,7 @@
 
 use std::cmp::{max, min};
 
-use async_stream::stream;
 use calling_common::{exponential_moving_average, Duration, Instant, RingBuffer};
-use futures::{pin_mut, Stream, StreamExt};
 use log::*;
 
 use crate::transportcc::{Ack, RemoteInstant};
@@ -47,20 +45,30 @@ impl<'a> From<&'a Ack> for AckGroupSummary {
     }
 }
 
-// Yields (group_summary, next_after_group)
-fn accumulate_ack_groups(
-    acks: impl Stream<Item = Ack>,
-) -> impl Stream<Item = (AckGroupSummary, Ack)> {
-    // TODO: Maybe make some of these configurable
-    let ack_group_min_duration = TimeDelta::from_millis(5.0);
-    let ack_group_max_duration = TimeDelta::from_millis(100.0);
+#[derive(Default)]
+enum AckGroupAccumulator {
+    #[default]
+    None,
+    Some {
+        first: Ack,
+        group: AckGroupSummary,
+    },
+}
 
-    stream! {
-        let acks = acks.peekable();
-        pin_mut!(acks);
-        while let Some(first) = acks.next().await {
-            let mut group = AckGroupSummary::from(&first);
-            while let Some(next) = acks.as_mut().peek().await {
+impl AckGroupAccumulator {
+    const MIN_DURATION: TimeDelta = TimeDelta::from_millis(5.0);
+    const MAX_DURATION: TimeDelta = TimeDelta::from_millis(100.0);
+
+    fn next<'a>(&mut self, next: &'a Ack) -> Option<(AckGroupSummary, &'a Ack)> {
+        match self {
+            AckGroupAccumulator::None => {
+                *self = Self::Some {
+                    first: next.clone(),
+                    group: AckGroupSummary::from(next),
+                };
+                None
+            }
+            AckGroupAccumulator::Some { first, group } => {
                 if next.departure >= first.departure {
                     // Allow out-of-order packets within groups, but not crossing group
                     // boundaries.
@@ -68,25 +76,29 @@ fn accumulate_ack_groups(
                     let departure_gap = next.departure.time_delta_since(group.latest_departure);
                     let arrival_gap = next.arrival.time_delta_since(group.latest_arrival);
                     let departure_duration_would_be_small =
-                        next.departure.time_delta_since(first.departure) <= ack_group_min_duration;
+                        next.departure.time_delta_since(first.departure) <= Self::MIN_DURATION;
                     let arrival_gap_is_small =
-                        (arrival_gap < departure_gap) && (arrival_gap <= ack_group_min_duration);
+                        (arrival_gap < departure_gap) && (arrival_gap <= Self::MIN_DURATION);
                     let arrival_duration_wouldnt_be_big =
-                        next.arrival.time_delta_since(first.arrival) < ack_group_max_duration;
+                        next.arrival.time_delta_since(first.arrival) < Self::MAX_DURATION;
+
                     if departed_at_same_time
                         || departure_duration_would_be_small
                         || (arrival_gap_is_small && arrival_duration_wouldnt_be_big)
                     {
                         // Combine into existing group
                         group.add(next);
+                        None
                     } else {
                         // Start a new group.
-                        yield (group, next.clone());
-                        break;
+                        let last_group = *group;
+                        *first = next.clone();
+                        *group = AckGroupSummary::from(next);
+                        Some((last_group, next))
                     }
+                } else {
+                    None
                 }
-
-                acks.next().await.unwrap();
             }
         }
     }
@@ -94,8 +106,6 @@ fn accumulate_ack_groups(
 
 #[cfg(test)]
 mod accumulate_ack_groups_tests {
-    use futures::FutureExt;
-
     use super::*;
     use crate::transportcc::RemoteInstant;
 
@@ -109,26 +119,33 @@ mod accumulate_ack_groups_tests {
     /// Creates an `Ack` for each departure/arrival offset.
     ///
     /// The size and feedback-arrival time should be ignored.
-    pub(super) fn acks_from_departure_and_arrival(
-        pairs: impl IntoIterator<Item = (Instant, RemoteInstant)>,
-    ) -> impl Stream<Item = Ack> {
-        futures::stream::iter(pairs.into_iter().map(move |(departure, arrival)| Ack {
-            size: Default::default(),
-            departure,
-            arrival,
-            feedback_arrival: departure,
-        }))
+    pub(super) fn ack_groups_from_departure_and_arrival(
+        pairs: Vec<(Instant, RemoteInstant)>,
+    ) -> Vec<(AckGroupSummary, Ack)> {
+        let mut accumulator = AckGroupAccumulator::default();
+        pairs
+            .iter()
+            .filter_map(|(departure, arrival)| {
+                accumulator
+                    .next(&Ack {
+                        size: Default::default(),
+                        departure: *departure,
+                        arrival: *arrival,
+                        feedback_arrival: *departure,
+                    })
+                    .map(|(summary, ack)| (summary, ack.clone()))
+            })
+            .collect()
     }
 
     // From WebRTC's InterArrivalTest::FirstPacket.
     #[test]
     fn first_packet() {
-        let stream = accumulate_ack_groups(acks_from_departure_and_arrival(vec![(
+        let stream = ack_groups_from_departure_and_arrival(vec![(
             Instant::now(),
             RemoteInstant::from_millis(17),
-        )]));
-        pin_mut!(stream);
-        assert!(stream.next().now_or_never().unwrap().is_none());
+        )]);
+        assert!(stream.is_empty());
     }
 
     // From WebRTC's InterArrivalTest::SecondGroup.
@@ -141,24 +158,22 @@ mod accumulate_ack_groups_tests {
 
         let start = Instant::now();
 
-        let stream = accumulate_ack_groups(acks_from_departure_and_arrival(vec![
+        let stream = ack_groups_from_departure_and_arrival(vec![
             (start, g1_arrival_time),
             (start + NEW_GROUP_INTERVAL, g2_arrival_time),
             (start + 2 * NEW_GROUP_INTERVAL, g3_arrival_time),
             (start + 3 * NEW_GROUP_INTERVAL, g4_arrival_time),
-        ]));
-        pin_mut!(stream);
+        ]);
         assert_eq!(
-            &[
+            vec![
                 (g1_arrival_time, g2_arrival_time),
                 (g2_arrival_time, g3_arrival_time),
                 (g3_arrival_time, g4_arrival_time),
             ],
-            &stream
+            stream
+                .iter()
                 .map(|(group, ack)| (group.latest_arrival, ack.arrival))
                 .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
         );
     }
 
@@ -186,18 +201,16 @@ mod accumulate_ack_groups_tests {
         let g3_arrival_time = RemoteInstant::from_millis(500);
         pairs.push((start + 2 * NEW_GROUP_INTERVAL, g3_arrival_time));
 
-        let stream = accumulate_ack_groups(acks_from_departure_and_arrival(pairs));
-        pin_mut!(stream);
+        let stream = ack_groups_from_departure_and_arrival(pairs);
         assert_eq!(
-            &[
+            vec![
                 (g1_arrival_time, g2_first_arrival_time),
                 (g2_last_arrival_time, g3_arrival_time),
             ],
-            &stream
+            stream
+                .iter()
                 .map(|(group, ack)| (group.latest_arrival, ack.arrival,))
                 .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
         );
     }
 
@@ -228,18 +241,16 @@ mod accumulate_ack_groups_tests {
         let g3_arrival_time = RemoteInstant::from_millis(500);
         pairs.push((start + 2 * NEW_GROUP_INTERVAL, g3_arrival_time));
 
-        let stream = accumulate_ack_groups(acks_from_departure_and_arrival(pairs));
-        pin_mut!(stream);
+        let stream = ack_groups_from_departure_and_arrival(pairs);
         assert_eq!(
-            &[
+            vec![
                 (g1_arrival_time, g2_first_arrival_time),
                 (g2_last_arrival_time, g3_arrival_time),
             ],
-            &stream
+            stream
+                .iter()
                 .map(|(group, ack)| (group.latest_arrival, ack.arrival))
                 .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
         );
     }
 
@@ -270,18 +281,16 @@ mod accumulate_ack_groups_tests {
         let g3_arrival_time = RemoteInstant::from_millis(500);
         pairs.push((start + 2 * NEW_GROUP_INTERVAL, g3_arrival_time));
 
-        let stream = accumulate_ack_groups(acks_from_departure_and_arrival(pairs));
-        pin_mut!(stream);
+        let stream = ack_groups_from_departure_and_arrival(pairs);
         assert_eq!(
-            &[
+            vec![
                 (g1_arrival_time, g2_first_arrival_time),
                 (g2_last_arrival_time, g3_arrival_time),
             ],
-            &stream
+            stream
+                .iter()
                 .map(|(group, ack)| (group.latest_arrival, ack.arrival))
                 .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
         );
     }
 
@@ -313,18 +322,16 @@ mod accumulate_ack_groups_tests {
             g3_arrival_time,
         ));
 
-        let stream = accumulate_ack_groups(acks_from_departure_and_arrival(pairs));
-        pin_mut!(stream);
+        let stream = ack_groups_from_departure_and_arrival(pairs);
         assert_eq!(
-            &[
+            vec![
                 (g1_arrival_time, g2_first_arrival_time),
                 (g2_last_arrival_time, g3_arrival_time),
             ],
-            &stream
+            stream
+                .iter()
                 .map(|(group, ack)| (group.latest_arrival, ack.arrival))
                 .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
         );
     }
 
@@ -337,7 +344,7 @@ mod accumulate_ack_groups_tests {
         let g4_arrival_time = g3_arrival_time + 10 * BURST_THRESHOLD;
         let g5_arrival_time = g4_arrival_time + 10 * BURST_THRESHOLD;
 
-        let stream = accumulate_ack_groups(acks_from_departure_and_arrival(vec![
+        let stream = ack_groups_from_departure_and_arrival(vec![
             (start, g1_arrival_time),
             // Same departure, earlier arrival.
             (
@@ -371,10 +378,9 @@ mod accumulate_ack_groups_tests {
             ),
             // One more to flush.
             (start + 4 * NEW_GROUP_INTERVAL, g5_arrival_time),
-        ]));
-        pin_mut!(stream);
+        ]);
         assert_eq!(
-            &[
+            vec![
                 (
                     Duration::ZERO,
                     g1_arrival_time,
@@ -396,7 +402,8 @@ mod accumulate_ack_groups_tests {
                     g5_arrival_time
                 ),
             ],
-            &stream
+            stream
+                .iter()
                 .inspect(|(group, _ack)| {
                     assert_eq!(group.latest_departure, group.latest_feedback_arrival);
                 })
@@ -409,26 +416,40 @@ mod accumulate_ack_groups_tests {
                     ack.arrival
                 ))
                 .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
         );
     }
 }
 
-// TODO: Maybe make some of these configurable
+#[derive(Default)]
+enum AckDeltaCalculator {
+    #[default]
+    None,
+    Some {
+        group1: AckGroupSummary,
+        consecutive_reorderings: u16,
+    },
+}
+
 const MAX_ARRIVAL_CHANGE: Duration = Duration::from_secs(3);
 const MAX_CONSECUTIVE_REORDERINGS: u16 = 3;
-
-// Yields (latest_ack, departure_delta, arrival_delta)
-fn calculate_ack_deltas(
-    groups: impl Stream<Item = (AckGroupSummary, Ack)>,
-) -> impl Stream<Item = (Ack, Duration, TimeDelta)> {
-    stream! {
-        let groups = groups.fuse();
-        pin_mut!(groups);
-        while let Some((mut group1, _)) = groups.next().await {
-            let mut consecutive_reorderings = 0u16;
-            while let Some((group2, latest_ack)) = groups.next().await {
+impl AckDeltaCalculator {
+    fn next<'a>(
+        &mut self,
+        group2: AckGroupSummary,
+        latest_ack: &'a Ack,
+    ) -> Option<(&'a Ack, Duration, TimeDelta)> {
+        match self {
+            AckDeltaCalculator::None => {
+                *self = Self::Some {
+                    group1: group2,
+                    consecutive_reorderings: 0,
+                };
+                None
+            }
+            AckDeltaCalculator::Some {
+                group1,
+                consecutive_reorderings,
+            } => {
                 // TODO: If it's over 2 seconds since we saw a packet, reset this state and everything in
                 // calculate_delay_slopes and calculate_delay_directions.
 
@@ -446,29 +467,31 @@ fn calculate_ack_deltas(
                         .saturating_duration_since(group1.latest_feedback_arrival);
 
                     if group2.latest_arrival < group1.latest_arrival {
-                        consecutive_reorderings += 1;
-                        if consecutive_reorderings >= MAX_CONSECUTIVE_REORDERINGS {
+                        *consecutive_reorderings += 1;
+                        if *consecutive_reorderings >= MAX_CONSECUTIVE_REORDERINGS {
                             // Throw out both of these groups and start over.
-                            break;
+                            *self = Self::None;
                         } else {
                             // Drop the new group and hope the next one is better.
-                            continue;
                         }
+                        return None;
                     } else {
-                        consecutive_reorderings = 0;
+                        *consecutive_reorderings = 0;
                     }
 
                     let arrival_delta_increased_too_much = arrival_delta.as_secs()
                         >= (feedback_delta + MAX_ARRIVAL_CHANGE).as_secs_f64();
                     if arrival_delta_increased_too_much {
                         // Throw out both of these groups and start over.
-                        break;
+                        *self = Self::None;
+                        return None;
                     }
 
-                    yield (latest_ack, departure_delta, arrival_delta);
-                    group1 = group2;
+                    *group1 = group2;
+                    Some((latest_ack, departure_delta, arrival_delta))
                 } else {
                     // Ignore packets that arrived out of order.
+                    None
                 }
             }
         }
@@ -492,55 +515,81 @@ const RTT_FOR_ACKS_AT_REGULAR_INTERVALS: Duration = Duration::from_millis(100);
 /// Providing a regular rate makes it easier to write tests that check
 /// when a particular change has occurred.
 #[cfg(test)]
-fn acks_at_regular_intervals(
-    mut departure: Instant,
+struct AcksAtRegularIntervals {
+    departure: Instant,
     departure_interval: Duration,
-    mut arrival: RemoteInstant,
+    arrival: RemoteInstant,
     arrival_interval: Duration,
-) -> impl Stream<Item = Ack> {
-    use calling_common::DataSize;
+}
 
-    futures::stream::repeat_with(move || {
-        let result = Ack {
+#[cfg(test)]
+impl AcksAtRegularIntervals {
+    fn new(
+        departure: Instant,
+        departure_interval: Duration,
+        arrival: RemoteInstant,
+        arrival_interval: Duration,
+    ) -> Self {
+        Self {
             departure,
+            departure_interval,
             arrival,
-            feedback_arrival: departure + RTT_FOR_ACKS_AT_REGULAR_INTERVALS,
-            size: DataSize::from_bytes(1200),
+            arrival_interval,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Iterator for AcksAtRegularIntervals {
+    type Item = Ack;
+    fn next(&mut self) -> Option<Ack> {
+        let result = Ack {
+            departure: self.departure,
+            arrival: self.arrival,
+            feedback_arrival: self.departure + RTT_FOR_ACKS_AT_REGULAR_INTERVALS,
+            size: calling_common::DataSize::from_bytes(1200),
         };
-        departure += departure_interval;
-        arrival += arrival_interval;
-        result
-    })
+        self.departure += self.departure_interval;
+        self.arrival += self.arrival_interval;
+        Some(result)
+    }
 }
 
 #[cfg(test)]
 mod calculate_ack_deltas_tests {
-    use std::future::ready;
-
-    use futures::FutureExt;
-
     use super::{
         accumulate_ack_groups_tests::{
-            acks_from_departure_and_arrival, BURST_THRESHOLD, NEW_GROUP_INTERVAL,
+            ack_groups_from_departure_and_arrival, BURST_THRESHOLD, NEW_GROUP_INTERVAL,
         },
         *,
     };
     use crate::transportcc::RemoteInstant;
 
+    fn calculate_ack_deltas(
+        ack_groups: Vec<(AckGroupSummary, Ack)>,
+    ) -> Vec<(Ack, Duration, TimeDelta)> {
+        let mut calculator = AckDeltaCalculator::default();
+        ack_groups
+            .iter()
+            .filter_map(|(group, ack)| {
+                calculator
+                    .next(*group, ack)
+                    .map(|(ack, departure_delta, arrival_delta)| {
+                        (ack.clone(), departure_delta, arrival_delta)
+                    })
+            })
+            .collect()
+    }
+
     /// Converts a stream of Acks into a stream of groups by assuming every Ack
     /// is in its own group.
-    fn ack_groups_from_acks(
-        mut acks: impl Stream<Item = Ack> + Unpin,
-    ) -> impl Stream<Item = (AckGroupSummary, Ack)> {
-        let first_ack = acks
-            .next()
-            .now_or_never()
-            .expect("ready")
-            .expect("non-empty");
+    fn ack_groups_from_acks(mut acks: impl Iterator<Item = Ack>) -> Vec<(AckGroupSummary, Ack)> {
+        let first_ack = acks.next().expect("ready");
         acks.scan(first_ack, |current, next| {
             let prev = std::mem::replace(current, next);
-            ready(Some((AckGroupSummary::from(&prev), current.clone())))
+            Some((AckGroupSummary::from(&prev), current.clone()))
         })
+        .collect()
     }
 
     // From WebRTC's InterArrivalTest::SecondGroup.
@@ -552,36 +601,34 @@ mod calculate_ack_deltas_tests {
         let g3_arrival_time = g2_arrival_time + BURST_THRESHOLD + Duration::MILLISECOND;
         let g4_arrival_time = g3_arrival_time + BURST_THRESHOLD + Duration::MILLISECOND;
 
-        let acks = acks_from_departure_and_arrival(vec![
+        let stream = ack_groups_from_departure_and_arrival(vec![
             (start, g1_arrival_time),
             (start + NEW_GROUP_INTERVAL, g2_arrival_time),
             (start + 2 * NEW_GROUP_INTERVAL, g3_arrival_time),
             (start + 3 * NEW_GROUP_INTERVAL, g4_arrival_time),
         ]);
-        let stream = calculate_ack_deltas(ack_groups_from_acks(acks));
-        pin_mut!(stream);
+        let stream = calculate_ack_deltas(stream);
         assert_eq!(
-            &[
+            vec![
                 (
                     g3_arrival_time,
-                    NEW_GROUP_INTERVAL,
-                    g2_arrival_time.time_delta_since(g1_arrival_time)
+                    &NEW_GROUP_INTERVAL,
+                    &g2_arrival_time.time_delta_since(g1_arrival_time)
                 ),
                 (
                     g4_arrival_time,
-                    NEW_GROUP_INTERVAL,
-                    g3_arrival_time.time_delta_since(g2_arrival_time)
+                    &NEW_GROUP_INTERVAL,
+                    &g3_arrival_time.time_delta_since(g2_arrival_time)
                 ),
             ],
-            &stream
+            stream
+                .iter()
                 .map(|(ack, departure_delta, arrival_delta)| (
                     ack.arrival,
                     departure_delta,
                     arrival_delta
                 ))
                 .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
         );
     }
 
@@ -597,10 +644,10 @@ mod calculate_ack_deltas_tests {
         // (And we're not actually running the group collection logic in this test;
         // we're just treating each Ack as a standalone group.)
         let acks =
-            acks_at_regular_intervals(initial_departure, interval, initial_arrival, interval)
+            AcksAtRegularIntervals::new(initial_departure, interval, initial_arrival, interval)
                 .take(2)
                 .chain(
-                    acks_at_regular_intervals(
+                    AcksAtRegularIntervals::new(
                         initial_departure + 2 * interval,
                         interval,
                         initial_arrival + 2 * interval + MAX_ARRIVAL_CHANGE,
@@ -610,9 +657,8 @@ mod calculate_ack_deltas_tests {
                 );
 
         let stream = calculate_ack_deltas(ack_groups_from_acks(acks));
-        pin_mut!(stream);
         assert_eq!(
-            &[
+            vec![
                 (
                     initial_arrival + 2 * interval + MAX_ARRIVAL_CHANGE,
                     interval,
@@ -624,15 +670,14 @@ mod calculate_ack_deltas_tests {
                     TimeDelta::from_secs(interval.as_secs_f64()),
                 ),
             ],
-            &stream
+            stream
+                .iter()
                 .map(|(ack, departure_delta, arrival_delta)| (
                     ack.arrival,
-                    departure_delta,
-                    arrival_delta
+                    *departure_delta,
+                    *arrival_delta,
                 ))
                 .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
         );
     }
 
@@ -651,10 +696,10 @@ mod calculate_ack_deltas_tests {
         let number_of_packets_after_jump = MAX_CONSECUTIVE_REORDERINGS as usize + 4;
 
         let acks =
-            acks_at_regular_intervals(initial_departure, interval, initial_arrival, interval)
+            AcksAtRegularIntervals::new(initial_departure, interval, initial_arrival, interval)
                 .take(3)
                 .chain(
-                    acks_at_regular_intervals(
+                    AcksAtRegularIntervals::new(
                         first_departure_after_jump,
                         interval,
                         first_arrival_after_jump,
@@ -664,9 +709,8 @@ mod calculate_ack_deltas_tests {
                 );
 
         let stream = calculate_ack_deltas(ack_groups_from_acks(acks));
-        pin_mut!(stream);
         assert_eq!(
-            &[
+            vec![
                 (
                     initial_arrival + 2 * interval,
                     interval,
@@ -691,74 +735,100 @@ mod calculate_ack_deltas_tests {
                     TimeDelta::from_secs(interval.as_secs_f64()),
                 ),
             ],
-            &stream
+            stream
+                .iter()
                 .map(|(ack, departure_delta, arrival_delta)| (
                     ack.arrival,
-                    departure_delta,
-                    arrival_delta
+                    *departure_delta,
+                    *arrival_delta,
                 ))
                 .collect::<Vec<_>>()
-                .now_or_never()
-                .unwrap()[..]
         );
     }
 }
 
-// Yields (now, delay_slope, duration, sample_count)
-fn calculate_delay_slopes(
-    ack_deltas: impl Stream<Item = (Ack, Duration, TimeDelta)>,
-) -> impl Stream<Item = (Instant, f64, Duration, usize)> {
+#[derive(Default)]
+enum DelaySlopeCalculator {
+    #[default]
+    None,
+    Some {
+        sample_count: usize,
+        accumulated_delay: TimeDelta,
+        smoothed_delay: TimeDelta,
+        history: RingBuffer<(f64, f64)>,
+        first_ack_arrival: RemoteInstant,
+    },
+}
+
+impl DelaySlopeCalculator {
     // TODO: Maybe make some of these configurable
-    let history_len: usize = 20;
-    let moving_average_alpha: f64 = 0.9;
-    let max_sample_count = 1000;
+    const HISTORY_LEN: usize = 20;
+    const MOVING_AVERAGE_ALPHA: f64 = 0.9;
+    const MAX_SAMPLE_COUNT: usize = 1000;
 
-    stream! {
-        pin_mut!(ack_deltas);
-        if let Some((first_ack, first_departure_delta, first_arrival_delta)) =
-            ack_deltas.next().await
-        {
-            let mut sample_count = 1;
-            let mut accumulated_delay: TimeDelta = first_arrival_delta - first_departure_delta;
-            let mut smoothed_delay: TimeDelta = accumulated_delay;
-            // Put secs in the history because it makes it easier to do the linear_regression without a bunch of generics.
-            let mut history: RingBuffer<(f64, f64)> = RingBuffer::new(history_len);
-            history.push((0.0, smoothed_delay.as_secs()));
-
-            yield (
-                first_ack.feedback_arrival,
-                0.0,
-                first_departure_delta,
+    fn next(
+        &mut self,
+        ack: &Ack,
+        departure_delta: Duration,
+        arrival_delta: TimeDelta,
+    ) -> Option<(Instant, f64, Duration, usize)> {
+        match self {
+            DelaySlopeCalculator::None => {
+                let delay = arrival_delta - departure_delta;
+                let mut history = RingBuffer::new(Self::HISTORY_LEN);
+                let relative_arrival = 0.0;
+                history.push((relative_arrival, delay.as_secs()));
+                let sample_count = 1;
+                *self = Self::Some {
+                    sample_count,
+                    accumulated_delay: delay,
+                    smoothed_delay: delay,
+                    history,
+                    first_ack_arrival: ack.arrival,
+                };
+                Some((
+                    ack.feedback_arrival,
+                    relative_arrival,
+                    departure_delta,
+                    sample_count,
+                ))
+            }
+            DelaySlopeCalculator::Some {
                 sample_count,
-            );
-
-            while let Some((latest_ack, departure_delta, arrival_delta)) = ack_deltas.next().await {
-                if sample_count < max_sample_count {
-                    sample_count += 1;
+                accumulated_delay,
+                smoothed_delay,
+                history,
+                first_ack_arrival,
+            } => {
+                if *sample_count < Self::MAX_SAMPLE_COUNT {
+                    *sample_count += 1;
                 }
-                let relative_arrival = latest_ack.arrival.time_delta_since(first_ack.arrival);
-                accumulated_delay = accumulated_delay + (arrival_delta - departure_delta);
-                smoothed_delay = exponential_moving_average(
-                    smoothed_delay,
-                    moving_average_alpha,
-                    accumulated_delay,
+                let relative_arrival = ack.arrival.time_delta_since(*first_ack_arrival);
+                *accumulated_delay = *accumulated_delay + (arrival_delta - departure_delta);
+                *smoothed_delay = exponential_moving_average(
+                    *smoothed_delay,
+                    Self::MOVING_AVERAGE_ALPHA,
+                    *accumulated_delay,
                 );
                 history.push((relative_arrival.as_secs(), smoothed_delay.as_secs()));
                 if history.is_full() {
                     if let Some(delay_slope) = linear_regression(history.iter().copied()) {
-                        yield (
-                            latest_ack.feedback_arrival,
+                        Some((
+                            ack.feedback_arrival,
                             delay_slope,
                             departure_delta,
-                            sample_count,
-                        );
+                            *sample_count,
+                        ))
                     } else {
                         error!(
                             "ack group history only contains one set of arrival times: {:?}",
                             history
                         );
                         debug_assert!(false, "after the first group, the history should never have all arrival times the same");
+                        None
                     }
+                } else {
+                    None
                 }
             }
         }
@@ -767,83 +837,79 @@ fn calculate_delay_slopes(
 
 #[cfg(test)]
 mod calculate_delay_slopes_tests {
-    use std::future::ready;
-
-    use futures::FutureExt;
-
     use super::*;
 
-    // Tests calculate_delay_slopes based on the stack of prior transformers.
-    fn calculate_delay_slopes_from_acks(
-        acks: impl Stream<Item = Ack>,
-    ) -> impl Stream<Item = (Instant, f64, Duration, usize)> {
-        calculate_delay_slopes(calculate_ack_deltas(accumulate_ack_groups(acks)))
+    // Tests DelaySlopeCalculator based on the stack of prior transformers.
+    fn calculate_delay_slopes_from_acks(acks: Vec<Ack>) -> Vec<(Instant, f64, Duration, usize)> {
+        let mut ack_groups = AckGroupAccumulator::default();
+        let mut ack_deltas = AckDeltaCalculator::default();
+        let mut delay_slopes = DelaySlopeCalculator::default();
+
+        acks.iter()
+            .filter_map(move |ack| ack_groups.next(ack))
+            .filter_map(move |(ack_group, latest_ack)| ack_deltas.next(ack_group, latest_ack))
+            .filter_map(move |(latest_ack, departure_delta, arrival_delta)| {
+                delay_slopes.next(latest_ack, departure_delta, arrival_delta)
+            })
+            .collect::<Vec<_>>()
     }
 
     // From WebRTC's TrendlineEstimatorTest::Normal.
     #[test]
     #[allow(clippy::float_cmp)]
     fn normal() {
-        let acks = acks_at_regular_intervals(
+        let acks = AcksAtRegularIntervals::new(
             Instant::now(),
             Duration::from_millis(20),
             RemoteInstant::from_millis(17),
             Duration::from_millis(20),
         )
-        .take(25);
+        .take(25)
+        .collect();
         let stream = calculate_delay_slopes_from_acks(acks);
-        pin_mut!(stream);
-        stream
-            .for_each(|(_now, slope, _duration, _count)| {
-                assert_eq!(0.0, slope);
-                ready(())
-            })
-            .now_or_never()
-            .unwrap();
+        stream.iter().for_each(|(_now, slope, _duration, _count)| {
+            assert_eq!(0.0, *slope);
+        });
     }
 
     // From WebRTC's TrendlineEstimatorTest::Overusing.
     #[test]
     fn overusing() {
-        let acks = acks_at_regular_intervals(
+        let acks = AcksAtRegularIntervals::new(
             Instant::now(),
             Duration::from_millis(20),
             RemoteInstant::from_millis(17),
             Duration::from_millis(22),
         )
-        .take(25);
+        .take(25)
+        .collect();
         let stream = calculate_delay_slopes_from_acks(acks);
-        pin_mut!(stream);
         stream
-            .skip_while(|(_now, slope, _duration, _count)| ready(*slope == 0.0))
+            .iter()
+            .skip_while(|(_now, slope, _duration, _count)| *slope == 0.0)
             .for_each(|(_now, slope, _duration, _count)| {
-                assert!(slope > 0.0);
-                ready(())
-            })
-            .now_or_never()
-            .unwrap();
+                assert!(*slope > 0.0);
+            });
     }
 
     // From WebRTC's TrendlineEstimatorTest::Underusing.
     #[test]
     fn underusing() {
-        let acks = acks_at_regular_intervals(
+        let acks = AcksAtRegularIntervals::new(
             Instant::now(),
             Duration::from_millis(20),
             RemoteInstant::from_millis(17),
             Duration::from_millis(17),
         )
-        .take(25);
+        .take(25)
+        .collect();
         let stream = calculate_delay_slopes_from_acks(acks);
-        pin_mut!(stream);
         stream
-            .skip_while(|(_now, slope, _duration, _count)| ready(*slope == 0.0))
+            .iter()
+            .skip_while(|(_now, slope, _duration, _count)| *slope == 0.0)
             .for_each(|(_now, slope, _duration, _count)| {
-                assert!(slope < 0.0);
-                ready(())
-            })
-            .now_or_never()
-            .unwrap();
+                assert!(*slope < 0.0);
+            });
     }
 
     #[test]
@@ -853,209 +919,250 @@ mod calculate_delay_slopes_tests {
         let interval = Duration::from_millis(20);
         let initial_arrival = RemoteInstant::from_millis(20_000);
 
-        let acks = acks_at_regular_intervals(
+        let acks = AcksAtRegularIntervals::new(
             initial_departure,
             interval,
             initial_arrival,
             interval.saturating_sub(Duration::from_millis(3)),
         )
-        .take(25);
-        let later_acks = acks_at_regular_intervals(
-            initial_departure + 25 * interval,
-            interval,
-            initial_arrival + 25 * interval,
-            interval,
+        .take(25)
+        .chain(
+            AcksAtRegularIntervals::new(
+                initial_departure + 25 * interval,
+                interval,
+                initial_arrival + 25 * interval,
+                interval,
+            )
+            .take(100),
         )
-        .take(100);
-        let stream = calculate_delay_slopes_from_acks(acks.chain(later_acks));
-        pin_mut!(stream);
+        .collect();
+        let stream = calculate_delay_slopes_from_acks(acks);
 
-        let mut slopes = stream.map(|(_now, slope, _duration, _count)| slope);
-        assert_eq!(
-            0.0,
-            slopes.next().now_or_never().expect("ready").expect("next")
-        );
+        let mut slopes = stream.iter().map(|(_now, slope, _duration, _count)| slope);
+        assert_eq!(0.0, *slopes.next().expect("must have slope"));
 
-        let mut slopes = slopes.skip_while(|slope| ready(0.0 == *slope));
-        assert!(
-            0.0 > slopes
-                .next()
-                .now_or_never()
-                .expect("ready")
-                .expect("has next")
-        );
+        let mut slopes = slopes.skip_while(|slope| 0.0 == **slope);
+        assert!(0.0 > *slopes.next().expect("must have slope"));
 
-        let mut slopes = slopes.skip_while(|slope| ready(0.0 > *slope));
-        assert!(
-            0.0 < slopes
-                .next()
-                .now_or_never()
-                .expect("ready")
-                .expect("has next")
-        );
+        let mut slopes = slopes.skip_while(|slope| 0.0 > **slope);
+        assert!(0.0 < *slopes.next().expect("must have slope"));
 
-        let mut slopes = slopes.skip_while(|slope| ready(0.0 < *slope));
-        assert_eq!(
-            0.0,
-            slopes
-                .next()
-                .now_or_never()
-                .expect("ready")
-                .expect("has next")
-        );
+        let mut slopes = slopes.skip_while(|slope| 0.0 < **slope);
+        assert_eq!(0.0, *slopes.next().expect("must have slope"));
     }
 }
 
-// These constants are taken from WebRTC's TrendlineEstimator, but divided by
-// sample_count_for_slope_shrinking, and then again by 4 to ignore
-// WebRTC's "threshold gain", which does not seem to serve any purpose.
-// This means they're all on the same scale as the incoming delay slopes.
-// TODO: Maybe make some of these configurable
+#[derive(Default)]
+enum DelayDirectionCalculator {
+    #[default]
+    None,
+    Some {
+        direction: DelayDirection,
+        increasing_count: usize,
+        prev_delay_slope: f64,
+        increasing_duration: Option<Duration>,
+        slope_threshold: f64,
+        slope_threshold_updated: Instant,
+    },
+}
+
 const INITIAL_DELAY_SLOPE_THRESHOLD: f64 = 0.052; // 52ms/s
 
-// TODO: If this is set to 2.5ms/s, the low bitrate tests from WebRTC start passing.
-// But is that a safe change?
-const MIN_DELAY_SLOPE_THRESHOLD: f64 = 0.025; // 25ms/s
-const MAX_DELAY_SLOPE_THRESHOLD: f64 = 2.5; // 2.5s/s
-
-const SLOPE_THRESHOLD_ADAPTATION_MAX_DIFFERENCE: f64 = 0.0625; // 62.5ms/s
-
-// Yields (latest_ack, direction)
-fn calculate_delay_directions_from_slopes(
-    delay_slopes: impl Stream<Item = (Instant, f64, Duration, usize)>,
-) -> impl Stream<Item = (Instant, DelayDirection)> {
+impl DelayDirectionCalculator {
+    // These constants are taken from WebRTC's TrendlineEstimator, but divided by
+    // sample_count_for_slope_shrinking, and then again by 4 to ignore
+    // WebRTC's "threshold gain", which does not seem to serve any purpose.
+    // This means they're all on the same scale as the incoming delay slopes.
     // TODO: Maybe make some of these configurable
-    let sample_count_for_slope_shrinking = 60;
-    let increasing_duration_threshold = Duration::from_millis(10);
 
-    let slope_threshold_adaptation_max_duration = Duration::from_millis(100);
+    // TODO: If this is set to 2.5ms/s, the low bitrate tests from WebRTC start passing.
+    // But is that a safe change?
+    const MIN_DELAY_SLOPE_THRESHOLD: f64 = 0.025; // 25ms/s
+    const MAX_DELAY_SLOPE_THRESHOLD: f64 = 2.5; // 2.5s/s
+
+    const SLOPE_THRESHOLD_ADAPTATION_MAX_DIFFERENCE: f64 = 0.0625; // 62.5ms/s
+
+    const SAMPLE_COUNT_FOR_SLOPE_SHRINKING: usize = 60;
+    const INCREASING_DURATION_THRESHOLD: Duration = Duration::from_millis(10);
+
+    const SLOPE_THRESHOLD_ADAPTATION_MAX_DURATION: Duration = Duration::from_millis(100);
     // Note that these are always multiplied by a duration that is at most
     // slope_threshold_adaption_max_duration above,
     // so the values aren't as extreme as they seem.
-    let slope_threshold_adapt_up_diff_part_per_second = 8.7;
-    let slope_threshold_adapt_down_diff_part_per_second = 39.0;
+    const SLOPE_THRESHOLD_ADAPT_UP_DIFF_PART_PER_SECOND: f64 = 8.7;
+    const SLOPE_THRESHOLD_ADAPT_DOWN_DIFF_PART_PER_SECOND: f64 = 39.0;
 
-    stream! {
-        pin_mut!(delay_slopes);
-        if let Some((start_time, mut prev_delay_slope, _, _)) = delay_slopes.next().await {
-            // Until we have 2 samples
-            let mut direction = DelayDirection::Steady;
-            let mut increasing_count = 0u64;
-            let mut increasing_duration = None;
-            let mut slope_threshold = INITIAL_DELAY_SLOPE_THRESHOLD;
-            let mut slope_threshold_updated = start_time;
-
-            yield (start_time, direction);
-
-            while let Some((now, delay_slope, departure_delta, sample_count)) =
-                delay_slopes.next().await
-            {
+    fn next(
+        &mut self,
+        now: Instant,
+        delay_slope: f64,
+        departure_delta: Duration,
+        sample_count: usize,
+    ) -> (Instant, DelayDirection) {
+        match self {
+            DelayDirectionCalculator::None => {
+                let direction = DelayDirection::Steady;
+                *self = Self::Some {
+                    direction,
+                    increasing_count: 0,
+                    prev_delay_slope: delay_slope,
+                    increasing_duration: None,
+                    slope_threshold: INITIAL_DELAY_SLOPE_THRESHOLD,
+                    slope_threshold_updated: now,
+                };
+                (now, direction)
+            }
+            DelayDirectionCalculator::Some {
+                direction,
+                increasing_count,
+                prev_delay_slope,
+                increasing_duration,
+                slope_threshold,
+                slope_threshold_updated,
+            } => {
                 // We shrink the delay slope while we have few samples to make the threshold look bigger.
                 // But it effectively shrinks as we get more samples.
                 let shrunk_delay_slope = delay_slope
-                    * min(sample_count_for_slope_shrinking, sample_count) as f64
-                    / sample_count_for_slope_shrinking as f64;
-                if shrunk_delay_slope > slope_threshold {
-                    increasing_count += 1;
-                    increasing_duration =
+                    * min(Self::SAMPLE_COUNT_FOR_SLOPE_SHRINKING, sample_count) as f64
+                    / Self::SAMPLE_COUNT_FOR_SLOPE_SHRINKING as f64;
+                if shrunk_delay_slope > *slope_threshold {
+                    *increasing_count += 1;
+                    *increasing_duration =
                         if let Some(previous_increasing_duration) = increasing_duration {
-                            Some(previous_increasing_duration + departure_delta)
+                            Some(*previous_increasing_duration + departure_delta)
                         } else {
                             Some(departure_delta / 2)
                         };
-                    if (increasing_count > 1)
-                        && (increasing_duration.unwrap() > increasing_duration_threshold)
-                        && (delay_slope >= prev_delay_slope)
+                    if (*increasing_count > 1)
+                        && (increasing_duration.unwrap() > Self::INCREASING_DURATION_THRESHOLD)
+                        && (delay_slope >= *prev_delay_slope)
                     {
-                        direction = DelayDirection::Increasing;
-                        increasing_count = 0;
-                        increasing_duration = Some(Duration::ZERO);
+                        *direction = DelayDirection::Increasing;
+                        *increasing_count = 0;
+                        *increasing_duration = Some(Duration::ZERO);
                     } else {
                         // Yield the existing direction and wait for more "increasing" signals.
                     }
-                } else if shrunk_delay_slope < -slope_threshold {
-                    direction = DelayDirection::Decreasing;
-                    increasing_count = 0;
-                    increasing_duration = None;
+                } else if shrunk_delay_slope < -*slope_threshold {
+                    *direction = DelayDirection::Decreasing;
+                    *increasing_count = 0;
+                    *increasing_duration = None;
                 } else {
-                    direction = DelayDirection::Steady;
-                    increasing_count = 0;
-                    increasing_duration = None;
+                    *direction = DelayDirection::Steady;
+                    *increasing_count = 0;
+                    *increasing_duration = None;
                 }
 
-                let slope_threshold_diff = shrunk_delay_slope.abs() - slope_threshold;
-                if slope_threshold_diff < SLOPE_THRESHOLD_ADAPTATION_MAX_DIFFERENCE {
+                let slope_threshold_diff = shrunk_delay_slope.abs() - *slope_threshold;
+                if slope_threshold_diff < Self::SLOPE_THRESHOLD_ADAPTATION_MAX_DIFFERENCE {
                     let adaption_duration = min(
-                        slope_threshold_adaptation_max_duration,
-                        now.saturating_duration_since(slope_threshold_updated),
+                        Self::SLOPE_THRESHOLD_ADAPTATION_MAX_DURATION,
+                        now.saturating_duration_since(*slope_threshold_updated),
                     );
                     let adaptation_diff_part_per_second = if slope_threshold_diff > 0.0 {
-                        slope_threshold_adapt_up_diff_part_per_second // up toward the slope (shrink the gap)
+                        Self::SLOPE_THRESHOLD_ADAPT_UP_DIFF_PART_PER_SECOND // up toward the slope (shrink the gap)
                     } else {
-                        slope_threshold_adapt_down_diff_part_per_second // down toward the slope (shrink the gap)
+                        Self::SLOPE_THRESHOLD_ADAPT_DOWN_DIFF_PART_PER_SECOND // down toward the slope (shrink the gap)
                     };
                     let adaptation = adaptation_diff_part_per_second
                         * slope_threshold_diff
                         * adaption_duration.as_secs_f64();
-                    slope_threshold = (slope_threshold + adaptation)
-                        .clamp(MIN_DELAY_SLOPE_THRESHOLD, MAX_DELAY_SLOPE_THRESHOLD);
+                    *slope_threshold = (*slope_threshold + adaptation).clamp(
+                        Self::MIN_DELAY_SLOPE_THRESHOLD,
+                        Self::MAX_DELAY_SLOPE_THRESHOLD,
+                    );
                 }
-                slope_threshold_updated = now;
+                *slope_threshold_updated = now;
+                *prev_delay_slope = delay_slope;
 
                 // We always yield a direction, even if it's the same as last time.
                 // This is because we adjust the bitrate up or down further on repeated increases or decreases.
-                yield (now, direction);
-
-                prev_delay_slope = delay_slope;
+                (now, *direction)
             }
         }
     }
 }
 
-pub fn calculate_delay_directions(
-    acks: impl Stream<Item = Ack>,
-) -> impl Stream<Item = (Instant, DelayDirection)> {
-    calculate_delay_directions_from_slopes(calculate_delay_slopes(calculate_ack_deltas(
-        accumulate_ack_groups(acks),
-    )))
+#[derive(Default)]
+pub struct DelayDirectionPipeline {
+    ack_groups: AckGroupAccumulator,
+    ack_deltas: AckDeltaCalculator,
+    delay_slopes: DelaySlopeCalculator,
+    delay_directions: DelayDirectionCalculator,
+}
+
+impl DelayDirectionPipeline {
+    pub fn next(&mut self, acks: &[Ack]) -> Option<(Instant, DelayDirection)> {
+        acks.iter()
+            .filter_map(|ack| self.ack_groups.next(ack))
+            .filter_map(|(ack_group, latest_ack)| self.ack_deltas.next(ack_group, latest_ack))
+            .filter_map(|(latest_ack, departure_delta, arrival_delta)| {
+                self.delay_slopes
+                    .next(latest_ack, departure_delta, arrival_delta)
+            })
+            .map(|(now, delay_slope, departure_delta, sample_count)| {
+                self.delay_directions
+                    .next(now, delay_slope, departure_delta, sample_count)
+            })
+            .last()
+    }
 }
 
 #[cfg(test)]
 mod calculate_delay_directions_from_slopes_tests {
-    use std::future::ready;
-
-    use futures::FutureExt;
     use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
 
     use super::*;
-    use crate::googcc::stream::StreamExt as _;
+
+    // Tests DelayDirectionCalculator based on the stack of prior transformers.
+    fn calculate_delay_directions(acks: Vec<Ack>) -> Vec<(Instant, DelayDirection)> {
+        let mut ack_groups = AckGroupAccumulator::default();
+        let mut ack_deltas = AckDeltaCalculator::default();
+        let mut delay_slopes = DelaySlopeCalculator::default();
+        let mut delay_directions = DelayDirectionCalculator::default();
+
+        acks.iter()
+            .filter_map(move |ack| ack_groups.next(ack))
+            .filter_map(move |(ack_group, latest_ack)| ack_deltas.next(ack_group, latest_ack))
+            .filter_map(move |(latest_ack, departure_delta, arrival_delta)| {
+                delay_slopes.next(latest_ack, departure_delta, arrival_delta)
+            })
+            .map(move |(now, delay_slope, departure_delta, sample_count)| {
+                delay_directions.next(now, delay_slope, departure_delta, sample_count)
+            })
+            .collect::<Vec<_>>()
+    }
+
+    fn calculate_delay_directions_from_slopes(
+        slope_tuples: Vec<(Instant, f64, Duration, usize)>,
+    ) -> Vec<(Instant, DelayDirection)> {
+        let mut delay_directions = DelayDirectionCalculator::default();
+
+        slope_tuples
+            .iter()
+            .map(|(now, delay_slope, departure_delta, sample_count)| {
+                delay_directions.next(*now, *delay_slope, *departure_delta, *sample_count)
+            })
+            .collect::<Vec<_>>()
+    }
 
     // From WebRTC's OveruseDetectorTest::SimpleNonOveruse30fps.
     #[test]
     fn simple_non_overuse_30_fps() {
-        let acks = acks_at_regular_intervals(
+        let acks = AcksAtRegularIntervals::new(
             Instant::now(),
             Duration::from_millis(33),
             RemoteInstant::from_millis(17),
             Duration::from_millis(33),
         );
-        let stream = calculate_delay_directions(acks.take(1_000));
-        pin_mut!(stream);
-        assert_eq!(
-            DelayDirection::Steady,
-            stream
-                .last()
-                .now_or_never()
-                .expect("ready")
-                .expect("non-empty")
-                .1
-        );
+        let stream = calculate_delay_directions(acks.take(1_000).collect());
+        assert_eq!(DelayDirection::Steady, stream.last().expect("non-empty").1);
     }
 
     // From WebRTC's OveruseDetectorTest::SimpleNonOveruseWithReceiveVariance.
     #[test]
     fn simple_non_overuse_with_arrival_variance() {
-        let acks = acks_at_regular_intervals(
+        let acks = AcksAtRegularIntervals::new(
             Instant::now(),
             Duration::from_millis(33),
             RemoteInstant::from_millis(17),
@@ -1067,25 +1174,16 @@ mod calculate_delay_directions_from_slopes_tests {
                 result.arrival += Duration::from_millis(10);
             }
             *is_odd = !*is_odd;
-            ready(Some(result))
+            Some(result)
         });
-        let stream = calculate_delay_directions(acks.take(1_000));
-        pin_mut!(stream);
-        assert_eq!(
-            DelayDirection::Steady,
-            stream
-                .last()
-                .now_or_never()
-                .expect("ready")
-                .expect("non-empty")
-                .1
-        );
+        let stream = calculate_delay_directions(acks.take(1_000).collect());
+        assert_eq!(DelayDirection::Steady, stream.last().expect("non-empty").1);
     }
 
     // From WebRTC's OveruseDetectorTest::SimpleNonOveruseWithRtpTimestampVariance.
     #[test]
     fn simple_non_overuse_with_departure_variance() {
-        let acks = acks_at_regular_intervals(
+        let acks = AcksAtRegularIntervals::new(
             Instant::now(),
             Duration::from_millis(33),
             RemoteInstant::from_millis(17),
@@ -1097,19 +1195,10 @@ mod calculate_delay_directions_from_slopes_tests {
                 result.departure += Duration::from_millis(10);
             }
             *is_odd = !*is_odd;
-            ready(Some(result))
+            Some(result)
         });
-        let stream = calculate_delay_directions(acks.take(1_000));
-        pin_mut!(stream);
-        assert_eq!(
-            DelayDirection::Steady,
-            stream
-                .last()
-                .now_or_never()
-                .expect("ready")
-                .expect("non-empty")
-                .1
-        );
+        let stream = calculate_delay_directions(acks.take(1_000).collect());
+        assert_eq!(DelayDirection::Steady, stream.last().expect("non-empty").1);
     }
 
     // From WebRTC's OveruseDetectorTest::SimpleOveruse2000Kbit30fps.
@@ -1119,38 +1208,33 @@ mod calculate_delay_directions_from_slopes_tests {
         let initial_arrival = RemoteInstant::from_millis(17);
         let interval = Duration::from_millis(33);
 
-        let initial_acks =
-            acks_at_regular_intervals(initial_departure, interval, initial_arrival, interval)
-                .take(100_000);
-
         let next_departure = initial_departure + 100_000 * interval;
         let next_arrival = initial_arrival + 100_000 * interval;
 
-        let delayed_acks = acks_at_regular_intervals(
-            next_departure,
-            interval,
-            next_arrival,
-            interval + Duration::MILLISECOND,
-        )
-        .take(1_000);
+        let acks =
+            AcksAtRegularIntervals::new(initial_departure, interval, initial_arrival, interval)
+                .take(100_000)
+                .chain(
+                    AcksAtRegularIntervals::new(
+                        next_departure,
+                        interval,
+                        next_arrival,
+                        interval + Duration::MILLISECOND,
+                    )
+                    .take(1_000),
+                );
 
-        let stream = calculate_delay_directions(
-            initial_acks
-                .chain(delayed_acks)
-                // Six packets per frame.
-                .flat_map(|ack| futures::stream::repeat(ack).take(6)),
-        );
-        pin_mut!(stream);
+        let stream =
+            calculate_delay_directions(acks.flat_map(|ack| std::iter::repeat_n(ack, 6)).collect());
         assert_eq!(
             // Ten frames (sixty packets) past WebRTC because calculate_delay_slopes doesn't start
             // yielding until its window is full.
             Some(100_017 * interval + RTT_FOR_ACKS_AT_REGULAR_INTERVALS),
             stream
-                .skip_while(|(_, direction)| ready(*direction != DelayDirection::Increasing))
+                .iter()
+                .skip_while(|(_, direction)| *direction != DelayDirection::Increasing)
                 .map(|(instant, _)| instant.checked_duration_since(initial_departure).unwrap())
                 .next()
-                .now_or_never()
-                .unwrap()
         );
     }
 
@@ -1162,31 +1246,31 @@ mod calculate_delay_directions_from_slopes_tests {
         let initial_arrival = RemoteInstant::from_millis(17);
         let interval = Duration::from_millis(100);
 
-        let initial_acks =
-            acks_at_regular_intervals(initial_departure, interval, initial_arrival, interval)
-                .take(100_000);
-
         let next_departure = initial_departure + 100_000 * interval;
         let next_arrival = initial_arrival + 100_000 * interval;
 
-        let delayed_acks = acks_at_regular_intervals(
-            next_departure,
-            interval,
-            next_arrival,
-            interval + Duration::MILLISECOND,
-        )
-        .take(1_000);
+        let acks =
+            AcksAtRegularIntervals::new(initial_departure, interval, initial_arrival, interval)
+                .take(100_000)
+                .chain(
+                    AcksAtRegularIntervals::new(
+                        next_departure,
+                        interval,
+                        next_arrival,
+                        interval + Duration::MILLISECOND,
+                    )
+                    .take(1_000),
+                )
+                .collect();
 
-        let stream = calculate_delay_directions(initial_acks.chain(delayed_acks));
-        pin_mut!(stream);
+        let stream = calculate_delay_directions(acks);
         assert_eq!(
             Some(100_017 * interval + RTT_FOR_ACKS_AT_REGULAR_INTERVALS),
             stream
-                .skip_while(|(_, direction)| ready(*direction != DelayDirection::Increasing))
+                .iter()
+                .skip_while(|(_, direction)| *direction != DelayDirection::Increasing)
                 .map(|(instant, _)| instant.checked_duration_since(initial_departure).unwrap())
-                .next()
-                .now_or_never()
-                .unwrap(),
+                .next(),
             "XFAIL: should detect increasing delay"
         );
     }
@@ -1197,46 +1281,68 @@ mod calculate_delay_directions_from_slopes_tests {
         let initial_departure = Instant::now();
         let initial_arrival = RemoteInstant::from_millis(17);
         let interval = Duration::from_millis(33);
+        let next_departure = initial_departure + 1_000 * interval;
+        let next_arrival = initial_arrival + 1_000 * interval;
 
-        let initial_acks =
-            acks_at_regular_intervals(initial_departure, interval, initial_arrival, interval)
+        let acks =
+            AcksAtRegularIntervals::new(initial_departure, interval, initial_arrival, interval)
                 .scan(false, |is_odd, ack| {
                     let mut result = ack;
                     if *is_odd {
                         result.arrival += Duration::from_millis(2);
                     }
                     *is_odd = !*is_odd;
-                    ready(Some(result))
+                    Some(result)
                 })
-                .take(1_000);
-
-        let next_departure = initial_departure + 1_000 * interval;
-        let next_arrival = initial_arrival + 1_000 * interval;
-
-        let delayed_acks = acks_at_regular_intervals(
-            next_departure,
-            interval,
-            next_arrival,
-            interval + Duration::from_millis(6),
-        )
-        .take(1_000);
+                .take(1_000)
+                .chain(
+                    AcksAtRegularIntervals::new(
+                        next_departure,
+                        interval,
+                        next_arrival,
+                        interval + Duration::from_millis(6),
+                    )
+                    .take(1_000),
+                );
 
         let stream = calculate_delay_directions(
-            initial_acks
-                .chain(delayed_acks)
+            acks
                 // Six packets per frame.
-                .flat_map(|ack| futures::stream::repeat(ack).take(6)),
+                .flat_map(|ack| std::iter::repeat_n(ack, 6))
+                .collect(),
         );
-        pin_mut!(stream);
         assert_eq!(
             Some(1_007 * interval + RTT_FOR_ACKS_AT_REGULAR_INTERVALS),
             stream
-                .skip_while(|(_, direction)| ready(*direction != DelayDirection::Increasing))
+                .iter()
+                .skip_while(|(_, direction)| *direction != DelayDirection::Increasing)
                 .map(|(instant, _)| instant.checked_duration_since(initial_departure).unwrap())
                 .next()
-                .now_or_never()
-                .unwrap()
         );
+    }
+
+    struct Variance {
+        gaussian: rand_distr::Normal<f64>,
+        rng: StdRng,
+    }
+
+    impl Variance {
+        fn new(arrival_std_dev: Duration) -> Self {
+            let gaussian = rand_distr::Normal::new(0.005, arrival_std_dev.as_secs_f64()).unwrap();
+            let seed: u64 = match std::env::var("RANDOM_SEED") {
+                Ok(v) => v.parse().unwrap(),
+                Err(_) => thread_rng().gen(),
+            };
+            let rng = StdRng::seed_from_u64(seed);
+            Self { gaussian, rng }
+        }
+    }
+
+    impl Iterator for Variance {
+        type Item = f64;
+        fn next(&mut self) -> Option<Self::Item> {
+            Some(self.rng.sample(self.gaussian))
+        }
     }
 
     /// Runs a simulation that WebRTC is fond of.
@@ -1253,57 +1359,44 @@ mod calculate_delay_directions_from_slopes_tests {
         arrival_drift_per_frame: Duration,
         assertion_tag: &str,
     ) {
-        let variance = stream! {
-            let gaussian = rand_distr::Normal::new(0.005, arrival_std_dev.as_secs_f64()).unwrap();
-            let seed: u64 = match std::env::var("RANDOM_SEED") {
-                Ok(v) => v.parse().unwrap(),
-                Err(_) => thread_rng().gen(),
-            };
-            let mut rng = StdRng::seed_from_u64(seed);
-            loop {
-                yield rng.sample(gaussian);
-            }
-        };
+        let variance = Variance::new(arrival_std_dev);
 
         let initial_departure = Instant::now();
         let initial_arrival = RemoteInstant::from_millis(17);
+        let next_departure = initial_departure + 100_000 * frame_interval;
+        let next_arrival = initial_arrival + 100_000 * frame_interval;
 
-        let initial_acks = acks_at_regular_intervals(
+        let acks = AcksAtRegularIntervals::new(
             initial_departure,
             frame_interval,
             initial_arrival,
             frame_interval,
         )
-        .take(100_000);
-
-        let next_departure = initial_departure + 100_000 * frame_interval;
-        let next_arrival = initial_arrival + 100_000 * frame_interval;
-
-        let delayed_acks = acks_at_regular_intervals(
-            next_departure,
-            frame_interval,
-            next_arrival,
-            frame_interval + arrival_drift_per_frame,
-        )
-        .take(1_000);
+        .take(100_000)
+        .chain(
+            AcksAtRegularIntervals::new(
+                next_departure,
+                frame_interval,
+                next_arrival,
+                frame_interval + arrival_drift_per_frame,
+            )
+            .take(1_000),
+        );
 
         let stream = calculate_delay_directions(
-            initial_acks
-                .chain(delayed_acks)
-                .zip(variance)
+            acks.zip(variance)
                 .map(|(mut ack, variance)| {
                     ack.arrival += Duration::from_millis(variance as u64);
                     ack
                 })
-                .flat_map(|ack| futures::stream::repeat(ack).take(acks_per_frame)),
+                .flat_map(|ack| std::iter::repeat_n(ack, acks_per_frame))
+                .collect(),
         );
-        pin_mut!(stream);
         let first_after_change = stream
-            .skip_while(|(_, direction)| ready(*direction != DelayDirection::Increasing))
+            .iter()
+            .skip_while(|(_, direction)| *direction != DelayDirection::Increasing)
             .map(|(instant, _)| instant.checked_duration_since(initial_departure).unwrap())
-            .next()
-            .now_or_never()
-            .expect("stream is synchronous");
+            .next();
         if let Some(first_after_change) = first_after_change {
             assert!(
                 100_000 * frame_interval + RTT_FOR_ACKS_AT_REGULAR_INTERVALS < first_after_change,
@@ -1563,65 +1656,55 @@ mod calculate_delay_directions_from_slopes_tests {
     #[test]
     fn threshold_adapts() {
         let mut start_time = Instant::now();
-        let incrementing_times = futures::stream::repeat_with(move || {
+        let incrementing_times = std::iter::repeat_with(move || {
             start_time += Duration::from_millis(5);
             start_time
         });
-        let slopes = stream! {
-            let slope: f64 = 1.02 * INITIAL_DELAY_SLOPE_THRESHOLD;
-            yield slope;
-            yield 1.1 * slope;
-            yield slope;
-            for _ in 0..15usize {
-                yield 0.7 * slope;
-            }
-            yield slope;
-        };
+        let slope: f64 = 1.02 * INITIAL_DELAY_SLOPE_THRESHOLD;
+        let mut slopes = vec![slope, 1.1 * slope, slope];
+        slopes.append(&mut vec![0.7 * slope; 15]);
+        slopes.push(slope);
+
         let batch_size = 10;
         let slope_tuples = slopes
-            .flat_map(|slope| futures::stream::repeat(slope).take(batch_size))
+            .iter()
+            .flat_map(|slope| std::iter::repeat_n(slope, batch_size))
             .zip(incrementing_times)
-            .map(|(slope, now)| (now, slope, Duration::from_secs(3), 60));
-        let stream = calculate_delay_directions_from_slopes(slope_tuples).chunks(batch_size);
-        pin_mut!(stream);
+            .map(|(slope, now)| (now, *slope, Duration::from_secs(3), 60))
+            .collect();
+
+        let results = calculate_delay_directions_from_slopes(slope_tuples);
+
+        let mut stream = results.chunks(batch_size);
+        println!("{:?}", results);
         // First batch is increasing.
         assert!(stream
             .next()
-            .now_or_never()
-            .expect("ready")
             .expect("stream not ended")
             .iter()
             .any(|(_now, direction)| direction == &DelayDirection::Increasing));
         // Second batch is also increasing, but should raise the threshold...
         assert!(stream
             .next()
-            .now_or_never()
-            .expect("ready")
             .expect("stream not ended")
             .iter()
             .any(|(_now, direction)| direction == &DelayDirection::Increasing));
         // ...so that the third batch is not considered increasing.
-        assert!(!stream
+        assert!(stream
             .next()
-            .now_or_never()
-            .expect("ready")
             .expect("stream not ended")
             .iter()
-            .any(|(_now, direction)| direction == &DelayDirection::Increasing));
+            .all(|(_now, direction)| direction == &DelayDirection::Steady));
         // But after many rounds of a lower value...
         let mut stream = stream.skip(14);
-        assert!(!stream
+        assert!(stream
             .next()
-            .now_or_never()
-            .expect("ready")
             .expect("stream not ended")
             .iter()
-            .any(|(_now, direction)| direction == &DelayDirection::Increasing));
+            .all(|(_now, direction)| direction == &DelayDirection::Steady));
         // ...the last batch should be increasing again.
         assert!(stream
             .next()
-            .now_or_never()
-            .expect("ready")
             .expect("stream not ended")
             .iter()
             .any(|(_now, direction)| direction == &DelayDirection::Increasing));
@@ -1631,33 +1714,27 @@ mod calculate_delay_directions_from_slopes_tests {
     #[test]
     fn does_not_adapt_to_spikes() {
         let mut start_time = Instant::now();
-        let incrementing_times = futures::stream::repeat_with(move || {
+        let incrementing_times = std::iter::repeat_with(move || {
             start_time += Duration::from_millis(5);
             start_time
         });
-        let slopes = stream! {
-            let slope: f64 = 1.02 * INITIAL_DELAY_SLOPE_THRESHOLD;
-            for _ in 0..10usize {
-                yield slope;
-            }
-            for _ in 0..3usize {
-                yield 20.0 * slope;
-            }
-            for _ in 0..10usize {
-                yield slope;
-            }
-        };
+        let slope: f64 = 1.02 * INITIAL_DELAY_SLOPE_THRESHOLD;
+        let mut slopes = vec![slope; 10];
+        slopes.append(&mut vec![20.0 * slope; 3]);
+        slopes.append(&mut vec![slope; 10]);
+
         let slope_tuples = slopes
+            .iter()
             .zip(incrementing_times)
-            .map(|(slope, now)| (now, slope, Duration::from_secs(3), 60));
-        let stream_output: Vec<_> = calculate_delay_directions_from_slopes(slope_tuples)
-            .collect()
-            .now_or_never()
-            .unwrap();
+            .map(|(slope, now)| (now, *slope, Duration::from_secs(3), 60))
+            .collect();
+        let stream_output = calculate_delay_directions_from_slopes(slope_tuples);
+
         // After a few slopes, the increase should be detected.
         assert!(stream_output
             .iter()
             .any(|(_now, direction)| direction == &DelayDirection::Increasing));
+
         // Make sure that the spike does not update the threshold,
         // i.e. even the slopes after the spikes are still considered increasing.
         stream_output

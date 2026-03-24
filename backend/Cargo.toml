@@ -68,11 +68,6 @@ aes = "0.8.4"
 aes-gcm = "0.10.3"
 zeroize = "1.8.2"
 
-# For congestion control
-async-stream = "0.3.6"
-# For congestion-control-specific helpers
-pin-project = "1.1.10"
-
 # For low-level UDP sockets and tracking TCP sockets
 nix = { version = "0.27.1", optional = true, features = ["time", "socket", "event", "signal", "net"] }
 unique_id = "0.1.7"

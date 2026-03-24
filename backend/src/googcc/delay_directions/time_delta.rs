@@ -14,11 +14,11 @@ pub struct TimeDelta {
 }
 
 impl TimeDelta {
-    pub fn from_secs(secs: f64) -> Self {
+    pub const fn from_secs(secs: f64) -> Self {
         Self { secs }
     }
 
-    pub fn from_millis(millis: f64) -> Self {
+    pub const fn from_millis(millis: f64) -> Self {
         Self::from_secs(millis / 1000.0)
     }
 
