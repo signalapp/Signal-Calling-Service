@@ -23,7 +23,7 @@ use super::{
     types::*,
     Packet, OPUS_PAYLOAD_TYPE, VERSION, VP8_PAYLOAD_TYPE,
 };
-use crate::transportcc as tcc;
+use crate::{rtp::VP9_PAYLOAD_TYPE, transportcc as tcc};
 
 const RTCP_HEADER_LEN: usize = 8;
 const RTCP_RECEIVER_REPORT_BLOCK_LEN: usize = 28;
@@ -563,7 +563,7 @@ impl RtcpReportSender {
     fn estimate_sample_freq(payload_type: PayloadType) -> u32 {
         if payload_type == OPUS_PAYLOAD_TYPE {
             48000
-        } else if payload_type == VP8_PAYLOAD_TYPE {
+        } else if payload_type == VP8_PAYLOAD_TYPE || payload_type == VP9_PAYLOAD_TYPE {
             90000
         } else {
             warn!(

@@ -22,7 +22,7 @@ use crate::{
     pacer::{self, Pacer},
     packet_server::{AddressType, SocketLocator},
     region::RegionRelation,
-    rtp::{self, TruncatedSequenceNumber},
+    rtp::{self, TemplateDependencyStructure, TruncatedSequenceNumber},
     sfu::ConnectionId,
 };
 
@@ -282,9 +282,12 @@ impl Connection {
     pub fn handle_rtp_packet<'packet>(
         &self,
         incoming_packet: &'packet mut [u8],
+        template_dependency_structure: Option<&TemplateDependencyStructure>,
         now: Instant,
     ) -> Result<Option<rtp::Packet<&'packet mut [u8]>>, Error> {
-        self.inner.write().handle_rtp_packet(incoming_packet, now)
+        self.inner
+            .write()
+            .handle_rtp_packet(incoming_packet, template_dependency_structure, now)
     }
 
     /// Decrypts an incoming RTCP packet and processes it.
@@ -725,6 +728,7 @@ impl ConnectionInner {
     fn handle_rtp_packet<'packet>(
         &mut self,
         incoming_packet: &'packet mut [u8],
+        template_dependency_structure: Option<&TemplateDependencyStructure>,
         now: Instant,
     ) -> Result<Option<rtp::Packet<&'packet mut [u8]>>, Error> {
         if self.closed {
@@ -733,7 +737,7 @@ impl ConnectionInner {
 
         let rtp_endpoint = &mut self.rtp.endpoint;
         let size = incoming_packet.len();
-        match rtp_endpoint.receive_rtp(incoming_packet, now) {
+        match rtp_endpoint.receive_rtp(incoming_packet, template_dependency_structure, now) {
             Some(packet) => {
                 if packet.is_rtx() {
                     event!("calling.bandwidth.incoming.rtx_bytes", size);
@@ -1553,7 +1557,7 @@ mod connection_tests {
         assert_eq!(
             expected_decrypted_rtp.to_owned(),
             connection
-                .handle_rtp_packet(&mut encrypted_rtp.into_serialized(), now)
+                .handle_rtp_packet(&mut encrypted_rtp.into_serialized(), None, now)
                 .unwrap()
                 .unwrap()
                 .to_owned()
@@ -1562,7 +1566,7 @@ mod connection_tests {
         let encrypted_rtp = new_encrypted_rtp(2, None, &encrypt, now);
         assert_eq!(
             Err(Error::ReceivedInvalidRtp),
-            connection.handle_rtp_packet(&mut encrypted_rtp.into_serialized(), now)
+            connection.handle_rtp_packet(&mut encrypted_rtp.into_serialized(), None, now)
         );
 
         let encrypted_rtp = new_encrypted_rtx_rtp(5, 2, None, &decrypt, now);
@@ -1570,7 +1574,7 @@ mod connection_tests {
         assert_eq!(
             expected_decrypted_rtp.borrow().to_owned(),
             connection
-                .handle_rtp_packet(&mut encrypted_rtp.into_serialized(), now)
+                .handle_rtp_packet(&mut encrypted_rtp.into_serialized(), None, now)
                 .unwrap()
                 .unwrap()
                 .to_owned()
@@ -1665,7 +1669,7 @@ mod connection_tests {
         let (buf, _addr) = &packets_to_send[0];
 
         assert_eq!(1172, buf.len());
-        let actual_padding_header = rtp::Header::parse(buf).unwrap();
+        let actual_padding_header = rtp::Header::parse(buf, None).unwrap();
         assert_eq!(padding_ssrc, actual_padding_header.ssrc);
         assert_eq!(99, actual_padding_header.payload_type);
         assert_eq!(1136, actual_padding_header.payload_range.len());
@@ -1710,7 +1714,7 @@ mod connection_tests {
         let (buf, _addr) = &packets_to_send[0];
 
         assert_eq!(1172, buf.len());
-        let actual_padding_header = rtp::Header::parse(buf).unwrap();
+        let actual_padding_header = rtp::Header::parse(buf, None).unwrap();
         assert_eq!(padding_ssrc, actual_padding_header.ssrc);
         assert_eq!(99, actual_padding_header.payload_type);
         assert_eq!(1136, actual_padding_header.payload_range.len());
@@ -1815,6 +1819,7 @@ mod connection_tests {
         connection
             .handle_rtp_packet(
                 &mut new_encrypted_rtp(1, Some(101), &decrypt, at(1)).into_serialized(),
+                None,
                 at(1),
             )
             .unwrap()
@@ -1823,6 +1828,7 @@ mod connection_tests {
         connection
             .handle_rtp_packet(
                 &mut new_encrypted_rtp(3, Some(103), &decrypt, at(3)).into_serialized(),
+                None,
                 at(3),
             )
             .unwrap()
@@ -1875,6 +1881,7 @@ mod connection_tests {
         connection
             .handle_rtp_packet(
                 &mut new_encrypted_rtp(2, Some(102), &decrypt, at(10002)).into_serialized(),
+                None,
                 at(10002),
             )
             .unwrap()

@@ -6,6 +6,7 @@
 //! Implementation of RTP/SRTP. See https://tools.ietf.org/html/rfc3550 and
 //! https://tools.ietf.org/html/rfc7714. Assumes AES-GCM 128.
 
+mod dependency_descriptor;
 mod nack;
 mod packet;
 mod rtcp;
@@ -16,13 +17,15 @@ mod types;
 use std::{collections::HashMap, convert::TryInto};
 
 use calling_common::{expand_truncated_counter, read_u16, Bits, Duration, Instant, Writer};
+pub use dependency_descriptor::*;
 use log::*;
 use metrics::*;
 use nack::*;
 pub use nack::{write_nack, Nack};
 use packet::*;
-pub use packet::{DependencyDescriptor, Header, Packet};
-pub use rtcp::{ControlPacket, KeyFrameRequest, *};
+pub use packet::{Header, Packet};
+use rtcp::*;
+pub use rtcp::{ControlPacket, KeyFrameRequest};
 pub use rtx::to_rtx_ssrc;
 use rtx::*;
 use srtp::*;
@@ -38,6 +41,7 @@ const PADDING_PAYLOAD_TYPE: PayloadType = 99;
 const CLIENT_SERVER_DATA_PAYLOAD_TYPE: PayloadType = 101;
 pub const OPUS_PAYLOAD_TYPE: PayloadType = 102;
 pub const VP8_PAYLOAD_TYPE: PayloadType = 108;
+pub const VP9_PAYLOAD_TYPE: PayloadType = 109;
 
 // Discard outgoing packets after this time.
 // 3 second lifetime matches WebRTC's RTX history
@@ -114,7 +118,7 @@ fn is_audio_payload_type(pt: PayloadType) -> bool {
 }
 
 fn is_video_payload_type(pt: PayloadType) -> bool {
-    pt == VP8_PAYLOAD_TYPE
+    pt == VP8_PAYLOAD_TYPE || pt == VP9_PAYLOAD_TYPE
 }
 
 fn is_padding_payload_type(pt: PayloadType) -> bool {
@@ -228,10 +232,11 @@ impl Endpoint {
     pub fn receive_rtp<'packet>(
         &mut self,
         encrypted: &'packet mut [u8],
+        template_dependency_structure: Option<&TemplateDependencyStructure>,
         now: Instant,
     ) -> Option<Packet<&'packet mut [u8]>> {
         // Header::parse will log a warning for every place where it fails to parse.
-        let header = Header::parse(encrypted)?;
+        let header = Header::parse(encrypted, template_dependency_structure)?;
 
         let tcc_seqnum = header
             .tcc_seqnum
@@ -859,7 +864,7 @@ pub mod fuzz {
     }
 
     pub fn parse_and_forward_rtp_for_fuzzing(data: Vec<u8>) -> Option<Vec<u8>> {
-        let header = Header::parse(&data)?;
+        let header = Header::parse(&data, None)?;
 
         let mut incoming = Packet::new(
             &header,
@@ -946,7 +951,7 @@ mod test {
             )
             .unwrap();
         let received1 = receiver
-            .receive_rtp(sent1.serialized.borrow_mut(), at(10))
+            .receive_rtp(sent1.serialized.borrow_mut(), None, at(10))
             .unwrap();
         sent1.encrypted = false; // Got decrypted by the above
         let received1 = received1.to_owned();
@@ -994,7 +999,7 @@ mod test {
             )
             .unwrap();
         let received3 = receiver
-            .receive_rtp(sent3.serialized.borrow_mut(), at(20))
+            .receive_rtp(sent3.serialized.borrow_mut(), None, at(20))
             .unwrap();
         sent3.encrypted = false; // Got decrypted by the above
         let received3 = received3.to_owned();
@@ -1018,7 +1023,7 @@ mod test {
 
         let mut resent2 = sender.resend_rtp(3, 2, at(50)).unwrap();
         let received2 = receiver
-            .receive_rtp(resent2.serialized.borrow_mut(), at(60))
+            .receive_rtp(resent2.serialized.borrow_mut(), None, at(60))
             .unwrap();
         resent2.encrypted = false; // Got decrypted by the above
         let mut received2 = received2.to_owned();
@@ -1047,7 +1052,7 @@ mod test {
             .send_rtp(sent2.rewrite(33, 22, 44), at(70))
             .unwrap();
         let forwarded2 = sender
-            .receive_rtp(forwarded2.serialized.borrow_mut(), at(80))
+            .receive_rtp(forwarded2.serialized.borrow_mut(), None, at(80))
             .unwrap();
         let forwarded2 = forwarded2.to_owned();
         assert_eq!(sent2.payload_type(), forwarded2.payload_type());
@@ -1063,13 +1068,13 @@ mod test {
             .unwrap();
         assert_eq!(1, reforwarded2.seqnum_in_header);
         assert_eq!(Some(22), reforwarded2.seqnum_in_payload);
-        let reforwarded2 = sender.receive_rtp(reforwarded2.serialized.borrow_mut(), at(90));
+        let reforwarded2 = sender.receive_rtp(reforwarded2.serialized.borrow_mut(), None, at(90));
         assert_eq!(reforwarded2, None);
 
         // Padding
         let mut padding = sender.send_padding(4, at(100)).unwrap();
         let received_padding = receiver
-            .receive_rtp(padding.serialized.borrow_mut(), at(110))
+            .receive_rtp(padding.serialized.borrow_mut(), None, at(110))
             .unwrap();
         assert_eq!(99, received_padding.payload_type());
         assert_eq!(99, received_padding.payload_type_in_header);
@@ -1179,14 +1184,14 @@ mod test {
             .unwrap();
         let mut sent200b = sent200a.clone();
 
-        let received1a = receiver.receive_rtp(sent1a.serialized.borrow_mut(), at(10));
-        let received1b = receiver.receive_rtp(sent1b.serialized.borrow_mut(), at(10));
-        let received2a = receiver.receive_rtp(sent2a.serialized.borrow_mut(), at(10));
-        let received2b = receiver.receive_rtp(sent2b.serialized.borrow_mut(), at(10));
-        let received200a = receiver.receive_rtp(sent200a.serialized.borrow_mut(), at(10));
-        let received200b = receiver.receive_rtp(sent200b.serialized.borrow_mut(), at(10));
-        let received1c = receiver.receive_rtp(sent1c.serialized.borrow_mut(), at(10));
-        let received2c = receiver.receive_rtp(sent2c.serialized.borrow_mut(), at(10));
+        let received1a = receiver.receive_rtp(sent1a.serialized.borrow_mut(), None, at(10));
+        let received1b = receiver.receive_rtp(sent1b.serialized.borrow_mut(), None, at(10));
+        let received2a = receiver.receive_rtp(sent2a.serialized.borrow_mut(), None, at(10));
+        let received2b = receiver.receive_rtp(sent2b.serialized.borrow_mut(), None, at(10));
+        let received200a = receiver.receive_rtp(sent200a.serialized.borrow_mut(), None, at(10));
+        let received200b = receiver.receive_rtp(sent200b.serialized.borrow_mut(), None, at(10));
+        let received1c = receiver.receive_rtp(sent1c.serialized.borrow_mut(), None, at(10));
+        let received2c = receiver.receive_rtp(sent2c.serialized.borrow_mut(), None, at(10));
 
         assert!(received1a.is_some());
         assert!(received1b.is_none());

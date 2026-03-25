@@ -4,6 +4,7 @@
 //
 
 pub mod audio;
+pub mod bitstream;
 pub mod call;
 pub mod call_lifecycle;
 pub mod candidate_selector;

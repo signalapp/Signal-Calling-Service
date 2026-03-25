@@ -841,7 +841,7 @@ impl Sfu {
             let incoming_rtp = {
                 time_scope_us!("calling.sfu.handle_packet.rtp.in_incoming_connection_lock");
                 incoming_connection
-                    .handle_rtp_packet(incoming_packet, Instant::now())
+                    .handle_rtp_packet(incoming_packet, None, Instant::now())
                     .map_err(SfuError::ConnectionError)?
             };
 

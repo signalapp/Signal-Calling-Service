@@ -60,6 +60,12 @@ path = "fuzz_targets/googcc.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "dependency-descriptor"
+path = "fuzz_targets/dependency_descriptor.rs"
+test = false
+doc = false
+
 # keep in sync with workspace patches
 [patch.crates-io]
 # Use our fork of curve25519-dalek because we're using zkgroup.

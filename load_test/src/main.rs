@@ -515,7 +515,7 @@ fn main() -> Result<()> {
             let incoming_packet = &mut buf[0..len];
             stats.bytes_total += len;
             if rtp::looks_like_rtp(incoming_packet) {
-                match endpoint.receive_rtp(incoming_packet, now) {
+                match endpoint.receive_rtp(incoming_packet, None, now) {
                     Some(packet) => {
                         let truncated_ntp_now = (ntp_now() >> 16) as u32;
                         let timestamp = BigEndian::read_u32(packet.payload());

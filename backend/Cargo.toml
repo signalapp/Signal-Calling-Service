@@ -16,6 +16,9 @@ mrp = { git = "https://github.com/signalapp/ringrtc", tag = "v2.59.1" }
 calling_common = { path = "../common" }
 metrics = { path = "../metrics" }
 
+# For small, inline collections
+smallvec = "1.15.1"
+
 # For error handling
 anyhow = "1.0.100"
 thiserror = "2.0.17"

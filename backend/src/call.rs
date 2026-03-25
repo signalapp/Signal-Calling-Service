@@ -1567,21 +1567,12 @@ impl CallInner {
                 sender.is_maybe_in_dtx = false;
             }
         }
-        let dependency_descriptor = if incoming_rtp.is_vp8() {
-            time_scope_us!("calling.call.handle_rtp.vp8_header");
-            if let Some((dependency_descriptor, need_reallocation)) =
-                sender.update_incoming_video_rate_and_resolution(&incoming_rtp, now)?
-            {
-                if need_reallocation {
-                    self.reallocate_target_send_rates(now);
-                }
-                Some(dependency_descriptor)
-            } else {
-                return Ok(vec![]);
-            }
-        } else {
-            None
-        };
+
+        if incoming_rtp.is_vp8()
+            && sender.update_incoming_video_rate_and_resolution(&incoming_rtp, now)?
+        {
+            self.reallocate_target_send_rates(now);
+        }
 
         let mut rtp_to_send = vec![];
 
@@ -1598,12 +1589,17 @@ impl CallInner {
                 LayerId::Audio => receiver.forward_audio_rtp(&incoming_rtp),
                 LayerId::RtpData => receiver.forward_data_rtp(&incoming_rtp),
                 LayerId::Video0 | LayerId::Video1 | LayerId::Video2 => {
-                    receiver.forward_video_rtp(&incoming_rtp, dependency_descriptor.as_ref())
+                    if incoming_rtp.is_vp8() {
+                        receiver.forward_video_rtp_vp8(&incoming_rtp)
+                    } else {
+                        None
+                    }
                 }
             } {
                 rtp_to_send.push((receiver.demux_id, rtp_to_forward));
             }
         }
+
         Ok(rtp_to_send)
     }
 
@@ -2921,13 +2917,10 @@ impl Client {
         &mut self,
         incoming_rtp: &rtp::Packet<&[u8]>,
         now: Instant,
-    ) -> Result<Option<(rtp::DependencyDescriptor, bool)>, Error> {
-        let dependency_descriptor =
-            if let Some((descriptor, _)) = incoming_rtp.dependency_descriptor {
-                descriptor
-            } else {
-                return Err(Error::MissingDependencyDescriptor);
-            };
+    ) -> Result<bool, Error> {
+        let Some((dependency_descriptor, _)) = incoming_rtp.dependency_descriptor.as_ref() else {
+            return Err(Error::MissingDependencyDescriptor);
+        };
         let incoming_layer_index =
             LayerId::layer_index_from_ssrc(incoming_rtp.ssrc()).ok_or(Error::InvalidRtpLayerId)?;
         let incoming_video = &mut self.incoming_video[incoming_layer_index];
@@ -2949,7 +2942,7 @@ impl Client {
         }
 
         let old_resolution = incoming_video.original_resolution;
-        if let Some(resolution) = dependency_descriptor.resolution {
+        if let Some(resolution) = dependency_descriptor.resolution() {
             incoming_video.apply_resolution(resolution, self.video_rotation);
         } else if old_resolution.is_none() && !incoming_video.needs_resolution {
             // Record that we have data on the stream, when the resolution has been cleared.
@@ -2963,7 +2956,7 @@ impl Client {
 
         // If this is a key frame, and it was not allocatable before, update the bitrate and run
         // allocation; this allows for switching to a new stream on the first key frame.
-        if dependency_descriptor.is_key_frame
+        if dependency_descriptor.is_key_frame()
             && (old_resolution.is_none() || incoming_video.rate().unwrap_or_default().as_bps() == 0)
         {
             incoming_video.rate_tracker.update(now);
@@ -3040,7 +3033,7 @@ impl Client {
             }
         }
 
-        Ok(Some((dependency_descriptor, need_reallocation)))
+        Ok(need_reallocation)
     }
 
     fn forward_audio_rtp(
@@ -3060,28 +3053,21 @@ impl Client {
         Some(outgoing_rtp)
     }
 
-    fn forward_video_rtp(
+    fn forward_video_rtp_vp8(
         &mut self,
         incoming_rtp: &rtp::Packet<&[u8]>,
-        dependency_descriptor: Option<&rtp::DependencyDescriptor>,
     ) -> Option<rtp::Packet<Vec<u8>>> {
-        let dependency_descriptor = dependency_descriptor?;
-
         let sender_demux_id = DemuxId::from_ssrc(incoming_rtp.ssrc());
         let forwarder = self
             .video_forwarder_by_sender_demux_id
             .get_mut(&sender_demux_id)?;
 
-        let (outgoing_ssrc, outgoing) =
-            forwarder.forward_vp8_rtp(incoming_rtp, dependency_descriptor)?;
+        let (outgoing_ssrc, outgoing) = forwarder.forward_vp8_rtp(incoming_rtp)?;
         let mut outgoing_rtp = incoming_rtp.rewrite(
             outgoing_ssrc,
             outgoing.seqnum,
             outgoing.timestamp as rtp::TruncatedTimestamp,
         );
-        if let Some((descriptor, _)) = &mut outgoing_rtp.dependency_descriptor {
-            descriptor.truncated_frame_number = outgoing.frame_number as rtp::TruncatedFrameNumber;
-        }
         outgoing_rtp.set_frame_number_in_header(outgoing.frame_number);
         Some(outgoing_rtp)
     }
@@ -3679,10 +3665,10 @@ impl Vp8SimulcastRtpForwarder {
     fn forward_vp8_rtp(
         &mut self,
         incoming_rtp: &rtp::Packet<&[u8]>,
-        dependency_descriptor: &rtp::DependencyDescriptor,
     ) -> Option<(rtp::Ssrc, VideoRewrittenIds)> {
+        let (dependency_descriptor, _) = incoming_rtp.dependency_descriptor.as_ref()?;
         if self.switching_ssrc() == Some(incoming_rtp.ssrc())
-            && dependency_descriptor.is_key_frame
+            && dependency_descriptor.is_key_frame()
             && (incoming_rtp.is_max_seqnum || self.forwarding_ssrc().is_none())
         {
             // When switching from forwarding one SSRC to another, we only
@@ -3718,7 +3704,7 @@ impl Vp8SimulcastRtpForwarder {
                 // In other words, we are only tracking the ROC since the switching point,
                 // and that is now, so the ROC is 0.
                 incoming_rtp.timestamp as rtp::FullTimestamp,
-                dependency_descriptor.truncated_frame_number as rtp::FullFrameNumber,
+                dependency_descriptor.truncated_frame_number() as rtp::FullFrameNumber,
             );
             // We make two simplifying assumptions here:
             // 1. The first packet we received is the first packet of the key frame.
@@ -3745,7 +3731,7 @@ impl Vp8SimulcastRtpForwarder {
             self.switching = Vp8SimulcastRtpSwitchingState::DoNotSwitch;
             self.max_outgoing = first_outgoing;
         } else if self.switching_ssrc() == Some(incoming_rtp.ssrc())
-            && dependency_descriptor.is_key_frame
+            && dependency_descriptor.is_key_frame()
         {
             event!("calling.forwarding.layer_switch.wait_for_in_order_key_frame");
             trace!(
@@ -3767,7 +3753,7 @@ impl Vp8SimulcastRtpForwarder {
         {
             if *incoming_ssrc == incoming_rtp.ssrc() {
                 let expanded_frame_number = rtp::expand_frame_number(
-                    dependency_descriptor.truncated_frame_number,
+                    dependency_descriptor.truncated_frame_number(),
                     &mut max_incoming.frame_number,
                 );
 
@@ -3781,7 +3767,7 @@ impl Vp8SimulcastRtpForwarder {
                     first_outgoing.checked_add(&incoming.checked_sub(first_incoming)?)?;
                 self.max_outgoing = self.max_outgoing.max(&outgoing);
 
-                if dependency_descriptor.is_key_frame {
+                if dependency_descriptor.is_key_frame() {
                     *needs_key_frame = false;
                 }
                 trace!(
@@ -3898,7 +3884,13 @@ mod call_tests {
     use mrp::MrpHeader;
 
     use super::*;
-    use crate::protos::sfu_to_device::{peek_info::PeekDeviceInfo, PeekInfo};
+    use crate::{
+        protos::sfu_to_device::{peek_info::PeekDeviceInfo, PeekInfo},
+        rtp::{
+            DependencyDescriptor, ExtendedDescriptorFields, MandatoryDescriptorFields,
+            TemplateDependencyStructure, TemplateDependencyStructureFields,
+        },
+    };
 
     static CALL_ID: &[u8; 7] = b"call_id";
 
@@ -3943,7 +3935,30 @@ mod call_tests {
             ssrc: u32,
             index: u32,
             rtp: rtp::Packet<Vec<u8>>,
-            dependency_descriptor: rtp::DependencyDescriptor,
+            resolution: Option<PixelSize>,
+        }
+
+        fn dummy_dependency_descriptor(
+            is_key_frame: bool,
+            frame_number: u16,
+            resolution: Option<PixelSize>,
+        ) -> DependencyDescriptor {
+            DependencyDescriptor {
+                mandatory_fields: MandatoryDescriptorFields {
+                    start_of_frame: true,
+                    frame_number,
+                    ..Default::default()
+                },
+                extended_fields: Some(ExtendedDescriptorFields {
+                    template_dependency_structure: is_key_frame.then_some(
+                        TemplateDependencyStructure::new(TemplateDependencyStructureFields {
+                            resolutions: resolution.map(|resolution| [resolution.into()].into()),
+                            ..Default::default()
+                        }),
+                    ),
+                    ..Default::default()
+                }),
+            }
         }
 
         impl Incoming {
@@ -3965,7 +3980,7 @@ mod call_tests {
                     self.rtp.ssrc(),
                     self.index + 1,
                     is_key_frame,
-                    self.dependency_descriptor.resolution,
+                    self.resolution,
                 )
             }
 
@@ -3981,15 +3996,19 @@ mod call_tests {
                 let mut rtp =
                     rtp::Packet::with_empty_tag(pt, seqnum, timestamp, ssrc, None, None, &[]);
                 rtp.is_max_seqnum = true;
+                rtp.dependency_descriptor = Some((
+                    dummy_dependency_descriptor(
+                        is_key_frame,
+                        ((1000 * ssrc) + index) as u16,
+                        resolution,
+                    ),
+                    0..0,
+                ));
                 Self {
                     ssrc,
                     index,
                     rtp,
-                    dependency_descriptor: rtp::DependencyDescriptor {
-                        truncated_frame_number: ((1000 * ssrc) + index) as u16,
-                        is_key_frame,
-                        resolution,
-                    },
+                    resolution,
                 }
             }
 
@@ -4002,12 +4021,10 @@ mod call_tests {
                 let mut rtp = self.rtp.clone();
                 rtp.set_seqnum_in_header(seqnum);
                 rtp.set_timestamp_in_header(timestamp);
+                let (dependency_descriptor, _) = rtp.dependency_descriptor.as_mut().unwrap();
+                dependency_descriptor.mandatory_fields.frame_number = truncated_frame_number;
                 Self {
                     rtp,
-                    dependency_descriptor: rtp::DependencyDescriptor {
-                        truncated_frame_number,
-                        ..self.dependency_descriptor
-                    },
                     ..self.clone()
                 }
             }
@@ -4016,7 +4033,7 @@ mod call_tests {
                 &self,
                 forwarder: &mut Vp8SimulcastRtpForwarder,
             ) -> Option<(rtp::Ssrc, VideoRewrittenIds)> {
-                forwarder.forward_vp8_rtp(&self.rtp.borrow(), &self.dependency_descriptor)
+                forwarder.forward_vp8_rtp(&self.rtp.borrow())
             }
         }
 
@@ -5058,6 +5075,46 @@ mod call_tests {
         create_rtp(sender_demux_id, layer_id, seqnum, &payload[..])
     }
 
+    fn create_dependency_descriptor(
+        frame_number: u16,
+        size: Option<PixelSize>,
+    ) -> DependencyDescriptor {
+        let mut descriptor = if let Some(size) = size {
+            let width_minus_1 = size.width - 1;
+            let height_minus_1 = size.height - 1;
+            let encoded = [
+                0b10000000u8,
+                0b00000000,
+                0b00000001,
+                0b10000000, // The first bit in this byte indicates that this is for a key frame.
+                0b00000010,
+                0b00000100,
+                0b01001110,
+                0b10101010,
+                0b10101111,
+                0b00101000,
+                0b01100000,
+                0b01000001,
+                0b01001101,
+                0b00110100,
+                0b01010011,
+                0b10001010,
+                0b00001001,
+                0b01000000,
+                0b0100_0000 | ((width_minus_1 >> 10) as u8), // width - 1 from 3rd bit
+                ((width_minus_1 >> 2) & 0xFF) as u8,
+                (((width_minus_1 & 0b0000_0011) << 6) as u8) | ((height_minus_1 >> 10) as u8), // height - 1 from 3rd bit
+                ((height_minus_1 >> 2) & 0xFF) as u8,
+                ((height_minus_1 & 0b0000_0011) << 6) as u8,
+            ];
+            DependencyDescriptor::read(&encoded, None).expect("parse the dependency descriptor")
+        } else {
+            DependencyDescriptor::default()
+        };
+        descriptor.mandatory_fields.frame_number = frame_number;
+        descriptor
+    }
+
     fn create_video_rtp(
         sender_demux_id: DemuxId,
         layer_id: LayerId,
@@ -5071,16 +5128,14 @@ mod call_tests {
         let ssrc = layer_id.to_ssrc(sender_demux_id);
         let pt = 108;
         let timestamp = seqnum as rtp::TruncatedTimestamp;
+        let dependency_descriptor =
+            create_dependency_descriptor(truncated_frame_number, key_frame_size);
         rtp::Packet::with_dependency_descriptor(
             pt,
             seqnum,
             timestamp,
             ssrc,
-            rtp::DependencyDescriptor {
-                is_key_frame: key_frame_size.is_some(),
-                resolution: key_frame_size,
-                truncated_frame_number,
-            },
+            dependency_descriptor,
             &payload,
         )
     }
