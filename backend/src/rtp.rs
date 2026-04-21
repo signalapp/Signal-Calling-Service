@@ -175,6 +175,23 @@ struct IncomingSsrcState {
     rtcp_report_sender: RtcpReportSender,
 }
 
+impl IncomingSsrcState {
+    const DEFAULT_MAX_SEQNUM: u64 = 0;
+}
+
+impl Default for IncomingSsrcState {
+    fn default() -> Self {
+        Self {
+            max_seqnum: Self::DEFAULT_MAX_SEQNUM,
+            seqnum_reuse_detector: SequenceNumberReuseDetector::default(),
+            // A 1KB RTCP payload with 4 bytes each would allow only 250
+            // in the worst case scenario.
+            nack_sender: NackSender::new(250),
+            rtcp_report_sender: RtcpReportSender::new(),
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub struct EndpointStats {
     pub remembered_packet_count: usize,
@@ -241,10 +258,14 @@ impl Endpoint {
         let tcc_seqnum = header
             .tcc_seqnum
             .map(|tcc_seqnum| tcc::expand_seqnum(tcc_seqnum, &mut self.max_received_tcc_seqnum));
-        let ssrc_state = self.get_incoming_ssrc_state(header.ssrc);
-        let mut max_seqnum = ssrc_state.max_seqnum;
+        let ssrc_state = self.state_by_incoming_ssrc.get(&header.ssrc);
+        let mut max_seqnum =
+            ssrc_state.map_or(IncomingSsrcState::DEFAULT_MAX_SEQNUM, |s| s.max_seqnum);
         let seqnum_in_header = expand_seqnum(header.seqnum, &mut max_seqnum);
-        let mut seqnum_reuse_detector = ssrc_state.seqnum_reuse_detector.clone();
+        let mut seqnum_reuse_detector = ssrc_state
+            .map_or_else(SequenceNumberReuseDetector::default, |s| {
+                s.seqnum_reuse_detector.clone()
+            });
         match seqnum_reuse_detector.remember_used(seqnum_in_header) {
             SequenceNumberReuse::UsedBefore => {
                 trace!("Dropping SRTP packet because we've already seen this seqnum ({}) from this ssrc ({})", seqnum_in_header, header.ssrc);
@@ -390,20 +411,7 @@ impl Endpoint {
     }
 
     fn get_incoming_ssrc_state_mut(&mut self, ssrc: Ssrc) -> &mut IncomingSsrcState {
-        self.state_by_incoming_ssrc
-            .entry(ssrc)
-            .or_insert(IncomingSsrcState {
-                max_seqnum: 0,
-                seqnum_reuse_detector: SequenceNumberReuseDetector::default(),
-                // A 1KB RTCP payload with 4 bytes each would allow only 250
-                // in the worst case scenario.
-                nack_sender: NackSender::new(250),
-                rtcp_report_sender: RtcpReportSender::new(),
-            })
-    }
-
-    fn get_incoming_ssrc_state(&mut self, ssrc: Ssrc) -> &IncomingSsrcState {
-        self.get_incoming_ssrc_state_mut(ssrc)
+        self.state_by_incoming_ssrc.entry(ssrc).or_default()
     }
 
     // Returns parsed and decrypted RTCP, and also processes transport-cc feedback based on

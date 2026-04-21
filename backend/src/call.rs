@@ -1383,7 +1383,7 @@ impl CallInner {
             if let Some(content) = proto.content {
                 let decoded = DeviceToSfu::decode(content.as_slice())
                     .map_err(|_| Error::InvalidClientToServerProtobuf)?;
-                self.handle_device_to_sfu(decoded, sender_demux_id, call_info, now)?;
+                self.handle_device_to_sfu_inner(decoded, sender_demux_id, call_info, now)?;
             } else {
                 self.handle_device_to_sfu_inner(proto, sender_demux_id, call_info, now)?;
             }
