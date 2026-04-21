@@ -27,6 +27,7 @@ const PRIORITY_LEN: usize = 4;
 const NOMINATION_LEN: usize = 0;
 const ICE_CONTROLLING_LEN: usize = 8;
 const ICE_CONTROLLED_LEN: usize = 8;
+const ERROR_CODE_MIN_LEN: usize = 4;
 const ATTR_HEADER_LEN: usize = 4;
 const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
 
@@ -199,6 +200,7 @@ pub struct PacketType([u8; 2]);
 impl PacketType {
     const BINDING_REQUEST: PacketType = PacketType([0x00, 0x01]);
     const BINDING_RESPONSE: PacketType = PacketType([0x01, 0x01]);
+    const BINDING_ERROR_RESPONSE: PacketType = PacketType([0x01, 0x11]);
 }
 
 impl Deref for PacketType {
@@ -346,6 +348,10 @@ impl StunPacketBuilder {
         Self::new(transaction_id, &PacketType::BINDING_RESPONSE)
     }
 
+    pub fn new_binding_error_response(transaction_id: &TransactionId) -> Self {
+        Self::new(transaction_id, &PacketType::BINDING_ERROR_RESPONSE)
+    }
+
     fn transaction_id(&self) -> &[u8] {
         &self.buffer[8..20]
     }
@@ -489,7 +495,7 @@ impl StunPacketBuilder {
         let number = error_code - (class * 100);
         self.append_attribute(
             AttributeId::ERROR_CODE,
-            &(class << 8 | number).to_be_bytes(),
+            &((class << 8 | number) as u32).to_be_bytes(),
         );
         self
     }
@@ -603,6 +609,18 @@ fn check_attr_len(attr_id: u16, len: usize, rng: Range<usize>) -> Result<(), Par
     }
 }
 
+fn check_attr_min_len(attr_id: u16, len: usize, rng: Range<usize>) -> Result<(), ParseError> {
+    if len <= rng.len() {
+        Ok(())
+    } else {
+        Err(ParseError::InvalidAttributeLength(
+            attr_id,
+            len as u16,
+            rng.len() as u16,
+        ))
+    }
+}
+
 // Determines the header length of an address field (MAPPED-ADDRESS, XOR-MAPPED-ADDRESS, ...).
 fn get_address_header_len(attr_id: u16, attr_val: &[u8]) -> Result<usize, ParseError> {
     if attr_val.len() < 8 {
@@ -689,6 +707,9 @@ impl<'a> StunPacket<'a> {
                     AttributeId::XOR_MAPPED_ADDRESS | AttributeId::MAPPED_ADDRESS => {
                         let len = get_address_header_len(attr_id, &packet[attr_rng.clone()])?;
                         check_attr_len(attr_id, len, attr_rng)?;
+                    }
+                    AttributeId::ERROR_CODE => {
+                        check_attr_min_len(attr_id, ERROR_CODE_MIN_LEN, attr_rng)?;
                     }
                     _ => {
                         // Any other attribute type we accept as-is.
@@ -808,7 +829,9 @@ impl<'a> TryFrom<StunPacket<'a>> for BindingResponse<'a> {
 
     fn try_from(packet: StunPacket<'a>) -> Result<Self, Self::Error> {
         match packet.packet_type() {
-            PacketType::BINDING_RESPONSE => Ok(BindingResponse { packet }),
+            PacketType::BINDING_RESPONSE | PacketType::BINDING_ERROR_RESPONSE => {
+                Ok(BindingResponse { packet })
+            }
             _ => Err(ParseError::TypeMismatch),
         }
     }
@@ -841,11 +864,6 @@ impl Display for StunPacket<'_> {
     }
 }
 
-fn looks_like_header(packet: &[u8], packet_type: PacketType) -> bool {
-    StunPacket::is_stun_packet(packet)
-        && PacketType::try_from(&packet[..2]).is_ok_and(|pt| pt == packet_type)
-}
-
 /// Provides all of the functionality of [`StunPacket`] with accessors that are relevant
 /// in the context of processing a STUN binding response.
 #[derive(Debug)]
@@ -855,7 +873,10 @@ pub struct BindingResponse<'a> {
 
 impl<'a> BindingResponse<'a> {
     pub fn looks_like_header(packet: &[u8]) -> bool {
-        looks_like_header(packet, PacketType::BINDING_RESPONSE)
+        StunPacket::is_stun_packet(packet)
+            && (PacketType::try_from(&packet[..2]).is_ok_and(|pt| {
+                pt == PacketType::BINDING_RESPONSE || pt == PacketType::BINDING_ERROR_RESPONSE
+            }))
     }
 
     /// Attempts to create a [BindingResponse] instance out of the given packet buffer. If the
@@ -885,10 +906,10 @@ impl<'a> BindingResponse<'a> {
         self.packet
             .get_attr_value(AttributeId::ERROR_CODE)
             .map(|code| {
-                let x = parse_u16(code);
+                let x = parse_u32(code);
                 let class = (x & 0xf00) >> 8;
                 let number = x & 0x0ff;
-                100 * class + number
+                (100 * class + number) as u16
             })
     }
 
@@ -976,7 +997,8 @@ pub struct BindingRequest<'a> {
 
 impl<'a> BindingRequest<'a> {
     pub fn looks_like_header(packet: &[u8]) -> bool {
-        looks_like_header(packet, PacketType::BINDING_REQUEST)
+        StunPacket::is_stun_packet(packet)
+            && PacketType::try_from(&packet[..2]).is_ok_and(|pt| pt == PacketType::BINDING_REQUEST)
     }
 
     /// Attempts to create a [BindingRequest] instance out of the given packet buffer. If the
@@ -1146,7 +1168,6 @@ mod tests {
         let response = StunPacketBuilder::new_binding_response(&TransactionId::new())
             .set_xor_mapped_address(&addr)
             .set_mapped_address(&addr)
-            .set_error_code(400)
             .build(pwd);
         let parsed_response = BindingResponse::try_from_buffer(&response)
             .expect("recognized")
@@ -1165,7 +1186,37 @@ mod tests {
                 .xor_mapped_address()
                 .expect("xor mapped address")
         );
+    }
+
+    #[test]
+    fn test_error_response_creation_and_parsing() {
+        let pwd = b"some interesting password";
+        let response = StunPacketBuilder::new_binding_error_response(&TransactionId::new())
+            .set_error_code(400)
+            .build(pwd);
+        let parsed_response = BindingResponse::try_from_buffer(&response)
+            .expect("recognized")
+            .expect("sane");
+        parsed_response
+            .verify_integrity(pwd)
+            .expect("integrity validated");
+        assert!(parsed_response.fingerprint().is_some());
         assert_eq!(400, parsed_response.error_code().expect("error code"));
+    }
+
+    #[test]
+    fn test_error_code_parsing() {
+        // Bad request (400) error response
+        let packet: &[u8] = &hex!(
+                          "0111 0034 2112a442b7e7cd91bd563c54429b003b"
+        /* error code */  "0009 0010 00000400426164205265717565737400"
+        /* hmac-sha1 */   "0008 0014 b8a473e21b2f3c9d4e5a6b7c8d9eafb0c1d2e3f4"
+        /* fingerprint */ "8028 0004 c73a1d2e"
+        );
+        let response = BindingResponse::try_from_buffer(packet)
+            .expect("valid response")
+            .expect("sane");
+        assert_eq!(response.error_code().expect("present"), 400u16);
     }
 
     mod header_identification_tests {
@@ -1218,7 +1269,7 @@ mod tests {
         use hex_literal::hex;
 
         use super::ParseError;
-        use crate::ice::{AttributeId, StunPacket};
+        use crate::ice::{AttributeId, BindingResponse, StunPacket};
 
         #[test]
         fn prevent_empty_packet() {
@@ -1406,6 +1457,26 @@ mod tests {
                 )),
                 StunPacket::from_buffer(packet).err()
             );
+        }
+
+        #[test]
+        fn prevent_wrong_length_error_code() {
+            // Bad request (400) error response
+            let packet: &[u8] = &hex!(
+                              "0111 0024 2112a442b7e7cd91bd563c54429b003b"
+            /* error code */  "0009 0000"
+            /* hmac-sha1 */   "0008 0014 b8a473e21b2f3c9d4e5a6b7c8d9eafb0c1d2e3f4"
+            /* fingerprint */ "8028 0004 c73a1d2e"
+            );
+            let response = BindingResponse::try_from_buffer(packet);
+            assert!(matches!(
+                response,
+                Err(ParseError::InvalidAttributeLength(
+                    AttributeId::ERROR_CODE,
+                    4,
+                    0
+                ))
+            ));
         }
     }
 
