@@ -1220,6 +1220,8 @@ mod connection_tests {
         transportcc as tcc,
     };
 
+    const MAX_CLIENTS_IN_CALL: usize = 8;
+
     fn new_call(
         call_id: &[u8],
         now: Instant,
@@ -1244,6 +1246,7 @@ mod connection_tests {
             persist_approval_for_all_users_who_join: false,
             endorsement_issuer: None,
             drop_fragmentable_updates: false,
+            max_clients: MAX_CLIENTS_IN_CALL,
         })
     }
 

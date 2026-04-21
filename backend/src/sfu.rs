@@ -704,15 +704,12 @@ impl Sfu {
                     .persist_approval_for_all_users_who_join,
                 endorsement_issuer: self.endorsement_issuer.clone(),
                 drop_fragmentable_updates: true,
+                max_clients: self.config.max_clients_per_call as usize,
             })
         });
 
         if call.has_client(demux_id) {
             return Err(SfuError::DuplicateDemuxIdDetected);
-        }
-
-        if call.size_including_pending_clients() == self.config.max_clients_per_call as usize {
-            return Err(SfuError::TooManyClients);
         }
 
         info!(
@@ -742,6 +739,10 @@ impl Sfu {
             user_agent,
             Instant::now(), // Now after taking the lock
         );
+
+        if client_status == ClientStatus::Rejected {
+            return Err(SfuError::TooManyClients);
+        }
 
         // ACKs can be sent from any SSRC that the client is configured to send with, which includes the
         // video base layer, so use that.

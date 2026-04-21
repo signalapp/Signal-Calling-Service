@@ -424,6 +424,7 @@ struct CallInfo {
     persist_approval_for_all_users_who_join: bool,
     initial_target_send_rate: DataRate,
     default_requested_max_send_rate: DataRate,
+    max_clients: usize,
 }
 
 pub struct CreateCallArgs {
@@ -441,6 +442,7 @@ pub struct CreateCallArgs {
     pub persist_approval_for_all_users_who_join: bool,
     pub endorsement_issuer: Option<Arc<Mutex<EndorsementIssuer>>>,
     pub drop_fragmentable_updates: bool,
+    pub max_clients: usize,
 }
 
 impl Call {
@@ -460,6 +462,7 @@ impl Call {
             persist_approval_for_all_users_who_join,
             endorsement_issuer,
             drop_fragmentable_updates,
+            max_clients,
         } = create_args;
 
         let loggable_call_id = LoggableCallId::from(&call_id);
@@ -489,6 +492,7 @@ impl Call {
             persist_approval_for_all_users_who_join,
             initial_target_send_rate,
             default_requested_max_send_rate,
+            max_clients,
         };
 
         Self { inner, call_info }
@@ -521,11 +525,6 @@ impl Call {
     #[inline(always)]
     pub fn size(&self) -> usize {
         self.inner.lock().size()
-    }
-
-    #[inline(always)]
-    pub fn size_including_pending_clients(&self) -> usize {
-        self.inner.lock().size_including_pending_clients()
     }
 
     #[inline(always)]
@@ -880,10 +879,6 @@ impl CallInner {
         self.clients.len()
     }
 
-    fn size_including_pending_clients(&self) -> usize {
-        self.clients.len() + self.pending_clients.len()
-    }
-
     pub fn peak_call_size(&self) -> usize {
         self.call_stats.peak_call_size
     }
@@ -950,6 +945,11 @@ impl CallInner {
         call_info: &CallInfo,
         now: Instant,
     ) -> ClientStatus {
+        let client_count = self.clients.len() + self.pending_clients.len();
+        if client_count >= call_info.max_clients {
+            return ClientStatus::Rejected;
+        }
+
         let member_ciphertext = (&user_id).try_into().ok();
         let pending_client = NonParticipantClient {
             demux_id,
@@ -4945,6 +4945,8 @@ mod call_tests {
         );
     }
 
+    const MAX_CLIENTS_IN_CALL: usize = usize::MAX;
+
     fn create_call(
         call_id: &[u8],
         now: Instant,
@@ -4969,6 +4971,7 @@ mod call_tests {
             persist_approval_for_all_users_who_join: false,
             endorsement_issuer: None,
             drop_fragmentable_updates: false,
+            max_clients: MAX_CLIENTS_IN_CALL,
         })
     }
 
@@ -4991,6 +4994,7 @@ mod call_tests {
             persist_approval_for_all_users_who_join: false,
             endorsement_issuer: None,
             drop_fragmentable_updates: false,
+            max_clients: MAX_CLIENTS_IN_CALL,
         })
     }
 

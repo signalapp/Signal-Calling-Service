@@ -13,6 +13,7 @@ pub enum ClientStatus {
     Active,
     Pending,
     Blocked,
+    Rejected,
 }
 
 impl fmt::Display for ClientStatus {
@@ -21,6 +22,7 @@ impl fmt::Display for ClientStatus {
             ClientStatus::Active => "ACTIVE",
             ClientStatus::Pending => "PENDING",
             ClientStatus::Blocked => "BLOCKED",
+            ClientStatus::Rejected => "REJECTED",
         })
     }
 }
