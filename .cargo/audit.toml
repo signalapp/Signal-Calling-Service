@@ -6,4 +6,10 @@ quiet = false
 ignore = [
     # Ignore advisory that bincode is unmaintained
     "RUSTSEC-2025-0141",
+    # Ignore RUSTSEC-2026-0104 RUSTSEC-2026-0098, and RUSTSEC-2026-0099 until
+    # our dependencies transition to a more recent rustls-webpki version.
+    # These do not affect the calling service.
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
 ]
