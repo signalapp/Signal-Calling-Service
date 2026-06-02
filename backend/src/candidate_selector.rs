@@ -33,6 +33,8 @@ const PING_RTO: Duration = Duration::from_millis(500);
 const PING_RTO_RM: u32 = 16;
 // Maximum number of ping retransmits before removing a candidate
 const PING_MAX_RETRANSMITS: u32 = 6;
+// Maximum time to live without a remote ping
+const REMOTE_PING_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub struct Config {
@@ -160,6 +162,7 @@ pub struct Candidate {
     ping_retransmit_count: u32,
     ping_next_send_time: Instant,
     ping_period: Duration,
+    received_ping_timeout: Instant,
 }
 
 impl Candidate {
@@ -186,6 +189,7 @@ impl Candidate {
             ping_sent_time: now,
             ping_retransmit_count: 0,
             ping_next_send_time: now,
+            received_ping_timeout: now + REMOTE_PING_TIMEOUT,
         };
 
         let action = candidate.will_transmit_ping(now);
@@ -247,11 +251,17 @@ impl Candidate {
         )
     }
 
-    fn tick(&mut self, now: Instant) -> Action {
+    fn tick(&mut self, now: Instant, is_selected: bool) -> Action {
         if self.ping_next_send_time > now {
             return Action::None;
         }
 
+        // If it's been too long since the client sent us a ping, remove the
+        // candidate.
+        if !is_selected && now > self.received_ping_timeout {
+            trace!("{}: timed out, no recent client pings", self.address);
+            return Action::Remove;
+        }
         // If there is currently no transaction we'll create a new one by creating
         // a new ping request. Otherwise, we'll either retransmit or trigger
         // a client timeout.
@@ -461,6 +471,7 @@ impl CandidateSelector {
         now: Instant,
     ) -> (Action, usize) {
         if let Some(index) = self.get_candidate_index_from_addr(source_addr) {
+            self.candidates[index].received_ping_timeout = now + REMOTE_PING_TIMEOUT;
             (Action::None, index)
         } else {
             trace!("{}: new candidate", source_addr);
@@ -557,7 +568,7 @@ impl CandidateSelector {
         let mut index = 0;
         while index < self.candidates.len() {
             let candidate = &mut self.candidates[index];
-            match candidate.tick(now) {
+            match candidate.tick(now, self.selected_candidate == Some(index)) {
                 Action::Remove => {
                     dead_candidates.push(candidate.address);
                     self.remove_candidate_by_index(index);
