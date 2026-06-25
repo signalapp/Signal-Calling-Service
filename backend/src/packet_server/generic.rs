@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     future::Future,
     io::ErrorKind,
-    net::{SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     sync::Arc,
 };
 
@@ -22,8 +22,14 @@ use rustls::ServerConfig;
 use crate::{
     connection::Connection,
     packet_server::{self, SocketLocator, TimerHeap, TimerHeapNextResult},
-    sfu::{self, HandleOutput, HandleUnconnectedOutput, Sfu, SfuError, SfuStats},
+    sfu::{
+        self, HandleOutput,
+        HandleUnconnectedOutput::{Connected, Stateless},
+        Sfu, SfuError, SfuStats,
+    },
 };
+
+const ZERO_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
 
 /// The shared state for a generic packet server, only UDP is supported.
 ///
@@ -40,12 +46,14 @@ pub struct PacketServerState {
 impl PacketServerState {
     /// Sets up the server state by binding a socket to `local_addr`.
     pub fn new(
-        local_addr_udp: SocketAddr,
-        _local_addr_tcp: SocketAddr,
-        _local_addr_tls: Option<SocketAddr>,
+        binding_ip: IpAddr,
+        udp_ports: Vec<u16>,
+        _tcp_ports: Vec<u16>,
+        _tls_ports: Vec<u16>,
         _tls_config: Option<Arc<ServerConfig>>,
         num_threads: usize,
     ) -> Result<Arc<Self>> {
+        let local_addr_udp = &SocketAddr::new(binding_ip, *udp_ports.first().unwrap());
         Ok(Arc::new(Self {
             socket: UdpSocket::bind(local_addr_udp)?,
             num_threads,
@@ -90,7 +98,13 @@ impl PacketServerState {
                         None
                     }
                 },
-                Ok((size, sender_addr)) => Some((size, SocketLocator::Udp(sender_addr))),
+                Ok((size, sender_addr)) => Some((
+                    size,
+                    SocketLocator::Udp {
+                        peer_addr: sender_addr,
+                        local_addr: ZERO_ADDR,
+                    },
+                )),
             };
 
             if let Some((size, sender_addr)) = received_packet {
@@ -117,23 +131,25 @@ impl PacketServerState {
                         }
                     } else {
                         drop(read_lock);
-                        if let Some(HandleUnconnectedOutput {
-                            packets_to_send,
-                            connection,
-                        }) = packet_server::handle_packet_unconnected(
+                        match packet_server::handle_packet_unconnected(
                             sfu,
                             sender_addr,
                             &mut buf[..size],
                         ) {
-                            trace!(
-                                "adding {} -> {} to connection_map",
-                                sender_addr,
-                                connection.id()
-                            );
-                            self.connection_map.write().insert(sender_addr, connection);
-                            (packets_to_send, vec![])
-                        } else {
-                            (vec![], vec![])
+                            Some(Connected {
+                                packets_to_send,
+                                connection,
+                            }) => {
+                                trace!(
+                                    "adding {} -> {} to connection_map",
+                                    sender_addr,
+                                    connection.id()
+                                );
+                                self.connection_map.write().insert(sender_addr, connection);
+                                (packets_to_send, vec![])
+                            }
+                            Some(Stateless(response)) => (vec![(response, sender_addr)], vec![]),
+                            None => (vec![], vec![]),
                         }
                     }
                 };
@@ -194,9 +210,9 @@ impl PacketServerState {
 
     pub fn send_packet(&self, buf: &[u8], addr: SocketLocator) {
         match addr {
-            SocketLocator::Udp(addr) => {
-                trace!("sending packet of {} bytes to {}", buf.len(), addr);
-                if let Err(err) = self.socket.send_to(buf, addr) {
+            SocketLocator::Udp { peer_addr, .. } => {
+                trace!("sending packet of {} bytes to {}", buf.len(), peer_addr);
+                if let Err(err) = self.socket.send_to(buf, peer_addr) {
                     warn!("send_to failed: {}", err);
                 }
             }

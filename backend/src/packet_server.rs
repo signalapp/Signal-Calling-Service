@@ -50,7 +50,10 @@ pub enum AddressType {
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum SocketLocator {
-    Udp(SocketAddr),
+    Udp {
+        peer_addr: SocketAddr,
+        local_addr: SocketAddr,
+    },
     Tcp {
         id: i64,
         is_ipv6: bool,
@@ -61,8 +64,8 @@ pub enum SocketLocator {
 impl SocketLocator {
     pub fn get_address_type(&self) -> AddressType {
         match self {
-            SocketLocator::Udp(addr) => {
-                if addr.ip().to_canonical().is_ipv6() {
+            SocketLocator::Udp { peer_addr, .. } => {
+                if peer_addr.ip().to_canonical().is_ipv6() {
                     AddressType::UdpV6
                 } else {
                     AddressType::UdpV4
@@ -84,14 +87,33 @@ impl fmt::Display for SocketLocator {
     #[cfg(not(debug_assertions))]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SocketLocator::Udp(SocketAddr::V4(a)) => {
-                let o = a.ip().octets();
-                write!(f, "Ux.x.{}.{}:{}", o[2], o[3], a.port())
-            }
-            SocketLocator::Udp(SocketAddr::V6(a)) => {
-                let s = a.ip().segments();
-                write!(f, "U::{:04x}:{:04x}:{}", s[0], s[7], a.port())
-            }
+            SocketLocator::Udp {
+                peer_addr,
+                local_addr,
+            } => match peer_addr {
+                SocketAddr::V4(a) => {
+                    let o = a.ip().octets();
+                    write!(
+                        f,
+                        "Ux.x.{}.{}:{}:{}",
+                        o[2],
+                        o[3],
+                        a.port(),
+                        local_addr.port()
+                    )
+                }
+                SocketAddr::V6(a) => {
+                    let s = a.ip().segments();
+                    write!(
+                        f,
+                        "U::{:04x}:{:04x}:{}:{}",
+                        s[0],
+                        s[7],
+                        a.port(),
+                        local_addr.port()
+                    )
+                }
+            },
             SocketLocator::Tcp {
                 id,
                 is_ipv6,
@@ -102,7 +124,10 @@ impl fmt::Display for SocketLocator {
     #[cfg(debug_assertions)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SocketLocator::Udp(a) => write!(f, "U{}", a),
+            SocketLocator::Udp {
+                peer_addr,
+                local_addr,
+            } => write!(f, "U{}-{}", peer_addr, local_addr),
             SocketLocator::Tcp {
                 id,
                 is_ipv6,
@@ -124,16 +149,11 @@ pub async fn start(
 
     let tick_interval = Duration::from_millis(config.tick_interval_ms);
 
-    let local_addr_udp = SocketAddr::new(config.binding_ip, config.ice_candidate_port);
-    let local_addr_tcp = SocketAddr::new(config.binding_ip, config.ice_candidate_port_tcp);
-    let local_addr_tls = config
-        .ice_candidate_port_tls
-        .map(|tls_port| SocketAddr::new(config.binding_ip, tls_port));
-
     let packet_handler_state = PacketServerState::new(
-        local_addr_udp,
-        local_addr_tcp,
-        local_addr_tls,
+        config.binding_ip,
+        config.ice_candidate_port.clone(),
+        config.ice_candidate_port_tcp.clone(),
+        config.ice_candidate_port_tls.clone(),
         tls_config,
         num_threads,
     )?;
@@ -144,8 +164,12 @@ pub async fn start(
     let sfu_for_cleanup = sfu.clone();
 
     info!(
-        "packet_server ready: udp {:?}, tcp {:?}; starting {} threads",
-        local_addr_udp, local_addr_tcp, num_threads
+        "packet_server ready: binding_ip {:?}, udp ports {:?}, tcp ports {:?}, tls ports {:?}; starting {} threads",
+        config.binding_ip,
+        config.ice_candidate_port,
+        config.ice_candidate_port_tcp,
+        config.ice_candidate_port_tls,
+         num_threads
     );
 
     sfu.set_packet_server(Some(packet_handler_state_for_stats));

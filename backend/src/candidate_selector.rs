@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::net::SocketAddr;
-
 use calling_common::{Duration, Instant};
 use log::{trace, warn};
 use metrics::event;
@@ -538,11 +536,10 @@ impl CandidateSelector {
             let username = &self.config.ice_credentials.client_username;
             let password = &self.config.ice_credentials.server_pwd;
             match source_addr {
-                SocketLocator::Udp(address) => {
-                    let address = SocketAddr::new(address.ip().to_canonical(), address.port());
+                SocketLocator::Udp { peer_addr, .. } => {
                     StunPacketBuilder::new_binding_response(transaction_id)
                         .set_username(username)
-                        .set_xor_mapped_address(&address)
+                        .set_xor_mapped_address(&peer_addr)
                         .build(password)
                 }
                 SocketLocator::Tcp { .. } => {
@@ -693,6 +690,8 @@ mod tests {
         ice::{BindingRequest, BindingResponse, StunPacketBuilder, TransactionId},
         packet_server::SocketLocator,
     };
+
+    const ZERO_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
 
     fn create_candidate_selector(now: Instant, ping_period: Duration) -> CandidateSelector {
         let config = Config {
@@ -957,10 +956,10 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -998,10 +997,10 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -1064,10 +1063,10 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -1102,14 +1101,14 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
-        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
-            8000,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
+        let client_addr2 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 8000),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -1157,14 +1156,14 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
-        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
-            8000,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
+        let client_addr2 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 8000),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -1210,10 +1209,10 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -1291,14 +1290,14 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
-        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8001,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
+        let client_addr2 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8001),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -1331,8 +1330,14 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp("[::1]:8001".parse().unwrap());
-        let client_addr2 = SocketLocator::Udp("10.0.0.1:8000".parse().unwrap());
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: "[::1]:8001".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
+        let client_addr2 = SocketLocator::Udp {
+            peer_addr: "10.0.0.1:8000".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         let client_addr3 = SocketLocator::Tcp {
             id: 0,
             is_ipv6: false,
@@ -1405,10 +1410,10 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -1442,10 +1447,10 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -1478,14 +1483,14 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
-        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8001,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
+        let client_addr2 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8001),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -1532,14 +1537,14 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
-        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8001,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
+        let client_addr2 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8001),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -1580,14 +1585,14 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
-        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8001,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
+        let client_addr2 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8001),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));
@@ -1629,14 +1634,14 @@ mod tests {
         const PING_PERIOD: Duration = Duration::from_secs(1);
         const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-        let client_addr1 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8000,
-        ));
-        let client_addr2 = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            8001,
-        ));
+        let client_addr1 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8000),
+            local_addr: ZERO_ADDR,
+        };
+        let client_addr2 = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8001),
+            local_addr: ZERO_ADDR,
+        };
 
         let time = Instant::now();
         let selector = Rc::new(RefCell::new(create_candidate_selector(time, PING_PERIOD)));

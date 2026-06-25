@@ -86,8 +86,6 @@ pub enum ParseError {
     WrongHMacLength(u16, u16),
     #[error("ICE binding request fingerprint length was {0} but expected {1}.")]
     WrongFingerprintLength(u16, u16),
-    #[error("ICE binding request fingerprint seen before hmac")]
-    FingerprintBeforeHMac,
     #[error("ICE binding request priority length was {0} but expected {1}.")]
     WrongPriorityLength(u16, u16),
     #[error("ICE binding request saw attribute {0:#06x} but expected fingerprint.")]
@@ -357,6 +355,7 @@ impl StunPacketBuilder {
     }
 
     /// Appends a MAPPED-ADDRESS attribute.
+    #[cfg(test)]
     pub fn set_mapped_address(mut self, addr: &SocketAddr) -> Self {
         // [ RFC 8489 ]
         //
@@ -388,6 +387,7 @@ impl StunPacketBuilder {
         // ignored by receivers.  These bits are present for aligning parameters
         // on natural 32-bit boundaries.
 
+        let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
         let (buffer, rng) = match addr {
             SocketAddr::V4(addr) => {
                 let mut buffer: [u8; 20] = [0; 20];
@@ -411,6 +411,7 @@ impl StunPacketBuilder {
 
     /// Appends a XOR-MAPPED-ADDRESS attribute.
     pub fn set_xor_mapped_address(mut self, addr: &SocketAddr) -> Self {
+        let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
         // [ RFC 8489 ]
         //
         // The XOR-MAPPED-ADDRESS attribute is identical to the MAPPED-ADDRESS
@@ -595,6 +596,16 @@ impl StunPacketBuilder {
 
         self.buffer
     }
+
+    /// Builds the STUN packet and returns a vector with the packet's on-wire representation. This
+    /// method does not generate MESSAGE-INTEGRITY or FINGERPRINT attributes.
+    pub fn build_no_fingerprint(mut self) -> Vec<u8> {
+        // Set the packet length.
+        let len = (self.buffer.len() - HEADER_LEN) as u16;
+        self.buffer[2..4].copy_from_slice(&len.to_be_bytes());
+
+        self.buffer
+    }
 }
 
 fn check_attr_len(attr_id: u16, len: usize, rng: Range<usize>) -> Result<(), ParseError> {
@@ -659,7 +670,12 @@ impl<'a> StunPacket<'a> {
     /// PRIORITY, USE-CANDIDATE, FINGERPRINT, ICE-CONTROLLING, ICE-CONTROLLED, and MESSAGE-INTEGRITY)
     /// additional length checks are performed  (i.e. they are not dynamic and have predefined lengths.)
     pub fn from_buffer(packet: &'a [u8]) -> Result<Self, ParseError> {
-        Self::sanity_check(packet)?;
+        Self::sanity_check(packet, false)?;
+        Ok(Self { packet })
+    }
+
+    pub fn from_buffer_stun(packet: &'a [u8]) -> Result<Self, ParseError> {
+        Self::sanity_check(packet, true)?;
         Ok(Self { packet })
     }
 
@@ -675,20 +691,25 @@ impl<'a> StunPacket<'a> {
     /// For the attributes for which accessors are provided (XOR-MAPPED-ADDRESS, MAPPED-ADDRESS,
     /// PRIORITY, USE-CANDIDATE, FINGERPRINT, ICE-CONTROLLING, ICE-CONTROLLED, and MESSAGE-INTEGRITY)
     /// additional length checks are performed  (i.e. they are not dynamic and have predefined lengths.)
-    pub fn sanity_check(packet: &'a [u8]) -> Result<(), ParseError> {
+    pub fn sanity_check(packet: &'a [u8], is_maybe_stun: bool) -> Result<(), ParseError> {
         let mut iter = StunAttributeIterator::new(packet)?;
         let mut attr_cnt = 0;
         let mut ice_controlling = false;
         let mut ice_controlled = false;
+        let mut had_fingerprint = false;
 
         for v in iter.by_ref() {
             attr_cnt += 1;
             match v {
                 Ok((attr_id, attr_rng)) => match attr_id {
-                    AttributeId::FINGERPRINT => return Err(ParseError::FingerprintBeforeHMac),
+                    AttributeId::FINGERPRINT => {
+                        check_attr_len(attr_id, FINGERPRINT_LEN, attr_rng)?;
+                        had_fingerprint = true;
+                        break; // end general attribute processing
+                    }
                     AttributeId::MESSAGE_INTEGRITY => {
                         check_attr_len(attr_id, HMAC_LEN, attr_rng)?;
-                        break;
+                        break; // end general attribute processing
                     }
                     AttributeId::PRIORITY => {
                         check_attr_len(attr_id, PRIORITY_LEN, attr_rng)?;
@@ -719,29 +740,32 @@ impl<'a> StunPacket<'a> {
             }
         }
 
-        if attr_cnt == 0 {
+        if attr_cnt == 0 && !is_maybe_stun {
             return Err(ParseError::PacketHasNoAttributes);
         }
         if ice_controlling && ice_controlled {
             return Err(ParseError::ContradictingICERoleAttributes);
         }
 
-        // If this is not a malformed STUN packet then either there is no next attribute or the
-        // next attribute is a FINGERPRINT attribute, not followed by any more attributes.
-        match iter.next() {
-            Some(Ok((attr_id, attr_rng))) if attr_id == AttributeId::FINGERPRINT => {
-                check_attr_len(attr_id, FINGERPRINT_LEN, attr_rng)?;
-                // There should be nothing following this attribute.
-                match iter.next() {
-                    Some(Ok((attr_id, _))) => Err(ParseError::AttributeAfterFingerprint(attr_id)),
-                    Some(Err(e)) => Err(e),
-                    None => Ok(()),
+        // Enforce attribute ordering requirements:
+        //  * no attributes are permitted after the FINGERPRINT attribute
+        //  * only FINGERPRINT is permitted after the MESSAGE_INTEGRITY attribute
+        for v in iter.by_ref() {
+            match v {
+                Ok((attr_id, attr_rng))
+                    if !had_fingerprint && attr_id == AttributeId::FINGERPRINT =>
+                {
+                    check_attr_len(attr_id, FINGERPRINT_LEN, attr_rng)?;
+                    had_fingerprint = true;
                 }
+                Ok((attr_id, _)) if had_fingerprint => {
+                    return Err(ParseError::AttributeAfterFingerprint(attr_id))
+                }
+                Ok((attr_id, _)) => return Err(ParseError::ExpectedFingerprint(attr_id)),
+                Err(e) => return Err(e),
             }
-            Some(Ok((attr_id, _))) => Err(ParseError::ExpectedFingerprint(attr_id)),
-            Some(Err(e)) => Err(e),
-            None => Ok(()),
         }
+        Ok(())
     }
 
     pub fn verify_integrity(&self, pwd: &[u8]) -> Result<(), ParseError> {
@@ -1007,6 +1031,16 @@ impl<'a> BindingRequest<'a> {
     pub fn try_from_buffer(packet: &'a [u8]) -> Result<Option<BindingRequest<'a>>, ParseError> {
         if Self::looks_like_header(packet) {
             Ok(Some(StunPacket::from_buffer(packet)?.try_into()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn try_from_buffer_stun(
+        packet: &'a [u8],
+    ) -> Result<Option<BindingRequest<'a>>, ParseError> {
+        if Self::looks_like_header(packet) {
+            Ok(Some(StunPacket::from_buffer_stun(packet)?.try_into()?))
         } else {
             Ok(None)
         }
@@ -1310,7 +1344,9 @@ mod tests {
                    /* hmac */ "0008 0014 5be1331d09c86d8cbfaf48f64687669096d32d3b"
             );
             assert_eq!(
-                Some(ParseError::FingerprintBeforeHMac),
+                Some(ParseError::AttributeAfterFingerprint(
+                    AttributeId::MESSAGE_INTEGRITY
+                )),
                 StunPacket::from_buffer(packet).err()
             );
         }
@@ -1415,6 +1451,27 @@ mod tests {
             );
             assert_eq!(
                 Some(ParseError::AttributeAfterFingerprint(0xabcd)),
+                StunPacket::from_buffer(packet).err()
+            );
+        }
+
+        #[test]
+        fn prevent_fingerprint_after_fingerprint() {
+            let packet: &[u8] = &hex!(
+                              "0001 0074 2112a442665175732f33426771346c7a"
+                              "0006 0025 33643462313062303033306363646638353762393063663962373032353939383a416d3356000000"
+                              "c057 0004 00010032"
+                              "802a 0008 eef8294dc5f11c9c"
+                              "0025 0000"
+                              "0024 0004 6e7f1eff"
+                              "0008 0014 62d3395bf9d117fa6b915cccd60d4dc141d39c92"
+            /* fingerprint */ "8028 0004 1698f47f"
+            /* fingerprint */ "8028 0004 1698f47f"
+            );
+            assert_eq!(
+                Some(ParseError::AttributeAfterFingerprint(
+                    AttributeId::FINGERPRINT
+                )),
                 StunPacket::from_buffer(packet).err()
             );
         }

@@ -27,17 +27,17 @@ pub struct Config {
     /// The port to use for ICE candidates. Clients will connect to the
     /// calling backend using this port.
     #[arg(long, default_value = "10000")]
-    pub ice_candidate_port: u16,
+    pub ice_candidate_port: Vec<u16>,
 
     /// The port to use for ICE candidates when connected over TCP. Clients
     /// will connect to the calling backend using this port.
     #[arg(long, default_value = "10000")]
-    pub ice_candidate_port_tcp: u16,
+    pub ice_candidate_port_tcp: Vec<u16>,
 
     /// The port to use for ICE candidates when connected over TCP+TLS. Clients
     /// will connect to the calling backend using this port.
     #[arg(long)]
-    pub ice_candidate_port_tls: Option<u16>,
+    pub ice_candidate_port_tls: Vec<u16>,
 
     /// The IP address to share for direct access to the signaling_server. If
     /// defined, then the signaling_server will be used, otherwise the
@@ -249,9 +249,9 @@ impl ServerMediaAddress {
         Self {
             addresses,
             ports: MediaPorts {
-                udp: config.ice_candidate_port,
-                tcp: config.ice_candidate_port_tcp,
-                tls: config.ice_candidate_port_tls,
+                udp: config.ice_candidate_port[0],
+                tcp: config.ice_candidate_port_tcp[0],
+                tls: config.ice_candidate_port_tls.first().copied(),
             },
             hostname: config.hostname.clone(),
         }
@@ -271,8 +271,8 @@ pub(crate) fn default_test_config() -> Config {
         ice_candidate_ip: vec![Ipv4Addr::LOCALHOST.into()],
         signaling_ip: Some(Ipv4Addr::LOCALHOST.into()),
         signaling_port: 8080,
-        ice_candidate_port: 10000,
-        ice_candidate_port_tcp: 10000,
+        ice_candidate_port: vec![10000],
+        ice_candidate_port_tcp: vec![10000],
         max_clients_per_call: 8,
         initial_target_send_rate_kbps: 1500,
         min_target_send_rate_kbps: 100,
@@ -292,7 +292,7 @@ pub(crate) fn default_test_config() -> Config {
         key_file_path: None,
         hostname: None,
         endorsement_secret: None,
-        ice_candidate_port_tls: None,
+        ice_candidate_port_tls: vec![],
         candidate_selector_options: Default::default(),
     }
 }

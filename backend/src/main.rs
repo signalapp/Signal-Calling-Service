@@ -41,8 +41,14 @@ fn print_config(config: &'static config::Config) {
     info!("config:");
     info!("  {:38}{}", "binding_ip:", config.binding_ip);
     info!("  {:38}{:?}", "ice_candidate_ip:", config.ice_candidate_ip);
-    info!("  {:38}{}", "ice_candidate_port:", config.ice_candidate_port);
-    info!("  {:38}{}", "ice_candidate_port_tcp:", config.ice_candidate_port_tcp);
+    info!("  {:38}{:?}", "ice_candidate_port:", config.ice_candidate_port);
+    info!("  {:38}{:?}", "ice_candidate_port_tcp:", config.ice_candidate_port_tcp);
+    if !config.ice_candidate_port_tls.is_empty() {
+        info!("  {:38}{:?}", "ice_candidate_port_tls:", config.ice_candidate_port_tls);
+        info!("  {:38}{:?}", "hostname:", config.hostname);
+        info!("  {:38}{:?}", "certificate_file_path:", config.certificate_file_path);
+        info!("  {:38}{:?}", "key_file_path:", config.key_file_path);
+    }
     info!("  {:38}{:?}", "signaling_ip:", config.signaling_ip);
     info!("  {:38}{}", "signaling_port:", config.signaling_port);
     info!("  {:38}{}", "max_clients_per_call:", config.max_clients_per_call);
@@ -56,12 +62,6 @@ fn print_config(config: &'static config::Config) {
               Some(host) => host,
               None => "Off",
           });
-    if config.ice_candidate_port_tls.is_some() {
-        info!("  {:38}{:?}", "ice_candidate_port_tls:", config.ice_candidate_port_tls);
-        info!("  {:38}{:?}", "hostname:", config.hostname);
-        info!("  {:38}{:?}", "certificate_file_path:", config.certificate_file_path);
-        info!("  {:38}{:?}", "key_file_path:", config.key_file_path);
-    }
     if config.endorsement_secret.is_some() {
         info!("  {:38}{:?}", "endorsement_secret:", "is_some");
     }
@@ -131,7 +131,7 @@ fn main() -> Result<()> {
         increase_nofile_limit(rlimit::INFINITY).expect("should be able to set RLIMIT_NOFILE");
     info!("FD limit: {}", fd_limit);
 
-    let tls_config = if config.ice_candidate_port_tls.is_some()
+    let tls_config = if !config.ice_candidate_port_tls.is_empty()
         && config.hostname.is_some()
         && config.certificate_file_path.is_some()
         && config.key_file_path.is_some()
@@ -164,7 +164,7 @@ fn main() -> Result<()> {
 
         Some(Arc::new(tls_config))
     } else {
-        if config.ice_candidate_port_tls.is_some()
+        if !config.ice_candidate_port_tls.is_empty()
             || config.hostname.is_some()
             || config.certificate_file_path.is_some()
             || config.key_file_path.is_some()

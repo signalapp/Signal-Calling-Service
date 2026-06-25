@@ -39,7 +39,9 @@ use crate::{
     },
     endorsements::EndorsementIssuer,
     googcc,
-    ice::{self, BindingRequest, BindingResponse},
+    ice::{
+        self, BindingRequest, BindingResponse, ParseError::PacketHasNoAttributes, StunPacketBuilder,
+    },
     pacer,
     packet_server::{AddressType, PacketServerState, SocketLocator},
     region::{Region, RegionRelation},
@@ -305,9 +307,12 @@ pub struct HandleOutput {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct HandleUnconnectedOutput {
-    pub packets_to_send: Vec<(PacketToSend, SocketLocator)>,
-    pub connection: Arc<Connection>,
+pub enum HandleUnconnectedOutput {
+    Connected {
+        packets_to_send: Vec<(PacketToSend, SocketLocator)>,
+        connection: Arc<Connection>,
+    },
+    Stateless(PacketToSend),
 }
 
 pub struct SfuStats {
@@ -1031,33 +1036,53 @@ impl Sfu {
         trace!("handle_packet_unconnected():");
 
         // ICE request check
-        if let Some(ice_binding_request) = BindingRequest::try_from_buffer(incoming_packet)
+        if let Some(ice_binding_request) = BindingRequest::try_from_buffer_stun(incoming_packet)
             .map_err(SfuError::ParseIceBindingRequest)?
         {
-            trace!("looks like ice binding request");
-            time_scope_us!("calling.sfu.handle_packet.unconnected_ice");
+            if let Some(username) = ice_binding_request.username() {
+                trace!("looks like ice binding request");
+                time_scope_us!("calling.sfu.handle_packet.unconnected_ice");
 
-            let username = ice_binding_request
-                .username()
-                .ok_or(SfuError::IceBindingRequestHasNoUsername)?;
+                let incoming_connection = self
+                    .connections
+                    .get_connection_from_ice_request_username(username)
+                    .ok_or_else(|| SfuError::IceBindingRequestUnknownUsername(username.to_vec()))?;
 
-            let incoming_connection = self
-                .connections
-                .get_connection_from_ice_request_username(username)
-                .ok_or_else(|| SfuError::IceBindingRequestUnknownUsername(username.to_vec()))?;
+                time_scope_us!("calling.sfu.handle_packet.unconnected_ice.in_locks");
 
-            time_scope_us!("calling.sfu.handle_packet.unconnected_ice.in_locks");
+                let now = Instant::now();
 
-            let now = Instant::now();
+                let packets_to_send = incoming_connection
+                    .handle_ice_binding_request(sender_addr, ice_binding_request, now)
+                    .map_err(SfuError::ConnectionError)?;
 
-            let packets_to_send = incoming_connection
-                .handle_ice_binding_request(sender_addr, ice_binding_request, now)
-                .map_err(SfuError::ConnectionError)?;
+                return Ok(HandleUnconnectedOutput::Connected {
+                    packets_to_send,
+                    connection: incoming_connection,
+                });
+            } else {
+                trace!("looks like stun binding request");
+                event!(
+                    "calling.bandwidth.incoming.stun_bytes",
+                    incoming_packet.len()
+                );
+                event!("calling.sfu.stun.incoming");
 
-            return Ok(HandleUnconnectedOutput {
-                packets_to_send,
-                connection: incoming_connection,
-            });
+                if let SocketLocator::Udp { peer_addr, .. } = sender_addr {
+                    let response = StunPacketBuilder::new_binding_response(
+                        &ice_binding_request.transaction_id(),
+                    )
+                    .set_xor_mapped_address(&peer_addr)
+                    .build_no_fingerprint();
+
+                    event!("calling.bandwidth.outgoing.stun_bytes", response.len());
+                    event!("calling.sfu.stun.outgoing");
+
+                    return Ok(HandleUnconnectedOutput::Stateless(response));
+                } else {
+                    return Err(SfuError::ParseIceBindingRequest(PacketHasNoAttributes));
+                }
+            }
         }
 
         if rtp::looks_like_rtp(incoming_packet) {
@@ -1450,6 +1475,8 @@ mod sfu_tests {
     use rand::{thread_rng, Rng};
 
     use super::*;
+
+    const ZERO_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
 
     fn random_byte_vector(n: usize) -> Vec<u8> {
         let mut numbers: Vec<u8> = Vec::new();
@@ -1938,13 +1965,123 @@ mod sfu_tests {
         let sfu = new_sfu(Instant::now(), &DEFAULT_CONFIG);
 
         let mut buf = [0u8; 1500];
-        let sender_addr = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::from_str("127.0.0.1").unwrap(),
-            20000,
-        ));
+        let sender_addr = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 20000),
+            local_addr: ZERO_ADDR,
+        };
 
         let result = sfu.handle_packet_unconnected(sender_addr, &mut buf);
         assert_eq!(result, Err(SfuError::UnknownAddress(sender_addr)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_packet_unconnected_stun() {
+        let local_addr = ZERO_ADDR;
+        let sfu = new_sfu(Instant::now(), &DEFAULT_CONFIG);
+        let id = ice::TransactionId::new();
+
+        let mut buf = StunPacketBuilder::new_binding_request(&id).build(&[]);
+
+        let peer_addr = SocketAddr::new(IpAddr::from_str("198.51.100.170").unwrap(), 43605);
+        let sender_addr = SocketLocator::Udp {
+            peer_addr,
+            local_addr,
+        };
+        let HandleUnconnectedOutput::Stateless(result) = sfu
+            .handle_packet_unconnected(sender_addr, &mut buf)
+            .unwrap()
+        else {
+            panic!("not a stateless result");
+        };
+        let response = BindingResponse::try_from_buffer(&result).unwrap().unwrap();
+        assert_eq!(id, response.transaction_id());
+        assert_eq!(Some(peer_addr), response.xor_mapped_address());
+
+        let peer_addr = SocketAddr::new(IpAddr::from_str("2001:db8::1").unwrap(), 43606);
+        let sender_addr = SocketLocator::Udp {
+            peer_addr,
+            local_addr,
+        };
+        let HandleUnconnectedOutput::Stateless(result) = sfu
+            .handle_packet_unconnected(sender_addr, &mut buf)
+            .unwrap()
+        else {
+            panic!("not a stateless result");
+        };
+        let response = BindingResponse::try_from_buffer(&result).unwrap().unwrap();
+        assert_eq!(id, response.transaction_id());
+        assert_eq!(Some(peer_addr), response.xor_mapped_address());
+
+        let peer_addr = SocketAddr::new(IpAddr::from_str("::ffff:198.51.100.170").unwrap(), 43607);
+        let canon_addr = SocketAddr::new(IpAddr::from_str("198.51.100.170").unwrap(), 43607);
+        let sender_addr = SocketLocator::Udp {
+            peer_addr,
+            local_addr,
+        };
+        let HandleUnconnectedOutput::Stateless(result) = sfu
+            .handle_packet_unconnected(sender_addr, &mut buf)
+            .unwrap()
+        else {
+            panic!("not a stateless result");
+        };
+        let response = BindingResponse::try_from_buffer(&result).unwrap().unwrap();
+        assert_eq!(id, response.transaction_id());
+        assert_eq!(Some(canon_addr), response.xor_mapped_address());
+    }
+
+    #[tokio::test]
+    async fn test_handle_packet_unconnected_stun_no_fingerprint() {
+        let local_addr = ZERO_ADDR;
+        let sfu = new_sfu(Instant::now(), &DEFAULT_CONFIG);
+        let id = ice::TransactionId::new();
+
+        let mut buf = StunPacketBuilder::new_binding_request(&id).build_no_fingerprint();
+
+        let peer_addr = SocketAddr::new(IpAddr::from_str("198.51.100.170").unwrap(), 43605);
+        let sender_addr = SocketLocator::Udp {
+            peer_addr,
+            local_addr,
+        };
+        let HandleUnconnectedOutput::Stateless(result) = sfu
+            .handle_packet_unconnected(sender_addr, &mut buf)
+            .unwrap()
+        else {
+            panic!("not a stateless result");
+        };
+        let response = BindingResponse::try_from_buffer(&result).unwrap().unwrap();
+        assert_eq!(id, response.transaction_id());
+        assert_eq!(Some(peer_addr), response.xor_mapped_address());
+
+        let peer_addr = SocketAddr::new(IpAddr::from_str("2001:db8::1").unwrap(), 43606);
+        let sender_addr = SocketLocator::Udp {
+            peer_addr,
+            local_addr,
+        };
+        let HandleUnconnectedOutput::Stateless(result) = sfu
+            .handle_packet_unconnected(sender_addr, &mut buf)
+            .unwrap()
+        else {
+            panic!("not a stateless result");
+        };
+        let response = BindingResponse::try_from_buffer(&result).unwrap().unwrap();
+        assert_eq!(id, response.transaction_id());
+        assert_eq!(Some(peer_addr), response.xor_mapped_address());
+
+        let peer_addr = SocketAddr::new(IpAddr::from_str("::ffff:198.51.100.170").unwrap(), 43607);
+        let canon_addr = SocketAddr::new(IpAddr::from_str("198.51.100.170").unwrap(), 43607);
+        let sender_addr = SocketLocator::Udp {
+            peer_addr,
+            local_addr,
+        };
+        let HandleUnconnectedOutput::Stateless(result) = sfu
+            .handle_packet_unconnected(sender_addr, &mut buf)
+            .unwrap()
+        else {
+            panic!("not a stateless result");
+        };
+        let response = BindingResponse::try_from_buffer(&result).unwrap().unwrap();
+        assert_eq!(id, response.transaction_id());
+        assert_eq!(Some(canon_addr), response.xor_mapped_address());
     }
 
     #[tokio::test]
@@ -1971,10 +2108,10 @@ mod sfu_tests {
             .unwrap();
 
         let mut buf = [0u8; 1500];
-        let sender_addr = SocketLocator::Udp(SocketAddr::new(
-            IpAddr::from_str("127.0.0.1").unwrap(),
-            20000,
-        ));
+        let sender_addr = SocketLocator::Udp {
+            peer_addr: SocketAddr::new(IpAddr::from_str("127.0.0.1").unwrap(), 20000),
+            local_addr: ZERO_ADDR,
+        };
 
         let result = sfu.handle_packet_connected(&connection, sender_addr, &mut buf);
         assert_eq!(result, Err(SfuError::UnknownPacketType(sender_addr)));

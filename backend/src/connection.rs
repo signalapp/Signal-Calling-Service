@@ -1207,7 +1207,10 @@ impl ConnectionRates {
 
 #[cfg(test)]
 mod connection_tests {
-    use std::borrow::Borrow;
+    use std::{
+        borrow::Borrow,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+    };
 
     use calling_common::{CallType, SystemTime, Writer};
     use candidate_selector::ScoringValues;
@@ -1221,6 +1224,7 @@ mod connection_tests {
     };
 
     const MAX_CLIENTS_IN_CALL: usize = 8;
+    const ZERO_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
 
     fn new_call(
         call_id: &[u8],
@@ -1444,7 +1448,10 @@ mod connection_tests {
             .set_username(&ice_credentials.server_username)
             .build(&ice_credentials.server_pwd);
 
-        let sender_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let sender_addr = SocketLocator::Udp {
+            peer_addr: "192.0.2.4:5".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         assert!(connection
             .handle_ice_binding_request(
                 sender_addr,
@@ -1466,7 +1473,10 @@ mod connection_tests {
             .set_username(&ice_credentials.server_username)
             .build(b"bad password");
 
-        let sender_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let sender_addr = SocketLocator::Udp {
+            peer_addr: "192.0.2.4:5".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         assert_eq!(
             connection.handle_ice_binding_request(
                 sender_addr,
@@ -1489,7 +1499,10 @@ mod connection_tests {
             .set_username(b"bad username")
             .build(&ice_credentials.server_pwd);
 
-        let sender_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let sender_addr = SocketLocator::Udp {
+            peer_addr: "192.0.2.4:5".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         assert_eq!(
             connection.handle_ice_binding_request(
                 sender_addr,
@@ -1515,7 +1528,10 @@ mod connection_tests {
             .set_xor_mapped_address(&"203.0.113.1:1".parse().unwrap())
             .build(&ice_credentials.client_pwd);
 
-        let sender_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let sender_addr = SocketLocator::Udp {
+            peer_addr: "192.0.2.4:5".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         assert_eq!(
             connection.handle_ice_binding_response(
                 sender_addr,
@@ -1537,7 +1553,10 @@ mod connection_tests {
             .set_username(&ice_credentials.server_username)
             .build(b"bad password");
 
-        let sender_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let sender_addr = SocketLocator::Udp {
+            peer_addr: "192.0.2.4:5".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         assert_eq!(
             connection.handle_ice_binding_response(
                 sender_addr,
@@ -1615,7 +1634,10 @@ mod connection_tests {
         // Can't send yet because there is no outgoing address.
         assert_eq!(0, packets_to_send.len());
 
-        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let client_addr = SocketLocator::Udp {
+            peer_addr: "192.0.2.4:5".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         establish_outbound_address(&connection, client_addr, now);
         // Packets without tcc seqnums skip the pacer queue and still go out even if the rate is 0.
         set_send_rate(&connection, DataRate::from_kbps(0), now);
@@ -1635,7 +1657,10 @@ mod connection_tests {
         let mut connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt, encrypt, now);
-        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let client_addr = SocketLocator::Udp {
+            peer_addr: "192.0.2.4:5".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         establish_outbound_address(&connection, client_addr, now);
 
         let set_padding_send_rate =
@@ -1731,7 +1756,10 @@ mod connection_tests {
         let connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt.clone(), encrypt.clone(), now);
-        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let client_addr = SocketLocator::Udp {
+            peer_addr: "192.0.2.4:5".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         establish_outbound_address(&connection, client_addr, now);
 
         let encrypted_rtp = new_encrypted_rtp(1, None, &encrypt, at(20));
@@ -1843,7 +1871,10 @@ mod connection_tests {
         connection.tick(&mut packets_to_send, at(4));
         assert_eq!(0, packets_to_send.len());
 
-        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let client_addr = SocketLocator::Udp {
+            peer_addr: "192.0.2.4:5".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         establish_outbound_address(&connection, client_addr, at(5));
         assert_eq!(Some(client_addr), connection.outgoing_addr());
 
@@ -1900,7 +1931,10 @@ mod connection_tests {
         let connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt, encrypt.clone(), now);
-        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let client_addr = SocketLocator::Udp {
+            peer_addr: "192.0.2.4:5".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         establish_outbound_address(&connection, client_addr, now);
 
         let ssrc = 10;
@@ -1951,7 +1985,10 @@ mod connection_tests {
         let connection = new_connection(now);
         let (decrypt, encrypt) = new_srtp_keys(0);
         connection.set_srtp_keys(decrypt.clone(), encrypt.clone(), now);
-        let client_addr = SocketLocator::Udp("192.0.2.4:5".parse().unwrap());
+        let client_addr = SocketLocator::Udp {
+            peer_addr: "192.0.2.4:5".parse().unwrap(),
+            local_addr: ZERO_ADDR,
+        };
         establish_outbound_address(&connection, client_addr, now);
 
         for seqnum in 1..=25 {

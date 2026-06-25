@@ -10,7 +10,7 @@ use std::{
     future::Future,
     io::{self, IoSlice, Read, Write},
     net::{
-        IpAddr::{V4, V6},
+        IpAddr::{self, V4, V6},
         SocketAddr, TcpListener, TcpStream, UdpSocket,
     },
     os::{
@@ -26,7 +26,7 @@ use std::{
 
 use anyhow::Result;
 use byteorder::{BigEndian, ByteOrder};
-use calling_common::{try_scoped, Duration, Instant};
+use calling_common::{try_scoped, Instant};
 use core_affinity::CoreId;
 use log::*;
 use metrics::{metric_config::TimingOptions, *};
@@ -42,7 +42,11 @@ use unique_id::{sequence::SequenceGenerator, Generator};
 use crate::{
     connection::Connection,
     packet_server::{self, SocketLocator, TimerHeap, TimerHeapNextResult},
-    sfu::{self, HandleOutput, HandleUnconnectedOutput, Sfu, SfuError, SfuStats},
+    sfu::{
+        self, HandleOutput,
+        HandleUnconnectedOutput::{Connected, Stateless},
+        Sfu, SfuError, SfuStats,
+    },
 };
 
 /// Controls number of sockets a particular thread will handle without going back to epoll.
@@ -69,12 +73,6 @@ const TCP_SEND_BUFFER_BYTES: usize = 10_000_000 / 8;
 /// limits the maximum delay for those timers. A larger value reduces CPU load.
 const EPOLL_WAIT_TIMEOUT_MS: isize = 25;
 
-/// Time between logging errors when receiving packets to the unpinned socket.
-///
-/// This indicates a singificant setup error, but if it happens at all, it
-/// will likely happen often, so don't overwelm the logs.
-const UNPINNED_LOG_INTERVAL: Duration = Duration::from_secs(60 * 5);
-
 /// The shared state for an epoll-based packet server.
 ///
 /// This server is implemented with a "new client" socket that receives new connections, plus a map
@@ -89,9 +87,10 @@ const UNPINNED_LOG_INTERVAL: Duration = Duration::from_secs(60 * 5);
 ///
 /// [epoll]: https://man7.org/linux/man-pages/man7/epoll.7.html
 pub struct PacketServerState {
-    local_addr_udp: SocketAddr,
-    local_addr_tcp: SocketAddr,
-    local_addr_tls: Option<SocketAddr>,
+    binding_ip: IpAddr,
+    udp_ports: Vec<u16>,
+    tcp_ports: Vec<u16>,
+    tls_ports: Vec<u16>,
     tls_config: Option<Arc<ServerConfig>>,
     all_connections: RwLock<ConnectionMap<ConnectedSocket>>,
     tick_number: AtomicU64, // u64 will never rollover
@@ -105,9 +104,10 @@ impl PacketServerState {
     ///
     /// Also creates a separate epoll file descriptor for each thread we plan to use.
     pub fn new(
-        local_addr_udp: SocketAddr,
-        local_addr_tcp: SocketAddr,
-        local_addr_tls: Option<SocketAddr>,
+        binding_ip: IpAddr,
+        udp_ports: Vec<u16>,
+        tcp_ports: Vec<u16>,
+        tls_ports: Vec<u16>,
         tls_config: Option<Arc<ServerConfig>>,
         num_threads: usize,
     ) -> Result<Arc<Self>> {
@@ -117,9 +117,10 @@ impl PacketServerState {
         timer_heaps.resize_with(num_threads, Default::default);
 
         let result = Self {
-            local_addr_udp,
-            local_addr_tcp,
-            local_addr_tls,
+            binding_ip,
+            udp_ports,
+            tcp_ports,
+            tls_ports,
             tls_config,
             all_connections: RwLock::new(ConnectionMap::new()),
             tick_number: 0.into(),
@@ -136,10 +137,12 @@ impl PacketServerState {
     fn open_socket_with_reusable_port(
         local_addr: &SocketAddr,
         core: Option<&CoreId>,
-    ) -> Result<(ConnectedSocket, RawFd)> {
+    ) -> Result<ConnectedSocket> {
         let socket = Self::open_socket_impl(local_addr, core)?;
-        let raw_fd = socket.as_raw_fd();
-        Ok((ConnectedSocket::unconnected(Socket::Udp(socket)), raw_fd))
+        Ok(ConnectedSocket::unconnected(Socket::Udp {
+            socket,
+            local_addr: *local_addr,
+        }))
     }
 
     fn connect_udp_socket(
@@ -152,7 +155,10 @@ impl PacketServerState {
         let raw_fd = socket.as_raw_fd();
         Ok((
             ConnectedSocket {
-                socket: Socket::Udp(socket),
+                socket: Socket::Udp {
+                    socket,
+                    local_addr: *local_addr,
+                },
                 connection: Some(connection),
             },
             raw_fd,
@@ -189,10 +195,7 @@ impl PacketServerState {
         Ok(result)
     }
 
-    fn open_listen_socket(
-        local_addr: &SocketAddr,
-        core: Option<&CoreId>,
-    ) -> Result<(TcpListener, RawFd)> {
+    fn open_listen_socket(local_addr: &SocketAddr, core: Option<&CoreId>) -> Result<TcpListener> {
         use nix::sys::socket::*;
 
         // Open a TCP socket in blocking mode.
@@ -224,8 +227,7 @@ impl PacketServerState {
         result
             .set_nonblocking(true)
             .expect("Cannot set non-blocking");
-        let raw_fd = result.as_raw_fd();
-        Ok((result, raw_fd))
+        Ok(result)
     }
 
     /// nix::sys::socket doesn't have a sockopt for SO_INCOMING_CPU, so do it ourselves...
@@ -280,82 +282,52 @@ impl PacketServerState {
         if !core_affinity::set_for_current(core) {
             error!("Could not cpu pin to core {}", core.id);
         }
-        let (new_client_socket, new_client_socket_fd) =
-            Self::open_socket_with_reusable_port(&self.local_addr_udp, None)?;
-
-        let (new_pinned_client_socket, new_pinned_client_socket_fd) =
-            Self::open_socket_with_reusable_port(&self.local_addr_udp, Some(&core))?;
-
-        let (new_tcp_socket, new_tcp_socket_fd) =
-            Self::open_listen_socket(&self.local_addr_tcp, None)?;
-        let (new_pinned_tcp_socket, new_pinned_tcp_socket_fd) =
-            Self::open_listen_socket(&self.local_addr_tcp, Some(&core))?;
-
-        let (new_tls_socket, new_tls_socket_fd, new_pinned_tls_socket, new_pinned_tls_socket_fd) =
-            if let Some(local_addr_tls) = self.local_addr_tls {
-                let (tls_socket, tls_fd) = Self::open_listen_socket(&local_addr_tls, None)?;
-                let (pinned_socket, pinned_fd) =
-                    Self::open_listen_socket(&local_addr_tls, Some(&core))?;
-                (Some(tls_socket), tls_fd, Some(pinned_socket), pinned_fd)
-            } else {
-                (None, -1, None, -1)
-            };
 
         let epoll = Epoll::new(EpollCreateFlags::empty())?;
-        epoll.add(
-            &new_client_socket,
-            EpollEvent::new(EpollFlags::EPOLLIN, new_client_socket_fd as u64),
-        )?;
-        epoll.add(
-            &new_pinned_client_socket,
-            EpollEvent::new(EpollFlags::EPOLLIN, new_pinned_client_socket_fd as u64),
-        )?;
-        epoll.add(
-            &new_tcp_socket,
-            EpollEvent::new(EpollFlags::EPOLLIN, new_tcp_socket_fd as u64),
-        )?;
-        epoll.add(
-            &new_pinned_tcp_socket,
-            EpollEvent::new(EpollFlags::EPOLLIN, new_pinned_tcp_socket_fd as u64),
-        )?;
 
-        if let Some(listen_socket) = &new_tls_socket {
+        let mut udp_sockets = Vec::with_capacity(self.udp_ports.len());
+        for (i, port) in self.udp_ports.iter().enumerate() {
+            let socket = Self::open_socket_with_reusable_port(
+                &SocketAddr::new(self.binding_ip, *port),
+                Some(&core),
+            )?;
+            udp_sockets.push(socket);
             epoll.add(
-                listen_socket,
-                EpollEvent::new(EpollFlags::EPOLLIN, new_tls_socket_fd as u64),
+                &udp_sockets[i],
+                EpollEvent::new(EpollFlags::EPOLLIN, EpollMap::Udp(i).to_u64()?),
             )?;
         }
-        if let Some(listen_socket) = &new_pinned_tls_socket {
+
+        let mut tcp_sockets = Vec::with_capacity(self.tcp_ports.len());
+        for (i, port) in self.tcp_ports.iter().enumerate() {
+            let socket =
+                Self::open_listen_socket(&SocketAddr::new(self.binding_ip, *port), Some(&core))?;
+            tcp_sockets.push(socket);
             epoll.add(
-                listen_socket,
-                EpollEvent::new(EpollFlags::EPOLLIN, new_pinned_tls_socket_fd as u64),
+                &tcp_sockets[i],
+                EpollEvent::new(EpollFlags::EPOLLIN, EpollMap::Tcp(i).to_u64()?),
+            )?;
+        }
+
+        let mut tls_sockets = Vec::with_capacity(self.tls_ports.len());
+        for (i, port) in self.tls_ports.iter().enumerate() {
+            let socket =
+                Self::open_listen_socket(&SocketAddr::new(self.binding_ip, *port), Some(&core))?;
+            tls_sockets.push(socket);
+            epoll.add(
+                &tls_sockets[i],
+                EpollEvent::new(EpollFlags::EPOLLIN, EpollMap::Tls(i).to_u64()?),
             )?;
         }
 
         let mut bufs = vec![PacketBuffer::new()];
         let mut poll_timeout_ms = EPOLL_WAIT_TIMEOUT_MS;
 
-        let (timer, timer_fd) = match TimerFd::new(ClockId::CLOCK_MONOTONIC, TimerFlags::empty()) {
-            Ok(timer) => {
-                let timer_fd = timer.as_fd().as_raw_fd();
-                match epoll.add(
-                    &timer,
-                    EpollEvent::new(EpollFlags::EPOLLIN, timer_fd as u64),
-                ) {
-                    Ok(()) => (timer, timer_fd),
-                    Err(e) => {
-                        error!("timerfd couldn't be added to epoll, {}", e);
-                        return Err(e.into());
-                    }
-                }
-            }
-            Err(e) => {
-                error!("timerfd creation failed, {}", e);
-                return Err(e.into());
-            }
-        };
-
-        let mut unpinned_recv = None;
+        let timer = TimerFd::new(ClockId::CLOCK_MONOTONIC, TimerFlags::empty())?;
+        epoll.add(
+            &timer,
+            EpollEvent::new(EpollFlags::EPOLLIN, EpollMap::Timer.to_u64()?),
+        )?;
 
         loop {
             let mut current_events = [EpollEvent::empty(); MAX_EPOLL_EVENTS];
@@ -366,39 +338,29 @@ impl PacketServerState {
                     0
                 });
             for event in &current_events[..num_events] {
-                let socket_fd = event.data() as i32;
-                if socket_fd == new_client_socket_fd {
-                    warn_unpinned(&mut unpinned_recv, "UDP");
-                    self.read_unconnected(&mut bufs[0], sfu, &epoll, &new_client_socket);
-                } else if socket_fd == new_pinned_client_socket_fd {
-                    self.read_unconnected(&mut bufs[0], sfu, &epoll, &new_pinned_client_socket);
-                } else if socket_fd == new_tcp_socket_fd {
-                    warn_unpinned(&mut unpinned_recv, "TCP");
-                    self.accept_tcp(&new_tcp_socket, &epoll, false);
-                } else if socket_fd == new_pinned_tcp_socket_fd {
-                    self.accept_tcp(&new_pinned_tcp_socket, &epoll, false);
-                } else if socket_fd == new_tls_socket_fd {
-                    warn_unpinned(&mut unpinned_recv, "TLS");
-                    let socket = new_tls_socket.as_ref().expect("socket must exist");
-                    self.accept_tcp(socket, &epoll, true);
-                } else if socket_fd == new_pinned_tls_socket_fd {
-                    let socket = new_pinned_tls_socket.as_ref().expect("socket must exist");
-                    self.accept_tcp(socket, &epoll, true);
-                } else if socket_fd == timer_fd {
-                    let _ = timer.wait();
-                } else {
-                    // Not a special fd, must be a client fd
-                    let is_error = event.events().contains(EpollFlags::EPOLLERR);
-                    let input_ready = event.events().contains(EpollFlags::EPOLLIN);
+                match EpollMap::from_u64(event.data()) {
+                    Some(EpollMap::Udp(i)) => {
+                        self.read_unconnected(&mut bufs[0], sfu, &epoll, &udp_sockets[i])
+                    }
+                    Some(EpollMap::Tcp(i)) => self.accept_tcp(&tcp_sockets[i], &epoll, false),
+                    Some(EpollMap::Tls(i)) => self.accept_tcp(&tls_sockets[i], &epoll, true),
+                    Some(EpollMap::Timer) => _ = timer.wait(),
+                    Some(EpollMap::Fd(socket_fd)) => {
+                        let is_error = event.events().contains(EpollFlags::EPOLLERR);
+                        let input_ready = event.events().contains(EpollFlags::EPOLLIN);
 
-                    self.read_connected(
-                        &mut bufs,
-                        timer_heap,
-                        sfu,
-                        socket_fd,
-                        is_error,
-                        input_ready,
-                    );
+                        self.read_connected(
+                            &mut bufs,
+                            timer_heap,
+                            sfu,
+                            socket_fd,
+                            is_error,
+                            input_ready,
+                        );
+                    }
+                    None => {
+                        error!("unparsable event data from epoll {:016x}", event.data());
+                    }
                 }
             }
 
@@ -421,75 +383,87 @@ impl PacketServerState {
             Ok(sender_addr) => sender_addr,
         };
 
-        let HandleUnconnectedOutput {
-            packets_to_send,
-            connection,
-        } = match packet_server::handle_packet_unconnected(sfu, sender_addr, buf.as_mut()) {
-            Some(output) => output,
-            None => return,
-        };
-
-        {
-            let mut write_lock = self.all_connections.write();
-            match write_lock.get_by_addr(&sender_addr) {
-                ConnectionState::New(_) => {
-                    write_lock.mark_as_active(&sender_addr, |s| s.connection = Some(connection));
-                }
-                ConnectionState::Connected(socket) => {
-                    if let Some(socket_connection) = &socket.connection {
-                        if socket_connection.id() != connection.id() {
-                            error!(
-                                "connection changed! addr {} id {} -> id {}",
-                                sender_addr,
-                                socket_connection.id(),
-                                connection.id()
-                            );
+        match packet_server::handle_packet_unconnected(sfu, sender_addr, buf.as_mut()) {
+            Some(Connected {
+                packets_to_send,
+                connection,
+            }) => {
+                {
+                    let mut write_lock = self.all_connections.write();
+                    match write_lock.get_by_addr(&sender_addr) {
+                        ConnectionState::New(_) => {
+                            write_lock
+                                .mark_as_active(&sender_addr, |s| s.connection = Some(connection));
                         }
-                    } else {
-                        error!(
-                            "sender_addr marked connected without Connection {}",
-                            sender_addr
-                        );
-                    }
-                }
-                ConnectionState::NotYetConnected => {
-                    trace!("connecting to {:?}", sender_addr);
-                    match sender_addr {
-                        SocketLocator::Udp(udp_addr) => {
-                            match try_scoped(|| {
-                                // TODO: socket.local address?
-                                let (client_socket, client_socket_fd) = Self::connect_udp_socket(
-                                    &self.local_addr_udp,
-                                    &udp_addr,
-                                    connection,
-                                )?;
-                                epoll.add(
-                                    &client_socket,
-                                    EpollEvent::new(EpollFlags::EPOLLIN, client_socket_fd as u64),
-                                )?;
-                                write_lock.get_or_insert_connected(
-                                    client_socket,
-                                    sender_addr,
-                                    None,
+                        ConnectionState::Connected(socket) => {
+                            if let Some(socket_connection) = &socket.connection {
+                                if socket_connection.id() != connection.id() {
+                                    error!(
+                                        "connection changed! addr {} id {} -> id {}",
+                                        sender_addr,
+                                        socket_connection.id(),
+                                        connection.id()
+                                    );
+                                }
+                            } else {
+                                error!(
+                                    "sender_addr marked connected without Connection {}",
+                                    sender_addr
                                 );
-                                Ok(())
-                            }) {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    error!("failed to connect to peer: {}", e);
+                            }
+                        }
+                        ConnectionState::NotYetConnected => {
+                            trace!("connecting to {:?}", sender_addr);
+                            match sender_addr {
+                                SocketLocator::Udp {
+                                    peer_addr,
+                                    local_addr,
+                                } => {
+                                    match try_scoped(|| {
+                                        let (client_socket, client_socket_fd) =
+                                            Self::connect_udp_socket(
+                                                &local_addr,
+                                                &peer_addr,
+                                                connection,
+                                            )?;
+                                        epoll.add(
+                                            &client_socket,
+                                            EpollEvent::new(
+                                                EpollFlags::EPOLLIN,
+                                                EpollMap::Fd(client_socket_fd).to_u64()?,
+                                            ),
+                                        )?;
+                                        write_lock.get_or_insert_connected(
+                                            client_socket,
+                                            sender_addr,
+                                            None,
+                                        );
+                                        Ok(())
+                                    }) {
+                                        Ok(()) => {}
+                                        Err(e) => {
+                                            error!("failed to connect to peer: {}", e);
+                                        }
+                                    }
+                                }
+                                SocketLocator::Tcp { .. } => {
+                                    error!("should not handle tcp connections in read_unconnected");
                                 }
                             }
                         }
-                        SocketLocator::Tcp { .. } => {
-                            error!("should not handle tcp connections in read_unconnected");
-                        }
                     }
                 }
+                for (buf, addr) in packets_to_send {
+                    self.send_packet(&buf, addr)
+                }
             }
-        }
-
-        for (buf, addr) in packets_to_send {
-            self.send_packet(&buf, addr)
+            Some(Stateless(response)) => match (&socket.socket, sender_addr) {
+                (Socket::Udp { socket, .. }, SocketLocator::Udp { peer_addr, .. }) => {
+                    let _ = socket.send_to(&response, peer_addr);
+                }
+                _ => error!("ignoring stateless stun request on non-udp packet"),
+            },
+            None => {}
         }
     }
 
@@ -673,7 +647,7 @@ impl PacketServerState {
                     }
                     Err(_) => (vec![], vec![]),
                 }
-            } else if let Some(HandleUnconnectedOutput {
+            } else if let Some(Connected {
                 packets_to_send,
                 connection: new_connection,
             }) =
@@ -732,11 +706,11 @@ impl PacketServerState {
                     ConnectedSocket::new_tcp(client_socket, id, is_ipv6, tls_config)
                 {
                     let mut write_lock = self.all_connections.write();
+                    let fd_u64 = EpollMap::Fd(client_socket.as_raw_fd())
+                        .to_u64()
+                        .expect("can't fail");
                     if epoll
-                        .add(
-                            &client_socket,
-                            EpollEvent::new(EpollFlags::EPOLLIN, client_socket.as_raw_fd() as u64),
-                        )
+                        .add(&client_socket, EpollEvent::new(EpollFlags::EPOLLIN, fd_u64))
                         .is_ok()
                     {
                         write_lock.get_or_insert_connected(
@@ -1036,18 +1010,6 @@ impl PacketServerState {
     }
 }
 
-fn warn_unpinned(unpinned_recv: &mut Option<Instant>, message: &str) {
-    if unpinned_recv.is_none_or(|instant| {
-        Instant::now().saturating_duration_since(instant) > UNPINNED_LOG_INTERVAL
-    }) {
-        error!(
-            "packet delivered to unpinned {} socket; check cpu pinning",
-            message
-        );
-        *unpinned_recv = Some(Instant::now());
-    }
-}
-
 struct PacketBuffer {
     buf: [u8; MAX_RTP_LENGTH],
     size: usize,
@@ -1317,7 +1279,10 @@ impl SocketStream {
 }
 
 enum Socket {
-    Udp(UdpSocket),
+    Udp {
+        socket: UdpSocket,
+        local_addr: SocketAddr,
+    },
     Tcp(Box<Mutex<TcpState>>),
 }
 
@@ -1329,7 +1294,7 @@ struct ConnectedSocket {
 impl AsRawFd for ConnectedSocket {
     fn as_raw_fd(&self) -> RawFd {
         match &self.socket {
-            Socket::Udp(s) => s.as_raw_fd(),
+            Socket::Udp { socket, .. } => socket.as_raw_fd(),
             Socket::Tcp(m) => m.lock().stream.as_raw_fd(),
         }
     }
@@ -1338,7 +1303,7 @@ impl AsRawFd for ConnectedSocket {
 impl AsFd for ConnectedSocket {
     fn as_fd(&self) -> BorrowedFd<'_> {
         match &self.socket {
-            Socket::Udp(s) => s.as_fd(),
+            Socket::Udp { socket, .. } => socket.as_fd(),
             Socket::Tcp(m) => {
                 let lock = m.lock();
                 let fd = lock.stream.as_fd();
@@ -1390,8 +1355,8 @@ impl ConnectedSocket {
 
     fn send(&self, buf: &[u8]) -> io::Result<()> {
         match &self.socket {
-            Socket::Udp(s) => {
-                let ret = s.send(buf).map(|_| ());
+            Socket::Udp { socket, .. } => {
+                let ret = socket.send(buf).map(|_| ());
                 if let Err(ref err) = ret {
                     if err.kind() == io::ErrorKind::WouldBlock {
                         event!("calling.udp.epoll.udp_send.would_block");
@@ -1405,16 +1370,29 @@ impl ConnectedSocket {
 
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketLocator)> {
         match &self.socket {
-            Socket::Udp(s) => s
-                .recv_from(buf)
-                .map(|(size, addr)| (size, SocketLocator::Udp(addr))),
+            Socket::Udp { socket, local_addr } => {
+                let (size, peer_addr) = socket.recv_from(buf)?;
+                Ok((
+                    size,
+                    SocketLocator::Udp {
+                        peer_addr,
+                        local_addr: *local_addr,
+                    },
+                ))
+            }
             Socket::Tcp(m) => m.lock().recv_from(buf),
         }
     }
 
     fn peer_addr(&self) -> io::Result<SocketLocator> {
         match &self.socket {
-            Socket::Udp(s) => s.peer_addr().map(SocketLocator::Udp),
+            Socket::Udp { socket, local_addr } => {
+                let peer_addr = socket.peer_addr()?;
+                Ok(SocketLocator::Udp {
+                    peer_addr,
+                    local_addr: *local_addr,
+                })
+            }
             Socket::Tcp(m) => {
                 let state = m.lock();
                 Ok(SocketLocator::Tcp {
@@ -1428,14 +1406,14 @@ impl ConnectedSocket {
 
     fn take_error(&self) -> io::Result<Option<io::Error>> {
         match &self.socket {
-            Socket::Udp(s) => s.take_error(),
+            Socket::Udp { socket, .. } => socket.take_error(),
             Socket::Tcp(m) => m.lock().stream.take_error(),
         }
     }
 
     fn has_pending_data(&self) -> bool {
         match &self.socket {
-            Socket::Udp(_) => false,
+            Socket::Udp { .. } => false,
             Socket::Tcp(m) => m.lock().stream.has_pending_data(),
         }
     }
@@ -1495,7 +1473,7 @@ impl<T: AsRawFd> ConnectionMap<T> {
         current_tick: Option<u64>,
     ) -> &T {
         let fd = socket.as_raw_fd();
-        let is_udp = matches!(peer_addr, SocketLocator::Udp(_));
+        let is_udp = matches!(peer_addr, SocketLocator::Udp { .. });
 
         match self.by_peer_addr.entry(peer_addr) {
             hash_map::Entry::Occupied(entry) => {
@@ -1614,11 +1592,67 @@ impl<T: AsRawFd> ConnectionMap<T> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum EpollMap {
+    Fd(i32),
+    Udp(usize),
+    Tcp(usize),
+    Tls(usize),
+    Timer,
+}
+
+impl EpollMap {
+    const FD_FLAG: u64 = 0x1000_0000_0000_0000;
+    const UDP_FLAG: u64 = 0x2000_0000_0000_0000;
+    const TCP_FLAG: u64 = 0x3000_0000_0000_0000;
+    const TLS_FLAG: u64 = 0x4000_0000_0000_0000;
+    const TIMER_FLAG: u64 = 0x5000_0000_0000_0000;
+    const FLAG_MASK: u64 = 0xF000_0000_0000_0000;
+    const DATA_MASK: u64 = 0x0FFF_FFFF_FFFF_FFFF;
+
+    fn to_u64(&self) -> Result<u64> {
+        match self {
+            Self::Fd(fd) => Ok(Self::FD_FLAG | (*fd as u32) as u64),
+            Self::Udp(index) if *index as u64 <= Self::DATA_MASK => {
+                Ok(Self::UDP_FLAG | *index as u64)
+            }
+            Self::Tcp(index) if *index as u64 <= Self::DATA_MASK => {
+                Ok(Self::TCP_FLAG | *index as u64)
+            }
+            Self::Tls(index) if *index as u64 <= Self::DATA_MASK => {
+                Ok(Self::TLS_FLAG | *index as u64)
+            }
+            Self::Timer => Ok(Self::TIMER_FLAG),
+            _ => {
+                error!("unable to EpollMap::to_u64({:?})", self);
+                Err(anyhow::anyhow!("unable to EpollMap::to_u64({:?})", self))
+            }
+        }
+    }
+
+    fn from_u64(value: u64) -> Option<Self> {
+        let flag = value & Self::FLAG_MASK;
+        let data = value & Self::DATA_MASK;
+        match flag {
+            Self::FD_FLAG if data <= u32::MAX as u64 => Some(Self::Fd(data as i32)),
+            Self::UDP_FLAG => Some(Self::Udp(data as usize)),
+            Self::TCP_FLAG => Some(Self::Tcp(data as usize)),
+            Self::TLS_FLAG => Some(Self::Tls(data as usize)),
+            Self::TIMER_FLAG if data == 0 => Some(Self::Timer),
+            _ => {
+                error!("unable to EpollMap::from_u64({:016x})", value);
+                None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, net::Ipv4Addr};
 
     use super::*;
+    const ZERO_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
 
     #[derive(Debug)]
     struct FakeSocket {
@@ -1634,7 +1668,10 @@ mod tests {
     #[test]
     fn connection_map_absent() {
         let mut map: ConnectionMap<FakeSocket> = ConnectionMap::new();
-        let addr = SocketLocator::Udp("127.0.0.1:80".parse().expect("valid SocketAddr"));
+        let addr = SocketLocator::Udp {
+            peer_addr: "127.0.0.1:80".parse().expect("valid SocketAddr"),
+            local_addr: ZERO_ADDR,
+        };
 
         assert!(map.get_by_fd(0).is_none());
         assert!(matches!(
@@ -1647,7 +1684,10 @@ mod tests {
     #[test]
     fn connection_map_lifecycle() {
         let mut map: ConnectionMap<FakeSocket> = ConnectionMap::new();
-        let addr = SocketLocator::Udp("127.0.0.1:80".parse().expect("valid SocketAddr"));
+        let addr = SocketLocator::Udp {
+            peer_addr: "127.0.0.1:80".parse().expect("valid SocketAddr"),
+            local_addr: ZERO_ADDR,
+        };
 
         // Insert
         let fd = 5;
@@ -1680,7 +1720,10 @@ mod tests {
     #[test]
     fn connection_map_first_insert_wins() {
         let mut map: ConnectionMap<FakeSocket> = ConnectionMap::new();
-        let addr = SocketLocator::Udp("127.0.0.1:80".parse().expect("valid SocketAddr"));
+        let addr = SocketLocator::Udp {
+            peer_addr: "127.0.0.1:80".parse().expect("valid SocketAddr"),
+            local_addr: ZERO_ADDR,
+        };
 
         let fd = 5;
         let id = 55;
@@ -1707,7 +1750,10 @@ mod tests {
     #[test]
     fn connection_map_can_insert_over_closed() {
         let mut map: ConnectionMap<FakeSocket> = ConnectionMap::new();
-        let addr = SocketLocator::Udp("127.0.0.1:80".parse().expect("valid SocketAddr"));
+        let addr = SocketLocator::Udp {
+            peer_addr: "127.0.0.1:80".parse().expect("valid SocketAddr"),
+            local_addr: ZERO_ADDR,
+        };
 
         let fd = 5;
         let id = 55;
@@ -1725,7 +1771,10 @@ mod tests {
     #[test]
     fn connection_map_remove_open() {
         let mut map: ConnectionMap<FakeSocket> = ConnectionMap::new();
-        let addr = SocketLocator::Udp("127.0.0.1:80".parse().expect("valid SocketAddr"));
+        let addr = SocketLocator::Udp {
+            peer_addr: "127.0.0.1:80".parse().expect("valid SocketAddr"),
+            local_addr: ZERO_ADDR,
+        };
 
         // Insert
         let fd = 5;
@@ -1802,6 +1851,130 @@ mod tests {
         assert!(
             map.inactive_ttls.is_empty(),
             "The only connections should have been removed"
+        );
+    }
+
+    #[test]
+    fn epoll_map_bad_flags() {
+        for value in [
+            0x0000_0000_0000_0000,
+            0x6000_0000_0000_0000,
+            0x7000_0000_0000_0000,
+            0x8000_0000_0000_0000,
+            0x9000_0000_0000_0000,
+            0xA000_0000_0000_0000,
+            0xB000_0000_0000_0000,
+            0xC000_0000_0000_0000,
+            0xD000_0000_0000_0000,
+            0xE000_0000_0000_0000,
+            0xF000_0000_0000_0000,
+        ] {
+            let result = EpollMap::from_u64(value);
+            assert!(
+                result.is_none(),
+                "shouldn't be able to parse {:016x}, was {:?}",
+                value,
+                result
+            )
+        }
+    }
+
+    #[test]
+    fn epoll_map_fd_range() {
+        let mut x = i32::MIN;
+        while x != 0 {
+            epoll_map_rt(&EpollMap::Fd(x));
+            x /= 2;
+        }
+        x = i32::MAX;
+        while x != 0 {
+            epoll_map_rt(&EpollMap::Fd(x));
+            x /= 2;
+        }
+        epoll_map_rt(&EpollMap::Fd(x));
+    }
+
+    #[test]
+    fn epoll_map_fd_out_of_range() {
+        let mut x = u32::MAX as u64 + 1;
+        while x <= EpollMap::DATA_MASK {
+            let int = EpollMap::FD_FLAG | x;
+            assert_eq!(None, EpollMap::from_u64(int));
+            x *= 2;
+        }
+    }
+
+    #[test]
+    fn epoll_map_indexes_in_range() {
+        let x: Result<usize, _> = EpollMap::DATA_MASK.try_into();
+        assert!(x.is_ok(), "u64 must fit into usize)");
+        let mut x = x.unwrap();
+        while x > 0 {
+            epoll_map_rt(&EpollMap::Udp(x));
+            epoll_map_rt(&EpollMap::Tcp(x));
+            epoll_map_rt(&EpollMap::Tls(x));
+            x /= 2;
+        }
+        epoll_map_rt(&EpollMap::Udp(x));
+        epoll_map_rt(&EpollMap::Tcp(x));
+        epoll_map_rt(&EpollMap::Tls(x));
+    }
+
+    #[test]
+    fn epoll_map_indexes_out_of_range() {
+        let x: Result<usize, _> = EpollMap::DATA_MASK.try_into();
+        assert!(x.is_ok(), "u64 must fit into usize)");
+        let mut x = x.unwrap() + 1;
+        while x > 0 {
+            epoll_map_assert_error(&EpollMap::Udp(x));
+            epoll_map_assert_error(&EpollMap::Tcp(x));
+            epoll_map_assert_error(&EpollMap::Tls(x));
+            x <<= 1;
+        }
+        let x: Result<usize, _> = EpollMap::DATA_MASK.try_into();
+        assert!(x.is_ok(), "u64 must fit into usize)");
+        let mut x = x.unwrap() << 1;
+        while x > 0 {
+            epoll_map_assert_error(&EpollMap::Udp(x));
+            epoll_map_assert_error(&EpollMap::Tcp(x));
+            epoll_map_assert_error(&EpollMap::Tls(x));
+            x <<= 1;
+        }
+    }
+
+    #[test]
+    fn epoll_map_timer() {
+        let mut x = 1;
+        while x <= EpollMap::DATA_MASK {
+            let int = EpollMap::TIMER_FLAG | x;
+            assert_eq!(None, EpollMap::from_u64(int));
+            x *= 2;
+        }
+
+        x = EpollMap::DATA_MASK;
+        while x > 0 {
+            let int = EpollMap::TIMER_FLAG | x;
+            assert_eq!(None, EpollMap::from_u64(int));
+            x /= 2;
+        }
+        epoll_map_rt(&EpollMap::Timer);
+    }
+
+    fn epoll_map_rt(value: &EpollMap) {
+        let int = value.to_u64();
+        assert!(int.is_ok());
+        let int = int.unwrap();
+        let result = EpollMap::from_u64(int);
+        assert_eq!(Some(value), result.as_ref(), "u64 mapping is {:016x}", int);
+    }
+
+    fn epoll_map_assert_error(value: &EpollMap) {
+        let int = value.to_u64();
+        assert!(
+            int.is_err(),
+            "{:?} mapped to {:016x}, expecting error",
+            value,
+            int.unwrap()
         );
     }
 }
