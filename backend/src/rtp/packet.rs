@@ -369,8 +369,8 @@ fn read_video_layers_allocation(bytes: &[u8]) -> Result<Vec<RtpStreamAllocation>
         for allocation in allocations.iter_mut() {
             for spatial_layer in allocation.iter_mut() {
                 spatial_layer.size = Some(PixelSize {
-                    width: data.read_u16(16)? + 1,
-                    height: data.read_u16(16)? + 1,
+                    width: data.read_u16(16)?.saturating_add(1),
+                    height: data.read_u16(16)?.saturating_add(1),
                 });
                 // Our server has no use for the framerate
                 let _framerate = Some(data.read_u8(8)?);
