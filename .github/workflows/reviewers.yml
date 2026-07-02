@@ -1,7 +1,5 @@
-name: 'Auto Assign'
+name: "Auto Assign"
 on:
-  pull_request_target:
-    types: [opened, ready_for_review]
   pull_request:
     types: [opened, ready_for_review]
 
@@ -16,4 +14,4 @@ jobs:
     steps:
       - uses: kentaro-m/auto-assign-action@v2.0.2
         with:
-          configuration-path: '.github/config/auto-assign.yml'
+          configuration-path: ".github/config/auto-assign.yml"
