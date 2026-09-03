@@ -5,6 +5,7 @@
 
 pub mod allocator;
 mod frame_tracker;
+mod simple_bitset;
 
 use std::{
     collections::HashMap,
@@ -501,6 +502,12 @@ impl ScalableVideoState {
         }
     }
 
+    /// Advances time-dependent state for all receivers and the sender, emits a periodic log
+    /// report if due, and recomputes the target send rate.
+    ///
+    /// Returns `updated_target_rate` as `Some` only when the effective rate (the minimum of the
+    /// requested and available rates) has changed since the last tick, so callers can skip
+    /// reconfiguration when nothing has changed.
     pub fn tick(&mut self, now: Instant) -> ScalableVideoTickResult {
         self.receivers.tick(now);
         self.sender.tick(now);

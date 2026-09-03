@@ -56,6 +56,9 @@ strum_macros = "0.26.4"
 # For common
 sha2 = { workspace = true }
 
+# For SVC frame tracker
+num-traits = "0.2.19"
+
 # For ICE
 crc = { workspace = true }
 hmac = { workspace = true }

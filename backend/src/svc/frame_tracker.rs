@@ -3,13 +3,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::{collections::VecDeque, ops::Range};
+use std::collections::VecDeque;
 
 use calling_common::{Duration, Instant};
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::rtp::{FullFrameNumber, FullSequenceNumber};
+use crate::{
+    rtp::{FullFrameNumber, FullSequenceNumber},
+    svc::simple_bitset::SimpleBitset,
+};
 
 /// Default maximum number of frames in flight. Since we expect minimal frame overlap and that
 /// frames need to be processed quickly, this number can be kept low.
@@ -27,11 +30,15 @@ pub const DEFAULT_FRAME_LIFETIME: Duration = Duration::from_secs(5);
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum FrameTrackerError {
     #[error("Start flag already set for frame {0}")]
-    FrameStartFlagAlreadySet(FullFrameNumber),
+    StartFlagAlreadySet(FullFrameNumber),
     #[error("End flag already set for frame {0}")]
-    FrameEndFlagAlreadySet(FullFrameNumber),
-    #[error("Too many missing packet ranges for frame {0}")]
-    TooManyMissingPacketRanges(FullFrameNumber),
+    EndFlagAlreadySet(FullFrameNumber),
+    #[error("Frame too large {0}")]
+    FrameTooLarge(FullFrameNumber),
+    #[error("The frame is invalid {0}")]
+    FrameIsInvalid(FullFrameNumber),
+    #[error("Too many frames in flight")]
+    TooManyFramesInFlight,
 }
 
 /// Instances of `FrameTracker` are used to track which frames have been fully received
@@ -58,7 +65,7 @@ pub struct FrameTracker {
     max_complete_frames: usize,
     complete_frames: VecDeque<FullFrameNumber>,
     frames_in_flight: SmallVec<[FrameInfo; MAX_FRAMES_IN_FLIGHT]>,
-    next_prune_time: Instant,
+    next_prune_time: Option<Instant>,
     prune_period: Duration,
     frame_lifetime: Duration,
 }
@@ -69,9 +76,9 @@ impl Default for FrameTracker {
     }
 }
 
+#[derive(Debug)]
 pub struct FrameTrackerConfig {
-    /// Maximum number of frame numbers identifying complete frames to store. This list
-    /// is maintained in the FIFO fashion.
+    /// Maximum number of frame numbers identifying complete frames to store.
     pub max_complete_frames: usize,
     /// How frequently to perform the pruning operation that discards stale frames in flight.
     pub prune_period: Duration,
@@ -111,17 +118,26 @@ impl FrameTracker {
             frame_lifetime,
             complete_frames: VecDeque::new(),
             frames_in_flight: SmallVec::new(),
-            next_prune_time: Instant::now() + prune_period,
+            next_prune_time: None,
         }
     }
 
     fn push_complete_frame(&mut self, frame_number: FullFrameNumber) {
         // Guard against a pathological case where the max_complete_frames is set to 0.
-        // We should probably disallow this case in the future.
         if self.max_complete_frames == 0 {
             return;
         }
         if self.complete_frames.len() >= self.max_complete_frames {
+            // If the new frame is older than the frame we have sitting at the head
+            // of the deque we'll simply drop it as it is too old to be worth
+            // tracking.
+            if self
+                .complete_frames
+                .front()
+                .is_some_and(|front| frame_number < *front)
+            {
+                return;
+            }
             self.complete_frames.pop_front();
         }
         // Find an appropriate place for the frame number so that the list remains sorted.
@@ -164,24 +180,25 @@ impl FrameTracker {
             .position(|frame| frame.frame_number == frame_number)
         {
             let frame = &mut self.frames_in_flight[index];
-            if let Err(e) = frame.handle_packet(packet_info) {
-                // Drop the frame if the number of missing seqnum ranges exceeds the limit.
-                if matches!(e, FrameTrackerError::TooManyMissingPacketRanges(_)) {
-                    self.frames_in_flight.swap_remove(index);
-                }
-                return Err(e);
-            }
+            frame.handle_packet(packet_info)?;
             if frame.is_complete() {
                 self.push_complete_frame(frame_number);
                 self.frames_in_flight.swap_remove(index);
             }
         } else {
+            // Guard against repeated inclusion of frames we already know are complete.
+            if self.is_complete(frame_number) {
+                return Ok(());
+            }
             let expires_at = now + self.frame_lifetime;
             let mut frame = FrameInfo::new(frame_number, expires_at);
             frame.handle_packet(packet_info)?;
             if frame.is_complete() {
                 self.push_complete_frame(frame_number);
             } else {
+                if self.frames_in_flight.len() >= MAX_FRAMES_IN_FLIGHT {
+                    return Err(FrameTrackerError::TooManyFramesInFlight);
+                }
                 self.frames_in_flight.push(frame);
             }
         }
@@ -192,8 +209,8 @@ impl FrameTracker {
     /// Performs periodic cleanup tasks. This should be invoked periodically to release
     /// resources that are considered expired.
     pub fn do_periodic_cleanup(&mut self, now: Instant) {
-        if now >= self.next_prune_time {
-            self.next_prune_time = now + self.prune_period;
+        if self.next_prune_time.is_none_or(|v| v <= now) {
+            self.next_prune_time = Some(now + self.prune_period);
             self.frames_in_flight.retain(|frame| frame.expires_at > now);
         }
     }
@@ -206,6 +223,7 @@ impl FrameTracker {
     }
 
     /// Returns `true` if there are no frames in flight.
+    #[must_use]
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.frames_in_flight.is_empty()
@@ -216,53 +234,38 @@ impl FrameTracker {
 struct FrameInfo {
     expires_at: Instant,
     frame_number: FullFrameNumber,
-    start_seqnum: Option<FullSequenceNumber>,
+    valid: bool,
+    start_seen: bool,
     end_seqnum: Option<FullSequenceNumber>,
     min_seqnum: Option<FullSequenceNumber>,
-    max_seqnum: Option<FullSequenceNumber>,
-    // Missing seqnums ranges are used to track missing packets. We allow up to 8 values
-    // within `FrameInfo` before we start spilling to heap. The overall maximum is
-    // controlled by `FrameInfo::MAX_MISSING_SEQNUM_RANGES`.
-    missing_seqnum_ranges: SmallVec<[Range<FullSequenceNumber>; 8]>,
+    seqnums_seen: SimpleBitset<2, u128>,
 }
 
 impl FrameInfo {
-    // Limit the maximum number of missing seqnums ranges to 20.
-    const MAX_MISSING_SEQNUM_RANGES: usize = 20;
-
     fn new(frame_number: FullFrameNumber, expires_at: Instant) -> Self {
         Self {
             expires_at,
             frame_number,
-            start_seqnum: None,
+            valid: true,
+            start_seen: false,
             end_seqnum: None,
             min_seqnum: None,
-            max_seqnum: None,
-            missing_seqnum_ranges: SmallVec::new(),
+            seqnums_seen: SimpleBitset::new(),
         }
     }
 
     #[inline]
     fn is_complete(&self) -> bool {
-        self.missing_seqnum_ranges.is_empty()
-            && self.start_seqnum.is_some()
-            && self.end_seqnum.is_some()
-    }
-
-    #[inline]
-    fn push_missing_seqnum_range_if_not_empty(
-        &mut self,
-        range: Range<FullSequenceNumber>,
-    ) -> Result<(), FrameTrackerError> {
-        if !range.is_empty() {
-            if self.missing_seqnum_ranges.len() >= Self::MAX_MISSING_SEQNUM_RANGES {
-                return Err(FrameTrackerError::TooManyMissingPacketRanges(
-                    self.frame_number,
-                ));
-            }
-            self.missing_seqnum_ranges.push(range);
+        if let (Some(end), Some(offset)) = (self.end_seqnum, self.min_seqnum) {
+            self.valid
+                && self.start_seen
+                && self
+                    .seqnums_seen
+                    .all_bits_in_subset_set((end - offset) as usize)
+                    .unwrap_or(false)
+        } else {
+            false
         }
-        Ok(())
     }
 
     fn handle_packet(&mut self, packet_info: PacketInfo) -> Result<(), FrameTrackerError> {
@@ -272,59 +275,46 @@ impl FrameInfo {
             seqnum,
             ..
         } = packet_info;
-
-        if start_frame_flag && self.start_seqnum.is_some() {
-            return Err(FrameTrackerError::FrameStartFlagAlreadySet(
-                self.frame_number,
-            ));
+        if !self.valid {
+            return Err(FrameTrackerError::FrameIsInvalid(self.frame_number));
+        }
+        if start_frame_flag && self.start_seen {
+            return Err(FrameTrackerError::StartFlagAlreadySet(self.frame_number));
         }
         if end_frame_flag && self.end_seqnum.is_some() {
-            return Err(FrameTrackerError::FrameEndFlagAlreadySet(self.frame_number));
+            return Err(FrameTrackerError::EndFlagAlreadySet(self.frame_number));
+        }
+        let offset = if let Some(min_seqnum) = self.min_seqnum {
+            // If this seqnum is below the minimum seqnum then we need to make room
+            // for it in our bit vector by shifting to the left. Flag the frame as
+            // being too large if any bits get shifted out.
+            if seqnum < min_seqnum {
+                if self.seqnums_seen.shift_left((min_seqnum - seqnum) as usize) {
+                    self.valid = false;
+                    return Err(FrameTrackerError::FrameTooLarge(self.frame_number));
+                }
+                self.min_seqnum = Some(seqnum);
+                seqnum
+            } else {
+                min_seqnum
+            }
+        } else {
+            self.min_seqnum = Some(seqnum);
+            seqnum
+        };
+        // seqnum is either equal to the offset or larger. The frame is too large
+        // if the index of the bit that we want to set exceeds the bit vector's
+        // capacity.
+        if self.seqnums_seen.set((seqnum - offset) as usize).is_err() {
+            self.valid = false;
+            return Err(FrameTrackerError::FrameTooLarge(self.frame_number));
         }
         if start_frame_flag {
-            self.start_seqnum = Some(seqnum);
+            self.start_seen = true;
         }
         if end_frame_flag {
             self.end_seqnum = Some(seqnum);
         }
-        if let Some(min_seqnum) = self.min_seqnum {
-            if seqnum < min_seqnum {
-                self.push_missing_seqnum_range_if_not_empty(seqnum + 1..min_seqnum)?;
-                self.min_seqnum = Some(seqnum);
-                if self.max_seqnum.is_none() {
-                    self.max_seqnum = Some(seqnum);
-                }
-                return Ok(());
-            }
-        } else {
-            self.min_seqnum = Some(seqnum);
-        }
-        if let Some(max_seqnum) = self.max_seqnum {
-            // We are dealing with extended sequence numbers. Theoretically, wraparound is
-            // possible but extremely unlikely.
-            if seqnum < max_seqnum {
-                if let Some(range_index) = self
-                    .missing_seqnum_ranges
-                    .iter()
-                    .position(|r| r.contains(&seqnum))
-                {
-                    // Remove the range and create additional ranges if necessary.
-                    let range = self.missing_seqnum_ranges.swap_remove(range_index);
-                    self.push_missing_seqnum_range_if_not_empty(range.start..seqnum)?;
-                    self.push_missing_seqnum_range_if_not_empty(seqnum + 1..range.end)?;
-                } else {
-                    self.push_missing_seqnum_range_if_not_empty(seqnum + 1..max_seqnum)?;
-                }
-            } else {
-                if max_seqnum + 1 < seqnum {
-                    self.push_missing_seqnum_range_if_not_empty(max_seqnum + 1..seqnum)?;
-                }
-                self.max_seqnum = Some(seqnum);
-            }
-        } else {
-            self.max_seqnum = Some(seqnum);
-        }
-
         Ok(())
     }
 }
@@ -562,7 +552,7 @@ mod tests {
                 seqnum: 2,
             },
         );
-        assert_eq!(result, Err(FrameTrackerError::FrameStartFlagAlreadySet(1)));
+        assert_eq!(result, Err(FrameTrackerError::StartFlagAlreadySet(1)));
     }
 
     #[test]
@@ -589,55 +579,7 @@ mod tests {
                 seqnum: 2,
             },
         );
-        assert_eq!(result, Err(FrameTrackerError::FrameEndFlagAlreadySet(1)));
-    }
-
-    #[test]
-    fn test_too_many_missing_packets_returns_error() {
-        let now = Instant::now();
-        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
-        // Send packets at even seqnums (0, 2, 4, ...) to create one gap per step.
-        // After 20 gaps (MAX_MISSING_SEQNUM_RANGES), the next gap triggers an error.
-        let mut seqnum = 0;
-        tracker
-            .update(
-                now,
-                PacketInfo {
-                    frame_number: 0,
-                    start_frame_flag: true,
-                    end_frame_flag: false,
-                    seqnum,
-                },
-            )
-            .unwrap();
-        for _ in 0..20 {
-            seqnum += 2;
-            tracker
-                .update(
-                    now,
-                    PacketInfo {
-                        frame_number: 0,
-                        start_frame_flag: false,
-                        end_frame_flag: false,
-                        seqnum,
-                    },
-                )
-                .unwrap();
-        }
-        seqnum += 2;
-        let result = tracker.update(
-            now,
-            PacketInfo {
-                frame_number: 0,
-                start_frame_flag: false,
-                end_frame_flag: false,
-                seqnum,
-            },
-        );
-        assert_eq!(
-            result,
-            Err(FrameTrackerError::TooManyMissingPacketRanges(0))
-        );
+        assert_eq!(result, Err(FrameTrackerError::EndFlagAlreadySet(1)));
     }
 
     #[test]
@@ -752,61 +694,413 @@ mod tests {
     }
 
     #[test]
-    fn test_gap_recorded_when_packet_arrives_below_max_seqnum() -> Result<(), FrameTrackerError> {
-        // When the first-received packet sets max_seqnum above the start packet's seqnum,
-        // the gap between them should be tracked. Packet arrival order: 5, 1 (start), 7 (end), 6.
-        // Seqnums 2, 3, 4 are never received.
+    fn test_frame_too_large() {
         let now = Instant::now();
         let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
-
-        // Seqnum 5 arrives first — sets max_seqnum=5 with no gaps below it tracked.
-        tracker.update(
+        tracker
+            .update(
+                now,
+                PacketInfo {
+                    frame_number: 1,
+                    start_frame_flag: true,
+                    end_frame_flag: false,
+                    seqnum: 0,
+                },
+            )
+            .unwrap();
+        // Seqnum 256 is exactly one past the bitmap capacity (2 * 128 bits).
+        let result = tracker.update(
             now,
             PacketInfo {
                 frame_number: 1,
                 start_frame_flag: false,
                 end_frame_flag: false,
-                seqnum: 5,
+                seqnum: 256,
             },
-        )?;
+        );
+        assert_eq!(result, Err(FrameTrackerError::FrameTooLarge(1)));
+    }
 
-        // Start packet at seqnum 1: below max_seqnum, gap [1..5) is recorded.
-        // Note: seqnum 1 itself is included in the missing range even though it just arrived;
-        // the range should ideally be (seqnum+1)..max_seqnum.
-        tracker.update(
-            now,
-            PacketInfo {
-                frame_number: 1,
-                start_frame_flag: true,
-                end_frame_flag: false,
-                seqnum: 1,
-            },
-        )?;
+    // Frames that complete out of order must still be stored sorted so binary_search works.
+    #[test]
+    fn test_out_of_order_completion_ordering() -> Result<(), FrameTrackerError> {
+        let now = Instant::now();
+        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
+        for frame_number in [10u64, 3, 7] {
+            tracker.update(
+                now,
+                PacketInfo {
+                    frame_number,
+                    start_frame_flag: true,
+                    end_frame_flag: true,
+                    seqnum: frame_number,
+                },
+            )?;
+        }
+        assert!(tracker.is_complete(3));
+        assert!(tracker.is_complete(7));
+        assert!(tracker.is_complete(10));
+        Ok(())
+    }
 
-        // End packet at seqnum 7: gap [6..7) is tracked above max_seqnum.
+    // All existing tests use seqnums near 0. This one uses a realistic RTP base
+    // and exercises the relative-offset arithmetic end-to-end.
+    #[test]
+    fn test_non_zero_seqnum_base() -> Result<(), FrameTrackerError> {
+        let now = Instant::now();
+        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
+
+        // Arrive out of order: end, middle, then start (each triggers a bitmap shift).
         tracker.update(
             now,
             PacketInfo {
                 frame_number: 1,
                 start_frame_flag: false,
                 end_frame_flag: true,
-                seqnum: 7,
+                seqnum: 1003,
             },
         )?;
-
-        // Fill the gap above the original max_seqnum. Seqnums 2, 3, 4 were never received.
         tracker.update(
             now,
             PacketInfo {
                 frame_number: 1,
                 start_frame_flag: false,
                 end_frame_flag: false,
-                seqnum: 6,
+                seqnum: 1002,
             },
         )?;
+        assert!(!tracker.is_complete(1));
+        tracker.update(
+            now,
+            PacketInfo {
+                frame_number: 1,
+                start_frame_flag: true,
+                end_frame_flag: false,
+                seqnum: 1001,
+            },
+        )?;
+        assert!(tracker.is_complete(1));
+        Ok(())
+    }
 
-        // Frame is not complete: the untracked gap is now recorded, preventing false completion.
+    #[test]
+    fn test_frame_survives_cleanup_if_not_expired() {
+        let now = Instant::now();
+        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
+        tracker
+            .update(
+                now,
+                PacketInfo {
+                    frame_number: 1,
+                    start_frame_flag: true,
+                    end_frame_flag: false,
+                    seqnum: 1,
+                },
+            )
+            .unwrap();
+        // Past prune_period so cleanup fires, but well before frame_lifetime (5s).
+        let t = now + DEFAULT_PRUNE_PERIOD + Duration::from_millis(1);
+        tracker.do_periodic_cleanup(t);
+        assert_eq!(tracker.len(), 1);
+    }
+
+    #[test]
+    fn test_max_complete_frames_zero() -> Result<(), FrameTrackerError> {
+        let now = Instant::now();
+        let config = FrameTrackerConfig {
+            max_complete_frames: 0,
+            ..FrameTrackerConfig::default()
+        };
+        let mut tracker = FrameTracker::new(config);
+        tracker.update(
+            now,
+            PacketInfo {
+                frame_number: 1,
+                start_frame_flag: true,
+                end_frame_flag: true,
+                seqnum: 1,
+            },
+        )?;
         assert!(!tracker.is_complete(1));
         Ok(())
+    }
+
+    #[test]
+    fn test_late_packet_for_complete_frame() -> Result<(), FrameTrackerError> {
+        let now = Instant::now();
+        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
+        tracker.update(
+            now,
+            PacketInfo {
+                frame_number: 1,
+                start_frame_flag: true,
+                end_frame_flag: true,
+                seqnum: 42,
+            },
+        )?;
+        assert!(tracker.is_complete(1));
+        assert!(tracker.is_empty());
+
+        // Late retransmission — should not error or corrupt state.
+        tracker.update(
+            now,
+            PacketInfo {
+                frame_number: 1,
+                start_frame_flag: true,
+                end_frame_flag: true,
+                seqnum: 42,
+            },
+        )?;
+        assert!(tracker.is_complete(1));
+        assert!(tracker.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_complete_returns_false_for_unknown_frame() {
+        let tracker = FrameTracker::new(FrameTrackerConfig::default());
+        assert!(!tracker.is_complete(42));
+    }
+
+    #[test]
+    fn test_too_many_frames_in_flight() {
+        let now = Instant::now();
+        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
+        for i in 0..MAX_FRAMES_IN_FLIGHT as FullFrameNumber {
+            tracker
+                .update(
+                    now,
+                    PacketInfo {
+                        frame_number: i,
+                        start_frame_flag: true,
+                        end_frame_flag: false,
+                        seqnum: i,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(tracker.len(), MAX_FRAMES_IN_FLIGHT);
+        let result = tracker.update(
+            now,
+            PacketInfo {
+                frame_number: MAX_FRAMES_IN_FLIGHT as FullFrameNumber,
+                start_frame_flag: true,
+                end_frame_flag: false,
+                seqnum: MAX_FRAMES_IN_FLIGHT as FullSequenceNumber,
+            },
+        );
+        assert_eq!(result, Err(FrameTrackerError::TooManyFramesInFlight));
+    }
+
+    #[test]
+    fn test_too_many_frames_in_flight_completing_frame_frees_slot() -> Result<(), FrameTrackerError>
+    {
+        let now = Instant::now();
+        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
+        for i in 0..MAX_FRAMES_IN_FLIGHT as FullFrameNumber {
+            tracker.update(
+                now,
+                PacketInfo {
+                    frame_number: i,
+                    start_frame_flag: true,
+                    end_frame_flag: false,
+                    seqnum: i,
+                },
+            )?;
+        }
+        assert_eq!(tracker.len(), MAX_FRAMES_IN_FLIGHT);
+        // Complete frame 0 by sending its end packet at the same seqnum — frees one slot.
+        tracker.update(
+            now,
+            PacketInfo {
+                frame_number: 0,
+                start_frame_flag: false,
+                end_frame_flag: true,
+                seqnum: 0,
+            },
+        )?;
+        assert_eq!(tracker.len(), MAX_FRAMES_IN_FLIGHT - 1);
+        tracker.update(
+            now,
+            PacketInfo {
+                frame_number: MAX_FRAMES_IN_FLIGHT as FullFrameNumber,
+                start_frame_flag: true,
+                end_frame_flag: false,
+                seqnum: MAX_FRAMES_IN_FLIGHT as FullSequenceNumber,
+            },
+        )?;
+        assert_eq!(tracker.len(), MAX_FRAMES_IN_FLIGHT);
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_packet_frame_does_not_consume_slot_at_capacity() -> Result<(), FrameTrackerError>
+    {
+        let now = Instant::now();
+        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
+        for i in 0..MAX_FRAMES_IN_FLIGHT as FullFrameNumber {
+            tracker.update(
+                now,
+                PacketInfo {
+                    frame_number: i,
+                    start_frame_flag: true,
+                    end_frame_flag: false,
+                    seqnum: i,
+                },
+            )?;
+        }
+        assert_eq!(tracker.len(), MAX_FRAMES_IN_FLIGHT);
+        // A single-packet frame completes before entering frames_in_flight, so no cap applies.
+        tracker.update(
+            now,
+            PacketInfo {
+                frame_number: MAX_FRAMES_IN_FLIGHT as FullFrameNumber,
+                start_frame_flag: true,
+                end_frame_flag: true,
+                seqnum: 999,
+            },
+        )?;
+        assert_eq!(tracker.len(), MAX_FRAMES_IN_FLIGHT);
+        assert!(tracker.is_complete(MAX_FRAMES_IN_FLIGHT as FullFrameNumber));
+        Ok(())
+    }
+
+    // test_frame_too_large exercises the set()-out-of-bounds path. This test exercises
+    // the shift-carry path: seqnum 256 fills bit 255 exactly, then seqnum 0 would shift
+    // it to bit 256, producing carry.
+    #[test]
+    fn test_frame_too_large_via_shift_overflow() {
+        let now = Instant::now();
+        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
+        // seqnum 1 → min=1, bit 0 set.
+        tracker
+            .update(
+                now,
+                PacketInfo {
+                    frame_number: 1,
+                    start_frame_flag: true,
+                    end_frame_flag: false,
+                    seqnum: 1,
+                },
+            )
+            .unwrap();
+        // seqnum 256 → bit 255 (bitmap exactly full, no error).
+        tracker
+            .update(
+                now,
+                PacketInfo {
+                    frame_number: 1,
+                    start_frame_flag: false,
+                    end_frame_flag: false,
+                    seqnum: 256,
+                },
+            )
+            .unwrap();
+        let result = tracker.update(
+            now,
+            PacketInfo {
+                frame_number: 1,
+                start_frame_flag: false,
+                end_frame_flag: false,
+                seqnum: 0,
+            },
+        );
+        assert_eq!(result, Err(FrameTrackerError::FrameTooLarge(1)));
+    }
+
+    #[test]
+    fn test_frame_is_invalid_after_too_large() {
+        let now = Instant::now();
+        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
+        tracker
+            .update(
+                now,
+                PacketInfo {
+                    frame_number: 1,
+                    start_frame_flag: true,
+                    end_frame_flag: false,
+                    seqnum: 0,
+                },
+            )
+            .unwrap();
+        tracker
+            .update(
+                now,
+                PacketInfo {
+                    frame_number: 1,
+                    start_frame_flag: false,
+                    end_frame_flag: false,
+                    seqnum: 512,
+                },
+            )
+            .unwrap_err();
+        let result = tracker.update(
+            now,
+            PacketInfo {
+                frame_number: 1,
+                start_frame_flag: false,
+                end_frame_flag: true,
+                seqnum: 1,
+            },
+        );
+        assert_eq!(result, Err(FrameTrackerError::FrameIsInvalid(1)));
+    }
+
+    #[test]
+    fn test_invalid_frame_pruned_by_cleanup() {
+        let now = Instant::now();
+        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
+        tracker
+            .update(
+                now,
+                PacketInfo {
+                    frame_number: 1,
+                    start_frame_flag: true,
+                    end_frame_flag: false,
+                    seqnum: 0,
+                },
+            )
+            .unwrap();
+        tracker
+            .update(
+                now,
+                PacketInfo {
+                    frame_number: 1,
+                    start_frame_flag: false,
+                    end_frame_flag: false,
+                    seqnum: 512,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(tracker.len(), 1);
+        let expired = now + DEFAULT_FRAME_LIFETIME + Duration::from_millis(1);
+        tracker.do_periodic_cleanup(expired);
+        assert!(tracker.is_empty());
+    }
+
+    // Replaces test_cleanup_does_not_fire_before_prune_period, whose name and comment
+    // described the old eager-initialization behavior. next_prune_time is now None at
+    // construction, so the first cleanup call always fires; subsequent calls within the
+    // same prune period are suppressed.
+    #[test]
+    fn test_cleanup_throttled_after_first_fire() {
+        let now = Instant::now();
+        let mut tracker = FrameTracker::new(FrameTrackerConfig::default());
+        // First call fires immediately (next_prune_time is None) and arms the timer.
+        tracker.do_periodic_cleanup(now);
+        tracker
+            .update(
+                now,
+                PacketInfo {
+                    frame_number: 1,
+                    start_frame_flag: true,
+                    end_frame_flag: false,
+                    seqnum: 1,
+                },
+            )
+            .unwrap();
+        // Second call at the same now — timer not yet elapsed, retain does not run.
+        tracker.do_periodic_cleanup(now);
+        assert_eq!(tracker.len(), 1);
     }
 }

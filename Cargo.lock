@@ -922,6 +922,7 @@ dependencies = [
  "mrp",
  "nix 0.27.1",
  "nonzero_ext",
+ "num-traits",
  "once_cell",
  "parking_lot",
  "prost",
