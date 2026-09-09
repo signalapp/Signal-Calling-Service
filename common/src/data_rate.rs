@@ -10,6 +10,8 @@ use std::{
     ops::{Add, AddAssign, Div, Mul, Sub, SubAssign},
 };
 
+use thiserror::Error;
+
 use crate::time::{Duration, Instant};
 
 #[derive(Copy, Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -391,6 +393,12 @@ pub struct DataRateTracker {
     target_rate: Option<DataRate>,
 }
 
+#[derive(Debug, Error, PartialEq)]
+pub enum Error {
+    #[error("Maximum Rate Exceeded")]
+    MaxRateExceeded,
+}
+
 impl DataRateTracker {
     const MAX_DURATION: Duration = Duration::from_millis(5000);
     const MIN_DURATION: Duration = Duration::from_millis(500);
@@ -460,6 +468,51 @@ impl DataRateTracker {
                 None => rate,
             }
         });
+    }
+}
+
+pub struct CheckedDataRateTracker {
+    tracker: DataRateTracker,
+    max_rate: DataRate,
+}
+
+impl CheckedDataRateTracker {
+    pub fn new(target: Option<DataRate>, max_rate: DataRate) -> Self {
+        Self {
+            tracker: DataRateTracker::new(target),
+            max_rate,
+        }
+    }
+
+    pub fn rate(&self) -> Option<DataRate> {
+        self.tracker.rate()
+    }
+
+    pub fn stable_rate(&self) -> Option<DataRate> {
+        self.tracker.stable_rate()
+    }
+
+    pub fn set_target(&mut self, target: Option<DataRate>) {
+        self.tracker.set_target(target)
+    }
+
+    pub fn push(&mut self, size: DataSize, time: Instant) -> Result<(), Error> {
+        if !self.tracker.history.is_empty()
+            && let Some(rate) = self.tracker.rate
+            && rate > self.max_rate
+        {
+            return Err(Error::MaxRateExceeded);
+        }
+        self.tracker.push(size, time);
+        Ok(())
+    }
+
+    pub fn push_bytes(&mut self, size: usize, time: Instant) -> Result<(), Error> {
+        self.push(DataSize::from_bytes(size as u64), time)
+    }
+
+    pub fn update(&mut self, now: Instant) {
+        self.tracker.update(now)
     }
 }
 
@@ -606,7 +659,7 @@ impl Div<DataRate> for DataSize {
 
 #[cfg(test)]
 mod data_rate_and_data_size_interaction_tests {
-    use super::{DataRate, DataRateTracker, DataSize};
+    use super::{CheckedDataRateTracker, DataRate, DataRateTracker, DataSize, Error};
     use crate::time::{Duration, Instant};
 
     #[test]
@@ -679,5 +732,50 @@ mod data_rate_and_data_size_interaction_tests {
         }
         tracker.update(at(100000));
         assert_eq!(Some(DataRate::from_bps(1000)), tracker.rate());
+    }
+
+    #[test]
+    fn test_checked_rate_tracker() -> Result<(), Error> {
+        let now = Instant::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut tracker = CheckedDataRateTracker::new(None, DataRate::from_bps(1000));
+        assert_eq!(None, tracker.rate());
+
+        tracker.push(DataSize::from_bits(1000), at(0))?;
+        tracker.update(at(1));
+        // We get ignore values until 500ms have passed
+        assert_eq!(None, tracker.rate());
+
+        tracker.update(at(500));
+        assert_eq!(Some(DataRate::from_bps(2000)), tracker.rate());
+        // Since the rate is above the limit, new data is discarded until an update reduces the rate below the limit
+        assert_eq!(
+            Err(Error::MaxRateExceeded),
+            tracker.push(DataSize::from_bits(1000), at(500))
+        );
+        assert_eq!(
+            Err(Error::MaxRateExceeded),
+            tracker.push(DataSize::from_bits(1000), at(1000))
+        );
+        // Data is still discarded, even though data is now under the limit
+        assert_eq!(
+            Err(Error::MaxRateExceeded),
+            tracker.push(DataSize::from_bits(1000), at(1500))
+        );
+        assert_eq!(
+            Err(Error::MaxRateExceeded),
+            tracker.push(DataSize::from_bits(1000), at(2000))
+        );
+        tracker.update(at(2000));
+        assert_eq!(Some(DataRate::from_bps(500)), tracker.rate());
+
+        // Once an update happens under the limit, data will be still flow even though it's above the limit
+        for i in 4..200 {
+            tracker.push(DataSize::from_bits(1000), at(i * 500))?;
+        }
+        tracker.update(at(100000));
+        assert_eq!(Some(DataRate::from_bps(2000)), tracker.rate());
+        Ok(())
     }
 }

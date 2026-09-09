@@ -13,8 +13,8 @@ use std::{
 
 use bincode::Options;
 use calling_common::{
-    CallType, ClientStatus, DataRate, DataRateTracker, DemuxId, Duration, Instant, PixelSize,
-    RoomId, SignalUserAgent, SystemTime, VideoHeight, rate_limit,
+    CallType, CheckedDataRateTracker, ClientStatus, DataRate, DemuxId, Duration, Instant,
+    PixelSize, RoomId, SignalUserAgent, SystemTime, VideoHeight, rate_limit,
 };
 use governor::Quota;
 use hex::ToHex;
@@ -103,7 +103,9 @@ const MIN_TARGET_SEND_RATE_GENERATION_INTERVAL: Duration = Duration::from_millis
 /// How much of the target send rate to allocate when the queue drain rate is high.
 const TARGET_RATE_MINIMUM_ALLOCATION_RATIO: f64 = 0.9;
 /// How much bitrate to assume clients will use to send layer 0 video.
-const ASSUMED_LAYER0_KBPS: u64 = 150;
+const ASSUMED_LAYER0_RATE: DataRate = DataRate::from_kbps(150);
+/// How much bitrate to allow clients to send before dropping incoming data.
+const MAX_INCOMING_VIDEO_RATE: DataRate = DataRate::from_kbps(10000);
 /// The max byte size of Packet serialized size before needing to be fragemented
 const MAX_PACKET_SERIALIZED_BYTE_SIZE: usize = 1200;
 /// The non-content byte size overhead of an MRP fragment
@@ -408,6 +410,8 @@ pub enum Error {
     Leave,
     #[error("Scalable video error")]
     ScalableVideoError(#[from] ScalableVideoError),
+    #[error("Incoming video bandwidth limit exceeded")]
+    IncomingVideoLimitExceeded,
 }
 
 /// Represents an RTP packet that should be sent to a particular client
@@ -3178,7 +3182,7 @@ impl Client {
             user_agent: pending_client_info.user_agent,
 
             incoming_video: [
-                IncomingVideoState::new(Some(DataRate::from_kbps(ASSUMED_LAYER0_KBPS))),
+                IncomingVideoState::new(Some(ASSUMED_LAYER0_RATE)),
                 IncomingVideoState::new(None),
                 IncomingVideoState::new(None),
             ],
@@ -3273,7 +3277,10 @@ impl Client {
         let incoming_video = &mut self.incoming_video[incoming_layer_index];
 
         let size = incoming_rtp.size().as_bytes() as usize;
-        incoming_video.rate_tracker.push_bytes(size, now);
+        if incoming_video.rate_tracker.push_bytes(size, now).is_err() {
+            event!("calling.bandwidth.incoming.video_overlimit_bytes", size);
+            return Err(Error::IncomingVideoLimitExceeded);
+        }
         match incoming_layer_index {
             0 => event!("calling.bandwidth.incoming.video0_bytes", size),
             1 => event!("calling.bandwidth.incoming.video1_bytes", size),
@@ -3475,9 +3482,8 @@ impl Client {
     }
 }
 
-#[derive(Default)]
 struct IncomingVideoState {
-    rate_tracker: DataRateTracker,
+    rate_tracker: CheckedDataRateTracker,
     /// The resolution of the video, ignoring rotation.
     original_resolution: Option<PixelSize>,
     /// The height of the video, taking rotation into account.
@@ -3489,8 +3495,10 @@ struct IncomingVideoState {
 impl IncomingVideoState {
     fn new(default: Option<DataRate>) -> Self {
         Self {
-            rate_tracker: DataRateTracker::new(default),
-            ..Default::default()
+            rate_tracker: CheckedDataRateTracker::new(default, MAX_INCOMING_VIDEO_RATE),
+            original_resolution: None,
+            height: None,
+            needs_resolution: false,
         }
     }
 

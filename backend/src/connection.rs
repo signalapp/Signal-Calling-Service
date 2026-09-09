@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use calling_common::{DataRate, DataRateTracker, DataSize, Duration, Instant, SignalUserAgent};
+use calling_common::{
+    CheckedDataRateTracker, DataRate, DataRateTracker, DataSize, Duration, Instant, SignalUserAgent,
+};
 use log::*;
 use metrics::event;
 use parking_lot::RwLock;
@@ -45,6 +47,9 @@ const ACK_CALCULATION_INTERVAL: Duration = Duration::from_millis(100);
 
 pub const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Incoming audio above this rate will be dropped.
+const MAX_INCOMING_AUDIO_RATE: DataRate = DataRate::from_kbps(1000);
+
 pub type PacketToSend = Vec<u8>;
 
 #[derive(Error, Debug, Eq, PartialEq)]
@@ -71,6 +76,16 @@ pub enum Error {
     ReceivedUnexpectedResponse,
     #[error("received ping response with non-matching transaction id")]
     ReceivedResponseWithInvalidTransactionId,
+    #[error("Incoming bandwidth limit exceeded")]
+    BandwidthLimitExceeded,
+}
+
+impl From<calling_common::Error> for Error {
+    fn from(value: calling_common::Error) -> Self {
+        match value {
+            calling_common::Error::MaxRateExceeded => Error::BandwidthLimitExceeded,
+        }
+    }
 }
 
 pub enum TickOutput {
@@ -285,9 +300,16 @@ impl Connection {
         template_dependency_structure: Option<&TemplateDependencyStructure>,
         now: Instant,
     ) -> Result<Option<rtp::Packet<&'packet mut [u8]>>, Error> {
-        self.inner
-            .write()
-            .handle_rtp_packet(incoming_packet, template_dependency_structure, now)
+        let size = incoming_packet.len();
+        let ret = self.inner.write().handle_rtp_packet(
+            incoming_packet,
+            template_dependency_structure,
+            now,
+        );
+        if let Err(Error::BandwidthLimitExceeded) = ret {
+            event!("calling.bandwidth.incoming.rtp_overlimit_bytes", size);
+        }
+        ret
     }
 
     /// Decrypts an incoming RTCP packet and processes it.
@@ -487,7 +509,7 @@ struct ConnectionInner {
     rtx_rate: DataRateTracker,
     padding_rate: DataRateTracker,
     non_media_rate: DataRateTracker,
-    incoming_audio_rate: DataRateTracker,
+    incoming_audio_rate: CheckedDataRateTracker,
     incoming_rtx_rate: DataRateTracker,
     incoming_padding_rate: DataRateTracker,
     incoming_non_media_rate: DataRateTracker,
@@ -534,7 +556,7 @@ impl ConnectionInner {
             padding_rate: DataRateTracker::default(),
             non_media_rate: DataRateTracker::default(),
 
-            incoming_audio_rate: DataRateTracker::default(),
+            incoming_audio_rate: CheckedDataRateTracker::new(None, MAX_INCOMING_AUDIO_RATE),
             incoming_rtx_rate: DataRateTracker::default(),
             incoming_padding_rate: DataRateTracker::default(),
             incoming_non_media_rate: DataRateTracker::default(),
@@ -610,7 +632,7 @@ impl ConnectionInner {
             rtx_rate: DataRateTracker::default(),
             padding_rate: DataRateTracker::default(),
             non_media_rate: DataRateTracker::default(),
-            incoming_audio_rate: DataRateTracker::default(),
+            incoming_audio_rate: CheckedDataRateTracker::new(None, MAX_INCOMING_AUDIO_RATE),
             incoming_rtx_rate: DataRateTracker::default(),
             incoming_padding_rate: DataRateTracker::default(),
             incoming_non_media_rate: DataRateTracker::default(),
@@ -743,8 +765,8 @@ impl ConnectionInner {
                     event!("calling.bandwidth.incoming.rtx_bytes", size);
                     self.incoming_rtx_rate.push_bytes(size, now);
                 } else if packet.is_audio() {
+                    self.incoming_audio_rate.push_bytes(size, now)?;
                     event!("calling.bandwidth.incoming.audio_bytes", size);
-                    self.incoming_audio_rate.push_bytes(size, now);
                 } else if packet.padding_byte_count as usize >= packet.payload().len() {
                     let size = packet.size().as_bytes() as usize;
                     event!("calling.bandwidth.incoming.padding_bytes", size);
@@ -1141,8 +1163,8 @@ impl ConnectionInner {
     }
 
     fn push_incoming_non_media_bytes(&mut self, size: usize, now: Instant) {
-        event!("calling.bandwidth.incoming.non_media_bytes", size);
         self.incoming_non_media_rate.push_bytes(size, now);
+        event!("calling.bandwidth.incoming.non_media_bytes", size);
     }
 
     fn push_outgoing_non_media_bytes(&mut self, size: usize, now: Instant) {
