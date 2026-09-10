@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
 
-ARG debian_ver=bullseye
+ARG debian_ver=trixie
 
 FROM debian:${debian_ver}
 
