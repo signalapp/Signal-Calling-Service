@@ -49,7 +49,7 @@ use crate::{
     pacer,
     packet_server::{AddressType, PacketServerState, SocketLocator},
     region::{Region, RegionRelation},
-    rtp::{self, new_master_key_material},
+    rtp::{self, LossStats, new_master_key_material},
 };
 pub use crate::{
     call::{CallActivity, CallId, UserId},
@@ -935,6 +935,7 @@ impl Sfu {
             let rtcp_now = Instant::now();
 
             let HandleRtcpResult {
+                incoming_sender_reports,
                 incoming_key_frame_requests,
                 mut packets_to_send,
                 dequeue_time,
@@ -971,8 +972,33 @@ impl Sfu {
                 )
             };
 
+            let mut outgoing_key_frame_requests: HashMap<_, _> =
+                outgoing_key_frame_requests.into_iter().collect();
+
             // We use one mutable outgoing ConnectionId to avoid cloning the CallId many times.
             let mut outgoing_connection_id = incoming_connection_id.clone();
+
+            if !incoming_sender_reports.is_empty() {
+                time_scope_us!("calling.sfu.handle_packet.rtcp.relay_sender_reports");
+                for demux_id in call.forwarding_demux_ids(incoming_connection_id.demux_id) {
+                    outgoing_connection_id.demux_id = demux_id;
+                    if let Some(outgoing_connection) = self
+                        .connections
+                        .get_connection_from_id(&outgoing_connection_id)
+                    {
+                        outgoing_connection
+                            .remember_forwarded_sender_reports(&incoming_sender_reports, rtcp_now);
+                        if let Some(key_frame_request) =
+                            outgoing_key_frame_requests.remove(&demux_id)
+                            && let Some(key_frame_request) = outgoing_connection
+                                .send_key_frame_request(key_frame_request, Instant::now())
+                        {
+                            packets_to_send.push(key_frame_request);
+                        };
+                    }
+                }
+            }
+
             for (demux_id, key_frame_request) in outgoing_key_frame_requests {
                 outgoing_connection_id.demux_id = demux_id;
                 if let Some(outgoing_connection) = self
@@ -1216,8 +1242,38 @@ impl Sfu {
 
         {
             time_scope_us!("calling.sfu.tick.connections");
-            for connection in self.connections.get_connections_snapshot() {
+
+            let mut max_receive_loss_frac_by_call_id =
+                HashMap::<CallId, HashMap<rtp::Ssrc, LossStats>>::new();
+            let connections = self.connections.get_connections_snapshot();
+
+            for connection in connections.iter() {
+                let call_losses = max_receive_loss_frac_by_call_id
+                    .entry(connection.id().call_id.clone())
+                    .or_default();
+                connection
+                    .rtp_endpoint_stats(now)
+                    .loss_stats
+                    .iter()
+                    .for_each(|(&ssrc, loss_stats)| {
+                        call_losses
+                            .entry(ssrc)
+                            .and_modify(|cur| {
+                                if cur.loss_frac < loss_stats.loss_frac {
+                                    *cur = loss_stats.clone();
+                                }
+                            })
+                            .or_insert_with(|| loss_stats.clone());
+                    });
+            }
+
+            for connection in connections {
                 let connection_id = connection.id();
+                if let Some(call_stats) =
+                    max_receive_loss_frac_by_call_id.get(&connection.id().call_id)
+                {
+                    connection.update_call_stats(call_stats);
+                }
                 match connection.tick(&mut packets_to_send, now) {
                     connection::TickOutput::Inactive => {
                         info!("dropping inactive connection: {}", connection_id);

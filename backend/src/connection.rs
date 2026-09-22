@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use calling_common::{
     CheckedDataRateTracker, DataRate, DataRateTracker, DataSize, Duration, Instant, SignalUserAgent,
@@ -24,7 +24,7 @@ use crate::{
     pacer::{self, Pacer},
     packet_server::{AddressType, SocketLocator},
     region::RegionRelation,
-    rtp::{self, TemplateDependencyStructure, TruncatedSequenceNumber},
+    rtp::{self, LossStats, Ssrc, TemplateDependencyStructure, TruncatedSequenceNumber},
     sfu::ConnectionId,
 };
 
@@ -51,6 +51,10 @@ pub const RTCP_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_INCOMING_AUDIO_RATE: DataRate = DataRate::from_kbps(1000);
 
 pub type PacketToSend = Vec<u8>;
+
+/// Represents a map from SSRC to the maximum loss fraction observed by
+/// a recent client in the last RTCP report
+pub type CallStats = HashMap<Ssrc, LossStats>;
 
 #[derive(Error, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -328,6 +332,20 @@ impl Connection {
         self.inner.write().handle_rtcp_packet(incoming_packet, now)
     }
 
+    /// Forward SenderReports that arrived on another connection, for streams this connection
+    /// uploads.
+    pub fn remember_forwarded_sender_reports(
+        &self,
+        sender_reports: &[rtp::SenderReport],
+        now: Instant,
+    ) {
+        self.inner
+            .write()
+            .rtp
+            .endpoint
+            .remember_forwarded_sender_reports(sender_reports, now);
+    }
+
     /// This must be called regularly (at least every 100ms, preferably more often) to
     /// keep ACKs and NACKs being sent to the client.
     // It would make more sense to return a Vec of packets, since the outgoing address is fixed,
@@ -395,6 +413,13 @@ impl Connection {
             .send_key_frame_request(key_frame_request, now)
     }
 
+    /// This takes in call stats and saves stats necessary for connection operation including:
+    /// - RTCP report stats
+    #[inline(always)]
+    pub fn update_call_stats(&self, call_stats: &CallStats) {
+        self.inner.write().update_call_stats(call_stats);
+    }
+
     #[inline(always)]
     pub fn outgoing_queue_size(&self) -> DataSize {
         self.inner.read().outgoing_queue_size()
@@ -406,7 +431,7 @@ impl Connection {
     }
 
     #[inline(always)]
-    pub fn rtp_endpoint_stats(&self, now: Instant) -> rtp::EndpointStats {
+    pub fn rtp_endpoint_stats(&self, now: Instant) -> Arc<rtp::EndpointStats> {
         self.inner.write().rtp_endpoint_stats(now)
     }
 
@@ -432,6 +457,7 @@ impl Connection {
         self.inner.read().stun_rtt()
     }
 
+    /// returns the rtcp based rtt and the stun based rtt
     #[inline(always)]
     pub fn rtts(&self, now: Instant) -> (Duration, Option<Duration>) {
         let mut inner = self.inner.write();
@@ -846,6 +872,7 @@ impl ConnectionInner {
 
         Ok(HandleRtcpResult {
             incoming_key_frame_requests: rtcp.key_frame_requests,
+            incoming_sender_reports: rtcp.sender_reports,
             packets_to_send,
             dequeue_time,
             new_target_send_rate,
@@ -1099,8 +1126,8 @@ impl ConnectionInner {
         self.congestion_control.pacer.queue_delay(now)
     }
 
-    fn rtp_endpoint_stats(&mut self, now: Instant) -> rtp::EndpointStats {
-        *(self.rtp.endpoint.update_stats(now))
+    fn rtp_endpoint_stats(&mut self, now: Instant) -> Arc<rtp::EndpointStats> {
+        self.rtp.endpoint.get_or_update_stats(now)
     }
 
     fn configure_congestion_control(
@@ -1198,11 +1225,19 @@ impl ConnectionInner {
     fn has_candidate(&mut self, sender_addr: SocketLocator) -> bool {
         !self.closed && self.candidate_selector.has_candidate(sender_addr)
     }
+
+    /// This takes in call stats and saves stats necessary for connection operation including:
+    /// - RTCP report stats
+    #[inline(always)]
+    pub fn update_call_stats(&mut self, call_stats: &CallStats) {
+        self.rtp.endpoint.update_max_receiver_loss_stats(call_stats);
+    }
 }
 
 /// Result of Connection::handle_rtcp_packet().
 /// See Connection::handle_rtcp_packet().
 pub struct HandleRtcpResult {
+    pub incoming_sender_reports: Vec<rtp::SenderReport>,
     pub incoming_key_frame_requests: Vec<rtp::KeyFrameRequest>,
     pub packets_to_send: Vec<(PacketToSend, SocketLocator)>,
     pub dequeue_time: Option<Instant>,

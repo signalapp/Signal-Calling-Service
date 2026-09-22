@@ -14,9 +14,9 @@ mod rtx;
 mod srtp;
 mod types;
 
-use std::{collections::HashMap, convert::TryInto};
+use std::{collections::HashMap, convert::TryInto, sync::Arc};
 
-use calling_common::{Bits, Duration, Instant, Writer, expand_truncated_counter, read_u16};
+use calling_common::{Bits, Duration, Instant, U24, Writer, expand_truncated_counter, read_u16};
 pub use dependency_descriptor::*;
 use log::*;
 use metrics::*;
@@ -25,7 +25,7 @@ pub use nack::{Nack, write_nack};
 use packet::*;
 pub use packet::{Header, Packet, RtpStreamAllocation, SpatialLayer};
 use rtcp::*;
-pub use rtcp::{ControlPacket, KeyFrameRequest};
+pub use rtcp::{ControlPacket, KeyFrameRequest, SenderReport};
 pub use rtx::to_rtx_ssrc;
 use rtx::*;
 use srtp::*;
@@ -34,7 +34,8 @@ pub use srtp::{KeyAndSalt, KeysAndSalts, MasterKeyMaterial, new_master_key_mater
 pub use srtp::{key_from, new_srtp_keys, salt_from};
 pub use types::*;
 
-use crate::transportcc as tcc;
+// TODO: refactor LayerID to not depend on call code
+use crate::{call::outgoing_ssrc_for_forwarded, transportcc as tcc};
 
 const VERSION: u8 = 2;
 const PADDING_PAYLOAD_TYPE: PayloadType = 99;
@@ -47,6 +48,8 @@ pub const RED_PAYLOAD_TYPE: PayloadType = 120;
 // Discard outgoing packets after this time.
 // 3 second lifetime matches WebRTC's RTX history
 const PACKET_LIFETIME: Duration = Duration::from_secs(3);
+/// Duration until we treat the endpoint stats as stale
+const STALE_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn looks_like_rtp(packet: &[u8]) -> bool {
     packet.len() > RTP_PAYLOAD_TYPE_OFFSET
@@ -181,8 +184,8 @@ pub struct Endpoint {
     rtx_sender: RtxSender,
 
     // For Endpoint stats
-    last_stats_calculated_time: Option<Instant>,
-    last_stats: EndpointStats,
+    last_stats_calculated_time: Instant,
+    last_stats: Option<Arc<EndpointStats>>,
 }
 
 struct SsrcState {
@@ -209,7 +212,13 @@ impl Default for SsrcState {
     }
 }
 
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Clone)]
+pub struct LossStats {
+    pub loss_frac: u8,
+    pub cumulative_packets_lost: U24,
+}
+
+#[derive(Debug, Clone)]
 pub struct EndpointStats {
     pub remembered_packet_count: usize,
     pub remembered_packet_bytes: usize,
@@ -217,6 +226,9 @@ pub struct EndpointStats {
     /// Average RTT across all SSRCs based on last 15 seconds
     /// returns None if stat is not currently available or recent
     pub rtt_estimate: Option<Duration>,
+
+    /// Loss stats from most recent RTCP report blocks
+    pub loss_stats: HashMap<Ssrc, LossStats>,
 }
 
 impl AsRef<EndpointStats> for EndpointStats {
@@ -255,8 +267,8 @@ impl Endpoint {
 
             rtx_sender: RtxSender::new(PACKET_LIFETIME),
 
-            last_stats: EndpointStats::default(),
-            last_stats_calculated_time: None,
+            last_stats: None,
+            last_stats_calculated_time: now,
         }
     }
 
@@ -485,11 +497,12 @@ impl Endpoint {
                 .process_feedback_and_correlate_acks(incoming.tcc_feedbacks.into_iter(), now);
         }
 
-        self.remember_incoming_sender_reports(incoming.sender_reports, now);
+        let sender_reports = self.remember_incoming_sender_reports(incoming.sender_reports, now);
         self.remember_receiver_reports(incoming.receiver_reports, now);
 
         Some(ProcessedControlPacket {
             key_frame_requests: incoming.key_frame_requests,
+            sender_reports,
             acks,
             nacks: incoming.nacks,
         })
@@ -577,6 +590,27 @@ impl Endpoint {
             received.push(sender_report);
         }
         received
+    }
+
+    /// Remembers a SenderReport forwarded from a different connection.
+    /// This connection must remember the SenderInfo to process subsequent stats
+    pub fn remember_forwarded_sender_reports(&mut self, reports: &[SenderReport], now: Instant) {
+        for sender_report in reports {
+            let Some(outgoing_ssrc) = outgoing_ssrc_for_forwarded(sender_report.ssrc()) else {
+                continue;
+            };
+            if let Some(state) = self.outgoing_ssrc_state.get_mut(&outgoing_ssrc) {
+                // Audio is forwarded with its timestamps untouched, so the origin's NTP/RTP pair
+                // still describes what the receiver sees. Video timestamps are rewritten, so only
+                // the NTP clock carries over.
+                let preserves_rtp_timestamps = outgoing_ssrc == sender_report.ssrc();
+                state.rtcp_report_sender.remember_forwarded_sender_info(
+                    sender_report,
+                    preserves_rtp_timestamps,
+                    now,
+                );
+            }
+        }
     }
 
     // counts packets/bytes and remembers timestamps for sender reports
@@ -790,28 +824,42 @@ impl Endpoint {
         Some(encrypted)
     }
 
-    pub fn get_or_update_stats(&mut self, now: Instant) -> &EndpointStats {
-        if let Some(calculated_time) = self.last_stats_calculated_time
-            && now.saturating_duration_since(calculated_time) < RTT_ESTIMATE_AGE_LIMIT
+    pub fn get_or_update_stats(&mut self, now: Instant) -> Arc<EndpointStats> {
+        // destructuring here causes wrong lifetimes (https://github.com/rust-lang/rust/issues/54663)
+        if let Some(stats) = self.last_stats.as_ref()
+            && now.saturating_duration_since(self.last_stats_calculated_time)
+                < UPDATE_STATS_INTERVAL
         {
-            return &self.last_stats;
+            return stats.clone();
         }
 
         self.update_stats(now)
     }
 
-    pub fn update_stats(&mut self, now: Instant) -> &EndpointStats {
+    pub fn update_stats(&mut self, now: Instant) -> Arc<EndpointStats> {
         let (remembered_packet_count, remembered_packet_bytes) =
             self.rtx_sender.remembered_packet_stats();
 
-        self.last_stats = EndpointStats {
+        let stats = Arc::new(EndpointStats {
             remembered_packet_count,
             remembered_packet_bytes,
             rtt_estimate: self.calculate_rtt(now),
-        };
-        self.last_stats_calculated_time = Some(now);
+            loss_stats: self.calculate_loss_stats(now),
+        });
 
-        &self.last_stats
+        self.last_stats = Some(stats.clone());
+        self.last_stats_calculated_time = now;
+        stats
+    }
+
+    pub fn update_max_receiver_loss_stats(&mut self, max_receiver_loss: &HashMap<Ssrc, LossStats>) {
+        for (ssrc, ssrc_state) in self.incoming_ssrc_state.iter_mut() {
+            if let Some(max_loss_stats) = max_receiver_loss.get(ssrc) {
+                ssrc_state
+                    .rtcp_report_sender
+                    .update_max_loss_stats(max_loss_stats.clone())
+            }
+        }
     }
 
     /// Average RTT estimates across all SSRCS that are not too old.
@@ -822,7 +870,7 @@ impl Endpoint {
 
         for (_, ssrc_state) in self.outgoing_ssrc_states_iter() {
             if let Some((estimate, last_updated)) = ssrc_state.rtcp_report_sender.rtt_estimate() {
-                if now.saturating_duration_since(last_updated) >= RTT_ESTIMATE_AGE_LIMIT {
+                if now.saturating_duration_since(last_updated) >= UPDATE_STATS_INTERVAL {
                     continue;
                 }
 
@@ -832,6 +880,34 @@ impl Endpoint {
         }
 
         if count != 0 { Some(sum / count) } else { None }
+    }
+
+    /// Collects reported receiver loss stats across all SSRCS.
+    /// We expire loss stats after we believe the client would have been disconnected.
+    /// There is a small chance they client is connected but we are losing consecutive
+    /// reports, but we are generous with the timeout to minimize that chance.
+    fn calculate_loss_stats(&self, now: Instant) -> HashMap<Ssrc, LossStats> {
+        self.outgoing_ssrc_state.iter().fold(
+            HashMap::with_capacity(self.incoming_ssrc_state.len()),
+            |mut acc, (&ssrc, state)| {
+                let stats_age = now.saturating_duration_since(
+                    state.rtcp_report_sender.last_receiver_report_time(),
+                );
+                if stats_age > STALE_ENDPOINT_TIMEOUT {
+                    return acc;
+                };
+
+                let (loss_frac, _) = state.rtcp_report_sender.total_loss_frac();
+                acc.insert(
+                    ssrc,
+                    LossStats {
+                        loss_frac,
+                        cumulative_packets_lost: state.rtcp_report_sender.cumulative_packets_lost(),
+                    },
+                );
+                acc
+            },
+        )
     }
 
     /// returns
@@ -1093,6 +1169,7 @@ mod test {
         assert_eq!(
             Some(ProcessedControlPacket {
                 key_frame_requests: vec![],
+                sender_reports: vec![],
                 acks: vec![],
                 nacks: vec![Nack {
                     ssrc: 3,

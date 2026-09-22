@@ -23,7 +23,10 @@ use super::{
     srtp::{Iv, Key, SRTP_AUTH_TAG_LEN, SRTP_IV_LEN, Salt},
     types::*,
 };
-use crate::{rtp::VP9_PAYLOAD_TYPE, transportcc as tcc};
+use crate::{
+    rtp::{LossStats, VP9_PAYLOAD_TYPE},
+    transportcc as tcc,
+};
 
 const RTCP_HEADER_LEN: usize = 8;
 const RTCP_RECEIVER_REPORT_BLOCK_LEN: usize = 28;
@@ -46,9 +49,8 @@ pub const RTCP_FORMAT_NACK: u8 = 1;
 pub const RTCP_FORMAT_TRANSPORT_CC: u8 = 15;
 pub const RTCP_TYPE_SPECIFIC_FEEDBACK: u8 = 206;
 pub const RTCP_FORMAT_PLI: u8 = 1;
-// 2 * RTCP_REPORT_INTERVAL + 1 second
-pub const RTT_ESTIMATE_AGE_LIMIT: Duration = Duration::from_secs(11);
-const RTT_ESTIMATE_AGE_LIMIT_SECS_F64: f64 = 11.0;
+pub const UPDATE_STATS_INTERVAL: Duration = Duration::from_secs(1);
+pub const UPDATE_STATS_INTERVAL_SECS: f64 = 1.0;
 
 #[derive(Default, Debug)]
 pub struct ControlPacket<'packet> {
@@ -342,6 +344,7 @@ pub struct ProcessedControlPacket {
     pub key_frame_requests: Vec<KeyFrameRequest>,
     pub acks: Vec<tcc::Ack>,
     pub nacks: Vec<Nack>,
+    pub sender_reports: Vec<SenderReport>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -369,19 +372,23 @@ impl ReceiveStats {
     }
 
     fn loss_pct(&self) -> u8 {
+        (256 * self.lost_num_packets_since_last_rr())
+            .checked_div(self.expected_num_packets_since_last_rr())
+            .unwrap_or(0) as u8
+    }
+
+    fn lost_num_packets_since_last_rr(&self) -> u32 {
+        self.cumulative_loss
+            .saturating_sub(self.cumulative_loss_in_last_report)
+    }
+
+    fn expected_num_packets_since_last_rr(&self) -> u32 {
         let (Some(max_seqnum), Some(last_reported_max_seqnum)) =
             (self.max_seqnum, self.last_reported_max_seqnum)
         else {
             return 0;
         };
-
-        let expected_since_last = max_seqnum.saturating_sub(last_reported_max_seqnum);
-        let lost_since_last = self
-            .cumulative_loss
-            .saturating_sub(self.cumulative_loss_in_last_report);
-        (256 * lost_since_last)
-            .checked_div(expected_since_last)
-            .unwrap_or(0) as u8
+        max_seqnum.saturating_sub(last_reported_max_seqnum)
     }
 }
 
@@ -415,8 +422,8 @@ struct RtcpReportStats {
     last_sender_info: Option<SenderInfo>,
     last_sender_report_time: Instant,
     last_receiver_report_time: Instant,
-    last_receiver_report_dlsr: u32,
-    last_receiver_report_frac_loss: u8,
+    last_receiver_report_block: Option<ReportBlock>,
+    max_loss_frac_reported_by_receiver: u8,
 }
 
 impl RtcpReportStats {
@@ -425,8 +432,8 @@ impl RtcpReportStats {
             last_sender_info: None,
             last_sender_report_time: now,
             last_receiver_report_time: now,
-            last_receiver_report_dlsr: 0,
-            last_receiver_report_frac_loss: 0,
+            last_receiver_report_block: None,
+            max_loss_frac_reported_by_receiver: 0,
         }
     }
 }
@@ -444,6 +451,8 @@ pub(super) struct RtcpReportSender {
 
     rtt_estimate: Option<Duration>,
     rtt_estimate_last_updated: Option<Instant>,
+    /// Max loss stats reported by a different connection in the call
+    max_receiver_loss_stats: Option<LossStats>,
 }
 
 impl RtcpReportSender {
@@ -456,7 +465,45 @@ impl RtcpReportSender {
 
             rtt_estimate: None,
             rtt_estimate_last_updated: None,
+            max_receiver_loss_stats: None,
         }
+    }
+
+    /// returns the timestamp of when the last receiver report was received
+    /// else the time the client was created
+    pub(super) fn last_receiver_report_time(&self) -> Instant {
+        self.received_report_stats.last_receiver_report_time
+    }
+
+    /// Remember SenderInfo to use for later SenderReports. Receivers echo timestamps back
+    /// as LSR, which is how we match their report blocks to our reports; without it LSR is zero
+    /// and the report block is unusable.
+    ///
+    /// `preserves_rtp_timestamps` must be false for streams whose timestamps we rewrite aka
+    /// simulcast video.
+    pub(super) fn remember_forwarded_sender_info(
+        &mut self,
+        sender_report: &SenderReport,
+        preserves_rtp_timestamps: bool,
+        receive_time: Instant,
+    ) {
+        // ignore older sender reports
+        if self
+            .received_report_stats
+            .last_sender_info
+            .as_ref()
+            .is_some_and(|info| sender_report.sender_info.ntp_ts <= info.ntp_ts)
+        {
+            return;
+        }
+
+        let mut sender_info = sender_report.sender_info.clone();
+        if !preserves_rtp_timestamps {
+            sender_info.rtp_ts = self.send_stats.last_rtp_timestamp;
+        }
+
+        self.received_report_stats.last_sender_report_time = receive_time;
+        self.received_report_stats.last_sender_info = Some(sender_info);
     }
 
     pub(super) fn remember_received_sender_report(
@@ -505,19 +552,50 @@ impl RtcpReportSender {
         // When our reporting interval is longer than the clients RR interval, the SFU will receive
         // multiple RR's with the same LSR referencing the same SR. These RR's may arrive out of
         // order - we prioritize the newest RR. We differentiate age of RR's based on their DLSR
-        if report_block.delay_last_sender_report
-            < self.received_report_stats.last_receiver_report_dlsr
+        if self
+            .received_report_stats
+            .last_receiver_report_block
+            .as_ref()
+            .is_some_and(|rb| rb.delay_last_sender_report > report_block.delay_last_sender_report)
         {
             return;
         }
 
-        self.remember_stats_for_loss(&report_block);
         self.remember_stats_for_rtt(&report_block, now);
         self.received_report_stats.last_receiver_report_time = now;
+        self.received_report_stats.last_receiver_report_block = Some(report_block);
     }
 
-    fn remember_stats_for_loss(&mut self, report_block: &ReportBlock) {
-        self.received_report_stats.last_receiver_report_frac_loss = report_block.fraction_loss;
+    pub(super) fn update_max_loss_stats(&mut self, loss_stats: LossStats) {
+        self.max_receiver_loss_stats = Some(loss_stats);
+    }
+
+    /// From the perspective of the receiving client. The total loss is based on the loss fraction
+    /// reported in the latest Receiver Report from Client to SFU in this SsrcState.
+    /// @return the loss frac in 255ths and the time of the last received receiver report
+    pub(super) fn total_loss_frac(&self) -> (u8, Instant) {
+        (
+            self.received_report_stats
+                .last_receiver_report_block
+                .as_ref()
+                .map_or(0, |rb| rb.fraction_loss),
+            self.received_report_stats.last_receiver_report_time,
+        )
+    }
+
+    pub(super) fn cumulative_packets_lost(&self) -> U24 {
+        // Negative cumulative loss isn't supported because it can cause problems with WebRTC
+        // https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/modules/rtp_rtcp/source/receive_statistics_impl.h;l=91-94;drc=18649971ab02d2f3fc8f360aee2e3c573652b7bd
+        const MAX_I24: u32 = (1 << 23) - 1;
+        U24::try_from(std::cmp::min(self.receive_stats.cumulative_loss, MAX_I24)).unwrap()
+    }
+
+    /// @return the upload loss frac in 255ths and the time of the last sent receiver report
+    pub(super) fn upload_loss_frac(&self) -> (u8, Instant) {
+        (
+            self.receive_stats.loss_pct(),
+            self.sent_report_stats.last_receiver_report_time,
+        )
     }
 
     fn remember_stats_for_rtt(&mut self, report_block: &ReportBlock, now: Instant) {
@@ -535,8 +613,6 @@ impl RtcpReportSender {
             self.received_report_stats.last_receiver_report_time,
             now,
         );
-        self.received_report_stats.last_receiver_report_dlsr =
-            report_block.delay_last_sender_report;
     }
 
     /// Update the rtt_estimate. Smoothes the changing of RTT estimates. Ages out estimates older than 15 seconds.
@@ -548,10 +624,10 @@ impl RtcpReportSender {
     ) {
         if let Some(old_rtt_estimate) = self.rtt_estimate {
             let estimate_age = now.saturating_duration_since(last_rr_time);
-            let weight = RTT_ESTIMATE_AGE_LIMIT
+            let weight = UPDATE_STATS_INTERVAL
                 .saturating_sub(estimate_age)
                 .as_secs_f64()
-                / RTT_ESTIMATE_AGE_LIMIT_SECS_F64;
+                / UPDATE_STATS_INTERVAL_SECS;
             self.rtt_estimate = Some(Duration::from_secs_f64(
                 weight * old_rtt_estimate.as_secs_f64()
                     + ((1.0 - weight) * new_rtt_estimate.as_secs_f64()),
@@ -769,14 +845,15 @@ impl RtcpReportSender {
         let Some(max_seqnum) = self.receive_stats.max_seqnum else {
             return;
         };
-        let upload_fraction_lost_since_last = self.receive_stats.loss_pct();
 
-        // Negative cumulative loss isn't supported because it can cause problems with WebRTC
-        // https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/modules/rtp_rtcp/source/receive_statistics_impl.h;l=91-94;drc=18649971ab02d2f3fc8f360aee2e3c573652b7bd
-        const MAX_I24: u32 = (1 << 23) - 1;
-        let cumulative_loss_i24 =
-            U24::try_from(std::cmp::min(self.receive_stats.cumulative_loss, MAX_I24)).unwrap();
-
+        let (total_loss_frac, cumulative_loss_i24) =
+            if let Some(loss_stats) = self.max_receiver_loss_stats.as_ref() {
+                (loss_stats.loss_frac, loss_stats.cumulative_packets_lost)
+            } else {
+                // handles case of a solo client or if no other client's reports
+                // are being received by the SFU
+                (self.upload_loss_frac().0, self.cumulative_packets_lost())
+            };
         self.receive_stats.last_reported_max_seqnum = self.receive_stats.max_seqnum;
         // cumulative_loss_in_last is used to figure out how many packets have been lost since
         // the last report. We can't update it based off lost_since_last since cumulative_loss
@@ -797,10 +874,19 @@ impl RtcpReportSender {
                 )
             });
 
+        let block = ReportBlock {
+            ssrc,
+            fraction_loss: total_loss_frac,
+            cumulative_loss_count: cumulative_loss_i24,
+            highest_sequence_num: max_seqnum,
+            jitter: interarrival_jitter,
+            last_sender_report: last_sender_report_timestamp,
+            delay_last_sender_report: delay_since_last_sender_report,
+        };
         (
             ssrc, // sender_ssrc - matches source ssrc since we send a separate report for every SSRC
             ssrc, // source_ssrc
-            [upload_fraction_lost_since_last],
+            [total_loss_frac],
             cumulative_loss_i24,
             max_seqnum,
             interarrival_jitter,
@@ -810,7 +896,7 @@ impl RtcpReportSender {
             .write(out);
 
         self.sent_report_stats.last_receiver_report_time = now;
-        self.sent_report_stats.last_receiver_report_dlsr = delay_since_last_sender_report;
+        self.sent_report_stats.last_receiver_report_block = Some(block);
     }
 
     /// Creates a SenderReport. Since we never forward media back to the original sender,
@@ -843,7 +929,13 @@ impl RtcpReportSender {
         self.sent_report_stats.last_sender_report_time = now;
         self.send_stats.updated_since_last_report = false;
         // reset the delay we use to identify old packets
-        self.received_report_stats.last_receiver_report_dlsr = 0;
+        if let Some(block) = self
+            .received_report_stats
+            .last_receiver_report_block
+            .as_mut()
+        {
+            block.delay_last_sender_report = 0;
+        }
     }
 
     /// returns the rtt estimate and when the estimate was last updated
@@ -902,7 +994,7 @@ fn dlsr_to_duration(delay_since_sr: u32) -> Duration {
     Duration::from_nanos(delay_since_sr as u64 * NANOS_TO_DELAY_UNIT)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtcpHeader {
     has_padding: bool,
     pub count_or_format: u8,
@@ -976,7 +1068,7 @@ impl Writer for RtcpHeader {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportBlock {
     pub ssrc: Ssrc,
     fraction_loss: u8,
@@ -1073,7 +1165,7 @@ impl Writer for SenderInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenderReport {
     header: RtcpHeader,
     sender_info: SenderInfo,
@@ -1253,6 +1345,14 @@ mod test {
 
     use super::*;
     use crate::{call::CLIENT_SERVER_DATA_PAYLOAD_TYPE, rtp::new_srtp_keys};
+
+    #[test]
+    fn test_update_stats_interval_matches() {
+        assert_eq!(
+            UPDATE_STATS_INTERVAL.as_secs_f64(),
+            UPDATE_STATS_INTERVAL_SECS
+        );
+    }
 
     #[test]
     fn test_parse_rtcp_reports() {

@@ -388,6 +388,19 @@ impl LayerId {
     }
 }
 
+/// Maps an incoming SSRC to the outgoing SSRC we forward it on. Audio and data keep their
+/// own SSRC, while the incoming video layers all use the Video0 ssrc for outgoing.
+/// Returns None for anything we do not forward, such as RTX.
+pub(crate) fn outgoing_ssrc_for_forwarded(ssrc: rtp::Ssrc) -> Option<rtp::Ssrc> {
+    match LayerId::from_ssrc(ssrc)? {
+        LayerId::Audio | LayerId::RtpData => Some(ssrc),
+        LayerId::Video0 | LayerId::Video1 | LayerId::Video2 => {
+            Some(LayerId::Video0.to_ssrc(DemuxId::from_ssrc(ssrc)))
+        }
+        LayerId::Svc => Some(ssrc),
+    }
+}
+
 #[derive(Error, Debug, Eq, PartialEq)]
 pub enum Error {
     #[error("received RTP data for server with invalid protobuf")]
@@ -692,6 +705,19 @@ impl Call {
         self.inner
             .lock()
             .handle_key_frame_requests(requester_id, key_frame_requests, now)
+    }
+
+    /// The demux ids of every other client in the call, which the sender's
+    /// media is forwarded to.
+    #[inline(always)]
+    pub fn forwarding_demux_ids(&self, sender_demux_id: DemuxId) -> Vec<DemuxId> {
+        self.inner
+            .lock()
+            .clients
+            .iter()
+            .map(|client| client.demux_id)
+            .filter(|demux_id| *demux_id != sender_demux_id)
+            .collect()
     }
 
     #[inline(always)]
