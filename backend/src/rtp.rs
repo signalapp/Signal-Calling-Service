@@ -16,7 +16,9 @@ mod types;
 
 use std::{collections::HashMap, convert::TryInto, sync::Arc};
 
-use calling_common::{Bits, Duration, Instant, U24, Writer, expand_truncated_counter, read_u16};
+use calling_common::{
+    Bits, DemuxId, Duration, Instant, U24, Writer, expand_truncated_counter, read_u16,
+};
 pub use dependency_descriptor::*;
 use log::*;
 use metrics::*;
@@ -35,7 +37,10 @@ pub use srtp::{key_from, new_srtp_keys, salt_from};
 pub use types::*;
 
 // TODO: refactor LayerID to not depend on call code
-use crate::{call::outgoing_ssrc_for_forwarded, transportcc as tcc};
+use crate::{
+    call::{DemuxIdExt, outgoing_ssrc_for_forwarded},
+    transportcc as tcc,
+};
 
 const VERSION: u8 = 2;
 const PADDING_PAYLOAD_TYPE: PayloadType = 99;
@@ -270,6 +275,14 @@ impl Endpoint {
             last_stats: None,
             last_stats_calculated_time: now,
         }
+    }
+
+    /// remove all data related to the DemuxId, specifically RTP
+    /// metadata of associated Ssrcs
+    pub fn remove_demux_id(&mut self, demux_id: DemuxId) {
+        self.outgoing_ssrc_state
+            .retain(|&ssrc, _state| demux_id != DemuxId::from_ssrc(ssrc));
+        self.rtx_sender.remove_demux_id(demux_id);
     }
 
     // Returns a Packet and an optional transport-cc feedback RTCP packet that should be sent.

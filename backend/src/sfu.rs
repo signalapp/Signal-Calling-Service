@@ -8,7 +8,7 @@
 use core::ops::DerefMut;
 use std::{
     cmp::min,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::TryInto,
     fmt::Write,
     ops::AddAssign,
@@ -23,6 +23,7 @@ use calling_common::{
     SignalUserAgent, SystemTime,
 };
 use hkdf::Hkdf;
+use itertools::Itertools;
 use log::*;
 use metrics::{
     metric_config::{Histogram, StaticStrTagsRef, Timer},
@@ -105,6 +106,12 @@ pub struct ConnectionId {
     demux_id: DemuxId,
 }
 
+impl AsRef<ConnectionId> for ConnectionId {
+    fn as_ref(&self) -> &ConnectionId {
+        self
+    }
+}
+
 impl ConnectionId {
     fn from_call_id_and_demux_id(call_id: CallId, demux_id: DemuxId) -> ConnectionId {
         Self { call_id, demux_id }
@@ -123,6 +130,10 @@ impl ConnectionId {
             call_id: CallId::from(vec![0u8; 8]),
             demux_id: DemuxId::from_const(0u32),
         }
+    }
+
+    pub fn demux_id(&self) -> DemuxId {
+        self.demux_id
     }
 }
 
@@ -173,6 +184,17 @@ impl Connections {
             .values()
             .map(Arc::clone)
             .collect()
+    }
+
+    /// Retrieves a snapshot of all connections that are currently managed by this
+    /// Connections instance.
+    fn get_connections_by_call_snapshot(&self) -> HashMap<CallId, Vec<Arc<Connection>>> {
+        self.synchronized_maps
+            .read()
+            .by_id
+            .values()
+            .map(Arc::clone)
+            .into_group_map_by(|conn| conn.id().call_id.clone())
     }
 
     /// Creates a new connection. The newly created connection becomes one of the connections
@@ -811,6 +833,27 @@ impl Sfu {
         }
     }
 
+    fn drop_inactive_connection(&self, connection: &Arc<Connection>, now: Instant) {
+        let connection_id = connection.id();
+        info!("dropping inactive connection: {}", connection_id);
+
+        let call = connection.call();
+        call.drop_client(connection_id.demux_id, now, "Inactive");
+
+        if connection.had_selected_candidate() {
+            event!("calling.sfu.close_connection.inactive");
+        } else {
+            event!("calling.sfu.close_connection.no_nominee");
+        }
+
+        self.connections
+            .remove_connection(connection_id, "Inactive");
+        connection.close();
+        if let Some(packet_server) = self.packet_server.lock().as_ref() {
+            packet_server.remove_connection(connection);
+        }
+    }
+
     /// Remove a client from a call.
     #[cfg(test)]
     pub fn remove_client_from_call(&self, now: Instant, call_id: CallId, demux_id: DemuxId) {
@@ -1242,74 +1285,66 @@ impl Sfu {
 
         {
             time_scope_us!("calling.sfu.tick.connections");
+            let connections_by_call = self.connections.get_connections_by_call_snapshot();
 
-            let mut max_receive_loss_frac_by_call_id =
-                HashMap::<CallId, HashMap<rtp::Ssrc, LossStats>>::new();
-            let connections = self.connections.get_connections_snapshot();
-
-            for connection in connections.iter() {
-                let call_losses = max_receive_loss_frac_by_call_id
-                    .entry(connection.id().call_id.clone())
-                    .or_default();
-                connection
-                    .rtp_endpoint_stats(now)
-                    .loss_stats
-                    .iter()
-                    .for_each(|(&ssrc, loss_stats)| {
-                        call_losses
-                            .entry(ssrc)
-                            .and_modify(|cur| {
-                                if cur.loss_frac < loss_stats.loss_frac {
-                                    *cur = loss_stats.clone();
-                                }
-                            })
-                            .or_insert_with(|| loss_stats.clone());
-                    });
-            }
-
-            for connection in connections {
-                let connection_id = connection.id();
-                if let Some(call_stats) =
-                    max_receive_loss_frac_by_call_id.get(&connection.id().call_id)
-                {
-                    connection.update_call_stats(call_stats);
-                }
-                match connection.tick(&mut packets_to_send, now) {
-                    connection::TickOutput::Inactive => {
-                        info!("dropping inactive connection: {}", connection_id);
-
-                        let call = connection.call();
-                        call.drop_client(connection_id.demux_id, now, "Inactive");
-
-                        if connection.had_selected_candidate() {
-                            event!("calling.sfu.close_connection.inactive");
-                        } else {
-                            event!("calling.sfu.close_connection.no_nominee");
-                        }
-
-                        self.connections
-                            .remove_connection(connection_id, "Inactive");
-                        connection.close();
-                        if let Some(packet_server) = self.packet_server.lock().as_ref() {
-                            packet_server.remove_connection(&connection);
-                        }
+            for connections in connections_by_call.values() {
+                let mut inactive_connections = HashSet::new();
+                let mut call_losses: HashMap<rtp::Ssrc, LossStats> = HashMap::new();
+                for connection in connections {
+                    if connection.inactive(now) {
+                        self.drop_inactive_connection(connection, now);
+                        inactive_connections.insert(connection.id());
+                        continue;
                     }
-                    connection::TickOutput::Active(dead_candidates) => {
-                        // Don't remove the connection; it's still active!
-                        for candidate in dead_candidates {
-                            if let Some(packet_server) = self.packet_server.lock().as_ref() {
-                                packet_server.remove_candidate(&connection, &candidate)
-                            }
-                        }
+                    connection
+                        .rtp_endpoint_stats(now)
+                        .loss_stats
+                        .iter()
+                        .for_each(|(&ssrc, loss_stats)| {
+                            call_losses
+                                .entry(ssrc)
+                                .and_modify(|cur| {
+                                    if cur.loss_frac < loss_stats.loss_frac {
+                                        *cur = loss_stats.clone();
+                                    }
+                                })
+                                .or_insert_with(|| loss_stats.clone());
+                        });
+                }
 
-                        outgoing_queue_sizes_by_call_id
-                            .entry(connection_id.call_id.clone())
-                            .or_default()
-                            .push((connection_id.demux_id, connection.outgoing_queue_size()));
-                        connection_rates_by_call_id
-                            .entry(connection_id.call_id.clone())
-                            .or_default()
-                            .push((connection_id.demux_id, connection.current_rates(now)));
+                for connection in connections {
+                    if inactive_connections.contains(connection.id()) {
+                        continue;
+                    }
+
+                    connection.remove_remote_connections(inactive_connections.iter());
+                    connection.update_call_stats(&call_losses);
+                    let connection_id = connection.id();
+                    match connection.tick(&mut packets_to_send, now) {
+                        connection::TickOutput::Inactive => {
+                            warn!(
+                                "unexpected, we skipped inactive and dropped connections already. Connection: {}",
+                                connection_id
+                            );
+                            self.drop_inactive_connection(connection, now);
+                        }
+                        connection::TickOutput::Active(dead_candidates) => {
+                            // Don't remove the connection; it's still active!
+                            for candidate in dead_candidates {
+                                if let Some(packet_server) = self.packet_server.lock().as_ref() {
+                                    packet_server.remove_candidate(connection, &candidate)
+                                }
+                            }
+
+                            outgoing_queue_sizes_by_call_id
+                                .entry(connection_id.call_id.clone())
+                                .or_default()
+                                .push((connection_id.demux_id, connection.outgoing_queue_size()));
+                            connection_rates_by_call_id
+                                .entry(connection_id.call_id.clone())
+                                .or_default()
+                                .push((connection_id.demux_id, connection.current_rates(now)));
+                        }
                     }
                 }
             }

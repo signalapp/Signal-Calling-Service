@@ -5,11 +5,11 @@
 
 use std::collections::HashMap;
 
-use calling_common::{Duration, Instant, TwoGenerationCache};
+use calling_common::{DemuxId, Duration, Instant, TwoGenerationCache};
 use metrics::event;
 
 use super::{Packet, types::*};
-use crate::rtp::tcc;
+use crate::{call::DemuxIdExt, rtp::tcc};
 
 const RTX_PAYLOAD_TYPE_OFFSET: PayloadType = 10;
 const RTX_SSRC_OFFSET: Ssrc = 1;
@@ -135,6 +135,12 @@ impl RtxSender {
         if let Some(packet) = self.previously_sent_by_seqnum.get_mut(&(ssrc, seqnum)) {
             packet.pending_retransmission = false;
         }
+    }
+
+    pub(super) fn remove_demux_id(&mut self, demux_id: DemuxId) {
+        self.next_outgoing_seqnum_by_ssrc
+            .retain(|&ssrc, _state| demux_id != DemuxId::from_ssrc(ssrc));
+        // we let the data in the two generation cache decay naturally
     }
 }
 

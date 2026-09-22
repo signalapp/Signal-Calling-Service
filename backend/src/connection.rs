@@ -259,6 +259,11 @@ impl Connection {
         self.inner.read().all_addrs()
     }
 
+    #[inline(always)]
+    pub fn inactive(&self, now: Instant) -> bool {
+        self.inner.read().inactive(now)
+    }
+
     /// Returns true if at least one candidate was ever selected.
     pub fn had_selected_candidate(&self) -> bool {
         self.inner.read().had_selected_candidate()
@@ -411,6 +416,16 @@ impl Connection {
         self.inner
             .write()
             .send_key_frame_request(key_frame_request, now)
+    }
+
+    pub fn remove_remote_connections<T: AsRef<ConnectionId>>(
+        &self,
+        connection_ids: impl Iterator<Item = T>,
+    ) {
+        let mut guard = self.inner.write();
+        for id in connection_ids {
+            guard.remove_remote_connection(id.as_ref());
+        }
     }
 
     /// This takes in call stats and saves stats necessary for connection operation including:
@@ -877,6 +892,10 @@ impl ConnectionInner {
             dequeue_time,
             new_target_send_rate,
         })
+    }
+
+    fn remove_remote_connection(&mut self, connection_id: &ConnectionId) {
+        self.rtp.endpoint.remove_demux_id(connection_id.demux_id());
     }
 
     fn candidate_selector_tick(
