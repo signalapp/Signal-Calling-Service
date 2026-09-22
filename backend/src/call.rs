@@ -1705,6 +1705,7 @@ impl CallInner {
         incoming_rtp: rtp::Packet<&mut [u8]>,
         now: Instant,
     ) -> Result<Vec<RtpToSend>, Error> {
+        let should_forward_dtx = self.should_forward_dtx();
         let sender = self
             .find_client_mut(sender_demux_id)
             .ok_or(UnknownDemuxId(sender_demux_id))?;
@@ -1719,6 +1720,7 @@ impl CallInner {
         let incoming_rtp = incoming_rtp.borrow();
         if let Some(audio_level) = incoming_rtp.audio_level
             && sender.handle_audio_level(audio_level, now)
+            && !should_forward_dtx
         {
             return Ok(vec![]);
         }
@@ -1975,6 +1977,18 @@ impl CallInner {
                 ideal_send_rate: client.ideal_send_rate,
             })
             .collect()
+    }
+
+    /// Whether silent packets while in DTX mode should be forwarded
+    #[cfg(not(test))]
+    fn should_forward_dtx(&self) -> bool {
+        self.clients.len() < 7
+    }
+
+    /// Whether silent packets while in DTX mode should be forwarded
+    #[cfg(test)]
+    fn should_forward_dtx(&self) -> bool {
+        false
     }
 
     fn reallocate_target_send_rates_if_its_been_too_long(
@@ -3261,6 +3275,7 @@ impl Client {
         }
     }
 
+    /// returns true on silent packets if the client is in DTX mode
     fn handle_audio_level(&mut self, audio_level: audio::Level, now: Instant) -> bool {
         time_scope_us!("calling.call.handle_rtp.audio_level");
         self.incoming_audio_levels.push(audio_level, now);
