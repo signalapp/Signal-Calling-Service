@@ -165,9 +165,12 @@ pub struct Endpoint {
     rtcp_sender_ssrc: Ssrc,
     next_outgoing_srtcp_index: u32,
 
-    // For seqnum expanasion of incoming packets
-    // and for SRTP replay attack protection
-    state_by_incoming_ssrc: HashMap<Ssrc, IncomingSsrcState>,
+    /// Tracks Client -> SFU state
+    /// For seqnum expansion of incoming packets
+    /// and for SRTP replay attack protection
+    incoming_ssrc_state: HashMap<Ssrc, SsrcState>,
+    /// Tracks SFU -> Client state
+    outgoing_ssrc_state: HashMap<Ssrc, SsrcState>,
 
     // For transport-cc
     tcc_receiver: tcc::Receiver,
@@ -182,18 +185,18 @@ pub struct Endpoint {
     last_stats: EndpointStats,
 }
 
-struct IncomingSsrcState {
+struct SsrcState {
     max_seqnum: FullSequenceNumber,
     seqnum_reuse_detector: SequenceNumberReuseDetector,
     nack_sender: NackSender,
     rtcp_report_sender: RtcpReportSender,
 }
 
-impl IncomingSsrcState {
+impl SsrcState {
     const DEFAULT_MAX_SEQNUM: u64 = 0;
 }
 
-impl Default for IncomingSsrcState {
+impl Default for SsrcState {
     fn default() -> Self {
         Self {
             max_seqnum: Self::DEFAULT_MAX_SEQNUM,
@@ -201,7 +204,7 @@ impl Default for IncomingSsrcState {
             // A 1KB RTCP payload with 4 bytes each would allow only 250
             // in the worst case scenario.
             nack_sender: NackSender::new(250),
-            rtcp_report_sender: RtcpReportSender::new(),
+            rtcp_report_sender: RtcpReportSender::new(Instant::now()),
         }
     }
 }
@@ -243,7 +246,8 @@ impl Endpoint {
             rtcp_sender_ssrc,
             next_outgoing_srtcp_index: 1,
 
-            state_by_incoming_ssrc: HashMap::new(),
+            incoming_ssrc_state: HashMap::new(),
+            outgoing_ssrc_state: HashMap::new(),
 
             tcc_sender: tcc::Sender::new(now),
             tcc_receiver: tcc::Receiver::new(ack_sender_ssrc, now),
@@ -272,9 +276,8 @@ impl Endpoint {
         let tcc_seqnum = header
             .tcc_seqnum
             .map(|tcc_seqnum| tcc::expand_seqnum(tcc_seqnum, &mut self.max_received_tcc_seqnum));
-        let ssrc_state = self.state_by_incoming_ssrc.get(&header.ssrc);
-        let mut max_seqnum =
-            ssrc_state.map_or(IncomingSsrcState::DEFAULT_MAX_SEQNUM, |s| s.max_seqnum);
+        let ssrc_state = self.get_incoming_ssrc_state(header.ssrc);
+        let mut max_seqnum = ssrc_state.map_or(SsrcState::DEFAULT_MAX_SEQNUM, |s| s.max_seqnum);
         let seqnum_in_header = expand_seqnum(header.seqnum, &mut max_seqnum);
         let mut seqnum_reuse_detector = ssrc_state
             .map_or_else(SequenceNumberReuseDetector::default, |s| {
@@ -331,7 +334,7 @@ impl Endpoint {
         }
 
         // Commit state changes
-        let ssrc_state = self.get_incoming_ssrc_state_mut(header.ssrc);
+        let ssrc_state = self.incoming_ssrc_state_mut(header.ssrc);
         ssrc_state.max_seqnum = max_seqnum;
         ssrc_state.seqnum_reuse_detector = seqnum_reuse_detector;
 
@@ -355,7 +358,7 @@ impl Endpoint {
                 );
                 return None;
             };
-            let original_ssrc_state = self.get_incoming_ssrc_state_mut(original_ssrc);
+            let original_ssrc_state = self.incoming_ssrc_state_mut(original_ssrc);
             let original_seqnum =
                 expand_seqnum(original_seqnum, &mut original_ssrc_state.max_seqnum);
             // This makes the Packet appear to be an RTX packet for the rest of the processing.
@@ -399,7 +402,7 @@ impl Endpoint {
         // otherwise, we'll not remember we received RTX packets and we'll
         // keep NACKing.
         if is_rtxable_payload_type(incoming.payload_type()) {
-            let ssrc_state = self.get_incoming_ssrc_state_mut(incoming.ssrc());
+            let ssrc_state = self.incoming_ssrc_state_mut(incoming.ssrc());
             // NACKs are delayed by a bit and sent in tick() to avoid
             // sending too many when there is a small amount of jitter.
             // And it makes it easy to resend them.
@@ -407,7 +410,7 @@ impl Endpoint {
         }
 
         if is_media_payload_type(incoming.payload_type()) {
-            let ssrc_state = self.get_incoming_ssrc_state_mut(incoming.ssrc());
+            let ssrc_state = self.incoming_ssrc_state_mut(incoming.ssrc());
 
             ssrc_state.rtcp_report_sender.remember_received(
                 incoming.seqnum(),
@@ -424,8 +427,40 @@ impl Endpoint {
         Some(incoming)
     }
 
-    fn get_incoming_ssrc_state_mut(&mut self, ssrc: Ssrc) -> &mut IncomingSsrcState {
-        self.state_by_incoming_ssrc.entry(ssrc).or_default()
+    fn get_incoming_ssrc_state(&self, ssrc: Ssrc) -> Option<&SsrcState> {
+        self.incoming_ssrc_state.get(&ssrc)
+    }
+
+    fn incoming_ssrc_state_mut(&mut self, ssrc: Ssrc) -> &mut SsrcState {
+        self.incoming_ssrc_state.entry(ssrc).or_default()
+    }
+
+    fn get_outgoing_ssrc_state(&self, ssrc: Ssrc) -> Option<&SsrcState> {
+        self.outgoing_ssrc_state.get(&ssrc)
+    }
+
+    fn outgoing_ssrc_state_mut(&mut self, ssrc: Ssrc) -> &mut SsrcState {
+        self.outgoing_ssrc_state.entry(ssrc).or_default()
+    }
+
+    fn outgoing_ssrc_states_iter(&self) -> impl Iterator<Item = (&Ssrc, &SsrcState)> + use<'_> {
+        self.outgoing_ssrc_state.iter()
+    }
+
+    fn knows_ssrc(&self, ssrc: Ssrc) -> bool {
+        self.incoming_ssrc_state.contains_key(&ssrc) || self.outgoing_ssrc_state.contains_key(&ssrc)
+    }
+
+    fn ssrc_states_iter(&self) -> impl Iterator<Item = (&Ssrc, &SsrcState)> + use<'_> {
+        self.incoming_ssrc_state
+            .iter()
+            .chain(self.outgoing_ssrc_state.iter())
+    }
+
+    fn ssrc_states_iter_mut(&mut self) -> impl Iterator<Item = (&Ssrc, &mut SsrcState)> + use<'_> {
+        self.incoming_ssrc_state
+            .iter_mut()
+            .chain(self.outgoing_ssrc_state.iter_mut())
     }
 
     // Returns parsed and decrypted RTCP, and also processes transport-cc feedback based on
@@ -449,11 +484,8 @@ impl Endpoint {
                 .tcc_sender
                 .process_feedback_and_correlate_acks(incoming.tcc_feedbacks.into_iter(), now);
         }
-        for sender_report in incoming.sender_reports {
-            self.get_incoming_ssrc_state_mut(sender_report.ssrc())
-                .rtcp_report_sender
-                .remember_received_sender_report(sender_report, now);
-        }
+
+        self.remember_incoming_sender_reports(incoming.sender_reports, now);
         self.remember_receiver_reports(incoming.receiver_reports, now);
 
         Some(ProcessedControlPacket {
@@ -524,6 +556,29 @@ impl Endpoint {
         }
     }
 
+    /// Call this on the endpoint that sent this SenderReport.
+    fn remember_incoming_sender_reports(
+        &mut self,
+        reports: Vec<SenderReport>,
+        now: Instant,
+    ) -> Vec<SenderReport> {
+        let mut received = Vec::with_capacity(reports.len());
+        for mut sender_report in reports {
+            debug!("Received sender report: {sender_report:?}");
+            let report_blocks = std::mem::take(&mut sender_report.report_blocks);
+
+            if let Some(state) = self.incoming_ssrc_state.get_mut(&sender_report.ssrc()) {
+                state
+                    .rtcp_report_sender
+                    .remember_received_sender_report(sender_report.clone(), now);
+            }
+
+            self.remember_report_blocks(report_blocks, now);
+            received.push(sender_report);
+        }
+        received
+    }
+
     // counts packets/bytes and remembers timestamps for sender reports
     // does not consider RTX packets or Client <-> SFU data packets
     pub fn remember_sent_for_reports(&mut self, outgoing: &Packet<Vec<u8>>, now: Instant) {
@@ -531,26 +586,36 @@ impl Endpoint {
             return;
         }
 
-        self.get_incoming_ssrc_state_mut(outgoing.ssrc())
+        self.outgoing_ssrc_state_mut(outgoing.ssrc())
             .rtcp_report_sender
             .remember_sent(outgoing, now);
     }
 
     fn remember_receiver_reports(&mut self, reports: Vec<ReceiverReport>, now: Instant) {
         for rr in reports {
-            if !self.state_by_incoming_ssrc.contains_key(&rr.ssrc()) {
+            // Ignore ReceiverReports from unrecognized ssrcs
+            if !self.knows_ssrc(rr.ssrc()) {
+                debug!("Ignoring receiver report, from unknown ssrc {}", rr.ssrc());
                 continue;
             }
 
-            for block in rr.report_blocks {
-                if !self.state_by_incoming_ssrc.contains_key(&block.ssrc) {
-                    continue;
-                }
+            self.remember_report_blocks(rr.report_blocks, now);
+        }
+    }
 
-                self.get_incoming_ssrc_state_mut(block.ssrc)
-                    .rtcp_report_sender
-                    .remember_report_block(block, now);
+    fn remember_report_blocks(&mut self, report_blocks: Vec<ReportBlock>, now: Instant) {
+        for block in report_blocks {
+            if self.get_outgoing_ssrc_state(block.ssrc).is_none() {
+                debug!(
+                    "Did not find outgoing ssrc state for {}, skipping",
+                    block.ssrc
+                );
+                continue;
             }
+
+            self.outgoing_ssrc_state_mut(block.ssrc)
+                .rtcp_report_sender
+                .remember_report_block(block, now);
         }
     }
 
@@ -588,13 +653,12 @@ impl Endpoint {
         time_scope_us!("calling.rtp.send_nacks");
 
         // We have to get all of these refs up front to avoid lifetime issues.
-        let state_by_incoming_ssrc = &mut self.state_by_incoming_ssrc;
         let rtcp_sender_ssrc = self.rtcp_sender_ssrc;
         let next_outgoing_srtcp_index = &mut self.next_outgoing_srtcp_index;
         let key = &self.encrypt.rtcp.key;
         let salt = &self.encrypt.rtcp.salt;
 
-        state_by_incoming_ssrc
+        self.incoming_ssrc_state
             .iter_mut()
             .filter_map(move |(ssrc, state)| {
                 let seqnums = state.nack_sender.send_nacks(now, rtt)?;
@@ -635,7 +699,7 @@ impl Endpoint {
         let mut is_first = true;
         let mut first_ssrc = 0u32;
         let mut block_buffer = Vec::with_capacity(ReceiverReport::MIN_LENGTH + ReportBlock::LENGTH);
-        for (ssrc, state) in &mut self.state_by_incoming_ssrc {
+        for (ssrc, state) in self.ssrc_states_iter_mut() {
             block_buffer.clear();
             let Some((payload_type, block_count, report_length)) = state
                 .rtcp_report_sender
@@ -756,7 +820,7 @@ impl Endpoint {
         let mut count = 0;
         let mut sum = Duration::from_secs(0);
 
-        for ssrc_state in self.state_by_incoming_ssrc.values() {
+        for (_, ssrc_state) in self.outgoing_ssrc_states_iter() {
             if let Some((estimate, last_updated)) = ssrc_state.rtcp_report_sender.rtt_estimate() {
                 if now.saturating_duration_since(last_updated) >= RTT_ESTIMATE_AGE_LIMIT {
                     continue;
@@ -776,18 +840,19 @@ impl Endpoint {
     /// - the number of reports to serialize
     fn create_buffer_for_rtcp_reports(&self) -> Option<Vec<u8>> {
         const RECEIVER_REPORT_MIN_LENGTH: usize = ReceiverReport::MIN_LENGTH + ReportBlock::LENGTH;
-        let expected_report_size = self.state_by_incoming_ssrc.iter().fold(
-            0usize,
-            |total_bytes, (ssrc, state)| match state.rtcp_report_sender.rtcp_report_payload_type() {
-                Some(RTCP_TYPE_SENDER_REPORT) => total_bytes + SenderReport::MIN_LENGTH,
-                Some(RTCP_TYPE_RECEIVER_REPORT) => total_bytes + RECEIVER_REPORT_MIN_LENGTH,
-                Some(unknown) => {
-                    warn!("Unexpected report type `{}` returned by {}", unknown, ssrc);
-                    total_bytes
-                }
-                None => total_bytes,
-            },
-        );
+        let expected_report_size =
+            self.ssrc_states_iter()
+                .fold(0usize, |total_bytes, (ssrc, state)| {
+                    match state.rtcp_report_sender.rtcp_report_payload_type() {
+                        Some(RTCP_TYPE_SENDER_REPORT) => total_bytes + SenderReport::MIN_LENGTH,
+                        Some(RTCP_TYPE_RECEIVER_REPORT) => total_bytes + RECEIVER_REPORT_MIN_LENGTH,
+                        Some(unknown) => {
+                            warn!("Unexpected report type `{}` returned by {}", unknown, ssrc);
+                            total_bytes
+                        }
+                        None => total_bytes,
+                    }
+                });
 
         if expected_report_size == 0 {
             None

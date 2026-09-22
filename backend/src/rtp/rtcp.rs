@@ -344,60 +344,116 @@ pub struct ProcessedControlPacket {
     pub nacks: Vec<Nack>,
 }
 
-pub(super) struct RtcpReportSender {
-    // receiver report stats
+#[derive(Debug, PartialEq, Eq)]
+struct ReceiveStats {
     max_seqnum: Option<u32>,
-    max_seqnum_in_last: Option<u32>,
+    last_reported_max_seqnum: Option<u32>,
     cumulative_loss: u32,
-    cumulative_loss_in_last: u32,
-    last_receive_time: Instant,
+    cumulative_loss_in_last_report: u32,
+    last_update_time: Instant,
     last_rtp_timestamp: u32,
     jitter_q4: u32,
-    last_received_sender_info: Option<SenderInfo>,
-    last_sender_report_received_time: Instant,
-    // sender report stats
-    sent_since_last_report: bool,
-    packets_sent: u32,
-    total_payload_bytes_sent: u32,
-    max_sent_seqnum: Option<u64>,
-    last_sent_time: Instant,
-    last_sent_rtp_timestamp: u32,
+}
+
+impl ReceiveStats {
+    fn new(now: Instant) -> Self {
+        Self {
+            max_seqnum: None,
+            last_reported_max_seqnum: None,
+            cumulative_loss: 0,
+            cumulative_loss_in_last_report: 0,
+            last_update_time: now,
+            last_rtp_timestamp: 0,
+            jitter_q4: 0,
+        }
+    }
+
+    fn loss_pct(&self) -> u8 {
+        let (Some(max_seqnum), Some(last_reported_max_seqnum)) =
+            (self.max_seqnum, self.last_reported_max_seqnum)
+        else {
+            return 0;
+        };
+
+        let expected_since_last = max_seqnum.saturating_sub(last_reported_max_seqnum);
+        let lost_since_last = self
+            .cumulative_loss
+            .saturating_sub(self.cumulative_loss_in_last_report);
+        (256 * lost_since_last)
+            .checked_div(expected_since_last)
+            .unwrap_or(0) as u8
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SendStats {
+    max_seqnum: Option<u64>,
+    cumulative_packets: u32,
+    total_payload_bytes: u32,
+    last_update_time: Instant,
+    last_rtp_timestamp: u32,
     sent_sample_freq: u64,
-    // additional stats state
-    last_sender_report_sent_time: Instant,
-    last_sender_report_sent_time_ntp: u64,
-    last_receiver_report_received_time: Instant,
+    updated_since_last_report: bool,
+}
+
+impl SendStats {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            max_seqnum: None,
+            cumulative_packets: 0,
+            total_payload_bytes: 0,
+            last_update_time: now,
+            last_rtp_timestamp: 0,
+            sent_sample_freq: 0,
+            updated_since_last_report: false,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RtcpReportStats {
+    last_sender_info: Option<SenderInfo>,
+    last_sender_report_time: Instant,
+    last_receiver_report_time: Instant,
     last_receiver_report_dlsr: u32,
+    last_receiver_report_frac_loss: u8,
+}
+
+impl RtcpReportStats {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_sender_info: None,
+            last_sender_report_time: now,
+            last_receiver_report_time: now,
+            last_receiver_report_dlsr: 0,
+            last_receiver_report_frac_loss: 0,
+        }
+    }
+}
+
+/// Records stats about received/sent packets and received/sent reports
+pub(super) struct RtcpReportSender {
+    /// Stats about packets from client to SFU
+    receive_stats: ReceiveStats,
+    /// Stats about packets from SFU to receiving clients
+    send_stats: SendStats,
+    /// Stats about reports from clients to SFU
+    received_report_stats: RtcpReportStats,
+    /// Stats about reports from SFU to clients
+    sent_report_stats: RtcpReportStats,
+
     rtt_estimate: Option<Duration>,
     rtt_estimate_last_updated: Option<Instant>,
 }
 
 impl RtcpReportSender {
-    pub(super) fn new() -> Self {
-        let now = Instant::now();
+    pub(super) fn new(now: Instant) -> Self {
         Self {
-            max_seqnum: None,
-            max_seqnum_in_last: None,
-            cumulative_loss: 0,
-            cumulative_loss_in_last: 0,
-            last_receive_time: now,
-            last_rtp_timestamp: 0,
-            jitter_q4: 0,
-            last_received_sender_info: None,
-            last_sender_report_received_time: now,
+            receive_stats: ReceiveStats::new(now),
+            send_stats: SendStats::new(now),
+            received_report_stats: RtcpReportStats::new(now),
+            sent_report_stats: RtcpReportStats::new(now),
 
-            sent_since_last_report: false,
-            packets_sent: 0,
-            total_payload_bytes_sent: 0,
-            max_sent_seqnum: None,
-            last_sent_time: now,
-            last_sent_rtp_timestamp: 0,
-            sent_sample_freq: 90000,
-
-            last_sender_report_sent_time: now,
-            last_sender_report_sent_time_ntp: 0,
-            last_receiver_report_received_time: now,
-            last_receiver_report_dlsr: 0,
             rtt_estimate: None,
             rtt_estimate_last_updated: None,
         }
@@ -410,50 +466,88 @@ impl RtcpReportSender {
     ) {
         // ignore older sender reports
         if self
-            .last_received_sender_info
+            .received_report_stats
+            .last_sender_info
             .as_ref()
             .is_some_and(|info| sender_report.sender_info.ntp_ts <= info.ntp_ts)
         {
             return;
         }
 
-        self.last_sender_report_received_time = receive_time;
-        self.last_received_sender_info = Some(sender_report.sender_info.clone());
+        self.received_report_stats.last_sender_report_time = receive_time;
+        self.received_report_stats.last_sender_info = Some(sender_report.sender_info);
     }
 
     pub(super) fn remember_report_block(&mut self, report_block: ReportBlock, now: Instant) {
-        if report_block.delay_last_sender_report == 0 || report_block.last_sender_report == 0 {
+        // We ignore this report block since we can't determine it's the latest report
+        // This means we in some cases the SFU will not generate stats until the second round of RTCP reports
+        if self.sent_report_stats.last_sender_info.is_some()
+            && (report_block.delay_last_sender_report == 0 || report_block.last_sender_report == 0)
+        {
+            debug!("Ignoring report block due to last sender info");
             return;
         }
         // Ignore reports for old SenderReports. In pathological cases, we may always ignore reports
         // if we always receive them too late. Remembering the last few sender reports would reduce
         // this issue, but shouldn't be an issue given reporting rates
-        if report_block.last_sender_report != get_lsr(self.last_sender_report_sent_time_ntp) {
+        if report_block.last_sender_report
+            != get_lsr(
+                self.sent_report_stats
+                    .last_sender_info
+                    .as_ref()
+                    .map_or(0, |info| info.ntp_ts),
+            )
+        {
+            debug!("Ignoring report block due to low LSR");
             return;
         }
 
         // When our reporting interval is longer than the clients RR interval, the SFU will receive
         // multiple RR's with the same LSR referencing the same SR. These RR's may arrive out of
         // order - we prioritize the newest RR. We differentiate age of RR's based on their DLSR
-        if report_block.delay_last_sender_report < self.last_receiver_report_dlsr {
+        if report_block.delay_last_sender_report
+            < self.received_report_stats.last_receiver_report_dlsr
+        {
+            return;
+        }
+
+        self.remember_stats_for_loss(&report_block);
+        self.remember_stats_for_rtt(&report_block, now);
+        self.received_report_stats.last_receiver_report_time = now;
+    }
+
+    fn remember_stats_for_loss(&mut self, report_block: &ReportBlock) {
+        self.received_report_stats.last_receiver_report_frac_loss = report_block.fraction_loss;
+    }
+
+    fn remember_stats_for_rtt(&mut self, report_block: &ReportBlock, now: Instant) {
+        if self.sent_report_stats.last_sender_info.is_none() {
             return;
         }
 
         let delay = dlsr_to_duration(report_block.delay_last_sender_report);
         let new_rtt_estimate = now
-            .saturating_duration_since(self.last_sender_report_sent_time)
+            .saturating_duration_since(self.sent_report_stats.last_sender_report_time)
             .saturating_sub(delay);
 
-        self.update_rtt_estimate(new_rtt_estimate, now);
-        self.last_receiver_report_received_time = now;
-        self.last_receiver_report_dlsr = report_block.delay_last_sender_report;
+        self.update_rtt_estimate(
+            new_rtt_estimate,
+            self.received_report_stats.last_receiver_report_time,
+            now,
+        );
+        self.received_report_stats.last_receiver_report_dlsr =
+            report_block.delay_last_sender_report;
     }
 
     /// Update the rtt_estimate. Smoothes the changing of RTT estimates. Ages out estimates older than 15 seconds.
-    fn update_rtt_estimate(&mut self, new_rtt_estimate: Duration, now: Instant) {
+    fn update_rtt_estimate(
+        &mut self,
+        new_rtt_estimate: Duration,
+        last_rr_time: Instant,
+        now: Instant,
+    ) {
         if let Some(old_rtt_estimate) = self.rtt_estimate {
-            let estimate_age =
-                now.saturating_duration_since(self.last_receiver_report_received_time);
+            let estimate_age = now.saturating_duration_since(last_rr_time);
             let weight = RTT_ESTIMATE_AGE_LIMIT
                 .saturating_sub(estimate_age)
                 .as_secs_f64()
@@ -468,6 +562,7 @@ impl RtcpReportSender {
         self.rtt_estimate_last_updated = Some(now);
     }
 
+    /// Remembers details about packets being received by the SFU from a client
     pub(super) fn remember_received(
         &mut self,
         seqnum: FullSequenceNumber,
@@ -475,53 +570,57 @@ impl RtcpReportSender {
         rtp_timestamp: u32,
         receive_time: Instant,
     ) {
+        let receive_stats = &mut self.receive_stats;
         let seqnum = seqnum as u32;
-        if let Some(max_seqnum) = self.max_seqnum {
+        if let Some(max_seqnum) = receive_stats.max_seqnum {
             if maybe_receive_stream_restart(seqnum, max_seqnum) {
                 // Reset state since the values for the old stream may not be relevant anymore.
-                self.cumulative_loss = 0;
-                self.cumulative_loss_in_last = 0;
-                self.max_seqnum = Some(seqnum);
-                self.max_seqnum_in_last = Some(seqnum.saturating_sub(1));
+                receive_stats.cumulative_loss = 0;
+                receive_stats.cumulative_loss_in_last_report = 0;
+                receive_stats.max_seqnum = Some(seqnum);
+                receive_stats.last_reported_max_seqnum = Some(seqnum.saturating_sub(1));
 
-                self.last_receive_time = receive_time;
-                self.last_rtp_timestamp = rtp_timestamp;
-                self.jitter_q4 = 0;
+                receive_stats.last_update_time = receive_time;
+                receive_stats.last_rtp_timestamp = rtp_timestamp;
+                receive_stats.jitter_q4 = 0;
                 return;
             }
 
             if seqnum > max_seqnum {
                 let seqnums_in_gap = seqnum - max_seqnum - 1;
-                self.cumulative_loss = self.cumulative_loss.saturating_add(seqnums_in_gap);
-                self.max_seqnum = Some(seqnum);
+                receive_stats.cumulative_loss =
+                    receive_stats.cumulative_loss.saturating_add(seqnums_in_gap);
+                receive_stats.max_seqnum = Some(seqnum);
 
-                self.update_jitter(payload_type, rtp_timestamp, receive_time);
+                Self::update_jitter(receive_stats, payload_type, rtp_timestamp, receive_time);
 
-                self.last_receive_time = receive_time;
-                self.last_rtp_timestamp = rtp_timestamp;
+                receive_stats.last_update_time = receive_time;
+                receive_stats.last_rtp_timestamp = rtp_timestamp;
             } else {
-                self.cumulative_loss = self.cumulative_loss.saturating_sub(1);
+                receive_stats.cumulative_loss = receive_stats.cumulative_loss.saturating_sub(1);
             }
         } else {
-            self.max_seqnum = Some(seqnum);
+            receive_stats.max_seqnum = Some(seqnum);
             // When we get the first seqnum, make it so we've expected 1 seqnum since "last"
             // even though there hasn't been a last yet.
-            self.max_seqnum_in_last = Some(seqnum.saturating_sub(1));
+            receive_stats.last_reported_max_seqnum = Some(seqnum.saturating_sub(1));
 
-            self.last_receive_time = receive_time;
-            self.last_rtp_timestamp = rtp_timestamp;
+            receive_stats.last_update_time = receive_time;
+            receive_stats.last_rtp_timestamp = rtp_timestamp;
         }
     }
 
+    /// Remembers details about packets being sent from the SFU to a client
     pub(super) fn remember_sent(&mut self, outgoing: &Packet<Vec<u8>>, now: Instant) {
         if outgoing.is_rtx() || outgoing.is_data() {
             return;
         }
 
+        let send_stats = &mut self.send_stats;
         // we want to remember the rtp timestamp so we use it to interpolate a timestamp for an SR
         // even though we may forward out of order, the max_sent_seqnum has the closest timestamp
         let seqnum = outgoing.seqnum();
-        if let Some(max_seqnum) = self.max_sent_seqnum {
+        if let Some(max_seqnum) = send_stats.max_seqnum {
             // if we think the stream rolled over, keep the stats. In pathological cases, max_seqnum
             // will change between high and low values, but still preserve the stats.
             // In the unfortunate case that we get a high seqnum very delayed, we may
@@ -529,30 +628,31 @@ impl RtcpReportSender {
             let restarted = maybe_send_stream_restart(seqnum, max_seqnum);
             let rolledover = maybe_stream_rollover(seqnum, max_seqnum);
             if seqnum > max_seqnum || rolledover || restarted {
-                self.max_sent_seqnum = Some(seqnum);
-                self.last_sent_rtp_timestamp = outgoing.timestamp;
-                self.last_sent_time = now;
+                send_stats.max_seqnum = Some(seqnum);
+                send_stats.last_rtp_timestamp = outgoing.timestamp;
+                send_stats.last_update_time = now;
             }
             if restarted && !rolledover {
-                self.packets_sent = 0;
-                self.total_payload_bytes_sent = 0;
+                send_stats.cumulative_packets = 0;
+                send_stats.total_payload_bytes = 0;
             }
         } else {
-            self.max_sent_seqnum = Some(seqnum);
-            self.last_sent_rtp_timestamp = outgoing.timestamp;
-            self.last_sent_time = now;
+            send_stats.max_seqnum = Some(seqnum);
+            send_stats.last_rtp_timestamp = outgoing.timestamp;
+            send_stats.last_update_time = now;
         }
 
-        self.sent_since_last_report = true;
+        send_stats.updated_since_last_report = true;
         // the spec is to wrap around these counts
         // must ignore padding bytes (though not padding packets)
-        self.packets_sent = self.packets_sent.wrapping_add(1);
+        send_stats.cumulative_packets = send_stats.cumulative_packets.wrapping_add(1);
         let net_bytes = (outgoing.payload_size_bytes() as u32)
             .saturating_sub(outgoing.padding_byte_count as u32);
-        self.total_payload_bytes_sent = self.total_payload_bytes_sent.wrapping_add(net_bytes);
+        send_stats.total_payload_bytes = send_stats.total_payload_bytes.wrapping_add(net_bytes);
 
         if outgoing.is_audio() || outgoing.is_video() {
-            self.sent_sample_freq = Self::estimate_sample_freq(outgoing.payload_type()) as u64;
+            send_stats.sent_sample_freq =
+                Self::estimate_sample_freq(outgoing.payload_type()) as u64;
         }
     }
 
@@ -576,12 +676,12 @@ impl RtcpReportSender {
     }
 
     fn update_jitter(
-        &mut self,
+        receive_stats: &mut ReceiveStats,
         payload_type: PayloadType,
         rtp_timestamp: u32,
         receive_time: Instant,
     ) {
-        let receive_diff = receive_time.saturating_duration_since(self.last_receive_time);
+        let receive_diff = receive_time.saturating_duration_since(receive_stats.last_update_time);
         let payload_freq_hz = Self::estimate_sample_freq(payload_type);
 
         // The difference in receive time (interarrival time) converted to the units of the RTP
@@ -590,13 +690,13 @@ impl RtcpReportSender {
 
         // The difference in transmission time represented in the units of RTP timestamps.
         let tx_diff_rtp = (receive_diff_rtp as i64)
-            .saturating_sub(rtp_timestamp.saturating_sub(self.last_rtp_timestamp) as i64)
+            .saturating_sub(rtp_timestamp.saturating_sub(receive_stats.last_rtp_timestamp) as i64)
             .unsigned_abs() as u32;
 
         // If the jump in timestamp is large, ignore the value to avoid skewing the jitter.
         if tx_diff_rtp < 10 * payload_freq_hz {
-            let jitter_diff_q4 = (tx_diff_rtp << 4) as i32 - self.jitter_q4 as i32;
-            self.jitter_q4 = self
+            let jitter_diff_q4 = (tx_diff_rtp << 4) as i32 - receive_stats.jitter_q4 as i32;
+            receive_stats.jitter_q4 = receive_stats
                 .jitter_q4
                 .saturating_add_signed((jitter_diff_q4 + 8) >> 4);
         }
@@ -637,9 +737,11 @@ impl RtcpReportSender {
 
     /// returns the next report's payload type
     pub(super) fn rtcp_report_payload_type(&self) -> Option<u8> {
-        if self.sent_since_last_report {
+        if self.send_stats.updated_since_last_report {
             Some(RTCP_TYPE_SENDER_REPORT)
-        } else if self.max_seqnum.is_some() && self.max_seqnum_in_last.is_some() {
+        } else if self.receive_stats.max_seqnum.is_some()
+            && self.receive_stats.last_reported_max_seqnum.is_some()
+        {
             Some(RTCP_TYPE_RECEIVER_REPORT)
         } else {
             None
@@ -664,48 +766,41 @@ impl RtcpReportSender {
         now: Instant,
         out: &mut dyn Writable,
     ) {
-        let (Some(max_seqnum), Some(max_seqnum_in_last)) =
-            (self.max_seqnum, self.max_seqnum_in_last)
-        else {
+        let Some(max_seqnum) = self.receive_stats.max_seqnum else {
             return;
         };
-        let expected_since_last = max_seqnum.saturating_sub(max_seqnum_in_last);
-        let lost_since_last = self
-            .cumulative_loss
-            .saturating_sub(self.cumulative_loss_in_last);
-        let fraction_lost_since_last = (256 * lost_since_last)
-            .checked_div(expected_since_last)
-            .unwrap_or(0) as u8;
+        let upload_fraction_lost_since_last = self.receive_stats.loss_pct();
 
         // Negative cumulative loss isn't supported because it can cause problems with WebRTC
         // https://source.chromium.org/chromium/chromium/src/+/main:third_party/webrtc/modules/rtp_rtcp/source/receive_statistics_impl.h;l=91-94;drc=18649971ab02d2f3fc8f360aee2e3c573652b7bd
         const MAX_I24: u32 = (1 << 23) - 1;
         let cumulative_loss_i24 =
-            U24::try_from(std::cmp::min(self.cumulative_loss, MAX_I24)).unwrap();
+            U24::try_from(std::cmp::min(self.receive_stats.cumulative_loss, MAX_I24)).unwrap();
 
-        self.max_seqnum_in_last = self.max_seqnum;
+        self.receive_stats.last_reported_max_seqnum = self.receive_stats.max_seqnum;
         // cumulative_loss_in_last is used to figure out how many packets have been lost since
         // the last report. We can't update it based off lost_since_last since cumulative_loss
         // can decrease (given duplicate packets), and lost_since_last wouldn't account for
         // that.
-        self.cumulative_loss_in_last = self.cumulative_loss;
+        self.receive_stats.cumulative_loss_in_last_report = self.receive_stats.cumulative_loss;
 
-        let interarrival_jitter: u32 = self.jitter_q4 >> 4;
+        let interarrival_jitter: u32 = self.receive_stats.jitter_q4 >> 4;
 
         let (last_sender_report_timestamp, delay_since_last_sender_report) = self
-            .last_received_sender_info
+            .received_report_stats
+            .last_sender_info
             .as_ref()
             .map_or((0, 0), |info| {
                 (
                     get_lsr(info.ntp_ts),
-                    calculate_dlsr(self.last_sender_report_received_time, now),
+                    calculate_dlsr(self.received_report_stats.last_sender_report_time, now),
                 )
             });
 
         (
             ssrc, // sender_ssrc - matches source ssrc since we send a separate report for every SSRC
             ssrc, // source_ssrc
-            [fraction_lost_since_last],
+            [upload_fraction_lost_since_last],
             cumulative_loss_i24,
             max_seqnum,
             interarrival_jitter,
@@ -713,6 +808,9 @@ impl RtcpReportSender {
             delay_since_last_sender_report,
         )
             .write(out);
+
+        self.sent_report_stats.last_receiver_report_time = now;
+        self.sent_report_stats.last_receiver_report_dlsr = delay_since_last_sender_report;
     }
 
     /// Creates a SenderReport. Since we never forward media back to the original sender,
@@ -724,27 +822,28 @@ impl RtcpReportSender {
         buffer: &mut dyn Writable,
     ) {
         let (ntp_ts, rtp_ts) = self
-            .last_received_sender_info
+            .received_report_stats
+            .last_sender_info
             .as_ref()
-            .map_or((0, self.last_sent_rtp_timestamp), |info| {
+            .map_or((0, self.send_stats.last_rtp_timestamp), |info| {
                 (info.ntp_ts, info.rtp_ts)
             });
-        self.last_sender_report_sent_time_ntp = ntp_ts;
-        let packet_count = self.packets_sent;
-        let octet_count = self.total_payload_bytes_sent;
-
-        self.sent_since_last_report = false;
-        self.last_receiver_report_dlsr = 0;
-        self.last_sender_report_sent_time = now;
-
-        SenderInfo {
+        let packet_count = self.send_stats.cumulative_packets;
+        let octet_count = self.send_stats.total_payload_bytes;
+        let sender_info = SenderInfo {
             ssrc,
             ntp_ts,
             rtp_ts,
             packet_count,
             octet_count,
-        }
-        .write(buffer);
+        };
+        sender_info.write(buffer);
+
+        self.sent_report_stats.last_sender_info = Some(sender_info);
+        self.sent_report_stats.last_sender_report_time = now;
+        self.send_stats.updated_since_last_report = false;
+        // reset the delay we use to identify old packets
+        self.received_report_stats.last_receiver_report_dlsr = 0;
     }
 
     /// returns the rtt estimate and when the estimate was last updated
@@ -932,7 +1031,7 @@ impl Writer for ReportBlock {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SenderInfo {
     ssrc: Ssrc,
     ntp_ts: u64,
@@ -978,7 +1077,7 @@ impl Writer for SenderInfo {
 pub struct SenderReport {
     header: RtcpHeader,
     sender_info: SenderInfo,
-    report_blocks: Vec<ReportBlock>,
+    pub report_blocks: Vec<ReportBlock>,
 }
 
 impl SenderReport {
@@ -1261,7 +1360,7 @@ mod test {
 
     #[test]
     fn test_receiver_report_sender_packet_loss() {
-        let mut receiver_report_sender = RtcpReportSender::new();
+        let mut receiver_report_sender = RtcpReportSender::new(Instant::now());
 
         fn expected_bytes(
             ssrc: Ssrc,
@@ -1384,7 +1483,7 @@ mod test {
 
     #[test]
     fn test_receiver_report_sender_jitter() {
-        let mut receiver_report_sender = RtcpReportSender::new();
+        let mut receiver_report_sender = RtcpReportSender::new(Instant::now());
 
         fn expected_bytes(ssrc: Ssrc, interarrival_jitter: u32, max_seqnum: u32) -> Vec<u8> {
             let last_sender_report_timestamp: u32 = 0;
@@ -1462,7 +1561,7 @@ mod test {
 
     #[test]
     fn test_receiver_report_sender_jitter_recovery() {
-        let mut receiver_report_sender = RtcpReportSender::new();
+        let mut receiver_report_sender = RtcpReportSender::new(Instant::now());
 
         fn expected_bytes(ssrc: Ssrc, interarrival_jitter: u32, max_seqnum: u32) -> Vec<u8> {
             let last_sender_report_timestamp: u32 = 0;
@@ -1570,7 +1669,7 @@ mod test {
 
     #[test]
     fn test_receiver_report_after_sender_report() {
-        let mut receiver_report_sender = RtcpReportSender::new();
+        let mut receiver_report_sender = RtcpReportSender::new(Instant::now());
         let mut sent = 1;
 
         fn expected_bytes(
@@ -1690,7 +1789,7 @@ mod test {
 
     #[test]
     fn test_sender_report_basic() {
-        let mut report_sender = RtcpReportSender::new();
+        let mut report_sender = RtcpReportSender::new(Instant::now());
 
         let ssrc = 123456;
         // Given a 20 ms ptime (50 packets / second) and a sample rate of 48000, RTP timestamps
