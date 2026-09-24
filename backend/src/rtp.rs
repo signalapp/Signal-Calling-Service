@@ -860,11 +860,9 @@ impl Endpoint {
 
     pub fn update_max_receiver_loss_stats(&mut self, max_receiver_loss: &HashMap<Ssrc, LossStats>) {
         for (ssrc, ssrc_state) in self.incoming_ssrc_state.iter_mut() {
-            if let Some(max_loss_stats) = max_receiver_loss.get(ssrc) {
-                ssrc_state
-                    .rtcp_report_sender
-                    .update_max_loss_stats(max_loss_stats.clone())
-            }
+            ssrc_state
+                .rtcp_report_sender
+                .update_max_loss_stats(max_receiver_loss.get(ssrc).cloned())
         }
     }
 

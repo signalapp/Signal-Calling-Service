@@ -566,8 +566,8 @@ impl RtcpReportSender {
         self.received_report_stats.last_receiver_report_block = Some(report_block);
     }
 
-    pub(super) fn update_max_loss_stats(&mut self, loss_stats: LossStats) {
-        self.max_receiver_loss_stats = Some(loss_stats);
+    pub(super) fn update_max_loss_stats(&mut self, loss_stats: Option<LossStats>) {
+        self.max_receiver_loss_stats = loss_stats;
     }
 
     /// From the perspective of the receiving client. The total loss is based on the loss fraction
@@ -1578,6 +1578,75 @@ mod test {
         assert_eq!(
             Some(expected_bytes(ssrc, 0, 0, 0)),
             receiver_report_sender.write_receiver_report_block(ssrc, at(5))
+        );
+    }
+
+    #[test]
+    fn test_receiver_report_sender_max_loss_is_cleared() {
+        let mut receiver_report_sender = RtcpReportSender::new(Instant::now());
+
+        fn expected_bytes(
+            ssrc: Ssrc,
+            fraction_lost_since_last: u8,
+            cumulative_loss: u32,
+            max_seqnum: u32,
+        ) -> Vec<u8> {
+            let interarrival_jitter: u32 = 0;
+            let last_sender_report_timestamp: u32 = 0;
+            let delay_since_last_sender_report: u32 = 0;
+
+            (
+                ssrc,
+                ssrc,
+                [fraction_lost_since_last],
+                U24::try_from(cumulative_loss).unwrap(),
+                max_seqnum,
+                (
+                    interarrival_jitter,
+                    last_sender_report_timestamp,
+                    delay_since_last_sender_report,
+                ),
+            )
+                .to_vec()
+        }
+
+        let ssrc = 123456;
+        let now = Instant::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        // The SFU sees no loss on its own inbound stream, so with no receiver stats yet the
+        // report carries 0.
+        for seqnum in 1000..=1004 {
+            receiver_report_sender.remember_received(seqnum, OPUS_PAYLOAD_TYPE, 0, at(0));
+        }
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 0, 1004)),
+            receiver_report_sender.write_receiver_report_block(ssrc, at(5))
+        );
+
+        // A client receiving this stream reports loss, so we forward that to the sender instead
+        // of our own inbound measurement.
+        receiver_report_sender.update_max_loss_stats(Some(LossStats {
+            loss_frac: 64,
+            cumulative_packets_lost: U24::from(7u16),
+        }));
+        for seqnum in 1005..=1009 {
+            receiver_report_sender.remember_received(seqnum, OPUS_PAYLOAD_TYPE, 0, at(0));
+        }
+        assert_eq!(
+            Some(expected_bytes(ssrc, 64, 7, 1009)),
+            receiver_report_sender.write_receiver_report_block(ssrc, at(15))
+        );
+
+        // Once no receiver has fresh stats for the stream -- they all left the call, or their
+        // reports aged out -- fall back to what the SFU measures itself.
+        receiver_report_sender.update_max_loss_stats(None);
+        for seqnum in 1010..=1014 {
+            receiver_report_sender.remember_received(seqnum, OPUS_PAYLOAD_TYPE, 0, at(0));
+        }
+        assert_eq!(
+            Some(expected_bytes(ssrc, 0, 0, 1014)),
+            receiver_report_sender.write_receiver_report_block(ssrc, at(25))
         );
     }
 
