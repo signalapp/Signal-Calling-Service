@@ -472,10 +472,6 @@ impl Endpoint {
         self.outgoing_ssrc_state.iter()
     }
 
-    fn knows_ssrc(&self, ssrc: Ssrc) -> bool {
-        self.incoming_ssrc_state.contains_key(&ssrc) || self.outgoing_ssrc_state.contains_key(&ssrc)
-    }
-
     fn ssrc_states_iter(&self) -> impl Iterator<Item = (&Ssrc, &SsrcState)> + use<'_> {
         self.incoming_ssrc_state
             .iter()
@@ -640,12 +636,9 @@ impl Endpoint {
 
     fn remember_receiver_reports(&mut self, reports: Vec<ReceiverReport>, now: Instant) {
         for rr in reports {
-            // Ignore ReceiverReports from unrecognized ssrcs
-            if !self.knows_ssrc(rr.ssrc()) {
-                debug!("Ignoring receiver report, from unknown ssrc {}", rr.ssrc());
-                continue;
-            }
-
+            // Don't filter on the ReceiverReport's sender SSRC. RTCP is bundled, so a client
+            // picks one of its local SSRCs as the report's sender SSRC, and that may be one the
+            // SFU has no state for. Each block is validated in `remember_report_blocks` instead.
             self.remember_report_blocks(rr.report_blocks, now);
         }
     }
