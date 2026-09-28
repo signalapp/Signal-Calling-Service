@@ -38,7 +38,7 @@ pub use types::*;
 
 // TODO: refactor LayerID to not depend on call code
 use crate::{
-    call::{DemuxIdExt, outgoing_ssrc_for_forwarded},
+    call::{DemuxIdExt, forwarding_preserves_rtp_timestamps, outgoing_ssrc_for_forwarded},
     transportcc as tcc,
 };
 
@@ -609,10 +609,8 @@ impl Endpoint {
                 continue;
             };
             if let Some(state) = self.outgoing_ssrc_state.get_mut(&outgoing_ssrc) {
-                // Audio is forwarded with its timestamps untouched, so the origin's NTP/RTP pair
-                // still describes what the receiver sees. Video timestamps are rewritten, so only
-                // the NTP clock carries over.
-                let preserves_rtp_timestamps = outgoing_ssrc == sender_report.ssrc();
+                let preserves_rtp_timestamps =
+                    forwarding_preserves_rtp_timestamps(sender_report.ssrc());
                 state.rtcp_report_sender.remember_forwarded_sender_info(
                     sender_report,
                     preserves_rtp_timestamps,

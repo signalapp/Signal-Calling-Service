@@ -388,6 +388,16 @@ impl LayerId {
     }
 }
 
+/// Whether we forward this stream's RTP timestamps untouched.
+pub(crate) fn forwarding_preserves_rtp_timestamps(ssrc: rtp::Ssrc) -> bool {
+    match LayerId::from_ssrc(ssrc) {
+        Some(LayerId::Audio | LayerId::RtpData | LayerId::Svc) => true,
+        Some(LayerId::Video0 | LayerId::Video1 | LayerId::Video2) => false,
+        // Not forwarded at all (such as RTX); prefer our own timestamps.
+        None => false,
+    }
+}
+
 /// Maps an incoming SSRC to the outgoing SSRC we forward it on. Audio and data keep their
 /// own SSRC, while the incoming video layers all use the Video0 ssrc for outgoing.
 /// Returns None for anything we do not forward, such as RTX.
@@ -4301,6 +4311,24 @@ mod call_tests {
     };
 
     static CALL_ID: &[u8; 7] = b"call_id";
+
+    #[test]
+    fn test_forwarding_preserves_rtp_timestamps() {
+        let demux_id = DemuxId::from_const(0x10);
+        for layer in [LayerId::Audio, LayerId::RtpData, LayerId::Svc] {
+            assert!(
+                forwarding_preserves_rtp_timestamps(layer.to_ssrc(demux_id)),
+                "{layer:?} is forwarded with its original timestamps"
+            );
+        }
+
+        for layer in [LayerId::Video0, LayerId::Video1, LayerId::Video2] {
+            assert!(
+                !forwarding_preserves_rtp_timestamps(layer.to_ssrc(demux_id)),
+                "{layer:?} has its timestamps rewritten"
+            );
+        }
+    }
 
     #[test]
     fn test_forward_audio() {
