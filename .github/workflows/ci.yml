@@ -19,10 +19,10 @@ jobs:
     - run: shellcheck **/*.sh
     - name: Environment
       run: rustup --version && cargo --version
-    - name: Build
-      run: cargo build
     - name: Check Cargo.lock is up to date
-      run: git diff --exit-code Cargo.lock
+      run: cargo fetch --locked
+    - name: Build
+      run: cargo build --offline
     - name: Format
       run: cargo +nightly fmt -- --check
     - name: Clippy
