@@ -8,6 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::{From, TryFrom},
     fmt::{self, Display, Formatter},
+    hash::Hash,
     sync::{Arc, LazyLock},
 };
 
@@ -26,7 +27,6 @@ use parking_lot::Mutex;
 use prost::Message;
 use reqwest::Url;
 use serde::Serialize;
-use smallvec::SmallVec;
 use strum::IntoEnumIterator;
 use strum_macros::{EnumIter, EnumString};
 use thiserror::Error;
@@ -41,11 +41,15 @@ use crate::{
 };
 
 mod approval_persistence;
+mod mixed_mode_allocator;
+mod simulcast_helpers;
+mod svc_helpers;
+
 use approval_persistence::ApprovedUsers;
 use metrics::{metric_config::StaticStrTagsRef, *};
 
 use crate::{
-    call::Error::UnknownDemuxId,
+    call::Error::{IncomingVideoLimitExceeded, UnknownDemuxId},
     endorsements::{CallEndorsementIssuer, CallSendEndorsements, EndorsementIssuer},
     protos::{
         DeviceToSfu, SfuToDevice, device_to_sfu,
@@ -53,14 +57,8 @@ use crate::{
     },
     rtp::TemplateDependencyStructure,
     sfu::CallSignalingInfo,
-    svc::{
-        DecodeTargetInfoList, DecodeTargetInfoLists, ExtendedPacketInfo, MAX_EXPECTED_CLIENTS,
-        ScalableVideoError, ScalableVideoState, ScalableVideoTickResult,
-        allocator::{
-            BasicAllocationStrategy, BasicAllocationStrategyResult, DefaultAllocator,
-            ThrottledAllocator,
-        },
-    },
+    simulcast::AllocatableVideoLayer,
+    svc::{ExtendedPacketInfo, ScalableVideoError, ScalableVideoState},
 };
 
 pub const CLIENT_SERVER_DATA_SSRC: rtp::Ssrc = 1;
@@ -101,7 +99,7 @@ const MRP_SEND_TIMEOUT_INTERVAL: Duration = Duration::from_secs(1);
 /// allocation uses the minimum target rate over the past two generations.
 const MIN_TARGET_SEND_RATE_GENERATION_INTERVAL: Duration = Duration::from_millis(2500);
 /// How much of the target send rate to allocate when the queue drain rate is high.
-const TARGET_RATE_MINIMUM_ALLOCATION_RATIO: f64 = 0.9;
+pub(crate) const TARGET_RATE_MINIMUM_ALLOCATION_RATIO: f64 = 0.9;
 /// How much bitrate to assume clients will use to send layer 0 video.
 const ASSUMED_LAYER0_RATE: DataRate = DataRate::from_kbps(150);
 /// How much bitrate to allow clients to send before dropping incoming data.
@@ -809,7 +807,7 @@ impl Call {
 struct CallInner {
     // Immutable
     /// Clients (AKA devices) that have joined the call
-    clients: Vec<Client>,
+    clients: Clients,
     /// Clients that have yet to be approved by an admin
     pending_clients: Vec<NonParticipantClient>,
     /// Clients that have been removed by an admin but haven't yet disconnected
@@ -860,8 +858,6 @@ struct CallInner {
     /// If true, do not send fragmentable updates for this call
     /// toggle when there is client support for fragmentable updates
     drop_fragmentable_updates: bool,
-
-    allocators: HashMap<DemuxId, ThrottledAllocator>,
 }
 
 #[derive(Debug, Default)]
@@ -916,7 +912,7 @@ impl CallInner {
         Self {
             approved_users,
 
-            clients: Vec::new(),
+            clients: Clients::new(),
             pending_clients: Vec::new(),
             removed_clients: Vec::new(),
             client_added_or_removed: now,
@@ -942,8 +938,6 @@ impl CallInner {
             key_frame_request_sent_by_ssrc: HashMap::new(),
             call_stats: CallStats::default(),
             drop_fragmentable_updates,
-
-            allocators: HashMap::new(),
         }
     }
 
@@ -1094,44 +1088,15 @@ impl CallInner {
         if let Some(endorsement_issuer) = self.endorsement_issuer.as_mut() {
             endorsement_issuer.track_member_added(pending_client.user_id.clone());
         }
-        let demux_id = pending_client.demux_id;
-        let mut client = Client::new(
+        let client = Client::new(
             pending_client,
             call_info.initial_target_send_rate,
             call_info.default_requested_max_send_rate,
             now,
         );
-        // If this is an SVC client we'll hook it up to the rest of the SVC clients that
-        // know how to send and receive SVC streams.
-        if let Some(scalable_video_state) = client.scalable_video_state.as_mut() {
-            self.clients.iter_mut().for_each(|existing_client| {
-                if let Some(existing_client_scalable_video_state) =
-                    existing_client.scalable_video_state.as_mut()
-                {
-                    scalable_video_state.add_receiver(existing_client.demux_id, now);
-                    existing_client_scalable_video_state.add_receiver(demux_id, now);
-                }
-            });
-            self.allocators.insert(
-                demux_id,
-                ThrottledAllocator::new(
-                    client.demux_id,
-                    Box::new(DefaultAllocator),
-                    Duration::from_millis(1000),
-                ),
-            );
-            self.clients.push(client);
-            self.svc_reallocate(now);
-        } else {
-            // Otherwise, this is a simulcast client.
-            self.clients.push(client);
-            self.allocate_video_layers(
-                demux_id,
-                call_info.initial_target_send_rate,
-                call_info.initial_target_send_rate,
-                now,
-            );
-        }
+        self.clients.insert(client, now);
+        // Force both SVC and simulcast reallocations
+        mixed_mode_allocator::reallocate(&mut self.clients, self.active_speaker_id, now);
         // We may have to update the padding SSRCs because there can't be any padding SSRCs until two people join
         self.update_padding_ssrcs();
         self.call_stats.peak_call_size = max(self.call_stats.peak_call_size, self.size());
@@ -1200,44 +1165,20 @@ impl CallInner {
     }
 
     fn update_for_removed_clients(&mut self, removed_demux_ids: &[DemuxId], now: Instant) {
-        self.reallocate_target_send_rates(now);
+        mixed_mode_allocator::reallocate(&mut self.clients, self.active_speaker_id, now);
         self.update_padding_ssrcs();
-
-        for client in &mut self.clients {
-            for demux_id in removed_demux_ids {
-                client.audio_forwarder_by_sender_demux_id.remove(demux_id);
-                client.video_forwarder_by_sender_demux_id.remove(demux_id);
-                client.data_forwarder_by_sender_demux_id.remove(demux_id);
-                // Entries are removed from allocated_height_by_sender_demux_id in allocate_video_layers.
-            }
-        }
-
         self.key_frame_request_sent_by_ssrc
             .retain(|ssrc, _timestamp| !removed_demux_ids.contains(&DemuxId::from_ssrc(*ssrc)));
     }
 
     fn remove_client(&mut self, demux_id: DemuxId, now: Instant) -> Option<Client> {
-        if let Some(index) = self
-            .clients
-            .iter()
-            .position(|client| client.demux_id == demux_id)
-        {
-            self.will_add_or_remove_client(now);
-            let removed_client = self.clients.swap_remove(index);
-            // If this is an SVC client, we'll unhook it from the rest of the SVC clients and
-            // also release its allocator.
-            if removed_client.is_svc_enabled() {
-                self.allocators.remove(&demux_id);
-                self.clients.iter_mut().for_each(|client| {
-                    if let Some(scalable_video_state) = client.scalable_video_state.as_mut() {
-                        scalable_video_state.remove_receiver(demux_id);
-                    }
-                })
-            }
-            self.update_for_removed_clients(&[demux_id], now);
-            Some(removed_client)
-        } else {
+        if !self.clients.contains(demux_id) {
             None
+        } else {
+            self.will_add_or_remove_client(now);
+            let removed = self.clients.remove(demux_id);
+            self.update_for_removed_clients(&[demux_id], now);
+            removed
         }
     }
 
@@ -1312,7 +1253,8 @@ impl CallInner {
         &self,
         demux_id: DemuxId,
     ) -> Option<TemplateDependencyStructure> {
-        self.find_client(demux_id)
+        self.clients
+            .get(demux_id)
             .and_then(|client| client.get_template_dependency_structure())
     }
 
@@ -1333,29 +1275,30 @@ impl CallInner {
     }
 
     fn block_client(&mut self, demux_id: DemuxId, call_info: &CallInfo, now: Instant) {
-        if let Some(user_id) = self
+        let Some(user_id) = self
             .clients
-            .iter()
-            .find(|client| client.demux_id == demux_id)
+            .get(demux_id)
             .map(|client| client.user_id.clone())
-        {
-            self.will_add_or_remove_client(now);
-            let removed_clients =
-                calling_common::drain_filter(&mut self.clients, |client| client.user_id == user_id);
-            let mut removed_demux_ids = Vec::new();
-            for removed_client in removed_clients {
+        else {
+            return;
+        };
+        let mut removed_demux_ids = Vec::new();
+        self.will_add_or_remove_client(now);
+        self.clients
+            .remove_if(|client| client.user_id == user_id)
+            .into_iter()
+            .for_each(|client| {
                 info!(
                     "call: {} dropping client {} (Admin Block)",
                     call_info.loggable_call_id,
                     demux_id.as_u32()
                 );
-                removed_demux_ids.push(removed_client.demux_id);
-                self.removed_clients.push(removed_client.into());
-            }
-            self.update_for_removed_clients(&removed_demux_ids, now);
-            self.approved_users.remove(&user_id);
-            self.blocked_users.insert(user_id);
-        }
+                removed_demux_ids.push(client.demux_id);
+                self.removed_clients.push(client.into());
+            });
+        self.update_for_removed_clients(&removed_demux_ids, now);
+        self.approved_users.remove(&user_id);
+        self.blocked_users.insert(user_id);
     }
 
     /// This updates the SSRCs that will be used to send padding.  We have to keep updating them
@@ -1367,8 +1310,8 @@ impl CallInner {
         // for each of the other clients in the call. So we have to pick one of those.
         // And the easiest one to pick is the RTX SSRC for the video base layer for
         // the given sender.demux_id.
-        let padding_ssrc = |sender: &Client| {
-            let ssrc = if sender.is_svc_enabled() {
+        let get_padding_ssrc = |sender: &Client| {
+            let ssrc = if sender.scalable_video_state.is_some() {
                 LayerId::Svc.to_rtx_ssrc(sender.demux_id)
             } else {
                 LayerId::Video0.to_rtx_ssrc(sender.demux_id)
@@ -1376,23 +1319,21 @@ impl CallInner {
             Some(ssrc)
         };
 
-        match self.clients.as_mut_slice() {
-            [] => {
-                // Nothing to update
-            }
-            [lonely] => {
-                // Padding is not possible
-                lonely.padding_ssrc = None;
-            }
-            [first, second, rest @ ..] => {
-                // Just pick someone else.  The easiest way is to pick the first unless you're the first.
-                first.padding_ssrc = padding_ssrc(second);
-                second.padding_ssrc = padding_ssrc(first);
-                for receiver in rest {
-                    receiver.padding_ssrc = padding_ssrc(first);
-                }
-            }
-        }
+        let mut iter = self.clients.iter_mut();
+        // No clients. Nothing to update.
+        let Some(first) = iter.next() else {
+            return;
+        };
+        // Single client; padding is not possible.
+        let Some(second) = iter.next() else {
+            first.padding_ssrc = None;
+            return;
+        };
+        // Just pick someone else. The easiest way is to pick the first, unless you're the first.
+        let first_padding_ssrc = get_padding_ssrc(first);
+        first.padding_ssrc = get_padding_ssrc(second);
+        second.padding_ssrc = first_padding_ssrc;
+        iter.for_each(|receiver| receiver.padding_ssrc = first_padding_ssrc);
     }
 
     fn handle_raise_hand(
@@ -1485,7 +1426,8 @@ impl CallInner {
         }
 
         let sender_mrp_stream = &mut self
-            .find_client_mut(sender_demux_id)
+            .clients
+            .get_mut(sender_demux_id)
             .ok_or(Error::UnknownDemuxId(sender_demux_id))?
             .mrp_stream;
         let ready_protos = if let Some(header) = proto.mrp_header.as_ref() {
@@ -1586,7 +1528,8 @@ impl CallInner {
         let default_requested_max_send_rate = call_info.default_requested_max_send_rate;
 
         let sender = self
-            .find_client_mut(sender_demux_id)
+            .clients
+            .get_mut(sender_demux_id)
             .ok_or(Error::UnknownDemuxId(sender_demux_id))?;
         // And snapshot this so we can drop 'sender' after processing video requests.
         let sender_is_admin = sender.is_admin;
@@ -1610,34 +1553,26 @@ impl CallInner {
                     }
                 })
                 .collect();
-            if let Some(scalable_video_state) = sender.scalable_video_state.as_mut() {
-                if let Some(target_rate) = video_request_proto.max_kbps {
-                    scalable_video_state
-                        .set_requested_target_rate(DataRate::from_kbps(target_rate as u64));
-                }
-                sender.video_request_proto = Some(video_request_proto);
-            } else {
-                sender.requested_max_send_rate = video_request_proto
-                    .max_kbps
-                    .map(|kbps| DataRate::from_kbps(kbps as u64))
-                    .unwrap_or(default_requested_max_send_rate);
-                sender.active_speaker_height = video_request_proto
-                    .active_speaker_height
-                    .map(|height| height as u16)
-                    .unwrap_or(0)
-                    .into();
-                sender.video_request_proto = Some(video_request_proto);
-                // We reallocate immediately to make a more pleasant expereience for the user
-                // (no extra delay for selecting a higher resolution or requesting a new max send rate)
-                let target_send_rate = sender.target_send_rate;
-                let min_target_send_rate = sender.min_target_send_rate();
-                self.allocate_video_layers(
-                    sender_demux_id,
-                    target_send_rate,
-                    min_target_send_rate,
-                    now,
-                );
-            }
+            sender.requested_max_send_rate = video_request_proto
+                .max_kbps
+                .map(|kbps| DataRate::from_kbps(kbps as u64))
+                .unwrap_or(default_requested_max_send_rate);
+            sender.active_speaker_height = video_request_proto
+                .active_speaker_height
+                .map(|height| height as u16)
+                .unwrap_or(0)
+                .into();
+            sender.video_request_proto = Some(video_request_proto);
+            // We reallocate immediately to make a more pleasant expereience for the user
+            // (no extra delay for selecting a higher resolution or requesting a new max send rate)
+            let target_send_rate = sender.target_send_rate;
+            mixed_mode_allocator::allocate(
+                &mut self.clients,
+                sender_demux_id,
+                self.active_speaker_id,
+                target_send_rate,
+                now,
+            );
         }
 
         if !proto.approve.is_empty()
@@ -1717,7 +1652,8 @@ impl CallInner {
     ) -> Result<Vec<RtpToSend>, Error> {
         let should_forward_dtx = self.should_forward_dtx();
         let sender = self
-            .find_client_mut(sender_demux_id)
+            .clients
+            .get_mut(sender_demux_id)
             .ok_or(UnknownDemuxId(sender_demux_id))?;
 
         let authorized_sender_demux_id = DemuxId::from_ssrc(incoming_rtp.ssrc());
@@ -1741,15 +1677,27 @@ impl CallInner {
             LayerId::RtpData => self.forward_data_rtp(sender_demux_id, &incoming_rtp),
             LayerId::Svc => match sender.scalable_video_state.as_mut() {
                 Some(scalable_video_state) if incoming_rtp.is_vp9() => {
-                    let ext_info = scalable_video_state.handle_packet(&incoming_rtp, now)?;
-                    self.svc_dispatch_packet(sender_demux_id, &incoming_rtp, ext_info, now)?
+                    scalable_video_state
+                        .update_incoming_rate(&incoming_rtp, now)
+                        .map_err(|_| IncomingVideoLimitExceeded)?;
+                    if let Some(buffered) = scalable_video_state.enqueue_packet(&incoming_rtp) {
+                        let incoming_rtp = buffered.borrow();
+                        let ext_info = scalable_video_state.handle_packet(&incoming_rtp, now)?;
+                        self.svc_dispatch_packet(sender_demux_id, &incoming_rtp, ext_info, now)?
+                    } else {
+                        vec![]
+                    }
                 }
                 _ => vec![],
             },
             _ => {
                 if incoming_rtp.is_vp8() {
                     if sender.update_incoming_video_rate_and_resolution(&incoming_rtp, now)? {
-                        self.reallocate_target_send_rates(now);
+                        mixed_mode_allocator::reallocate(
+                            &mut self.clients,
+                            self.active_speaker_id,
+                            now,
+                        );
                     }
                     self.forward_vp8(sender_demux_id, &incoming_rtp)
                 } else {
@@ -1831,9 +1779,13 @@ impl CallInner {
 
         self.approved_users.tick();
 
-        self.svc_tick(now);
+        for sender in self.clients.iter_mut() {
+            if let Some(svc_state) = sender.scalable_video_state.as_mut() {
+                svc_state.tick(now);
+            }
+        }
 
-        for sender in &mut self.clients {
+        for sender in self.clients.iter_mut() {
             for v in sender.incoming_video.each_mut().iter_mut() {
                 v.rate_tracker.update(now);
             }
@@ -1918,35 +1870,32 @@ impl CallInner {
         now: Instant,
     ) -> Result<(), Error> {
         let receiver = self
-            .find_client_mut(receiver_demux_id)
+            .clients
+            .get_mut(receiver_demux_id)
             .ok_or(Error::UnknownDemuxId(receiver_demux_id))?;
 
         receiver.target_send_rate = new_target_send_rate;
 
-        if let Some(scalable_video_state) = receiver.scalable_video_state.as_mut() {
-            scalable_video_state.set_available_rate(new_target_send_rate);
-        } else {
-            if now > receiver.next_min_target_generation_update_time {
-                receiver.old_generation_min_target_send_rate =
-                    receiver.current_generation_min_target_send_rate;
-                receiver.current_generation_min_target_send_rate = new_target_send_rate;
-                receiver.next_min_target_generation_update_time =
-                    now + MIN_TARGET_SEND_RATE_GENERATION_INTERVAL;
-            } else if new_target_send_rate < receiver.current_generation_min_target_send_rate {
-                receiver.current_generation_min_target_send_rate = new_target_send_rate;
-            }
+        if now > receiver.next_min_target_generation_update_time {
+            receiver.old_generation_min_target_send_rate =
+                receiver.current_generation_min_target_send_rate;
+            receiver.current_generation_min_target_send_rate = new_target_send_rate;
+            receiver.next_min_target_generation_update_time =
+                now + MIN_TARGET_SEND_RATE_GENERATION_INTERVAL;
+        } else if new_target_send_rate < receiver.current_generation_min_target_send_rate {
+            receiver.current_generation_min_target_send_rate = new_target_send_rate;
+        }
 
-            let min_target_send_rate = receiver.min_target_send_rate();
-            if receiver.allocated_send_rate * SEND_RATE_REALLOCATE_IMMEDIATELY_THRESHOLD
-                > new_target_send_rate
-            {
-                self.allocate_video_layers(
-                    receiver_demux_id,
-                    new_target_send_rate,
-                    min_target_send_rate,
-                    now,
-                );
-            }
+        if receiver.allocated_send_rate * SEND_RATE_REALLOCATE_IMMEDIATELY_THRESHOLD
+            > new_target_send_rate
+        {
+            mixed_mode_allocator::allocate(
+                &mut self.clients,
+                receiver_demux_id,
+                self.active_speaker_id,
+                new_target_send_rate,
+                now,
+            );
         }
 
         Ok(())
@@ -1958,7 +1907,8 @@ impl CallInner {
         outgoing_queue_drain_rate: DataRate,
     ) -> Result<(), Error> {
         let receiver = self
-            .find_client_mut(receiver_demux_id)
+            .clients
+            .get_mut(receiver_demux_id)
             .ok_or(Error::UnknownDemuxId(receiver_demux_id))?;
         receiver.outgoing_queue_drain_rate = outgoing_queue_drain_rate;
         Ok(())
@@ -1970,7 +1920,8 @@ impl CallInner {
         connection_rates: ConnectionRates,
     ) -> Result<(), Error> {
         let receiver = self
-            .find_client_mut(receiver_demux_id)
+            .clients
+            .get_mut(receiver_demux_id)
             .ok_or(Error::UnknownDemuxId(receiver_demux_id))?;
         receiver.connection_rates = connection_rates;
         Ok(())
@@ -2010,14 +1961,8 @@ impl CallInner {
             .clients
             .iter()
             .filter_map(|receiver| {
-                if !receiver.is_svc_enabled()
-                    && now > (receiver.send_rate_allocated + SEND_RATE_REALLOCATION_INTERVAL)
-                {
-                    Some((
-                        receiver.demux_id,
-                        receiver.target_send_rate,
-                        receiver.min_target_send_rate(),
-                    ))
+                if now > (receiver.send_rate_allocated + SEND_RATE_REALLOCATION_INTERVAL) {
+                    Some((receiver.demux_id, receiver.target_send_rate))
                 } else if let Some(active_speaker_id) = new_active_speaker {
                     // If the speaker has changed, and the new speaker will
                     // be shown larger, reallocate immediately.
@@ -2029,11 +1974,7 @@ impl CallInner {
                                 .get(&active_speaker_id)
                                 .unwrap_or(&VideoHeight::from(1))
                     {
-                        Some((
-                            receiver.demux_id,
-                            receiver.target_send_rate,
-                            receiver.min_target_send_rate(),
-                        ))
+                        Some((receiver.demux_id, receiver.target_send_rate))
                     } else {
                         None
                     }
@@ -2043,159 +1984,15 @@ impl CallInner {
             })
             .collect();
 
-        for (receiver_demux_id, target_send_rate, min_target_send_rate) in receivers {
-            self.allocate_video_layers(
+        for (receiver_demux_id, target_send_rate) in receivers {
+            mixed_mode_allocator::allocate(
+                &mut self.clients,
                 receiver_demux_id,
+                self.active_speaker_id,
                 target_send_rate,
-                min_target_send_rate,
                 now,
             );
         }
-    }
-
-    fn reallocate_target_send_rates(&mut self, now: Instant) {
-        let receivers: Vec<_> = self
-            .clients
-            .iter()
-            .map(|client| {
-                (
-                    client.demux_id,
-                    client.target_send_rate,
-                    client.min_target_send_rate(),
-                )
-            })
-            .collect();
-        for (receiver_demux_id, target_send_rate, min_target_send_rate) in receivers {
-            self.allocate_video_layers(
-                receiver_demux_id,
-                target_send_rate,
-                min_target_send_rate,
-                now,
-            );
-        }
-    }
-
-    /// Determines which video layers should be forwarded from other clients to
-    /// `receiver_demux_id` based on what congestion control calculated.
-    fn allocate_video_layers(
-        &mut self,
-        receiver_demux_id: DemuxId,
-        new_target_send_rate: DataRate,
-        min_target_send_rate: DataRate,
-        now: Instant,
-    ) {
-        let receiver = self
-            .find_client(receiver_demux_id)
-            .expect("Client exists before trying to allocate target send rate");
-
-        // TODO(emir): figure out why this is getting called for an SVC target
-        if receiver.is_svc_enabled() {
-            return;
-        }
-
-        // We have to collect these because we can't get a mutable ref to the receiver while getting
-        // immutable refs to the senders.
-        let allocatable_videos: Vec<AllocatableVideo> = self
-            .clients
-            .iter()
-            .filter_map(|sender| {
-                // Ignore SVC sources and the receiver itself
-                if sender.is_svc_enabled() || sender.demux_id == receiver_demux_id {
-                    return None;
-                }
-
-                let mut requested_height = receiver
-                    .requested_height_by_demux_id
-                    .get(&sender.demux_id)
-                    .copied()
-                    .unwrap_or_else(|| VideoHeight::from(1));
-
-                // Override the requested height for the active speaker to support early requests
-                // from the SFU for higher video layers before the client's UI updates.
-                if Some(sender.demux_id) == self.active_speaker_id
-                    && receiver.active_speaker_height > requested_height
-                {
-                    requested_height = receiver.active_speaker_height;
-                }
-
-                let allocated_layer_index = receiver
-                    .video_forwarder_by_sender_demux_id
-                    .get(&sender.demux_id)
-                    .and_then(|f| f.forwarding_ssrc())
-                    .and_then(LayerId::layer_index_from_ssrc);
-
-                let layers = sender
-                    .incoming_video
-                    .each_ref()
-                    .map(|v| v.as_allocatable_layer());
-                let ideal_layer_index = ideal_video_layer_index(requested_height, &layers);
-
-                Some(AllocatableVideo {
-                    sender_demux_id: sender.demux_id,
-                    layers: sender
-                        .incoming_video
-                        .each_ref()
-                        .map(|v| v.as_allocatable_layer()),
-                    requested_height,
-                    allocated_layer_index,
-                    ideal_layer_index,
-                    interesting: sender.became_active_speaker,
-                })
-            })
-            .collect();
-        let receiver = self.find_client_mut(receiver_demux_id).unwrap();
-
-        // We have to collect these because we can't get a mutable ref to the receiver while getting
-        // immutable refs to the senders.
-        let sender_demux_ids: Vec<DemuxId> = allocatable_videos
-            .iter()
-            .map(|video| video.sender_demux_id)
-            .filter(|sender_demux_id| *sender_demux_id != receiver.demux_id)
-            .collect();
-        let requested_base_rate =
-            requested_base_rate(&allocatable_videos, receiver.requested_max_send_rate);
-        let ideal_send_rate =
-            ideal_send_rate(&allocatable_videos, receiver.requested_max_send_rate);
-
-        let allocated_video_by_sender_demux_id = allocate_send_rate(
-            new_target_send_rate,
-            min_target_send_rate,
-            ideal_send_rate,
-            receiver.outgoing_queue_drain_rate,
-            allocatable_videos,
-        );
-        let allocated_send_rate = allocated_video_by_sender_demux_id
-            .values()
-            .map(|allocated| allocated.rate)
-            .sum();
-
-        receiver.allocated_height_by_sender_demux_id.clear();
-        for sender_demux_id in sender_demux_ids {
-            let desired_incoming_ssrc = allocated_video_by_sender_demux_id
-                .get(&sender_demux_id)
-                .map(|allocated_video| {
-                    receiver
-                        .allocated_height_by_sender_demux_id
-                        .insert(sender_demux_id, allocated_video.height);
-
-                    let layer_id =
-                        LayerId::from_video_layer_index(allocated_video.layer_index).unwrap();
-                    layer_id.to_ssrc(allocated_video.sender_demux_id)
-                });
-            let forwarder = receiver
-                .video_forwarder_by_sender_demux_id
-                .entry(sender_demux_id)
-                .or_insert_with(|| {
-                    let outgoing_ssrc = LayerId::Video0.to_ssrc(sender_demux_id);
-                    Vp8SimulcastRtpForwarder::new(outgoing_ssrc)
-                });
-            forwarder.set_desired_ssrc(desired_incoming_ssrc);
-        }
-        receiver.target_send_rate = new_target_send_rate;
-        receiver.requested_base_rate = requested_base_rate;
-        receiver.ideal_send_rate = ideal_send_rate;
-        receiver.allocated_send_rate = allocated_send_rate;
-        receiver.send_rate_allocated = now;
     }
 
     fn handle_key_frame_requests(
@@ -2206,18 +2003,16 @@ impl CallInner {
     ) -> Vec<(DemuxId, rtp::KeyFrameRequest)> {
         for key_frame_request in key_frame_requests {
             let video_sender_demux_id = DemuxId::from_ssrc(key_frame_request.ssrc);
-            if let Some(client) = self.find_client_mut(video_sender_demux_id)
+            if let Some(client) = self.clients.get_mut(video_sender_demux_id)
                 && let Some(scalable_video_state) = client.scalable_video_state.as_mut()
             {
-                scalable_video_state.set_needs_keyframe_immediately();
+                scalable_video_state.set_needs_keyframe();
             }
         }
 
-        let requester = self.find_client_mut(requester_id);
-        if requester.is_none() {
+        let Some(requester) = self.clients.get_mut(requester_id) else {
             return vec![];
-        }
-        let requester = requester.unwrap();
+        };
 
         for key_frame_request in key_frame_requests {
             // This might not send them immediately because we might have just sent one
@@ -2234,18 +2029,6 @@ impl CallInner {
         self.send_key_frame_requests_if_its_been_too_long(now)
     }
 
-    fn find_client(&self, demux_id: DemuxId) -> Option<&Client> {
-        self.clients
-            .iter()
-            .find(|client| client.demux_id == demux_id)
-    }
-
-    fn find_client_mut(&mut self, demux_id: DemuxId) -> Option<&mut Client> {
-        self.clients
-            .iter_mut()
-            .find(|client| client.demux_id == demux_id)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn send_update_proto_to_participating_clients(
         &mut self,
@@ -2259,13 +2042,14 @@ impl CallInner {
     ) {
         let should_send_stats = now >= self.stats_update_sent + STATS_MESSAGE_INTERVAL;
         if admin_update_device_joined_or_left.is_some() || speaker.is_some() || should_send_stats {
-            let raw_demux_ids: Vec<u32> = self
+            let mut raw_demux_ids: Vec<u32> = self
                 .clients
                 .iter()
                 .map(|client| client.demux_id.as_u32())
                 .collect();
+            raw_demux_ids.sort();
 
-            for client in &mut self.clients {
+            for client in self.clients.iter_mut() {
                 let (demux_ids_with_video, allocated_heights) = client
                     .video_forwarder_by_sender_demux_id
                     .iter()
@@ -2475,7 +2259,7 @@ impl CallInner {
                 ..Default::default()
             };
 
-            for client in &mut self.clients {
+            for client in self.clients.iter_mut() {
                 // Set the target_seqnum of the client
                 let target_seqnum = self
                     .raised_hands_seqnums
@@ -2519,7 +2303,7 @@ impl CallInner {
     ) {
         let unwrapped_now = now.into();
         let tags = self.call_tags(call_info);
-        for client in &mut self.clients {
+        for client in self.clients.iter_mut() {
             let client_demux_id = client.demux_id;
             let _ = client.mrp_stream.try_send_ack(|header| {
                 let ack = protos::SfuToDevice {
@@ -2662,14 +2446,16 @@ impl CallInner {
 
     fn calculate_active_speaker(&mut self, now: Instant) -> Option<DemuxId> {
         self.active_speaker_calculated = now;
-        let first = self.clients.first()?;
         let mut newly_most_active_since = now;
+
+        let first = self.clients.iter().min_by_key(|client| client.demux_id)?;
+
         let mut most_active = self
             .active_speaker_id
-            .and_then(|demux_id| self.find_client(demux_id))
+            .and_then(|demux_id| self.clients.get(demux_id))
             .unwrap_or(first);
 
-        for contender in &self.clients {
+        for contender in self.clients.iter() {
             if contender.demux_id != most_active.demux_id {
                 let (is_more_active, since_when) = contender
                     .incoming_audio_levels
@@ -2683,7 +2469,8 @@ impl CallInner {
 
         let most_active_demux_id = most_active.demux_id;
         if self.active_speaker_id != Some(most_active_demux_id) {
-            self.find_client_mut(most_active_demux_id)
+            self.clients
+                .get_mut(most_active_demux_id)
                 .unwrap()
                 .became_active_speaker = Some(now);
             self.active_speaker_id = Some(most_active_demux_id);
@@ -2721,31 +2508,24 @@ impl CallInner {
         }
 
         let mut desired_incoming_ssrcs: HashSet<rtp::Ssrc> = HashSet::new();
-        for receiver in &mut self.clients {
-            if let Some(scalable_video_state) = receiver.scalable_video_state.as_ref() {
-                if scalable_video_state.needs_keyframe() {
-                    let ssrc = LayerId::Svc.to_ssrc(receiver.demux_id);
-                    trace!(
-                        "svc: {:?}: requesting keyframe: ssrc={ssrc}",
-                        receiver.demux_id
-                    );
+        for receiver in self.clients.iter() {
+            if let Some(scalable_video_state) = receiver.scalable_video_state.as_ref()
+                && scalable_video_state.needs_keyframe()
+            {
+                let ssrc = LayerId::Svc.to_ssrc(receiver.demux_id);
+                desired_incoming_ssrcs.insert(ssrc);
+            }
+            for video_forwarder in receiver.video_forwarder_by_sender_demux_id.values() {
+                if let Some(desired_incoming_ssrc) = video_forwarder.needs_key_frame() {
+                    desired_incoming_ssrcs.insert(desired_incoming_ssrc);
+                }
+            }
+            for (i, incoming_video) in receiver.incoming_video.iter().enumerate() {
+                if incoming_video.needs_resolution && incoming_video.rate() > Some(DataRate::ZERO) {
+                    let ssrc = LayerId::from_video_layer_index(i)
+                        .unwrap()
+                        .to_ssrc(receiver.demux_id);
                     desired_incoming_ssrcs.insert(ssrc);
-                }
-            } else {
-                for video_forwarder in receiver.video_forwarder_by_sender_demux_id.values() {
-                    if let Some(desired_incoming_ssrc) = video_forwarder.needs_key_frame() {
-                        desired_incoming_ssrcs.insert(desired_incoming_ssrc);
-                    }
-                }
-                for (i, incoming_video) in receiver.incoming_video.iter().enumerate() {
-                    if incoming_video.needs_resolution
-                        && incoming_video.rate() > Some(DataRate::ZERO)
-                    {
-                        let ssrc = LayerId::from_video_layer_index(i)
-                            .unwrap()
-                            .to_ssrc(receiver.demux_id);
-                        desired_incoming_ssrcs.insert(ssrc);
-                    }
                 }
             }
         }
@@ -2792,17 +2572,37 @@ impl CallInner {
     }
 
     fn incoming_video_height(&self, ssrc: rtp::Ssrc) -> Option<VideoHeight> {
-        let client = self.find_client(DemuxId::from_ssrc(ssrc))?;
-        let index = LayerId::layer_index_from_ssrc(ssrc)?;
-        client.incoming_video[index].height
+        let client = self.clients.get(DemuxId::from_ssrc(ssrc))?;
+        if let Some(svc_state) = client.scalable_video_state.as_ref() {
+            svc_state.get_maximum_video_height()
+        } else {
+            let index = LayerId::layer_index_from_ssrc(ssrc)?;
+            client.incoming_video[index].height
+        }
     }
 
     /// Get the DemuxIds and opaque user IDs for each client.  These are needed for signaling.
     fn get_client_ids(&self) -> Vec<(DemuxId, UserId)> {
-        self.clients
-            .iter()
-            .map(|client| (client.demux_id, client.user_id.clone()))
-            .collect()
+        // Tests expect the ids to appear in a deterministic order. The Clients class does not
+        // promise any particular client ordering. Therefore, we differentiate between
+        // the testing case, which requires ordering, and the production case, which does not.
+        #[cfg(test)]
+        fn reorder(mut client_ids: Vec<(DemuxId, UserId)>) -> Vec<(DemuxId, UserId)> {
+            client_ids.sort_by_key(|(demux_id, _)| *demux_id);
+            client_ids
+        }
+        #[cfg(not(test))]
+        fn reorder(client_ids: Vec<(DemuxId, UserId)>) -> Vec<(DemuxId, UserId)> {
+            // No-op
+            client_ids
+        }
+
+        reorder(
+            self.clients
+                .iter()
+                .map(|client| (client.demux_id, client.user_id.clone()))
+                .collect(),
+        )
     }
 
     /// Get the list of DemuxIds that require SVC processing.
@@ -2810,11 +2610,10 @@ impl CallInner {
         self.clients
             .iter()
             .filter_map(|client| {
-                if client.is_svc_enabled() {
-                    Some(client.demux_id)
-                } else {
-                    None
-                }
+                client
+                    .scalable_video_state
+                    .as_ref()
+                    .map(|_| client.demux_id)
             })
             .collect()
     }
@@ -2891,137 +2690,6 @@ impl CallInner {
         CALL_TAG_VALUES.get(&(call_type, client_count.into()))
     }
 
-    /// SVC tick processing.
-    fn svc_tick(&mut self, now: Instant) {
-        let mut alloc_candidates: SmallVec<[_; MAX_EXPECTED_CLIENTS]> = SmallVec::new();
-        for sender in &mut self.clients {
-            if let Some(scalable_video_state) = sender.scalable_video_state.as_mut() {
-                let ScalableVideoTickResult {
-                    updated_target_rate,
-                    ..
-                } = scalable_video_state.tick(now);
-                if let Some(updated_target_rate) = updated_target_rate {
-                    alloc_candidates.push((
-                        sender.demux_id,
-                        updated_target_rate,
-                        sender.outgoing_queue_drain_rate,
-                    ));
-                }
-            }
-        }
-        for (demux_id, rate, drain_rate) in alloc_candidates {
-            self.svc_allocate(demux_id, rate, drain_rate, false, now);
-        }
-    }
-
-    /// Allocates and updates decode targets for the receiver based on the given demux ID
-    /// and target data rate.
-    fn svc_allocate(
-        &mut self,
-        receiver_demux_id: DemuxId,
-        target_rate: DataRate,
-        outgoing_queue_drain_rate: DataRate,
-        force: bool,
-        now: Instant,
-    ) {
-        let Some(allocator) = self.allocators.get_mut(&receiver_demux_id) else {
-            warn!("svc: {receiver_demux_id:?} has no allocator");
-            return;
-        };
-        if !allocator.acquire(now, force) {
-            return;
-        }
-
-        let BasicAllocationStrategyResult {
-            ideal_send_rate,
-            requested_base_rate,
-            allocated_rate,
-            selected_decode_targets,
-        } = {
-            let decode_target_lists = self
-                .clients
-                .iter()
-                .map(|sender| {
-                    if sender.demux_id == receiver_demux_id {
-                        DecodeTargetInfoList::empty()
-                    } else {
-                        sender
-                            .scalable_video_state
-                            .as_ref()
-                            .map(|state| state.get_decode_targets())
-                            .unwrap_or(DecodeTargetInfoList::empty())
-                    }
-                })
-                .collect::<DecodeTargetInfoLists>();
-
-            let allocation_strategy = BasicAllocationStrategy {
-                demux_id: receiver_demux_id,
-                target_rate,
-                heights: None,
-                decode_target_lists,
-                outgoing_queue_drain_rate,
-                target_rate_allocation_ratio: TARGET_RATE_MINIMUM_ALLOCATION_RATIO,
-            };
-
-            allocation_strategy.allocate(allocator)
-        };
-
-        allocator.release(now);
-
-        for (client, decode_target) in self.clients.iter_mut().zip(selected_decode_targets) {
-            if let Some(scalable_video_state) = client.scalable_video_state.as_mut() {
-                if client.demux_id == receiver_demux_id {
-                    client.ideal_send_rate = ideal_send_rate;
-                    client.requested_base_rate = requested_base_rate;
-                    client.allocated_send_rate = allocated_rate;
-                    client.target_send_rate = target_rate;
-                    client.send_rate_allocated = now;
-                } else if let Err(e) = scalable_video_state
-                    .set_decode_target_for_receiver(receiver_demux_id, decode_target)
-                {
-                    error!("svc: {receiver_demux_id:?}: failed to update decode target: {e}");
-                }
-            }
-        }
-    }
-
-    /// Reallocates resources for scalable video coding (SVC) based on the target rates
-    /// of the clients currently connected to the system.
-    fn svc_reallocate(&mut self, now: Instant) {
-        let client_info = self
-            .clients
-            .iter()
-            .filter_map(|client| {
-                client.scalable_video_state.as_ref().map(|state| {
-                    (
-                        client.demux_id,
-                        client.outgoing_queue_drain_rate,
-                        state.get_target_rate(),
-                    )
-                })
-            })
-            .collect::<SmallVec<[_; MAX_EXPECTED_CLIENTS]>>();
-        for (demux_id, outgoing_queue_drain_rate, rate) in client_info {
-            self.svc_allocate(demux_id, rate, outgoing_queue_drain_rate, true, now);
-        }
-    }
-
-    /// Dispatches an RTP packet to the SVC handling logic.
-    ///
-    /// # Parameters
-    /// - `sender_demux_id`: The demux ID representing the sender of the RTP packet.
-    /// - `packet`: The received RTP packet.
-    /// - `ext_info`: Additional metadata about the packet.
-    /// - `now`: The current timestamp used to track when the packet was processed.
-    ///
-    /// # Returns
-    /// - `Ok(Vec<RtpToSend>)`: On success, returns a vector of RTP packets ready to be sent
-    ///   after processing (may be empty if no packets are generated).
-    /// - `Err(Error)`: On failure, returns an error indicating the reason for the failure
-    ///
-    /// # Errors
-    /// - `UnknownDemuxId(sender_demux_id)`: Returned when the provided sender demux ID does
-    ///   not correspond to any known client.
     fn svc_dispatch_packet(
         &mut self,
         sender_demux_id: DemuxId,
@@ -3031,10 +2699,11 @@ impl CallInner {
     ) -> Result<Vec<RtpToSend>, Error> {
         if ext_info.needs_allocation {
             trace!("svc_dispatch_packet: packet from {sender_demux_id:?}: needs realloc");
-            self.svc_reallocate(now);
+            mixed_mode_allocator::reallocate(&mut self.clients, self.active_speaker_id, now);
         }
         let sender = self
-            .find_client_mut(sender_demux_id)
+            .clients
+            .get_mut(sender_demux_id)
             .ok_or(UnknownDemuxId(sender_demux_id))?;
         let state = sender
             .scalable_video_state
@@ -3124,6 +2793,111 @@ impl From<mrp::MrpHeader> for protos::MrpHeader {
             ack_num: value.ack_num,
             seqnum: value.seqnum,
             num_packets: value.num_packets,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Clients(HashMap<DemuxId, Client>);
+
+impl Clients {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn contains(&self, demux_id: DemuxId) -> bool {
+        self.0.contains_key(&demux_id)
+    }
+
+    fn get(&self, demux_id: DemuxId) -> Option<&Client> {
+        self.0.get(&demux_id)
+    }
+
+    fn get_mut(&mut self, demux_id: DemuxId) -> Option<&mut Client> {
+        self.0.get_mut(&demux_id)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Client> {
+        self.0.values()
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Client> {
+        self.0.values_mut()
+    }
+
+    #[cfg(test)]
+    fn demux_ids(&self) -> Vec<DemuxId> {
+        self.0.keys().cloned().collect()
+    }
+
+    /// Removes the clients that match the given predicate and detaches them from the remaining
+    /// clients the same way [`Clients::remove`] does. Returns a vector of the removed `Client`
+    /// structures.
+    fn remove_if<F: Fn(&Client) -> bool>(&mut self, predicate: F) -> Vec<Client> {
+        let removed = self
+            .0
+            .extract_if(|_, client| predicate(client))
+            .map(|(_, client)| client)
+            .collect::<Vec<_>>();
+        for removed_client in &removed {
+            let demux_id = removed_client.demux_id;
+            self.iter_mut().for_each(|client| {
+                client.audio_forwarder_by_sender_demux_id.remove(&demux_id);
+                client.video_forwarder_by_sender_demux_id.remove(&demux_id);
+                client.data_forwarder_by_sender_demux_id.remove(&demux_id);
+                // Entries are removed from allocated_height_by_sender_demux_id in allocate_video_layers.
+            });
+            self.iter_mut()
+                .filter_map(|client| client.scalable_video_state.as_mut())
+                .for_each(|state| state.remove_receiver(demux_id));
+        }
+        removed
+    }
+
+    /// Removes the client with the given demux ID and detaches it from any SVC senders
+    /// that it may be attached to. Returns the removed `Client` structure, or `None`
+    /// if no such client could be found.
+    fn remove(&mut self, demux_id: DemuxId) -> Option<Client> {
+        let removed = self.0.remove(&demux_id);
+        if removed.is_some() {
+            self.iter_mut().for_each(|client| {
+                client.audio_forwarder_by_sender_demux_id.remove(&demux_id);
+                client.video_forwarder_by_sender_demux_id.remove(&demux_id);
+                client.data_forwarder_by_sender_demux_id.remove(&demux_id);
+                // Entries are removed from allocated_height_by_sender_demux_id in allocate_video_layers.
+            });
+            self.iter_mut()
+                .filter_map(|client| client.scalable_video_state.as_mut())
+                .for_each(|state| state.remove_receiver(demux_id));
+        }
+        removed
+    }
+
+    /// Inserts a client into the client map. The client becomes a receiver for all
+    /// currently registered SVC senders. If the client is also an SVC sender, all
+    /// current clients become its receivers.
+    pub fn insert(&mut self, mut client: Client, now: Instant) {
+        let demux_id = client.demux_id;
+        if self.0.contains_key(&demux_id) {
+            warn!("Duplicate demux ID: {demux_id:?}");
+        } else {
+            self.iter_mut()
+                .filter_map(|client| client.scalable_video_state.as_mut())
+                .for_each(|state| state.add_receiver(demux_id, now));
+            if let Some(svc_state) = client.scalable_video_state.as_mut() {
+                self.0.keys().for_each(|demux_id| {
+                    svc_state.add_receiver(*demux_id, now);
+                });
+            }
+            self.0.insert(demux_id, client);
         }
     }
 }
@@ -3274,14 +3048,9 @@ impl Client {
                 .next_server_to_client_data_rtp_seqnum,
 
             // SVC state
-            scalable_video_state: pending_client_info.requires_svc.then(|| {
-                ScalableVideoState::new(
-                    pending_client_info.demux_id,
-                    initial_target_send_rate,
-                    requested_max_send_rate,
-                    now,
-                )
-            }),
+            scalable_video_state: pending_client_info
+                .requires_svc
+                .then(|| ScalableVideoState::new(pending_client_info.demux_id, now)),
         }
     }
 
@@ -3521,9 +3290,24 @@ impl Client {
         )
     }
 
-    #[inline]
-    fn is_svc_enabled(&self) -> bool {
-        self.scalable_video_state.is_some()
+    fn requested_height_for(
+        &self,
+        sender_demux_id: DemuxId,
+        active_speaker_id: Option<DemuxId>,
+    ) -> VideoHeight {
+        let requested_height = self
+            .requested_height_by_demux_id
+            .get(&sender_demux_id)
+            .copied()
+            .unwrap_or_else(|| VideoHeight::from(1));
+
+        if Some(sender_demux_id) == active_speaker_id
+            && self.active_speaker_height > requested_height
+        {
+            self.active_speaker_height
+        } else {
+            requested_height
+        }
     }
 
     fn get_template_dependency_structure(&self) -> Option<TemplateDependencyStructure> {
@@ -3595,230 +3379,6 @@ impl IncomingVideoState {
     }
 }
 
-// This is spatial layers, not temporal layers
-#[derive(Clone, Debug)]
-struct AllocatableVideoLayer {
-    incoming_rate: DataRate,
-    incoming_height: VideoHeight,
-}
-
-#[derive(Clone, Debug)]
-struct AllocatableVideo {
-    sender_demux_id: DemuxId,
-    // This is spatial layers, not temporal layers
-    // lower index == lower resolution
-    layers: [AllocatableVideoLayer; 3],
-    requested_height: VideoHeight,
-    allocated_layer_index: Option<usize>,
-    ideal_layer_index: Option<usize>,
-    // AKA became active speaker
-    interesting: Option<Instant>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AllocatedVideo {
-    sender_demux_id: DemuxId,
-    layer_index: usize,
-    // It is a convenience to include the following fields.
-    // They could be derived from AllocatableVideo + layer_index.
-    rate: DataRate,
-    height: VideoHeight,
-}
-
-fn ideal_video_layer_index(
-    requested_height: VideoHeight,
-    layers: &[AllocatableVideoLayer],
-) -> Option<usize> {
-    let has_rate = |layer: &AllocatableVideoLayer| layer.incoming_rate.as_bps() > 0;
-    let has_height = |layer: &AllocatableVideoLayer| layer.incoming_height > VideoHeight::from(0);
-    let has_height_and_rate = |layer: &AllocatableVideoLayer| has_rate(layer) && has_height(layer);
-    let has_enough_height_and_rate = |layer: &AllocatableVideoLayer| {
-        layer.incoming_height >= requested_height && has_rate(layer)
-    };
-
-    if requested_height == VideoHeight::from(0) {
-        // Nothing was requested, so nothing is ideal.
-        None
-    } else if let Some(first_layer_which_has_enough) =
-        layers.iter().position(has_enough_height_and_rate)
-    {
-        // It's possible for several layers to have the ideal height.
-        // The ideal layer is the highest layer with the ideal height.
-        let ideal_height = layers[first_layer_which_has_enough].incoming_height;
-
-        layers.iter().rposition(|layer: &AllocatableVideoLayer| {
-            layer.incoming_height == ideal_height && has_rate(layer)
-        })
-    } else {
-        // None of the layers have enough height and rate, so just take the
-        // highest layer that has any height and rate.
-        layers.iter().rposition(has_height_and_rate)
-    }
-}
-
-fn ideal_send_rate(videos: &[AllocatableVideo], max_requested_send_rate: DataRate) -> DataRate {
-    let allocatable: DataRate = videos
-        .iter()
-        .filter_map(|video| {
-            let ideal_layer_index = video.ideal_layer_index?;
-            Some(video.layers[ideal_layer_index].incoming_rate)
-        })
-        .sum();
-    min(allocatable, max_requested_send_rate)
-}
-
-fn base_video_layer_index(video: &AllocatableVideo) -> Option<usize> {
-    if video.requested_height == VideoHeight::from(0) || video.layers[0].incoming_rate.as_bps() == 0
-    {
-        // Nothing was requested or the base layer doesn't have a rate
-        None
-    } else {
-        Some(0)
-    }
-}
-
-fn requested_base_rate(videos: &[AllocatableVideo], max_requested_send_rate: DataRate) -> DataRate {
-    let allocatable: DataRate = videos
-        .iter()
-        .filter_map(|video| {
-            let base_layer_index = base_video_layer_index(video)?;
-            Some(video.layers[base_layer_index].incoming_rate)
-        })
-        .sum();
-    min(allocatable, max_requested_send_rate)
-}
-
-fn allocate_send_rate(
-    target_send_rate: DataRate,
-    min_target_send_rate: DataRate,
-    ideal_send_rate: DataRate,
-    outgoing_queue_drain_rate: DataRate,
-    mut videos: Vec<AllocatableVideo>,
-) -> HashMap<DemuxId, AllocatedVideo> {
-    // We leave some target send rate unallocated to allow the queue to drain.
-    // But if the ideal rate is lower than the target rate, there is room
-    // between the ideal rate and the target rate to drain the queue.
-
-    // First use whichever is greater of (minimum target rate minus queue
-    // drain rate) and the minimum allocation ratio.
-    let allocatable_rate_for_different_layers = max(
-        min_target_send_rate.saturating_sub(outgoing_queue_drain_rate),
-        min_target_send_rate * TARGET_RATE_MINIMUM_ALLOCATION_RATIO,
-    );
-    // Now use the lesser of that result and the ideal send rate; layers
-    // must be under this bitrate to be allocated, if not currently
-    // selected.
-    let allocatable_rate_for_different_layers =
-        min(allocatable_rate_for_different_layers, ideal_send_rate);
-
-    // Do the same process with the current target rate
-    let allocatable_rate_for_existing_layers = max(
-        target_send_rate.saturating_sub(outgoing_queue_drain_rate),
-        target_send_rate * TARGET_RATE_MINIMUM_ALLOCATION_RATIO,
-    );
-
-    // This bitrate will be equal to or greater than the rate for different
-    // layers; allowing more bandwidth to be used to keep a currently
-    // selected layer than to switch layers, so there's less layer switching
-    // as available bandwidth changes.
-    let allocatable_rate_for_existing_layers =
-        min(allocatable_rate_for_existing_layers, ideal_send_rate);
-
-    let mut allocated_by_sender_demux_id: HashMap<DemuxId, AllocatedVideo> = HashMap::new();
-    let mut allocated_rate = DataRate::ZERO;
-
-    // Biggest first and then (for the same size), most recently interesting first
-    videos.sort_by_key(|video| std::cmp::Reverse((video.requested_height, video.interesting)));
-
-    // We try to get the lowest layers for each one before trying to get the higher layer for any one.
-    // In the future we may want to allow clients to prioritize a video to a degree
-    // that it gets all of its layers first.
-    for layer_index in 0..=2 {
-        trace!("Allocating layer {}", layer_index);
-        for video in &videos {
-            let mut candidate_layer_index = layer_index;
-            let mut layer = &video.layers[candidate_layer_index];
-
-            trace!(
-                "Allocating {:?}.{} = ({}, {:?})",
-                video.sender_demux_id,
-                layer_index,
-                layer.incoming_rate.as_kbps(),
-                layer.incoming_height
-            );
-            if layer.incoming_height == VideoHeight::from(0) && layer.incoming_rate.as_bps() == 0 {
-                trace!("Skipped layer with nothing coming in.");
-                continue;
-            }
-
-            if let Some(ideal_layer_index) = video.ideal_layer_index {
-                if ideal_layer_index < layer_index {
-                    trace!(
-                        "Skipped layer that's not requested (ideal layer index: {:?}).",
-                        ideal_layer_index
-                    );
-                    continue;
-                }
-
-                for possible_layer_index in layer_index + 1..=ideal_layer_index {
-                    let possible_layer = &video.layers[possible_layer_index];
-                    if possible_layer.incoming_height != VideoHeight::from(0)
-                        && possible_layer.incoming_rate.as_bps() != 0
-                        && possible_layer.incoming_rate < layer.incoming_rate
-                    {
-                        candidate_layer_index = possible_layer_index;
-                        layer = possible_layer;
-                    }
-                }
-            } else {
-                trace!("Skipped layer that's not requested (ideal layer index: None).");
-                continue;
-            }
-
-            let layer_rate = layer.incoming_rate;
-            let lower_layer_rate = allocated_by_sender_demux_id
-                .get(&video.sender_demux_id)
-                .map(|allocated| allocated.rate)
-                .unwrap_or_default();
-            let rate_increase = layer_rate.saturating_sub(lower_layer_rate);
-            let increased_allocated_rate = allocated_rate + rate_increase;
-            let allocatable_rate = if Some(candidate_layer_index) == video.allocated_layer_index {
-                allocatable_rate_for_existing_layers
-            } else {
-                allocatable_rate_for_different_layers
-            };
-
-            if increased_allocated_rate > allocatable_rate {
-                trace!(
-                    "Skipped layer that's too big ({}/{} allocated and {}={}-{} increase)",
-                    allocated_rate.as_kbps(),
-                    allocatable_rate.as_kbps(),
-                    rate_increase.as_kbps(),
-                    layer_rate.as_kbps(),
-                    lower_layer_rate.as_kbps()
-                );
-                continue;
-            }
-
-            allocated_by_sender_demux_id.insert(
-                video.sender_demux_id,
-                AllocatedVideo {
-                    sender_demux_id: video.sender_demux_id,
-                    layer_index: candidate_layer_index,
-                    rate: layer.incoming_rate,
-                    height: layer.incoming_height,
-                },
-            );
-            allocated_rate = increased_allocated_rate;
-            trace!(
-                "Allocated layer.  New allocated_rate: {:?}",
-                allocated_rate.as_kbps()
-            );
-        }
-    }
-    allocated_by_sender_demux_id
-}
-
 // State to allow forwarding one SSRC to one SSRC.
 // It's fairly simple, but it must deal with gaps
 // in the seqnums and make sure to not reuse expanded seqnums.
@@ -3873,6 +3433,7 @@ impl SingleSsrcRtpForwarder {
 // State to allow forwarding a set of N video SSRCs as 1 video SSRC by changing
 // the seqnums and dependency descriptor frame numbers to make it appear that
 // it's one stream rather than N.
+#[derive(Debug)]
 struct Vp8SimulcastRtpForwarder {
     // The outgoing SSRC.  It never changes.
     outgoing_ssrc: rtp::Ssrc,
@@ -3885,11 +3446,12 @@ struct Vp8SimulcastRtpForwarder {
     // retain it across various pause/forward cycles.
     max_outgoing: VideoRewrittenIds,
 }
+#[derive(Debug)]
 enum Vp8SimulcastRtpSwitchingState {
     DoNotSwitch,
     SwitchAtNextKeyFrame(rtp::Ssrc),
 }
-
+#[derive(Debug)]
 enum Vp8SimulcastRtpForwardingState {
     Paused,
     Forwarding {
@@ -4298,6 +3860,8 @@ mod loggable_call_id_tests {
 
 #[cfg(test)]
 mod call_tests {
+    use std::fmt::Debug;
+
     use calling_common::PixelSize;
     use mrp::MrpHeader;
 
@@ -4308,9 +3872,28 @@ mod call_tests {
             DependencyDescriptor, ExtendedDescriptorFields, MandatoryDescriptorFields,
             TemplateDependencyStructure, TemplateDependencyStructureFields,
         },
+        simulcast,
+        simulcast::{AllocatableVideo, AllocatableVideoLayer},
     };
 
     static CALL_ID: &[u8; 7] = b"call_id";
+
+    // Asserts that two vectors have the same elements, without taking into account the ordering
+    // of the elements ([1, 2] is equal to [2, 1]). Since it achieves this by first sorting
+    // the elements and then comparing them, it is required for the elements to be sortable.
+    fn vec_elem_eq<T: Ord + Clone + Debug>(mut lhs: Vec<T>, mut rhs: Vec<T>) {
+        lhs.sort();
+        rhs.sort();
+        assert_eq!(lhs, rhs);
+    }
+
+    // Asserts that two vectors containing (demux id, rtp packet) tuples have the same elements,
+    // without taking into account the ordering of the elements.
+    fn rtp_to_send_eq(mut lhs: Vec<RtpToSend>, mut rhs: Vec<RtpToSend>) {
+        lhs.sort_by_key(|(demux_id, _)| *demux_id);
+        rhs.sort_by_key(|(demux_id, _)| *demux_id);
+        assert_eq!(lhs, rhs);
+    }
 
     #[test]
     fn test_forwarding_preserves_rtp_timestamps() {
@@ -4675,7 +4258,8 @@ mod call_tests {
         fn request(requested_height: VideoHeight, video: &AllocatableVideo) -> AllocatableVideo {
             let mut video: AllocatableVideo = video.clone();
             video.requested_height = requested_height;
-            video.ideal_layer_index = ideal_video_layer_index(requested_height, &video.layers);
+            video.ideal_layer_index =
+                simulcast::ideal_video_layer_index(requested_height, &video.layers);
             video
         }
 
@@ -4702,18 +4286,21 @@ mod call_tests {
             videos: &[&AllocatableVideo],
             max_requested_send_rate_kbps: u64,
         ) -> (u64, Vec<(u32, usize, u64)>) {
-            let videos: Vec<AllocatableVideo> = videos.iter().copied().cloned().collect();
+            let mut videos: Vec<AllocatableVideo> = videos.iter().copied().cloned().collect();
+            videos.sort_by_key(|video| {
+                std::cmp::Reverse((video.requested_height, video.interesting))
+            });
             let target_send_rate = DataRate::from_kbps(target_send_rate_kbps);
             let min_target_send_rate = DataRate::from_kbps(min_target_send_rate_kbps);
             let outgoing_queue_drain_rate = DataRate::from_kbps(outgoing_queue_drain_rate_kbps);
             let max_requested_send_rate = DataRate::from_kbps(max_requested_send_rate_kbps);
-            let ideal_send_rate = ideal_send_rate(&videos, max_requested_send_rate);
-            let mut allocated: Vec<_> = allocate_send_rate(
+            let ideal_send_rate = simulcast::ideal_send_rate(&videos, max_requested_send_rate);
+            let mut allocated: Vec<_> = simulcast::allocate_send_rate(
                 target_send_rate,
                 min_target_send_rate,
                 ideal_send_rate,
                 outgoing_queue_drain_rate,
-                videos,
+                &videos,
             )
             .iter()
             .map(|(demux_id, allocated)| {
@@ -5618,17 +5205,12 @@ mod call_tests {
 
     fn ack_all_mrp(call: &mut Call) {
         let mut call = call.inner.lock();
-        for i in 0..call.clients.len() {
-            let demux_id = call.clients.get(i).unwrap().demux_id;
-            ack_latest_mrp(demux_id, &mut call);
+        for client in call.clients.iter_mut() {
+            ack_latest_mrp(client);
         }
     }
 
-    fn ack_latest_mrp(demux_id: DemuxId, call: &mut CallInner) {
-        let Some(client) = call.clients.iter_mut().find(|c| c.demux_id == demux_id) else {
-            return;
-        };
-
+    fn ack_latest_mrp(client: &mut Client) {
         let mut header: MrpHeader = Default::default();
         let _ = client.mrp_stream.try_send(|h| {
             header.ack_num = h.seqnum;
@@ -5939,12 +5521,12 @@ mod call_tests {
         let rtp_to_send = call
             .handle_rtp(sender_demux_id, rtp1.borrow_mut(), now)
             .unwrap();
-        assert_eq!(
+        rtp_to_send_eq(
             vec![
                 (receiver1_demux_id, rtp1.clone()),
-                (receiver2_demux_id, rtp1.clone())
+                (receiver2_demux_id, rtp1.clone()),
             ],
-            rtp_to_send
+            rtp_to_send,
         );
 
         let mut rtp2 = create_data_rtp(sender_demux_id, 2);
@@ -5958,12 +5540,12 @@ mod call_tests {
         let rtp_to_send = call
             .handle_rtp(sender_demux_id, rtp2.borrow_mut(), now)
             .unwrap();
-        assert_eq!(
+        rtp_to_send_eq(
             vec![
                 (receiver1_demux_id, rtp2.clone()),
-                (receiver2_demux_id, rtp2)
+                (receiver2_demux_id, rtp2),
             ],
-            rtp_to_send
+            rtp_to_send,
         );
     }
 
@@ -5993,12 +5575,12 @@ mod call_tests {
         let rtp_to_send = call
             .handle_rtp(sender_demux_id, rtp1.borrow_mut(), now)
             .unwrap();
-        assert_eq!(
+        rtp_to_send_eq(
             vec![
                 (receiver1_demux_id, rtp1.clone()),
-                (receiver2_demux_id, rtp1.clone())
+                (receiver2_demux_id, rtp1.clone()),
             ],
-            rtp_to_send
+            rtp_to_send,
         );
 
         let mut rtp2 = create_audio_rtp(sender_demux_id, 2);
@@ -6012,12 +5594,12 @@ mod call_tests {
         let rtp_to_send = call
             .handle_rtp(sender_demux_id, rtp2.borrow_mut(), now)
             .unwrap();
-        assert_eq!(
+        rtp_to_send_eq(
             vec![
                 (receiver1_demux_id, rtp2.clone()),
-                (receiver2_demux_id, rtp2)
+                (receiver2_demux_id, rtp2),
             ],
-            rtp_to_send
+            rtp_to_send,
         );
 
         let mut rtp3 = create_audio_rtp(sender_demux_id, 3);
@@ -6033,12 +5615,12 @@ mod call_tests {
         let rtp_to_send = call
             .handle_rtp(sender_demux_id, rtp4.borrow_mut(), now)
             .unwrap();
-        assert_eq!(
+        rtp_to_send_eq(
             vec![
                 (receiver1_demux_id, rtp4.clone()),
-                (receiver2_demux_id, rtp4)
+                (receiver2_demux_id, rtp4),
             ],
-            rtp_to_send
+            rtp_to_send,
         );
 
         let mut rtp5 = create_audio_rtp(sender_demux_id, 4);
@@ -6046,12 +5628,12 @@ mod call_tests {
         let rtp_to_send = call
             .handle_rtp(sender_demux_id, rtp5.borrow_mut(), now)
             .unwrap();
-        assert_eq!(
+        rtp_to_send_eq(
             vec![
                 (receiver1_demux_id, rtp5.clone()),
-                (receiver2_demux_id, rtp5)
+                (receiver2_demux_id, rtp5),
             ],
-            rtp_to_send
+            rtp_to_send,
         );
     }
 
@@ -6109,11 +5691,23 @@ mod call_tests {
         call.tick(at(501), sys_at(501));
         assert_eq!(
             Some(DataRate::from_bps(40320)),
-            call.inner.lock().clients[0].incoming_video[0].rate()
+            call.inner
+                .lock()
+                .clients
+                .get(sender_demux_id)
+                .unwrap()
+                .incoming_video[0]
+                .rate()
         );
         assert_eq!(
             Some(VideoHeight::from(size.height)),
-            call.inner.lock().clients[0].incoming_video[0].height
+            call.inner
+                .lock()
+                .clients
+                .get(sender_demux_id)
+                .unwrap()
+                .incoming_video[0]
+                .height
         );
 
         let receiver1_demux_id = add_client(&mut call, "receiver1", 2, at(502));
@@ -6183,12 +5777,12 @@ mod call_tests {
             Some(size),
         );
         rewritten_rtp.set_seqnum_in_header(rewritten_seqnum);
-        assert_eq!(
+        rtp_to_send_eq(
             vec![
                 (receiver1_demux_id, rewritten_rtp.clone()),
                 (receiver2_demux_id, rewritten_rtp),
             ],
-            rtp_to_send
+            rtp_to_send,
         );
 
         // And we don't ask for a key frame any more
@@ -6236,11 +5830,23 @@ mod call_tests {
         call.tick(at(2500), sys_at(2500));
         assert_eq!(
             Some(DataRate::from_bps(60480)),
-            call.inner.lock().clients[0].incoming_video[1].rate()
+            call.inner
+                .lock()
+                .clients
+                .get(sender_demux_id)
+                .unwrap()
+                .incoming_video[1]
+                .rate()
         );
         assert_eq!(
             Some(VideoHeight::from(size_layer1.height)),
-            call.inner.lock().clients[0].incoming_video[1].height
+            call.inner
+                .lock()
+                .clients
+                .get(sender_demux_id)
+                .unwrap()
+                .incoming_video[1]
+                .height
         );
 
         let mut resolution_request = create_resolution_request_rtp(1, 480);
@@ -6261,7 +5867,11 @@ mod call_tests {
         );
         assert_eq!(
             Some(expected_key_frame_request_layer1.1.ssrc),
-            call.inner.lock().clients[1]
+            call.inner
+                .lock()
+                .clients
+                .get(receiver1_demux_id)
+                .unwrap()
                 .video_forwarder_by_sender_demux_id
                 .get(&sender_demux_id)
                 .unwrap()
@@ -6297,12 +5907,12 @@ mod call_tests {
             Some(size),
         );
         rewritten_rtp.set_seqnum_in_header(rewritten_seqnum);
-        assert_eq!(
+        rtp_to_send_eq(
             vec![
                 (receiver1_demux_id, rewritten_rtp.clone()),
                 (receiver2_demux_id, rewritten_rtp),
             ],
-            rtp_to_send
+            rtp_to_send,
         );
 
         frame_number_layer1 += 1;
@@ -6329,7 +5939,7 @@ mod call_tests {
             Some(size_layer1),
         );
         rewritten_rtp.set_seqnum_in_header(rewritten_seqnum);
-        assert_eq!(vec![(receiver1_demux_id, rewritten_rtp),], rtp_to_send);
+        rtp_to_send_eq(vec![(receiver1_demux_id, rewritten_rtp)], rtp_to_send);
 
         // If the incoming bitrate rate gets higher than the target send rate, drop back to the base layer
         for _ in 0..900 {
@@ -6362,18 +5972,33 @@ mod call_tests {
 
         let (_rtp_to_send, outgoing_key_frame_requests) = call.tick(at(5100), sys_at(5100));
         dbg!(
-            call.inner.lock().clients[0].incoming_video[1]
+            call.inner
+                .lock()
+                .clients
+                .get(sender_demux_id)
+                .unwrap()
+                .incoming_video[1]
                 .rate()
                 .unwrap()
                 .as_bps()
         );
         assert_eq!(
             Some(DataRate::from_bps(1043790)),
-            call.inner.lock().clients[0].incoming_video[1].rate()
+            call.inner
+                .lock()
+                .clients
+                .get(sender_demux_id)
+                .unwrap()
+                .incoming_video[1]
+                .rate()
         );
         assert_eq!(
             Some(expected_key_frame_request.1.ssrc),
-            call.inner.lock().clients[1]
+            call.inner
+                .lock()
+                .clients
+                .get(receiver1_demux_id)
+                .unwrap()
                 .video_forwarder_by_sender_demux_id
                 .get(&sender_demux_id)
                 .unwrap()
@@ -6384,32 +6009,39 @@ mod call_tests {
             outgoing_key_frame_requests
         );
 
-        assert_eq!(
-            vec![
-                SendRateAllocationInfo {
-                    demux_id: sender_demux_id,
-                    padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(receiver1_demux_id)),
-                    target_send_rate: DataRate::from_kbps(600),
-                    requested_base_rate: DataRate::default(),
-                    ideal_send_rate: DataRate::from_bps(0),
-                },
-                SendRateAllocationInfo {
-                    demux_id: receiver1_demux_id,
-                    padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(sender_demux_id)),
-                    target_send_rate: DataRate::from_kbps(600),
-                    requested_base_rate: DataRate::from_bps(34546),
-                    ideal_send_rate: DataRate::from_bps(1043790),
-                },
-                SendRateAllocationInfo {
-                    demux_id: receiver2_demux_id,
-                    padding_ssrc: Some(LayerId::Video0.to_rtx_ssrc(sender_demux_id)),
-                    target_send_rate: DataRate::from_kbps(600),
-                    requested_base_rate: DataRate::from_bps(34546),
-                    ideal_send_rate: DataRate::from_bps(34546),
-                }
-            ],
-            call.get_send_rate_allocation_info()
-        );
+        // Ignore padding SSRCs when comparing here since there are no guarantees that
+        // the padding SSRC will be in any particular order, as long as they satisfy
+        // the basic requirements (see update_padding_ssrcs for more info.)
+        let mut expected_info = vec![
+            SendRateAllocationInfo {
+                demux_id: sender_demux_id,
+                padding_ssrc: None,
+                target_send_rate: DataRate::from_kbps(600),
+                requested_base_rate: DataRate::default(),
+                ideal_send_rate: DataRate::from_bps(0),
+            },
+            SendRateAllocationInfo {
+                demux_id: receiver1_demux_id,
+                padding_ssrc: None,
+                target_send_rate: DataRate::from_kbps(600),
+                requested_base_rate: DataRate::from_bps(34546),
+                ideal_send_rate: DataRate::from_bps(1043790),
+            },
+            SendRateAllocationInfo {
+                demux_id: receiver2_demux_id,
+                padding_ssrc: None,
+                target_send_rate: DataRate::from_kbps(600),
+                requested_base_rate: DataRate::from_bps(34546),
+                ideal_send_rate: DataRate::from_bps(34546),
+            },
+        ];
+        expected_info.sort_by_key(|v| v.demux_id);
+        let mut allocation_info = call.get_send_rate_allocation_info();
+        allocation_info
+            .iter_mut()
+            .for_each(|info| info.padding_ssrc = None);
+        allocation_info.sort_by_key(|v| v.demux_id);
+        assert_eq!(expected_info, allocation_info);
     }
 
     #[test]
@@ -6434,12 +6066,12 @@ mod call_tests {
         .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100), sys_at(100));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![(
                 demux_id1,
-                create_server_to_client_rtps(1, &expected_update_payload_just_client1)
+                create_server_to_client_rtps(1, &expected_update_payload_just_client1),
             )]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
@@ -6462,18 +6094,18 @@ mod call_tests {
         .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200), sys_at(200));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(3, &expected_update_payload_demux1)
+                    create_server_to_client_rtps(3, &expected_update_payload_demux1),
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(1, &expected_update_payload_demux2)
-                )
+                    create_server_to_client_rtps(1, &expected_update_payload_demux2),
+                ),
             ]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         // Nothing is sent out because nothing changed.
@@ -6492,12 +6124,12 @@ mod call_tests {
         .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400), sys_at(400));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![(
                 demux_id2,
-                create_server_to_client_rtps(3, &expected_update_payload_just_client2)
+                create_server_to_client_rtps(3, &expected_update_payload_just_client2),
             )]),
-            rtp_to_send
+            rtp_to_send,
         );
     }
 
@@ -6523,12 +6155,12 @@ mod call_tests {
         )
         .encode_collection();
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100), sys_at(100));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![(
                 demux_id1,
-                create_server_to_client_rtps(1, &expected_update_payload_just_client1)
+                create_server_to_client_rtps(1, &expected_update_payload_just_client1),
             )]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
@@ -6566,22 +6198,22 @@ mod call_tests {
         .encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200), sys_at(200));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(3, &expected_update_payload_demux1)
-                ),
-                (
-                    demux_id3,
-                    create_server_to_client_rtps(1, &expected_update_payload_demux3,)
+                    create_server_to_client_rtps(3, &expected_update_payload_demux1),
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(1, &expected_update_payload_demux2,)
-                )
+                    create_server_to_client_rtps(1, &expected_update_payload_demux2),
+                ),
+                (
+                    demux_id3,
+                    create_server_to_client_rtps(1, &expected_update_payload_demux3),
+                ),
             ]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         call.approve_pending_client(demux_id2, at(300));
@@ -6590,7 +6222,7 @@ mod call_tests {
             true,
             mrp_header(5, None),
             Some(demux_id1),
-            &[demux_id1, demux_id3, demux_id2],
+            &[demux_id1, demux_id2, demux_id3],
             &[],
         )
         .encode_collection();
@@ -6598,29 +6230,29 @@ mod call_tests {
             true,
             mrp_header(3, None),
             Some(demux_id1),
-            &[demux_id1, demux_id3, demux_id2],
+            &[demux_id1, demux_id2, demux_id3],
             &[],
         )
         .encode_collection();
 
         ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300), sys_at(300));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(5, &expected_update_payload_demux_1)
-                ),
-                (
-                    demux_id3,
-                    create_server_to_client_rtps(3, &expected_update_payload_demux_3_and_2)
+                    create_server_to_client_rtps(5, &expected_update_payload_demux_1),
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(3, &expected_update_payload_demux_3_and_2)
-                )
+                    create_server_to_client_rtps(3, &expected_update_payload_demux_3_and_2),
+                ),
+                (
+                    demux_id3,
+                    create_server_to_client_rtps(3, &expected_update_payload_demux_3_and_2),
+                ),
             ]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         call.drop_client(demux_id2, at(400), "test");
@@ -6644,18 +6276,18 @@ mod call_tests {
 
         ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(400), sys_at(400));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(7, &expected_update_payload_demux1)
+                    create_server_to_client_rtps(7, &expected_update_payload_demux1),
                 ),
                 (
                     demux_id3,
-                    create_server_to_client_rtps(5, &expected_update_payload_demux3)
-                )
+                    create_server_to_client_rtps(5, &expected_update_payload_demux3),
+                ),
             ]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         // Re-add the same user.
@@ -6665,7 +6297,7 @@ mod call_tests {
             true,
             mrp_header(9, None),
             Some(demux_id1),
-            &[demux_id1, demux_id3, demux_id2],
+            &[demux_id1, demux_id2, demux_id3],
             &[],
         )
         .encode_collection();
@@ -6673,7 +6305,7 @@ mod call_tests {
             true,
             mrp_header(1, None),
             Some(demux_id1),
-            &[demux_id1, demux_id3, demux_id2],
+            &[demux_id1, demux_id2, demux_id3],
             &[],
         )
         .encode_collection();
@@ -6681,29 +6313,29 @@ mod call_tests {
             true,
             mrp_header(7, None),
             Some(demux_id1),
-            &[demux_id1, demux_id3, demux_id2],
+            &[demux_id1, demux_id2, demux_id3],
             &[],
         )
         .encode_collection();
 
         ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500), sys_at(500));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(9, &expected_update_payload_demux1,)
-                ),
-                (
-                    demux_id3,
-                    create_server_to_client_rtps(7, &expected_update_payload_demux3,)
+                    create_server_to_client_rtps(9, &expected_update_payload_demux1),
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(1, &expected_update_payload_demux2,)
-                )
+                    create_server_to_client_rtps(1, &expected_update_payload_demux2),
+                ),
+                (
+                    demux_id3,
+                    create_server_to_client_rtps(7, &expected_update_payload_demux3),
+                ),
             ]),
-            rtp_to_send
+            rtp_to_send,
         );
     }
 
@@ -6736,7 +6368,7 @@ mod call_tests {
         let _non_admin = add_client(&mut call, "1", 1, at(100));
         assert_eq!(0, call.inner.lock().clients.len());
         let admin = add_admin(&mut call, "2", 2, at(200));
-        assert_eq!(vec![admin], demux_ids(&call.inner.lock().clients));
+        assert_eq!(vec![admin], call.inner.lock().clients.demux_ids());
     }
 
     #[test]
@@ -6757,20 +6389,20 @@ mod call_tests {
                 vec![client_device_1, other_device, client_device_2],
                 demux_ids(&inner.pending_clients)
             );
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
         }
 
         call.approve_pending_client(client_device_2, at(400));
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![other_device], demux_ids(&inner.pending_clients));
-            assert_eq!(
+            vec_elem_eq(vec![other_device], demux_ids(&inner.pending_clients));
+            vec_elem_eq(
                 vec![client_device_1, client_device_2],
-                demux_ids(&inner.clients)
+                inner.clients.demux_ids(),
             );
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
         }
     }
 
@@ -6792,7 +6424,7 @@ mod call_tests {
                 vec![client_device_1, other_device, client_device_2],
                 demux_ids(&inner.pending_clients)
             );
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, inner.clients.demux_ids());
             assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
         }
 
@@ -6801,7 +6433,7 @@ mod call_tests {
         {
             let inner = call.inner.lock();
             assert_eq!(vec![other_device], demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, inner.clients.demux_ids());
             assert_eq!(
                 vec![client_device_1, client_device_2],
                 demux_ids(&inner.removed_clients)
@@ -6822,7 +6454,7 @@ mod call_tests {
         {
             let inner = call.inner.lock();
             assert_eq!(vec![non_admin], demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, inner.clients.demux_ids());
             assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
         }
 
@@ -6832,7 +6464,7 @@ mod call_tests {
             let inner = call.inner.lock();
             assert_eq!(Error::Leave, result.unwrap_err());
             assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, inner.clients.demux_ids());
             assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
         }
     }
@@ -6850,7 +6482,7 @@ mod call_tests {
         {
             let inner = call.inner.lock();
             assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![non_admin], demux_ids(&inner.clients));
+            assert_eq!(vec![non_admin], inner.clients.demux_ids());
             assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
         }
 
@@ -6859,7 +6491,7 @@ mod call_tests {
         {
             let inner = call.inner.lock();
             assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, inner.clients.demux_ids());
             assert_eq!(vec![non_admin], demux_ids(&inner.removed_clients));
         }
 
@@ -6869,7 +6501,7 @@ mod call_tests {
             let inner = call.inner.lock();
             assert_eq!(Error::Leave, result.unwrap_err());
             assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
+            assert_eq!(vec![] as Vec<DemuxId>, inner.clients.demux_ids());
             assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
         }
     }
@@ -6898,12 +6530,12 @@ mod call_tests {
 
         ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100), sys_at(100));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![(
                 demux_id1,
-                create_server_to_client_rtps(1, &expected_update_payload_just_client1)
+                create_server_to_client_rtps(1, &expected_update_payload_just_client1),
             )]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         let demux_id2 = add_client(&mut call, "2", 2, at(200));
@@ -6928,18 +6560,18 @@ mod call_tests {
         .encode_collection();
         ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200), sys_at(200));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(3, &expected_update_payload_demux1)
+                    create_server_to_client_rtps(3, &expected_update_payload_demux1),
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(1, &expected_update_payload_demux2)
-                )
+                    create_server_to_client_rtps(1, &expected_update_payload_demux2),
+                ),
             ]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         call.force_remove_client(demux_id2, at(300));
@@ -6958,21 +6590,21 @@ mod call_tests {
         .encode_to_vec();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(300), sys_at(300));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(5, &expected_update_payload_demux1)
+                    create_server_to_client_rtps(5, &expected_update_payload_demux1),
                 ),
                 (
                     demux_id2,
                     vec![create_server_to_client_rtp(
                         3,
-                        &expected_update_payload_for_removed
-                    )]
-                )
+                        &expected_update_payload_for_removed,
+                    )],
+                ),
             ]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         call.drop_client(demux_id2, at(400), "test");
@@ -7004,18 +6636,18 @@ mod call_tests {
         let expected_update_payload_demux1 = expected_update_payload_demux1.encode_collection();
 
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(500), sys_at(500));
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(7, &expected_update_payload_demux1)
+                    create_server_to_client_rtps(7, &expected_update_payload_demux1),
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(1, &expected_update_payload_demux2)
-                )
+                    create_server_to_client_rtps(1, &expected_update_payload_demux2),
+                ),
             ]),
-            rtp_to_send
+            rtp_to_send,
         );
     }
 
@@ -7034,12 +6666,12 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2, bob_device_1, bob_device_2],
-                demux_ids(&inner.pending_clients)
+                demux_ids(&inner.pending_clients),
             );
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
         }
 
         call.approve_pending_client(alice_device_1, at(500));
@@ -7047,23 +6679,23 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2, bob_device_1, bob_device_2],
-                demux_ids(&inner.clients)
+                inner.clients.demux_ids(),
             );
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
         }
 
         call.block_client(alice_device_1, at(700));
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![bob_device_1, bob_device_2], demux_ids(&inner.clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![bob_device_1, bob_device_2], inner.clients.demux_ids());
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2],
-                demux_ids(&inner.removed_clients)
+                demux_ids(&inner.removed_clients),
             );
         }
 
@@ -7071,11 +6703,11 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![bob_device_1, bob_device_2], demux_ids(&inner.clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![bob_device_1, bob_device_2], inner.clients.demux_ids());
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2, alice_device_3],
-                demux_ids(&inner.removed_clients)
+                demux_ids(&inner.removed_clients),
             );
         }
 
@@ -7084,11 +6716,11 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![bob_device_1], demux_ids(&inner.clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![bob_device_1], inner.clients.demux_ids());
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2, alice_device_3, bob_device_2],
-                demux_ids(&inner.removed_clients)
+                demux_ids(&inner.removed_clients),
             );
         }
 
@@ -7096,11 +6728,11 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![bob_device_1, bob_device_3], demux_ids(&inner.clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![bob_device_1, bob_device_3], inner.clients.demux_ids());
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2, alice_device_3, bob_device_2],
-                demux_ids(&inner.removed_clients)
+                demux_ids(&inner.removed_clients),
             );
         }
     }
@@ -7119,9 +6751,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
             assert!(inner.denied_users.is_empty());
             assert!(inner.blocked_users.is_empty());
         }
@@ -7130,9 +6762,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.removed_clients));
             assert!(inner.denied_users.contains(&alice_user_id));
             assert!(inner.blocked_users.is_empty());
         }
@@ -7142,9 +6774,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.removed_clients));
             assert!(inner.denied_users.contains(&alice_user_id));
             assert!(inner.blocked_users.is_empty());
         }
@@ -7153,9 +6785,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![alice_device_2], demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![alice_device_2], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.removed_clients));
             assert!(inner.denied_users.contains(&alice_user_id));
             assert!(inner.blocked_users.is_empty());
         }
@@ -7164,11 +6796,11 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2],
-                demux_ids(&inner.removed_clients)
+                demux_ids(&inner.removed_clients),
             );
             assert!(inner.denied_users.contains(&alice_user_id));
             assert!(inner.blocked_users.contains(&alice_user_id));
@@ -7178,11 +6810,11 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2, alice_device_3],
-                demux_ids(&inner.removed_clients)
+                demux_ids(&inner.removed_clients),
             );
             assert!(inner.denied_users.contains(&alice_user_id));
             assert!(inner.blocked_users.contains(&alice_user_id));
@@ -7203,9 +6835,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.is_empty());
         }
 
@@ -7213,9 +6845,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![alice_device_1], inner.clients.demux_ids());
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.contains(&alice_user_id));
         }
 
@@ -7223,9 +6855,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.is_empty());
         }
 
@@ -7233,9 +6865,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![alice_device_2], demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![alice_device_2], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.is_empty());
         }
     }
@@ -7254,9 +6886,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.is_empty());
         }
 
@@ -7264,12 +6896,12 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2],
-                demux_ids(&inner.pending_clients)
+                demux_ids(&inner.pending_clients),
             );
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.is_empty());
         }
 
@@ -7277,12 +6909,12 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2],
-                demux_ids(&inner.clients)
+                inner.clients.demux_ids(),
             );
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.contains(&alice_user_id));
         }
 
@@ -7290,9 +6922,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![alice_device_2], demux_ids(&inner.clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![alice_device_2], inner.clients.demux_ids());
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.contains(&alice_user_id));
         }
 
@@ -7300,12 +6932,12 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(
                 vec![alice_device_2, alice_device_3],
-                demux_ids(&inner.clients)
+                inner.clients.demux_ids(),
             );
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.contains(&alice_user_id));
         }
     }
@@ -7324,9 +6956,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.is_empty());
         }
 
@@ -7334,9 +6966,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![alice_device_1], inner.clients.demux_ids());
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.contains(&alice_user_id));
         }
 
@@ -7344,9 +6976,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.is_empty());
         }
 
@@ -7354,11 +6986,11 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2],
-                demux_ids(&inner.removed_clients)
+                demux_ids(&inner.removed_clients),
             );
             assert!(inner.approved_users.is_empty());
         }
@@ -7378,9 +7010,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.is_empty());
             assert!(inner.denied_users.is_empty());
             assert!(inner.blocked_users.is_empty());
@@ -7390,9 +7022,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.is_empty());
             assert!(inner.denied_users.contains(&alice_user_id));
             assert!(inner.blocked_users.is_empty());
@@ -7402,9 +7034,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![alice_device_2], demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![alice_device_2], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.is_empty());
             assert!(inner.denied_users.contains(&alice_user_id));
             assert!(inner.blocked_users.is_empty());
@@ -7414,9 +7046,9 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![alice_device_2], demux_ids(&inner.clients));
-            assert_eq!(vec![alice_device_1], demux_ids(&inner.removed_clients));
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![alice_device_2], inner.clients.demux_ids());
+            vec_elem_eq(vec![alice_device_1], demux_ids(&inner.removed_clients));
             assert!(inner.approved_users.contains(&alice_user_id));
             assert!(inner.denied_users.is_empty());
             assert!(inner.blocked_users.is_empty());
@@ -7426,11 +7058,11 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2],
-                demux_ids(&inner.removed_clients)
+                demux_ids(&inner.removed_clients),
             );
             assert!(inner.approved_users.is_empty());
             assert!(inner.denied_users.is_empty());
@@ -7441,11 +7073,11 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![alice_device_3], demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(
+            vec_elem_eq(vec![alice_device_3], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2],
-                demux_ids(&inner.removed_clients)
+                demux_ids(&inner.removed_clients),
             );
             assert!(inner.approved_users.is_empty());
             assert!(inner.denied_users.is_empty());
@@ -7456,11 +7088,11 @@ mod call_tests {
 
         {
             let inner = call.inner.lock();
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.pending_clients));
-            assert_eq!(vec![] as Vec<DemuxId>, demux_ids(&inner.clients));
-            assert_eq!(
+            vec_elem_eq(vec![], demux_ids(&inner.pending_clients));
+            vec_elem_eq(vec![], inner.clients.demux_ids());
+            vec_elem_eq(
                 vec![alice_device_1, alice_device_2, alice_device_3],
-                demux_ids(&inner.removed_clients)
+                demux_ids(&inner.removed_clients),
             );
             assert!(inner.approved_users.is_empty());
             assert!(inner.denied_users.contains(&alice_user_id));
@@ -7491,18 +7123,18 @@ mod call_tests {
         )
         .encode_collection();
         assert_eq!(Some(demux_id1), call.inner.lock().active_speaker_id);
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(1, &expected_update_payload)
+                    create_server_to_client_rtps(1, &expected_update_payload),
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(1, &expected_update_payload)
-                )
+                    create_server_to_client_rtps(1, &expected_update_payload),
+                ),
             ]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         // Switch to demux_id2 as active speaker and send out an update.
@@ -7524,18 +7156,18 @@ mod call_tests {
         )
         .encode_collection();
         assert_eq!(Some(demux_id2), call.inner.lock().active_speaker_id);
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(3, &expected_update_payload)
+                    create_server_to_client_rtps(3, &expected_update_payload),
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(3, &expected_update_payload)
-                )
+                    create_server_to_client_rtps(3, &expected_update_payload),
+                ),
             ]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         // Switch to demux_id1 as active speaker and send out an update.
@@ -7561,18 +7193,18 @@ mod call_tests {
         )
         .encode_collection();
         assert_eq!(Some(demux_id1), call.inner.lock().active_speaker_id);
-        assert_eq!(
+        rtp_to_send_eq(
             to_rtp_to_send(vec![
                 (
                     demux_id1,
-                    create_server_to_client_rtps(4, &expected_update_payload)
+                    create_server_to_client_rtps(4, &expected_update_payload),
                 ),
                 (
                     demux_id2,
-                    create_server_to_client_rtps(4, &expected_update_payload)
-                )
+                    create_server_to_client_rtps(4, &expected_update_payload),
+                ),
             ]),
-            rtp_to_send
+            rtp_to_send,
         );
 
         let get_stats = |from_server: &[RtpToSend],
@@ -7630,6 +7262,108 @@ mod call_tests {
                 allocated_send_rate_kbps: Some(0),
             }),
             get_stats(&rtp_to_send, demux_id2)
+        );
+    }
+
+    #[test]
+    fn requested_height_for_applies_the_active_speaker_override() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(CALL_ID, now, system_now, false);
+        let demux_id1 = add_client(&mut call, "1", 1, at(1));
+        let demux_id2 = add_client(&mut call, "2", 2, at(2));
+        let demux_id3 = add_client(&mut call, "3", 3, at(3));
+
+        // Client1 shows client2 in a 120p tile, and says it will show the active speaker at 480p.
+        let mut request = create_active_speaker_height_rtp(2, 120, 480);
+        call.handle_rtp(demux_id1, request.borrow_mut(), at(4))
+            .unwrap();
+
+        let inner = call.inner.lock();
+        let receiver = inner.clients.get(demux_id1).unwrap();
+
+        // With no active speaker the explicit request stands.
+        assert_eq!(
+            receiver.requested_height_for(demux_id2, None),
+            VideoHeight::from(120)
+        );
+        // Client2 speaking raises its request to the active speaker height, so the SFU can ask
+        // for the larger layer before client1's UI catches up and requests it itself.
+        assert_eq!(
+            receiver.requested_height_for(demux_id2, Some(demux_id2)),
+            VideoHeight::from(480)
+        );
+        // Someone else speaking leaves client2's request alone.
+        assert_eq!(
+            receiver.requested_height_for(demux_id2, Some(demux_id3)),
+            VideoHeight::from(120)
+        );
+        // A sender nothing was requested from defaults to the smallest layer being sent...
+        assert_eq!(
+            receiver.requested_height_for(demux_id3, None),
+            VideoHeight::from(1)
+        );
+        // ...and is still raised when it starts speaking.
+        assert_eq!(
+            receiver.requested_height_for(demux_id3, Some(demux_id3)),
+            VideoHeight::from(480)
+        );
+    }
+
+    #[test]
+    fn requested_height_for_ignores_a_lower_active_speaker_height() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(CALL_ID, now, system_now, false);
+        let demux_id1 = add_client(&mut call, "1", 1, at(1));
+        let demux_id2 = add_client(&mut call, "2", 2, at(2));
+
+        // The tile client1 already shows client2 in is larger than its active-speaker tile.
+        let mut request = create_active_speaker_height_rtp(2, 720, 240);
+        call.handle_rtp(demux_id1, request.borrow_mut(), at(3))
+            .unwrap();
+
+        let inner = call.inner.lock();
+        let receiver = inner.clients.get(demux_id1).unwrap();
+
+        // The override only ever raises the request, never lowers it.
+        assert_eq!(
+            receiver.requested_height_for(demux_id2, Some(demux_id2)),
+            VideoHeight::from(720)
+        );
+    }
+
+    #[test]
+    fn requested_height_for_overrides_a_declined_sender() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+
+        let mut call = create_call(CALL_ID, now, system_now, false);
+        let demux_id1 = add_client(&mut call, "1", 1, at(1));
+        let demux_id2 = add_client(&mut call, "2", 2, at(2));
+
+        // Height 0 means client1 has declined client2's video outright.
+        let mut request = create_active_speaker_height_rtp(2, 0, 480);
+        call.handle_rtp(demux_id1, request.borrow_mut(), at(3))
+            .unwrap();
+
+        let inner = call.inner.lock();
+        let receiver = inner.clients.get(demux_id1).unwrap();
+
+        assert_eq!(
+            receiver.requested_height_for(demux_id2, None),
+            VideoHeight::from(0)
+        );
+        // A declined sender is still promoted once it starts speaking. This mirrors what the
+        // simulcast path has always done; see the note on requested_height_for.
+        assert_eq!(
+            receiver.requested_height_for(demux_id2, Some(demux_id2)),
+            VideoHeight::from(480)
         );
     }
 
@@ -7908,6 +7642,74 @@ mod call_tests {
     }
 
     #[test]
+    fn blocked_client_stops_being_listed_as_forwarding_video() {
+        let now = Instant::now();
+        let system_now = SystemTime::now();
+        let at = |millis| now + Duration::from_millis(millis);
+        let sys_at = |millis| system_now + Duration::from_millis(millis);
+        let get_forwarding_video_demux_ids =
+            |from_server: &[RtpToSend], receiver_demux_id: DemuxId| -> Option<Vec<DemuxId>> {
+                let (_demux_id, rtp) = from_server
+                    .iter()
+                    .find(|(demux_id, _rtp)| *demux_id == receiver_demux_id)?;
+                let proto = protos::SfuToDevice::decode(rtp.payload()).ok()?;
+                let mut demux_ids: Vec<DemuxId> = proto
+                    .current_devices?
+                    .demux_ids_with_video
+                    .iter()
+                    .map(|demux_id| DemuxId::try_from(*demux_id).unwrap())
+                    .collect();
+                demux_ids.sort();
+                Some(demux_ids)
+            };
+
+        let mut call = create_call(CALL_ID, now, system_now, false);
+        let demux_id1 = add_client(&mut call, "1", 1, at(1));
+        let demux_id2 = add_client(&mut call, "2", 2, at(2));
+        let demux_id3 = add_client(&mut call, "3", 3, at(3));
+
+        // Send some video from client2 so the other clients start forwarding it.
+        for seqnum in 0..10 {
+            let mut to_server = create_video_rtp(
+                demux_id2,
+                LayerId::Video0,
+                1,
+                seqnum,
+                Some(PixelSize {
+                    width: 640,
+                    height: 480,
+                }),
+            );
+            call.handle_rtp(demux_id2, to_server.borrow_mut(), at(5))
+                .unwrap();
+        }
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(1006), sys_at(1006));
+        assert_eq!(
+            Some(vec![demux_id2]),
+            get_forwarding_video_demux_ids(&from_server, demux_id1)
+        );
+        assert_eq!(
+            Some(vec![demux_id2]),
+            get_forwarding_video_demux_ids(&from_server, demux_id3)
+        );
+
+        // An admin blocks client2. Its forwarders have to be torn down on every remaining
+        // client, or they keep drawing a tile for a participant who has left the call.
+        call.block_client(demux_id2, at(1007));
+
+        let (from_server, _outgoing_key_frame_requests) = call.tick(at(2008), sys_at(2008));
+        assert_eq!(
+            Some(vec![]),
+            get_forwarding_video_demux_ids(&from_server, demux_id1)
+        );
+        assert_eq!(
+            Some(vec![]),
+            get_forwarding_video_demux_ids(&from_server, demux_id3)
+        );
+    }
+
+    #[test]
     fn allocated_height_updates() {
         let now = Instant::now();
         let system_now = SystemTime::now();
@@ -8135,24 +7937,24 @@ mod call_tests {
         .encode_to_vec();
 
         // A raised hands message should be sent to all clients
-        assert_eq!(
+        rtp_to_send_eq(
             vec![
                 (
                     demux_id1,
                     create_server_to_client_rtp(
                         3,
-                        &expected_update_payload_for_raised_hands_client1
-                    )
+                        &expected_update_payload_for_raised_hands_client1,
+                    ),
                 ),
                 (
                     demux_id2,
                     create_server_to_client_rtp(
                         3,
-                        &expected_update_payload_for_raised_hands_client2
-                    )
-                )
+                        &expected_update_payload_for_raised_hands_client2,
+                    ),
+                ),
             ],
-            rtp_to_send
+            rtp_to_send,
         );
     }
 
@@ -8166,14 +7968,14 @@ mod call_tests {
 
         let alice_device_1 = add_admin(&mut call, "Alice", 1, at(100));
         let bob_device_1 = add_client(&mut call, "Bob", 2, at(200));
-        assert_eq!(
+        vec_elem_eq(
             vec![bob_device_1],
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
-        assert_eq!(
+        vec_elem_eq(vec![alice_device_1], call.inner.lock().clients.demux_ids());
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().removed_clients)
+            demux_ids(&call.inner.lock().removed_clients),
         );
 
         // Alice: Approve Bob
@@ -8196,17 +7998,17 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec![alice_device_1, bob_device_1],
-            demux_ids(&call.inner.lock().clients)
+            call.inner.lock().clients.demux_ids(),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().removed_clients)
+            demux_ids(&call.inner.lock().removed_clients),
         );
 
         // Alice: Remove Bob
@@ -8229,25 +8031,25 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
-        assert_eq!(
+        vec_elem_eq(vec![alice_device_1], call.inner.lock().clients.demux_ids());
+        vec_elem_eq(
             vec![bob_device_1],
-            demux_ids(&call.inner.lock().removed_clients)
+            demux_ids(&call.inner.lock().removed_clients),
         );
 
         let carol_device_1 = add_client(&mut call, "Carol", 3, at(500));
-        assert_eq!(
+        vec_elem_eq(
             vec![carol_device_1],
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
-        assert_eq!(
+        vec_elem_eq(vec![alice_device_1], call.inner.lock().clients.demux_ids());
+        vec_elem_eq(
             vec![bob_device_1],
-            demux_ids(&call.inner.lock().removed_clients)
+            demux_ids(&call.inner.lock().removed_clients),
         );
 
         // Alice: Deny Carol
@@ -8270,28 +8072,28 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
-        assert_eq!(
+        vec_elem_eq(vec![alice_device_1], call.inner.lock().clients.demux_ids());
+        vec_elem_eq(
             vec![bob_device_1, carol_device_1],
-            demux_ids(&call.inner.lock().removed_clients)
+            demux_ids(&call.inner.lock().removed_clients),
         );
 
         let damien_device_1 = add_admin(&mut call, "Damien", 4, at(700));
-        assert_eq!(
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec![alice_device_1, damien_device_1],
-            demux_ids(&call.inner.lock().clients)
+            call.inner.lock().clients.demux_ids(),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec![bob_device_1, carol_device_1],
-            demux_ids(&call.inner.lock().removed_clients)
+            demux_ids(&call.inner.lock().removed_clients),
         );
 
         // Alice: Block Damien
@@ -8314,16 +8116,16 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
-        assert_eq!(
+        vec_elem_eq(vec![alice_device_1], call.inner.lock().clients.demux_ids());
+        vec_elem_eq(
             vec![bob_device_1, carol_device_1, damien_device_1],
-            demux_ids(&call.inner.lock().removed_clients)
+            demux_ids(&call.inner.lock().removed_clients),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec!["Damien"],
             call.inner
                 .lock()
@@ -8344,14 +8146,14 @@ mod call_tests {
 
         let alice_device_1 = add_admin(&mut call, "Alice", 1, at(100));
         let bob_device_1 = add_client(&mut call, "Bob", 2, at(200));
-        assert_eq!(
+        vec_elem_eq(
             vec![bob_device_1],
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
-        assert_eq!(
+        vec_elem_eq(vec![alice_device_1], call.inner.lock().clients.demux_ids());
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().removed_clients)
+            demux_ids(&call.inner.lock().removed_clients),
         );
 
         fn mrp_header_with_seqnum(seqnum: u64) -> Option<protos::MrpHeader> {
@@ -8388,11 +8190,11 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(
+        vec_elem_eq(
             vec![bob_device_1] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
+        vec_elem_eq(vec![alice_device_1], call.inner.lock().clients.demux_ids());
         assert!(call.inner.lock().removed_clients.is_empty());
         assert!(call.inner.lock().denied_users.is_empty());
 
@@ -8406,13 +8208,13 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec![alice_device_1, bob_device_1],
-            demux_ids(&call.inner.lock().clients)
+            call.inner.lock().clients.demux_ids(),
         );
         assert!(call.inner.lock().removed_clients.is_empty());
         assert!(call.inner.lock().denied_users.is_empty());
@@ -8427,13 +8229,13 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec![alice_device_1, bob_device_1],
-            demux_ids(&call.inner.lock().clients)
+            call.inner.lock().clients.demux_ids(),
         );
         assert!(call.inner.lock().removed_clients.is_empty());
         assert!(call.inner.lock().denied_users.is_empty());
@@ -8448,13 +8250,13 @@ mod call_tests {
             .unwrap();
         assert!(rtp_to_send.is_empty());
 
-        assert_eq!(
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec![alice_device_1, bob_device_1],
-            demux_ids(&call.inner.lock().clients)
+            call.inner.lock().clients.demux_ids(),
         );
         assert!(call.inner.lock().removed_clients.is_empty());
         assert!(call.inner.lock().denied_users.is_empty());
@@ -8462,13 +8264,13 @@ mod call_tests {
         // Carol: Joins
         let carol_device_1 = add_client(&mut call, "Carol", 3, at(500));
         let carol_user_id = UserId::from("Carol".to_string());
-        assert_eq!(
+        vec_elem_eq(
             vec![carol_device_1],
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec![alice_device_1, bob_device_1],
-            demux_ids(&call.inner.lock().clients)
+            call.inner.lock().clients.demux_ids(),
         );
         assert!(call.inner.lock().removed_clients.is_empty());
         assert!(call.inner.lock().denied_users.is_empty());
@@ -8501,13 +8303,13 @@ mod call_tests {
             )
             .unwrap();
         assert!(rtp_to_send.is_empty());
-        assert_eq!(
+        vec_elem_eq(
             vec![carol_device_1],
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec![alice_device_1, bob_device_1],
-            demux_ids(&call.inner.lock().clients)
+            call.inner.lock().clients.demux_ids(),
         );
         assert!(call.inner.lock().removed_clients.is_empty());
         assert!(call.inner.lock().denied_users.is_empty());
@@ -8521,13 +8323,13 @@ mod call_tests {
             )
             .unwrap();
         assert!(rtp_to_send.is_empty());
-        assert_eq!(
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec![alice_device_1, bob_device_1],
-            demux_ids(&call.inner.lock().clients)
+            call.inner.lock().clients.demux_ids(),
         );
         assert!(carol_user_id == call.inner.lock().removed_clients[0].user_id);
         assert!(HashSet::from([carol_user_id.clone()]) == call.inner.lock().denied_users);
@@ -8541,13 +8343,13 @@ mod call_tests {
             )
             .unwrap();
         assert!(rtp_to_send.is_empty());
-        assert_eq!(
+        vec_elem_eq(
             vec![] as Vec<DemuxId>,
-            demux_ids(&call.inner.lock().pending_clients)
+            demux_ids(&call.inner.lock().pending_clients),
         );
-        assert_eq!(
+        vec_elem_eq(
             vec![alice_device_1, bob_device_1],
-            demux_ids(&call.inner.lock().clients)
+            call.inner.lock().clients.demux_ids(),
         );
         assert!(carol_user_id == call.inner.lock().removed_clients[0].user_id);
         assert!(HashSet::from([carol_user_id.clone()]) == call.inner.lock().denied_users);
@@ -8570,7 +8372,7 @@ mod call_tests {
             vec![bob_device_1],
             demux_ids(&call.inner.lock().pending_clients)
         );
-        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
+        assert_eq!(vec![alice_device_1], call.inner.lock().clients.demux_ids());
 
         let rtp_to_send = call
             .handle_rtp(
@@ -8596,7 +8398,7 @@ mod call_tests {
             vec![bob_device_1],
             demux_ids(&call.inner.lock().pending_clients)
         );
-        assert_eq!(vec![alice_device_1], demux_ids(&call.inner.lock().clients));
+        assert_eq!(vec![alice_device_1], call.inner.lock().clients.demux_ids());
     }
 
     #[test]
@@ -8870,7 +8672,7 @@ mod call_tests {
         let fragment2 = &content[MAX_MRP_FRAGMENT_BYTE_SIZE..];
         let expected = expected_rtp(&demux_ids, 1, &update, &[fragment1, fragment2]);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(100), sys_at(100));
-        assert_eq!(expected, rtp_to_send);
+        rtp_to_send_eq(expected, rtp_to_send);
 
         let pending_demux_ids = (101..=150)
             .map(|i| add_client(&mut call, &i.to_string(), i, at(101)))
@@ -8913,6 +8715,6 @@ mod call_tests {
 
         ack_all_mrp(&mut call);
         let (rtp_to_send, _outgoing_key_frame_requests) = call.tick(at(200), sys_at(200));
-        assert_eq!(expected, rtp_to_send);
+        rtp_to_send_eq(expected, rtp_to_send);
     }
 }

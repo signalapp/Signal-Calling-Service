@@ -382,7 +382,7 @@ impl Div<f64> for DataRate {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct DataRateTracker {
     // Oldest is at the back. The newest is at the front. This makes it easier
     // to do removal using VecDeque::split_off.
@@ -471,6 +471,7 @@ impl DataRateTracker {
     }
 }
 
+#[derive(Debug)]
 pub struct CheckedDataRateTracker {
     tracker: DataRateTracker,
     max_rate: DataRate,

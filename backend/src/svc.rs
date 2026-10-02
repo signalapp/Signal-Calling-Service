@@ -14,7 +14,9 @@ use std::{
     sync::LazyLock,
 };
 
-use calling_common::{DataRate, DataRateTracker, DemuxId, Duration, Instant};
+use calling_common::{
+    CheckedDataRateTracker, DataRate, DataRateTracker, DemuxId, Duration, Instant, VideoHeight,
+};
 use log::{error, info, trace, warn};
 use metrics::event;
 use smallvec::SmallVec;
@@ -27,14 +29,15 @@ use crate::{
         ActiveDecodeTargetsBitmask, DependencyDescriptor, Dti, ExtendedDescriptorFields,
         FrameDependencyDefinition, FullFrameNumber, FullSequenceNumber, MandatoryDescriptorFields,
         Resolution, RtpStreamAllocation, TemplateDependencyStructure, expand_frame_number,
+        packet_buffer::PacketBuffer,
     },
     svc::{
         ScalableVideoError::{
             ActiveDecodeTargetsBitmaskNotAvailable, DecodeTargetChainIndicesNotAvailable,
             DependencyDescriptorNotAvailable, DependencyStructureNotAvailable,
-            FailedToCreatePacket, InconsistentState, InvalidChainIndex, InvalidDecodeTarget,
-            InvalidDemuxId, InvalidFrameDependencyTemplateId, ResolutionsNotAvailable,
-            VideoLayerAllocationNotAvailable,
+            FailedToCreatePacket, IncomingVideoLimitExceeded, InconsistentState, InvalidChainIndex,
+            InvalidDecodeTarget, InvalidDemuxId, InvalidFrameDependencyTemplateId,
+            ResolutionsNotAvailable, VideoLayerAllocationNotAvailable,
         },
         frame_tracker::{FrameTracker, PacketInfo},
     },
@@ -47,10 +50,12 @@ pub const MAX_EXPECTED_CLIENTS: usize = 75;
 
 /// Periodic report generation period
 const PERIODIC_REPORT_GENERATION_PERIOD: Duration = Duration::from_secs(10);
-/// The decode target switching mechanism cannot request keyframes more requently than this
-const KEYFRAME_REQUEST_PERIOD: Duration = Duration::from_millis(3000);
-/// Base layer target
-const BASE_LAYER_TARGET: DecodeTarget = 0;
+/// How much bitrate to assume clients will use to send layer 0 video.
+const ASSUMED_BASE_LAYER_RATE: DataRate = DataRate::from_kbps(150);
+/// Maximum inbound video data rate per SSRC
+const MAX_VIDEO_DATA_RATE_PER_SSRC: DataRate = DataRate::from_kbps(30000);
+/// Maximum number of packets to buffer
+const PACKET_BUFFER_SIZE: usize = 5;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ScalableVideoError {
@@ -90,6 +95,8 @@ pub enum ScalableVideoError {
     VideoLayerAllocationNotAvailable,
     #[error("Frame tracker error")]
     FrameTrackerError(#[from] frame_tracker::FrameTrackerError),
+    #[error("Incoming video limit exceeded")]
+    IncomingVideoLimitExceeded,
 }
 
 #[derive(Default, Debug)]
@@ -104,10 +111,8 @@ pub struct ScalableVideoState {
     demux_id: DemuxId,
     sender: ScalableVideoSender,
     receivers: Receivers,
-    current_target_rate: DataRate,
-    requested_target_rate: Option<DataRate>,
-    available_rate: Option<DataRate>,
     next_periodic_report_time: Instant,
+    packet_buffer: PacketBuffer,
 }
 
 #[derive(Default)]
@@ -117,9 +122,7 @@ struct Receivers(HashMap<DemuxId, ScalableVideoReceiver>);
 struct ScalableVideoReceiver {
     // The receiver's demux ID.
     demux_id: DemuxId,
-    seqnum: FullSequenceNumber,
     seqnum_offset: FullSequenceNumber,
-    max_inbound_seqnum: Option<FullSequenceNumber>,
     // The decode target to which the receiver is about to switch
     switch_decode_target: Option<DecodeTarget>,
     // The decode target bitmask to which the receiver is about to switch.
@@ -149,6 +152,7 @@ struct ScalableVideoSender {
     // An optional `TemplateDependencyStructure`, which defines the dependency
     // relationships between the layers of the scalable video stream.
     dependency_structure: Option<TemplateDependencyStructure>,
+    max_inbound_seqnum: Option<FullSequenceNumber>,
     // Currently active decode targets.
     active_decode_targets_bitmask: ActiveDecodeTargetsBitmask,
     // Allocation details for the RTP video layers.
@@ -163,9 +167,38 @@ struct ScalableVideoSender {
     decode_targets: DecodeTargetInfoList,
     // Will be set to true if a PLI needs to be sent to the sender.
     needs_keyframe: bool,
-    // PLI request throttling. Used by this module only. See `KEYFRAME_REQUEST_PERIOD`
-    // for the throttling period.
-    next_keyframe_request_time: Option<Instant>,
+    // The rate tracker that is used to limit inbound video processing. All packets received
+    // from the sender will be dropped while the inbound data rate is found to be excessive.
+    rate_tracker: ScalableVideoDataRateTracker,
+}
+
+/// SVC-specific Data rate tracker used to ensure that incoming SVC video is kept in check.
+/// This is a simple wrapper around [`CheckedDataRateTracker`] that provides a [`Default`]
+/// implementation.
+#[derive(Debug)]
+struct ScalableVideoDataRateTracker(CheckedDataRateTracker);
+
+impl Default for ScalableVideoDataRateTracker {
+    fn default() -> Self {
+        Self(CheckedDataRateTracker::new(
+            Some(ASSUMED_BASE_LAYER_RATE),
+            MAX_VIDEO_DATA_RATE_PER_SSRC,
+        ))
+    }
+}
+
+impl Deref for ScalableVideoDataRateTracker {
+    type Target = CheckedDataRateTracker;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ScalableVideoDataRateTracker {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 #[derive(Debug)]
@@ -174,11 +207,7 @@ pub struct ExtendedPacketInfo {
     pub needs_allocation: bool,
     pub frame_dependency_definition: FrameDependencyDefinition,
     pub end_of_frame: bool,
-}
-
-#[derive(Debug)]
-pub struct ScalableVideoTickResult {
-    pub updated_target_rate: Option<DataRate>,
+    pub is_new_max_seqnum: bool,
 }
 
 /// The `DecodeTargetInfo` struct holds metadata about a target's decoding parameters,
@@ -251,6 +280,10 @@ impl Stats {
 }
 
 impl Receivers {
+    fn get(&self, demux_id: DemuxId) -> Option<&ScalableVideoReceiver> {
+        self.0.get(&demux_id)
+    }
+
     fn get_mut(&mut self, demux_id: DemuxId) -> Option<&mut ScalableVideoReceiver> {
         self.0.get_mut(&demux_id)
     }
@@ -308,10 +341,8 @@ impl Default for ScalableVideoState {
             demux_id: DemuxId::from_const(0),
             sender: ScalableVideoSender::default(),
             receivers: Receivers::default(),
-            requested_target_rate: None,
-            available_rate: None,
-            current_target_rate: DataRate::ZERO,
             next_periodic_report_time: Instant::now(),
+            packet_buffer: PacketBuffer::new(PACKET_BUFFER_SIZE),
         }
     }
 }
@@ -321,22 +352,29 @@ impl ScalableVideoState {
         self.sender.dependency_structure.clone()
     }
 
-    pub fn new(
-        demux_id: DemuxId,
-        initial_target_rate: DataRate,
-        initial_requested_target_rate: DataRate,
-        now: Instant,
-    ) -> Self {
+    pub fn new(demux_id: DemuxId, now: Instant) -> Self {
         event!("calling.svc.client");
         Self {
             demux_id,
             sender: Default::default(),
             receivers: Default::default(),
-            current_target_rate: initial_target_rate,
-            requested_target_rate: Some(initial_requested_target_rate),
-            available_rate: None,
             next_periodic_report_time: now + PERIODIC_REPORT_GENERATION_PERIOD,
+            packet_buffer: PacketBuffer::new(PACKET_BUFFER_SIZE),
         }
+    }
+
+    /// Enqueues a packet in the internal packet buffer. If this method yields a packet, that
+    /// packet should be submitted to [`ScalableVideoState::handle_packet`].
+    pub fn enqueue_packet(&mut self, packet: &rtp::Packet<&[u8]>) -> Option<rtp::Packet<Vec<u8>>> {
+        self.packet_buffer.push_packet_and_yield(packet)
+    }
+
+    pub fn update_incoming_rate(
+        &mut self,
+        incoming_rtp: &rtp::Packet<&[u8]>,
+        now: Instant,
+    ) -> Result<(), ScalableVideoError> {
+        self.sender.update_rate_tracker(incoming_rtp, now)
     }
 
     pub fn needs_keyframe(&self) -> bool {
@@ -349,9 +387,14 @@ impl ScalableVideoState {
             self.demux_id
         );
         self.sender.needs_keyframe = true;
+        let init_seqnum_offset = self
+            .sender
+            .max_inbound_seqnum
+            .unwrap_or(0)
+            .saturating_sub(PACKET_BUFFER_SIZE as u64);
         self.receivers.insert(
             receiver_demux_id,
-            ScalableVideoReceiver::new(receiver_demux_id, now),
+            ScalableVideoReceiver::new(receiver_demux_id, init_seqnum_offset, now),
         );
     }
 
@@ -359,22 +402,14 @@ impl ScalableVideoState {
         self.receivers.remove(receiver_demux_id);
     }
 
-    /// Initiates a PLI send to the sender.
-    pub fn set_needs_keyframe_immediately(&mut self) {
-        self.sender.needs_keyframe = true;
+    /// Returns the maximum video height currently sent by the sender.
+    pub fn get_maximum_video_height(&self) -> Option<VideoHeight> {
+        self.sender.get_maximum_video_height()
     }
 
-    /// Initiates a PLI send to the sendr. This is throttled so that only one keyframe request
-    /// can be made during a `KEYFRAME_REQUEST_PERIOD`.
-    fn set_needs_keyframe(&mut self, now: Instant) {
-        if self
-            .sender
-            .next_keyframe_request_time
-            .is_none_or(|v| v < now)
-        {
-            self.sender.next_keyframe_request_time = Some(now + KEYFRAME_REQUEST_PERIOD);
-            self.sender.needs_keyframe = true;
-        }
+    /// Initiates a PLI send to the sender.
+    pub fn set_needs_keyframe(&mut self) {
+        self.sender.needs_keyframe = true;
     }
 
     /// Returns the list of active decode targets. This list will not include those
@@ -383,22 +418,14 @@ impl ScalableVideoState {
         &self.sender.decode_targets
     }
 
-    /// Sets the requested target rate according to what the client signaled.
-    /// The possible reallocation will take place during periodic tick processing.
-    pub fn set_requested_target_rate(&mut self, target_rate: DataRate) {
-        self.requested_target_rate = Some(target_rate);
-    }
-
-    /// Sets the avaialble rate according to what congestion control has calculated.
-    /// The possible reallocation will take place during periodic tick processing.
-    pub fn set_available_rate(&mut self, available_rate: DataRate) {
-        self.available_rate = Some(available_rate);
-    }
-
-    /// Retrieves the current target rate. This must always be the smaller of
-    /// the requested and available target values.
-    pub fn get_target_rate(&self) -> DataRate {
-        self.current_target_rate
+    /// Retrieves the currently active decode target for the given receiver.
+    pub fn get_decode_target_for_receiver(
+        &self,
+        receiver_demux_id: DemuxId,
+    ) -> Option<DecodeTarget> {
+        self.receivers
+            .get(receiver_demux_id)
+            .and_then(|receiver| receiver.active_decode_target)
     }
 
     /// Sets or clears the decode target for the given receiver.
@@ -411,7 +438,11 @@ impl ScalableVideoState {
     ) -> Result<(), ScalableVideoError> {
         let decode_target_params = if let Some(decode_target) = decode_target {
             match self.sender.active_decode_targets_bitmask.size() {
-                Some(size) if size > decode_target => Some((decode_target, size)),
+                Some(size)
+                    if size > decode_target && self.sender.decode_targets.len() > decode_target =>
+                {
+                    Some((decode_target, size))
+                }
                 Some(_) => {
                     warn!("svc: {receiver_demux_id:?} bad decode target: {decode_target}");
                     return Err(InvalidDecodeTarget(decode_target));
@@ -432,7 +463,9 @@ impl ScalableVideoState {
     }
 
     /// Performs initial packet handling. If the packet contains *updated* dependency
-    /// information, the internal structures are updated.
+    /// information, the internal structures are updated. Only those packets that have
+    /// been yielded by [`ScalableVideoState::enqueue_packet`] should be submitted to
+    /// this method.
     pub fn handle_packet(
         &mut self,
         inbound_rtp: &rtp::Packet<&[u8]>,
@@ -472,7 +505,7 @@ impl ScalableVideoState {
         {
             Ok((rtp_to_send, needs_keyframe)) => {
                 if needs_keyframe {
-                    self.set_needs_keyframe(now);
+                    self.sender.needs_keyframe = true;
                 }
                 Ok(rtp_to_send)
             }
@@ -485,62 +518,27 @@ impl ScalableVideoState {
         }
     }
 
-    fn update_target_rate(&mut self) -> Option<DataRate> {
-        let new_target_rate = match (self.requested_target_rate, self.available_rate) {
-            (Some(requested_target_rate), Some(available_rate)) => {
-                available_rate.min(requested_target_rate)
-            }
-            (Some(requested_target_rate), None) => requested_target_rate,
-            (None, Some(available_rate)) => available_rate,
-            _ => DataRate::ZERO,
-        };
-        if self.current_target_rate != new_target_rate {
-            self.current_target_rate = new_target_rate;
-            Some(new_target_rate)
-        } else {
-            None
-        }
-    }
-
     /// Advances time-dependent state for all receivers and the sender, emits a periodic log
     /// report if due, and recomputes the target send rate.
-    ///
-    /// Returns `updated_target_rate` as `Some` only when the effective rate (the minimum of the
-    /// requested and available rates) has changed since the last tick, so callers can skip
-    /// reconfiguration when nothing has changed.
-    pub fn tick(&mut self, now: Instant) -> ScalableVideoTickResult {
+    pub fn tick(&mut self, now: Instant) {
         self.receivers.tick(now);
         self.sender.tick(now);
         self.log_periodic_report(now);
-        let updated_target_rate = self.update_target_rate();
-        ScalableVideoTickResult {
-            updated_target_rate,
-        }
     }
 
     fn log_periodic_report(&mut self, now: Instant) {
         if now >= self.next_periodic_report_time {
             self.next_periodic_report_time = now + PERIODIC_REPORT_GENERATION_PERIOD;
-            info!(
-                "svc: {:?}: requested={:?}, current={:?}, available={:?}, req-keyframe={}",
-                self.demux_id,
-                self.requested_target_rate,
-                self.current_target_rate,
-                self.available_rate,
-                self.sender.needs_keyframe
-            );
             self.receivers.log_periodic_report(&self.sender);
         }
     }
 }
 
 impl ScalableVideoReceiver {
-    fn new(demux_id: DemuxId, _now: Instant) -> Self {
+    fn new(demux_id: DemuxId, initial_seqnum_offset: FullSequenceNumber, _now: Instant) -> Self {
         Self {
             demux_id,
-            seqnum: 0,
-            seqnum_offset: 0,
-            max_inbound_seqnum: None,
+            seqnum_offset: initial_seqnum_offset,
             current_frame_number: None,
             switch_decode_target: None,
             switch_decode_target_bitmask: ActiveDecodeTargetsBitmask::Uninitialized,
@@ -554,10 +552,8 @@ impl ScalableVideoReceiver {
     /// Must be invoked for every dropped packet. Updates stats and adjusts the seqnum
     /// generation logic to take into account the dropped packet.
     #[inline]
-    fn on_dropped_packet<T>(&mut self, inbound_rtp: &rtp::Packet<T>) {
-        let inbound_seqnum = inbound_rtp.seqnum();
-        if self.max_inbound_seqnum.is_none_or(|v| v < inbound_seqnum) {
-            self.max_inbound_seqnum = Some(inbound_seqnum);
+    fn on_dropped_packet(&mut self, ext_info: &ExtendedPacketInfo) {
+        if ext_info.is_new_max_seqnum {
             self.seqnum_offset += 1;
         }
     }
@@ -570,8 +566,7 @@ impl ScalableVideoReceiver {
 
     #[inline]
     fn bump_seqnum(&mut self, inbound_seqnum: FullSequenceNumber) -> FullSequenceNumber {
-        self.seqnum = inbound_seqnum.saturating_sub(self.seqnum_offset);
-        self.seqnum
+        inbound_seqnum.saturating_sub(self.seqnum_offset)
     }
 
     #[inline]
@@ -595,9 +590,8 @@ impl ScalableVideoReceiver {
 
     /// Attempts to downgrade the currently selected active decode target by checking
     /// the chains of the available lower decode targets, looking for the best one with
-    /// its chain intact. Once an appropriate decode target is found, a request is
-    /// made for a decode target switch. If no appropriate decode target can be found,
-    /// the decode target that selects the base layer will be selected (0).
+    /// its chain intact. Once an appropriate decode target is found, the switch is
+    /// immediately made. Otherwise, forwarding to the receiver is suppressed.
     fn on_chain_broken(
         &mut self,
         sender: &ScalableVideoSender,
@@ -617,7 +611,7 @@ impl ScalableVideoReceiver {
             return Ok(());
         };
 
-        let mut selected_target = Some((BASE_LAYER_TARGET, size));
+        let mut selected_target = None;
         for target in (0..=active_decode_target).rev() {
             if bitmask & (1 << target) != 0
                 && sender.is_chain_intact(target, current_frame_number, frame_dep)?
@@ -626,12 +620,13 @@ impl ScalableVideoReceiver {
                 break;
             }
         }
-        trace!(
-            "svc: {:?}: will downshift to {selected_target:?}",
-            self.demux_id
-        );
 
-        self.request_decode_target_switch(selected_target);
+        if selected_target.is_some() {
+            self.request_decode_target_switch(selected_target);
+            self.switch_decode_target();
+        } else {
+            self.suppress_forwarding();
+        }
 
         Ok(())
     }
@@ -651,7 +646,13 @@ impl ScalableVideoReceiver {
     /// in immediate suppression of forwarding.
     fn request_decode_target_switch(&mut self, decode_target: Option<(DecodeTarget, usize)>) {
         if let Some((target, size)) = decode_target {
-            if self.switch_decode_target != Some(target) {
+            // If the request is to set the same decode target as the target that is currently
+            // selected, we'll simply clear the current switch request, if there is one. It is
+            // simply being overriden by something that is, effectively, a no-op.
+            if self.active_decode_target == Some(target) {
+                self.switch_decode_target = None;
+                self.switch_decode_target_bitmask = ActiveDecodeTargetsBitmask::Uninitialized;
+            } else if self.switch_decode_target != Some(target) {
                 let v = 1 << target;
                 let bitmask = ActiveDecodeTargetsBitmask::Available {
                     bitmask: v | (v - 1),
@@ -670,7 +671,7 @@ impl ScalableVideoReceiver {
     }
 
     /// Evaluates whether decode target switch can be performed. It is always invoked on the frame
-    /// boundary. Returns `Some(result)` if it was able to conclusively determine if a switch can
+    /// boundary. Returns `Some(result)` if it was able to conclusively determine that a switch can
     /// be performed. If `None` is returned it indicates that the switch is a temporal-only switch,
     /// and that the frame dependency structure needs to be consulted.
     ///
@@ -712,10 +713,10 @@ impl ScalableVideoReceiver {
         }
     }
 
-    /// This method manages packet forwarding for the receiver. If there is a pending request to switch
-    /// the decode target, it will be evaluated here, prior to the evaluation of the packet. Finally,
-    /// if the packet is determined that it can be forwarded, it will be added to the `rtp_to_send`
-    /// list.
+    /// This method manages packet forwarding for the receiver. If there is a pending request to
+    /// switch the decode target, it will be evaluated here, prior to the evaluation of the packet.
+    /// Finally, if the packet is determined that it can be forwarded, it will be added to
+    /// the `rtp_to_send` list.
     ///
     /// This method returns `true` if this receiver requires a keyframe from the sender. This will
     /// happen if there currently is no active decode target.
@@ -739,7 +740,7 @@ impl ScalableVideoReceiver {
         // If this is a packet that belongs to one of the previous frames we'll reject it
         // (since we're not buffering packet (yet?)).
         if self.current_frame_number.is_some_and(|v| v > *frame_number) {
-            self.on_dropped_packet(inbound_rtp);
+            self.on_dropped_packet(ext_info);
             return Ok(false);
         }
 
@@ -761,9 +762,7 @@ impl ScalableVideoReceiver {
                 let can_switch = match switch_eval_decision {
                     Some(can_switch) => {
                         // If we cannot switch because we're waiting for a keyframe we'll request
-                        // one here in order to avoid a possible decoder stall. Note: keyframe
-                        // requests are throttled in the SVC layer, as well as in the lower
-                        // layer that is responsible for putting them on the wire.
+                        // one here in order to avoid a possible decoder stall.
                         needs_keyframe = !can_switch;
                         can_switch
                     }
@@ -785,7 +784,7 @@ impl ScalableVideoReceiver {
 
         // At this point, if we sill don't have a decode target we'll request a keyframe.
         let Some(decode_target) = self.active_decode_target else {
-            self.on_dropped_packet(inbound_rtp);
+            self.on_dropped_packet(ext_info);
             return Ok(true);
         };
 
@@ -797,13 +796,13 @@ impl ScalableVideoReceiver {
             self.on_sent(&outbound_rtp, now);
             rtp_to_send.push((self.demux_id, outbound_rtp));
         } else {
-            self.on_dropped_packet(inbound_rtp);
+            self.on_dropped_packet(ext_info);
         }
 
         Ok(needs_keyframe)
     }
 
-    /// Creates a copy of the given packet that incldues the active decode target bitmask.
+    /// Creates a copy of the given packet that includes the active decode target bitmask.
     /// If the packet already contains the dependency descriptor with the extended fields,
     /// the decode target bitmask will be updated with the current value. Otherwise, a new
     /// decode target bitmask field will be added.
@@ -864,6 +863,40 @@ impl ScalableVideoReceiver {
 impl ScalableVideoSender {
     fn tick(&mut self, now: Instant) {
         self.frame_tracker.do_periodic_cleanup(now);
+        self.rate_tracker.update(now);
+    }
+
+    fn update_max_inbound_seqnum(&mut self, inbound_seqnum: FullSequenceNumber) -> bool {
+        if self.max_inbound_seqnum.is_none_or(|v| v < inbound_seqnum) {
+            self.max_inbound_seqnum = Some(inbound_seqnum);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn update_rate_tracker(
+        &mut self,
+        incoming_rtp: &rtp::Packet<&[u8]>,
+        now: Instant,
+    ) -> Result<(), ScalableVideoError> {
+        let size = incoming_rtp.size().as_bytes() as usize;
+        if self.rate_tracker.push_bytes(size, now).is_err() {
+            event!("calling.bandwidth.incoming.svc.video_overlimit_bytes", size);
+            Err(IncomingVideoLimitExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn get_maximum_video_height(&self) -> Option<VideoHeight> {
+        self.decode_targets
+            .iter()
+            .filter_map(|decode_target| {
+                (decode_target.rate > DataRate::ZERO)
+                    .then_some(VideoHeight::from(decode_target.resolution.height))
+            })
+            .max()
     }
 
     fn get_frame_dependency_structure(
@@ -896,6 +929,8 @@ impl ScalableVideoSender {
             .as_ref()
             .ok_or(DependencyDescriptorNotAvailable)?;
 
+        let is_new_max_seqnum = self.update_max_inbound_seqnum(incoming_rtp.seqnum());
+
         let vla_updated = self.update_vla(incoming_rtp);
 
         let needs_allocation = self.update_dependency_state(descriptor, vla_updated);
@@ -924,6 +959,7 @@ impl ScalableVideoSender {
             needs_allocation,
             frame_dependency_definition,
             end_of_frame,
+            is_new_max_seqnum,
         })
     }
 
@@ -1087,7 +1123,7 @@ impl ScalableVideoSender {
 
 #[cfg(test)]
 mod tests {
-    use calling_common::{DataRate, DemuxId, Instant};
+    use calling_common::{DataRate, DemuxId, Duration, Instant};
     use smallvec::smallvec;
 
     use crate::{
@@ -1101,7 +1137,8 @@ mod tests {
             DecodeTargetInfo, DecodeTargetInfoList,
             ScalableVideoError::{
                 ActiveDecodeTargetsBitmaskNotAvailable, DependencyDescriptorNotAvailable,
-                DependencyStructureNotAvailable, InvalidDecodeTarget, InvalidDemuxId,
+                DependencyStructureNotAvailable, IncomingVideoLimitExceeded, InvalidDecodeTarget,
+                InvalidDemuxId,
             },
             ScalableVideoSender, ScalableVideoState,
         },
@@ -1278,6 +1315,45 @@ mod tests {
         })
     }
 
+    /// 3-DT structure for exercising chain breaks. Decode target N uses chain N.
+    ///
+    /// - Template 0 (the one `make_keyframe_packet_3dt` uses): every chain intact.
+    /// - Template 1: DT2's chain has frame delta 1 while DT0's and DT1's stay intact, so a
+    ///   frame dispatched without its predecessor breaks only DT2.
+    /// - Template 2: every chain has frame delta 1, so no target survives.
+    ///
+    /// Every template marks all targets `Switch`, because `on_chain_broken` is only reachable
+    /// when a pending switch commits on the same frame whose chain turns out to be broken.
+    fn make_3dt_chain_break_structure() -> TemplateDependencyStructure {
+        let switchable = |chains: [u8; 3]| Template {
+            layer: Layer::zero(),
+            dtis: [Dti::Switch, Dti::Switch, Dti::Switch].into(),
+            fdiffs: Fdiffs::default(),
+            chains: chains.into(),
+        };
+        TemplateDependencyStructure::new(TemplateDependencyStructureFields {
+            template_id_offset: 0,
+            decode_target_count: 3,
+            chain_count: 3,
+            max_layer: Layer::zero(),
+            layers: [Layer::zero(), Layer::zero(), Layer::zero()].into(),
+            templates: vec![
+                switchable([0, 0, 0]),
+                switchable([0, 0, 1]),
+                switchable([1, 1, 1]),
+            ],
+            decode_target_layers: [Layer::zero(), Layer::zero(), Layer::zero()].into(),
+            decode_target_chain_indices: Some([0u8, 1u8, 2u8].into()),
+            resolutions: Some(
+                [Resolution {
+                    width: 640,
+                    height: 360,
+                }]
+                .into(),
+            ),
+        })
+    }
+
     fn make_keyframe_packet_3dt(
         seqnum: u64,
         frame_number: u16,
@@ -1428,54 +1504,6 @@ mod tests {
         packet
     }
 
-    // === Rate management ===
-
-    #[test]
-    fn test_update_target_rate_uses_min_of_requested_and_available() {
-        let mut state = ScalableVideoState::default();
-        state.set_requested_target_rate(DataRate::from_kbps(1000));
-        state.set_available_rate(DataRate::from_kbps(800));
-        assert_eq!(state.update_target_rate(), Some(DataRate::from_kbps(800)));
-        assert_eq!(state.get_target_rate(), DataRate::from_kbps(800));
-    }
-
-    #[test]
-    fn test_update_target_rate_available_lower_than_requested() {
-        let mut state = ScalableVideoState::default();
-        state.set_requested_target_rate(DataRate::from_kbps(500));
-        state.set_available_rate(DataRate::from_kbps(1000));
-        assert_eq!(state.update_target_rate(), Some(DataRate::from_kbps(500)));
-    }
-
-    #[test]
-    fn test_update_target_rate_with_only_requested() {
-        let mut state = ScalableVideoState::default();
-        state.set_requested_target_rate(DataRate::from_kbps(1000));
-        assert_eq!(state.update_target_rate(), Some(DataRate::from_kbps(1000)));
-    }
-
-    #[test]
-    fn test_update_target_rate_with_only_available() {
-        let mut state = ScalableVideoState::default();
-        state.set_available_rate(DataRate::from_kbps(600));
-        assert_eq!(state.update_target_rate(), Some(DataRate::from_kbps(600)));
-    }
-
-    #[test]
-    fn test_update_target_rate_neither_set_no_change() {
-        let mut state = ScalableVideoState::default();
-        // current_target_rate starts at ZERO, neither rate is set → no change
-        assert_eq!(state.update_target_rate(), None);
-    }
-
-    #[test]
-    fn test_update_target_rate_unchanged_returns_none() {
-        let mut state = ScalableVideoState::default();
-        state.set_requested_target_rate(DataRate::from_kbps(1000));
-        state.update_target_rate();
-        assert_eq!(state.update_target_rate(), None);
-    }
-
     // === Receiver management ===
 
     #[test]
@@ -1586,6 +1614,101 @@ mod tests {
         let ext = state.handle_packet(&delta.borrow(), now).unwrap();
         let forwarded = state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
         assert!(forwarded.is_empty());
+    }
+
+    // === Decode target re-selection ===
+
+    /// Brings a receiver to a steady state over a 2-DT structure: DT0 active, no pending switch.
+    fn state_with_active_dt0() -> ScalableVideoState {
+        let now = Instant::now();
+        let mut state = ScalableVideoState::default();
+        state.add_receiver(DEMUX_A, now);
+
+        // Arm DT0 before dispatching the keyframe so dispatching it completes the initial
+        // switch (see note in test_dispatch_packet_required_dti_forwarded).
+        let kf = make_keyframe_packet_2dt(1, 0, make_2dt_structure());
+        let ext = state.handle_packet(&kf.borrow(), now).unwrap();
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(0))
+            .unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+
+        let receiver = state.receivers.get(DEMUX_A).unwrap();
+        assert_eq!(receiver.active_decode_target, Some(0));
+        assert_eq!(receiver.switch_decode_target, None);
+
+        state
+    }
+
+    #[test]
+    fn test_reselecting_active_decode_target_arms_no_switch() {
+        let mut state = state_with_active_dt0();
+        let bitmask_before = state
+            .receivers
+            .get(DEMUX_A)
+            .unwrap()
+            .active_decode_target_bitmask;
+
+        // Steady state: the allocator re-selects the target already being forwarded on every
+        // pass. That must not arm a switch -- switch_decode_target() cannot clear a switch
+        // that equals the active target, so it would stay pending for the life of the call.
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(0))
+            .unwrap();
+
+        let receiver = state.receivers.get(DEMUX_A).unwrap();
+        assert_eq!(receiver.switch_decode_target, None);
+        assert_eq!(receiver.active_decode_target, Some(0));
+        assert_eq!(receiver.active_decode_target_bitmask, bitmask_before);
+    }
+
+    #[test]
+    fn test_reselecting_active_decode_target_drops_pending_switch() {
+        let mut state = state_with_active_dt0();
+
+        // Arm an upgrade to DT1, then have the allocator re-select DT0 before the switch point
+        // arrives. The upgrade has been superseded and must not survive.
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(1))
+            .unwrap();
+        assert_eq!(
+            state.receivers.get(DEMUX_A).unwrap().switch_decode_target,
+            Some(1)
+        );
+
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(0))
+            .unwrap();
+
+        let receiver = state.receivers.get(DEMUX_A).unwrap();
+        assert_eq!(receiver.switch_decode_target, None);
+        assert_eq!(
+            receiver.switch_decode_target_bitmask,
+            ActiveDecodeTargetsBitmask::Uninitialized
+        );
+        assert_eq!(receiver.active_decode_target, Some(0));
+    }
+
+    #[test]
+    fn test_requesting_different_decode_target_arms_switch() {
+        let mut state = state_with_active_dt0();
+
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(1))
+            .unwrap();
+
+        let receiver = state.receivers.get(DEMUX_A).unwrap();
+        assert_eq!(receiver.switch_decode_target, Some(1));
+        // v = 1 << 1 = 2, so the bitmask is 2 | 1 over a 2-DT structure.
+        assert_eq!(
+            receiver.switch_decode_target_bitmask,
+            ActiveDecodeTargetsBitmask::Available {
+                bitmask: 0b11,
+                size: 2,
+            }
+        );
+        // Arming a switch must leave the active target alone until the switch point.
+        assert_eq!(receiver.active_decode_target, Some(0));
     }
 
     // === Dispatch / forwarding pipeline ===
@@ -1729,14 +1852,90 @@ mod tests {
     }
 
     #[test]
-    fn test_tick_propagates_rate_update() {
+    fn test_late_dropped_packet_does_not_reuse_an_emitted_seqnum() {
         let now = Instant::now();
         let mut state = ScalableVideoState::default();
-        state.set_requested_target_rate(DataRate::from_kbps(1000));
-        state.set_available_rate(DataRate::from_kbps(800));
-        let result = state.tick(now);
-        assert_eq!(result.updated_target_rate, Some(DataRate::from_kbps(800)));
-        assert_eq!(state.get_target_rate(), DataRate::from_kbps(800));
+        state.add_receiver(DEMUX_A, now);
+
+        let kf = make_keyframe_packet(1, 0, make_l1t1_structure_switch(), Some(make_vla(500)));
+        let ext = state.handle_packet(&kf.borrow(), now).unwrap();
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(0))
+            .unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+
+        let delta1 = make_delta_packet(2, 1);
+        let ext1 = state.handle_packet(&delta1.borrow(), now).unwrap();
+        state.dispatch_packet(&delta1.borrow(), ext1, now).unwrap();
+
+        let delta2 = make_delta_packet(3, 2);
+        let ext2 = state.handle_packet(&delta2.borrow(), now).unwrap();
+        let fwd2 = state.dispatch_packet(&delta2.borrow(), ext2, now).unwrap();
+        let emitted = fwd2[0].1.seqnum();
+
+        // Frame 1 arrives again, after frame 2 has already been forwarded. It is dropped as a
+        // stale frame, but it is NOT a new max inbound seqnum, so it must not advance
+        // seqnum_offset: the packets it would renumber are already on the wire, and
+        // decrementing their successors would reuse an outbound seqnum that has been sent.
+        let late = make_delta_packet(2, 1);
+        let ext_late = state.handle_packet(&late.borrow(), now).unwrap();
+        assert!(!ext_late.is_new_max_seqnum);
+        let fwd_late = state
+            .dispatch_packet(&late.borrow(), ext_late, now)
+            .unwrap();
+        assert!(fwd_late.is_empty());
+
+        let delta3 = make_delta_packet(4, 3);
+        let ext3 = state.handle_packet(&delta3.borrow(), now).unwrap();
+        let fwd3 = state.dispatch_packet(&delta3.borrow(), ext3, now).unwrap();
+
+        assert_eq!(fwd3[0].1.seqnum(), emitted + 1);
+    }
+
+    #[test]
+    fn test_receiver_added_mid_stream_gets_reorder_headroom() {
+        let now = Instant::now();
+        let mut state = ScalableVideoState::default();
+        state.add_receiver(DEMUX_A, now);
+
+        let kf = make_keyframe_packet(1, 0, make_l1t1_structure_switch(), Some(make_vla(500)));
+        let ext = state.handle_packet(&kf.borrow(), now).unwrap();
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(0))
+            .unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+
+        // Run the stream forward so the sender's max inbound seqnum is well clear of zero.
+        for seqnum in 2..=10u64 {
+            let delta = make_delta_packet(seqnum, seqnum as u16 - 1);
+            let ext = state.handle_packet(&delta.borrow(), now).unwrap();
+            state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+        }
+        let max_at_join = 10u64;
+
+        // A receiver joining now is seeded with an offset of max - PACKET_BUFFER_SIZE, leaving
+        // headroom so that a packet yielded a few positions late still maps above zero instead
+        // of saturating to 0 and colliding with its neighbours.
+        state.add_receiver(DEMUX_B, now);
+        state
+            .set_decode_target_for_receiver(DEMUX_B, Some(0))
+            .unwrap();
+
+        // A new receiver can only switch on a keyframe, so send one; it carries the same
+        // structure and VLA, so it does not force a reallocation.
+        let kf2 = make_keyframe_packet(11, 10, make_l1t1_structure_switch(), Some(make_vla(500)));
+        let ext2 = state.handle_packet(&kf2.borrow(), now).unwrap();
+        let fwd = state.dispatch_packet(&kf2.borrow(), ext2, now).unwrap();
+
+        let (_, packet_b) = fwd
+            .iter()
+            .find(|(demux_id, _)| *demux_id == DEMUX_B)
+            .expect("the new receiver should be forwarding after the keyframe");
+        assert_eq!(
+            packet_b.seqnum(),
+            11 - (max_at_join - super::PACKET_BUFFER_SIZE as u64)
+        );
+        assert!(packet_b.seqnum() > 0);
     }
 
     #[test]
@@ -1759,6 +1958,76 @@ mod tests {
     }
 
     // === Chain integrity ===
+
+    /// Establishes the chain-break structure with DT0 active and no pending switch.
+    fn state_with_chain_break_structure() -> (ScalableVideoState, Instant) {
+        let now = Instant::now();
+        let mut state = ScalableVideoState::default();
+        state.add_receiver(DEMUX_A, now);
+
+        let kf = make_keyframe_packet_3dt(1, 0, make_3dt_chain_break_structure());
+        let ext = state.handle_packet(&kf.borrow(), now).unwrap();
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(0))
+            .unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+
+        assert_eq!(
+            state.receivers.get(DEMUX_A).unwrap().active_decode_target,
+            Some(0)
+        );
+        assert!(!state.needs_keyframe());
+
+        (state, now)
+    }
+
+    #[test]
+    fn test_chain_broken_downshifts_immediately_to_intact_target() {
+        let (mut state, now) = state_with_chain_break_structure();
+
+        // Arm a switch to DT2. Frame 5 uses template 1, which is a switch point for DT2 but
+        // gives its chain frame delta 1 -- and frame 4 never arrives. DT1's chain stays
+        // intact, so the receiver must land on DT1 on this very packet rather than waiting
+        // for another switch point.
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(2))
+            .unwrap();
+        let frame5 = make_packet(2, 5, 1, true, true);
+        let ext = state.handle_packet(&frame5.borrow(), now).unwrap();
+        state.dispatch_packet(&frame5.borrow(), ext, now).unwrap();
+
+        let receiver = state.receivers.get(DEMUX_A).unwrap();
+        assert_eq!(receiver.active_decode_target, Some(1));
+        assert_eq!(receiver.switch_decode_target, None);
+        assert!(!state.needs_keyframe());
+    }
+
+    #[test]
+    fn test_chain_broken_with_no_intact_target_suppresses_and_requests_keyframe() {
+        let (mut state, now) = state_with_chain_break_structure();
+
+        // Arm a switch to DT1. Frame 5 uses template 2, where every chain has frame delta 1,
+        // so once the switch commits nothing is left intact at any target.
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(1))
+            .unwrap();
+        let frame5 = make_packet(2, 5, 2, true, true);
+        let ext = state.handle_packet(&frame5.borrow(), now).unwrap();
+        let forwarded = state.dispatch_packet(&frame5.borrow(), ext, now).unwrap();
+
+        // Forwarding is suppressed and the sender is asked for a keyframe on this same
+        // packet, rather than the receiver being pinned to a broken chain.
+        assert!(forwarded.is_empty());
+        assert!(state.needs_keyframe());
+
+        let receiver = state.receivers.get(DEMUX_A).unwrap();
+        assert_eq!(receiver.active_decode_target, None);
+        assert_eq!(receiver.switch_decode_target, None);
+        assert_eq!(
+            receiver.active_decode_target_bitmask,
+            ActiveDecodeTargetsBitmask::Uninitialized
+        );
+    }
 
     /// When the highest-layer chain breaks but an intermediate layer chain is intact,
     /// the receiver downgrades to the intermediate layer rather than all the way to the
@@ -1896,15 +2165,6 @@ mod tests {
     // === API smoke tests ===
 
     #[test]
-    fn test_set_needs_keyframe() {
-        let now = Instant::now();
-        let mut state = ScalableVideoState::default();
-        assert!(!state.needs_keyframe());
-        state.set_needs_keyframe(now);
-        assert!(state.needs_keyframe());
-    }
-
-    #[test]
     fn test_get_template_dependency_structure_none_before_keyframe() {
         let state = ScalableVideoState::default();
         assert!(state.get_template_dependency_structure().is_none());
@@ -2003,6 +2263,163 @@ mod tests {
         let fwd = state.dispatch_packet(&next_pkt.borrow(), ext, now).unwrap();
         assert_eq!(fwd.len(), 1);
         assert_eq!(fwd[0].1.seqnum(), next_pkt.seqnum() - 1);
+    }
+
+    // === Incoming rate limiting ===
+
+    fn make_packet_with_payload(
+        seqnum: u64,
+        frame_number: u16,
+        payload_size: usize,
+    ) -> Packet<Vec<u8>> {
+        let descriptor = DependencyDescriptor {
+            mandatory_fields: MandatoryDescriptorFields {
+                start_of_frame: true,
+                end_of_frame: true,
+                frame_dependency_template_id: 0,
+                frame_number,
+            },
+            extended_fields: None,
+        };
+        let payload = vec![0u8; payload_size];
+        Packet::with_dependency_descriptor(
+            VP8_PAYLOAD_TYPE,
+            seqnum,
+            0,
+            0x12345678,
+            descriptor,
+            &payload,
+        )
+    }
+
+    // 2 MB in 500 ms ≈ 32 Mbps, over the 30 Mbps limit.
+    const OVER_LIMIT_BYTES: usize = 2_000_000;
+
+    // First packet always passes: CheckedDataRateTracker only rejects when history
+    // is non-empty AND the previously-computed rate exceeds the limit.
+    #[test]
+    fn test_update_incoming_rate_first_packet_always_accepted() {
+        let mut state = ScalableVideoState::default();
+        let large = make_packet_with_payload(1, 0, OVER_LIMIT_BYTES);
+        assert!(
+            state
+                .update_incoming_rate(&large.borrow(), Instant::now())
+                .is_ok()
+        );
+    }
+
+    // rate is None until update() sees >= MIN_DURATION (500 ms) of history, so the
+    // rejection gate never fires before then.
+    #[test]
+    fn test_update_incoming_rate_rate_none_before_min_duration_accepts_packets() {
+        let mut state = ScalableVideoState::default();
+        let now = Instant::now();
+        let large = make_packet_with_payload(1, 0, OVER_LIMIT_BYTES);
+        state.update_incoming_rate(&large.borrow(), now).unwrap();
+        // 499 ms < MIN_DURATION: update() yields None, so no rejection can happen.
+        state.tick(now + Duration::from_millis(499));
+        let pkt = make_delta_packet(2, 1);
+        assert!(
+            state
+                .update_incoming_rate(&pkt.borrow(), now + Duration::from_millis(499))
+                .is_ok()
+        );
+    }
+
+    // Packets at well under 30 Mbps are never rejected.
+    #[test]
+    fn test_update_incoming_rate_accepts_when_rate_under_limit() {
+        let mut state = ScalableVideoState::default();
+        let now = Instant::now();
+        let small = make_delta_packet(1, 0); // empty payload, tiny packet
+        state.update_incoming_rate(&small.borrow(), now).unwrap();
+        state.tick(now + Duration::from_millis(500));
+        assert!(
+            state
+                .update_incoming_rate(
+                    &make_delta_packet(2, 1).borrow(),
+                    now + Duration::from_millis(501)
+                )
+                .is_ok()
+        );
+    }
+
+    // 2 MB in 500 ms ≈ 32 Mbps > 30 Mbps → rejected.
+    #[test]
+    fn test_update_incoming_rate_rejects_when_rate_exceeds_limit() {
+        let mut state = ScalableVideoState::default();
+        let now = Instant::now();
+        let large = make_packet_with_payload(1, 0, OVER_LIMIT_BYTES);
+        state.update_incoming_rate(&large.borrow(), now).unwrap();
+        state.tick(now + Duration::from_millis(500)); // rate ≈ 32 Mbps
+        assert!(matches!(
+            state.update_incoming_rate(
+                &make_delta_packet(2, 1).borrow(),
+                now + Duration::from_millis(501)
+            ),
+            Err(IncomingVideoLimitExceeded)
+        ));
+    }
+
+    // Bytes from rejected packets are not pushed into the tracker. After 20 rejected
+    // attempts, the tracked rate still reflects only the one originally-accepted packet.
+    // At 600 ms the window gives 2 MB / 600 ms ≈ 26.7 Mbps < 30 Mbps → accepted.
+    // If rejected bytes had counted (20 × 2 MB), the rate at 600 ms would be ≈ 560
+    // Mbps and the packet would remain rejected.
+    #[test]
+    fn test_update_incoming_rate_rejected_bytes_not_counted() {
+        let mut state = ScalableVideoState::default();
+        let now = Instant::now();
+        let large = make_packet_with_payload(1, 0, OVER_LIMIT_BYTES);
+        state.update_incoming_rate(&large.borrow(), now).unwrap();
+        state.tick(now + Duration::from_millis(500));
+        for i in 0..20u64 {
+            let rejected = make_packet_with_payload(2 + i, 1, OVER_LIMIT_BYTES);
+            assert!(
+                state
+                    .update_incoming_rate(&rejected.borrow(), now + Duration::from_millis(501 + i))
+                    .is_err()
+            );
+        }
+        // Rate is still based on the single accepted 2 MB packet. At t=600 ms the
+        // window is 600 ms, giving 2MB/0.6s ≈ 26.7 Mbps < limit.
+        state.tick(now + Duration::from_millis(600));
+        assert!(
+            state
+                .update_incoming_rate(
+                    &make_delta_packet(100, 2).borrow(),
+                    now + Duration::from_millis(601)
+                )
+                .is_ok()
+        );
+    }
+
+    // After the rate exceeds the limit, advancing time causes the window to widen
+    // and the measured rate to fall below 30 Mbps, restoring acceptance.
+    #[test]
+    fn test_update_incoming_rate_recovers_after_time_advance() {
+        let mut state = ScalableVideoState::default();
+        let now = Instant::now();
+        let large = make_packet_with_payload(1, 0, OVER_LIMIT_BYTES);
+        state.update_incoming_rate(&large.borrow(), now).unwrap();
+        state.tick(now + Duration::from_millis(500)); // rate ≈ 32 Mbps → over limit
+        assert!(
+            state
+                .update_incoming_rate(
+                    &make_delta_packet(2, 1).borrow(),
+                    now + Duration::from_millis(501)
+                )
+                .is_err()
+        );
+        state.tick(now + Duration::from_millis(600)); // rate ≈ 26.7 Mbps → under limit
+        assert!(
+            state
+                .update_incoming_rate(
+                    &make_delta_packet(2, 1).borrow(),
+                    now + Duration::from_millis(601)
+                )
+                .is_ok()
+        );
     }
 
     // === DecodeTargetInfoList PartialEq (derived) ===

@@ -9,6 +9,7 @@
 mod dependency_descriptor;
 mod nack;
 mod packet;
+pub mod packet_buffer;
 mod rtcp;
 mod rtx;
 mod srtp;
