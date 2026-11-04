@@ -47,7 +47,6 @@ use crate::{
 /// the maximum number of expected clients. Heap allocations will be performed If the number
 /// of clients exceeds this value.
 pub const MAX_EXPECTED_CLIENTS: usize = 75;
-
 /// Periodic report generation period
 const PERIODIC_REPORT_GENERATION_PERIOD: Duration = Duration::from_secs(10);
 /// How much bitrate to assume clients will use to send layer 0 video.
@@ -56,6 +55,16 @@ const ASSUMED_BASE_LAYER_RATE: DataRate = DataRate::from_kbps(150);
 const MAX_VIDEO_DATA_RATE_PER_SSRC: DataRate = DataRate::from_kbps(30000);
 /// Maximum number of packets to buffer
 const PACKET_BUFFER_SIZE: usize = 5;
+/// A VLA rate change of at most this percentage of the old rate is not "significant" -- see
+/// `ScalableVideoSender::vla_differs_significantly`.
+///
+/// Every significant VLA change rebuilds the decode targets, suppresses forwarding for all
+/// receivers and reallocates the whole call. RingRTC sends rate-only VLA changes on keyframes
+/// only, and the rates almost never match exactly, so without a threshold every keyframe would
+/// reallocate.
+///
+/// This threshold is above the noise, and below the smallest gap between decode targets.
+const VLA_RATE_CHANGE_THRESHOLD_PCT: u64 = 9;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ScalableVideoError {
@@ -939,7 +948,22 @@ impl ScalableVideoSender {
 
         let vla_updated = self.update_vla(incoming_rtp);
 
+        // RingRTC only sends VLA updates on keyframes, where any resulting forwarding
+        // suppression is resolved by the same packet. An update on a delta frame may
+        // suppress forwarding for all receivers until the next keyframe.
+        //
+        // Note: We will also receive VLAs on spatial layer drops.
+        if vla_updated && !descriptor.is_key_frame() {
+            event!("calling.svc.vla_updated_on_delta_frame");
+        }
+
         let needs_allocation = self.update_dependency_state(descriptor, vla_updated);
+
+        // Forwarding suppression on a delta frame, whatever the cause (VLA, active decode
+        // targets bitmask, ...), stalls all receivers until the next keyframe.
+        if needs_allocation && !descriptor.is_key_frame() {
+            event!("calling.svc.forwarding_suppressed_on_delta_frame");
+        }
 
         let frame_dependency_definition = self.get_frame_dependency_structure(descriptor)?;
 
@@ -970,17 +994,60 @@ impl ScalableVideoSender {
     }
 
     fn update_vla(&mut self, incoming_rtp: &rtp::Packet<&[u8]>) -> bool {
-        if let Some(vla) = incoming_rtp
+        let Some(vla) = incoming_rtp
             .video_layers_allocation
             .as_ref()
             .and_then(|vla| vla.first())
-            && *vla != self.video_layer_allocation
-        {
+        else {
+            return false;
+        };
+        if Self::vla_differs_significantly(&self.video_layer_allocation, vla) {
             trace!("svc: vla: {vla:?}");
             self.video_layer_allocation = vla.clone();
             return true;
         }
         false
+    }
+
+    /// A new VLA is "significant" if it has a different number of spatial layers, if any
+    /// spatial layer has a different number of temporal layers, or if any temporal layer's
+    /// rate differs from the stored one by more than `VLA_RATE_CHANGE_THRESHOLD_PCT` percent.
+    fn vla_differs_significantly(
+        old_vla: &RtpStreamAllocation,
+        new_vla: &RtpStreamAllocation,
+    ) -> bool {
+        if old_vla.len() != new_vla.len() {
+            return true;
+        }
+        // WebRTC specific: VLA reports rate allocator targets, where temporal rates are
+        // always a fixed geometric fraction of the spatial layer total. Checking the last
+        // (highest cumulative) entry is therefore equivalent to checking every temporal
+        // layer individually.
+        old_vla.iter().zip(new_vla).any(|(old_layer, new_layer)| {
+            if old_layer.temporal_layer_rates.len() != new_layer.temporal_layer_rates.len() {
+                true
+            } else {
+                match (
+                    old_layer.temporal_layer_rates.last(),
+                    new_layer.temporal_layer_rates.last(),
+                ) {
+                    (Some(&old_rate), Some(&new_rate)) => {
+                        let old_bps = old_rate.as_bps();
+                        let new_bps = new_rate.as_bps();
+                        if old_bps == 0 {
+                            new_bps != 0
+                        } else {
+                            // The extension parser ensures that the rates are limited to
+                            // MAX_TEMPORAL_LAYER_RATE (10 mbps). Therefore, the following
+                            // calculation will not overflow.
+                            old_bps.abs_diff(new_bps) * 100
+                                > old_bps * VLA_RATE_CHANGE_THRESHOLD_PCT
+                        }
+                    }
+                    _ => false,
+                }
+            }
+        })
     }
 
     fn update_decode_targets(&mut self) -> Result<bool, ScalableVideoError> {
@@ -2309,6 +2376,107 @@ mod tests {
         packet.video_layers_allocation = Some(make_vla(1000));
         assert!(sender.update_vla(&packet.borrow()));
         assert_eq!(sender.video_layer_allocation, make_vla(1000)[0]);
+    }
+
+    // === ScalableVideoSender::vla_differs_significantly ===
+
+    fn make_spatial_layer(rates_kbps: &[u64]) -> SpatialLayer {
+        SpatialLayer {
+            temporal_layer_rates: rates_kbps.iter().map(|&k| DataRate::from_kbps(k)).collect(),
+            size: None,
+        }
+    }
+
+    #[test]
+    fn test_vla_differs_significantly_spatial_layer_count_change() {
+        let one: RtpStreamAllocation = vec![make_spatial_layer(&[1000])];
+        let two: RtpStreamAllocation =
+            vec![make_spatial_layer(&[300]), make_spatial_layer(&[1000])];
+        assert!(ScalableVideoSender::vla_differs_significantly(&one, &two));
+        assert!(ScalableVideoSender::vla_differs_significantly(&two, &one));
+    }
+
+    #[test]
+    fn test_vla_differs_significantly_temporal_layer_count_change() {
+        let one_tl: RtpStreamAllocation = vec![make_spatial_layer(&[1000])];
+        let three_tl: RtpStreamAllocation = vec![make_spatial_layer(&[540, 703, 1000])];
+        assert!(ScalableVideoSender::vla_differs_significantly(
+            &one_tl, &three_tl
+        ));
+    }
+
+    #[test]
+    fn test_vla_differs_significantly_identical() {
+        let vla: RtpStreamAllocation = vec![make_spatial_layer(&[540, 703, 1000])];
+        assert!(!ScalableVideoSender::vla_differs_significantly(
+            &vla,
+            &vla.clone()
+        ));
+    }
+
+    #[test]
+    fn test_vla_differs_significantly_change_below_threshold() {
+        // 1000 kbps base; 9% = 90 kbps; an 89 kbps increase is below the threshold.
+        let old: RtpStreamAllocation = vec![make_spatial_layer(&[1000])];
+        let new: RtpStreamAllocation = vec![make_spatial_layer(&[1089])];
+        assert!(!ScalableVideoSender::vla_differs_significantly(&old, &new));
+    }
+
+    #[test]
+    fn test_vla_differs_significantly_change_at_threshold() {
+        // Exactly 9%: abs_diff * 100 == old_bps * 9, not strictly greater → suppressed.
+        let old: RtpStreamAllocation = vec![make_spatial_layer(&[1000])];
+        let new: RtpStreamAllocation = vec![make_spatial_layer(&[1090])];
+        assert!(!ScalableVideoSender::vla_differs_significantly(&old, &new));
+    }
+
+    #[test]
+    fn test_vla_differs_significantly_increase_above_threshold() {
+        // 91 kbps on 1000 kbps base = 9.1%.
+        let old: RtpStreamAllocation = vec![make_spatial_layer(&[1000])];
+        let new: RtpStreamAllocation = vec![make_spatial_layer(&[1091])];
+        assert!(ScalableVideoSender::vla_differs_significantly(&old, &new));
+    }
+
+    #[test]
+    fn test_vla_differs_significantly_decrease_above_threshold() {
+        // abs_diff is symmetric; a drop of 91 kbps from 1000 kbps also fires.
+        let old: RtpStreamAllocation = vec![make_spatial_layer(&[1000])];
+        let new: RtpStreamAllocation = vec![make_spatial_layer(&[909])];
+        assert!(ScalableVideoSender::vla_differs_significantly(&old, &new));
+    }
+
+    #[test]
+    fn test_vla_differs_significantly_old_zero_new_nonzero() {
+        let old: RtpStreamAllocation = vec![make_spatial_layer(&[0, 0, 0])];
+        let new: RtpStreamAllocation = vec![make_spatial_layer(&[0, 0, 1000])];
+        assert!(ScalableVideoSender::vla_differs_significantly(&old, &new));
+    }
+
+    #[test]
+    fn test_vla_differs_significantly_old_zero_new_zero() {
+        let vla: RtpStreamAllocation = vec![make_spatial_layer(&[0, 0, 0])];
+        assert!(!ScalableVideoSender::vla_differs_significantly(
+            &vla,
+            &vla.clone()
+        ));
+    }
+
+    #[test]
+    fn test_vla_differs_significantly_multi_spatial_only_top_layer_changes() {
+        // Three spatial layers with L3T3 cumulative rates (54% / 70.3% / 100%).
+        // S0 and S1 are stable; S2 total increases by 9.1% (1091 vs 1000 kbps).
+        let old: RtpStreamAllocation = vec![
+            make_spatial_layer(&[162, 211, 300]),
+            make_spatial_layer(&[297, 386, 549]),
+            make_spatial_layer(&[540, 703, 1000]),
+        ];
+        let new: RtpStreamAllocation = vec![
+            make_spatial_layer(&[162, 211, 300]),
+            make_spatial_layer(&[297, 386, 549]),
+            make_spatial_layer(&[589, 767, 1091]),
+        ];
+        assert!(ScalableVideoSender::vla_differs_significantly(&old, &new));
     }
 
     // === NotPresent DTI drop bookkeeping (isolated from switch evaluation) ===
