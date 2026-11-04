@@ -592,23 +592,26 @@ impl ScalableVideoReceiver {
     /// the chains of the available lower decode targets, looking for the best one with
     /// its chain intact. Once an appropriate decode target is found, the switch is
     /// immediately made. Otherwise, forwarding to the receiver is suppressed.
+    ///
+    /// Returns `true` if forwarding was suppressed, in which case nothing can be forwarded to
+    /// the receiver until the next keyframe.
     fn on_chain_broken(
         &mut self,
         sender: &ScalableVideoSender,
         frame_dep: &FrameDependencyDefinition,
-    ) -> Result<(), ScalableVideoError> {
+    ) -> Result<bool, ScalableVideoError> {
         self.stats.inc_chain_broken();
         let (Some(active_decode_target), Some(current_frame_number)) =
             (self.active_decode_target, self.current_frame_number)
         else {
-            return Ok(());
+            return Ok(false);
         };
         let (Some(bitmask), Some(size)) = (
             sender.active_decode_targets_bitmask.bitmask(),
             sender.active_decode_targets_bitmask.size(),
         ) else {
             self.suppress_forwarding();
-            return Ok(());
+            return Ok(true);
         };
 
         let mut selected_target = None;
@@ -624,11 +627,11 @@ impl ScalableVideoReceiver {
         if selected_target.is_some() {
             self.request_decode_target_switch(selected_target);
             self.switch_decode_target();
+            Ok(false)
         } else {
             self.suppress_forwarding();
+            Ok(true)
         }
-
-        Ok(())
     }
 
     /// Removes the currently selecte active decode target and clears the pending decode
@@ -719,7 +722,8 @@ impl ScalableVideoReceiver {
     /// the `rtp_to_send` list.
     ///
     /// This method returns `true` if this receiver requires a keyframe from the sender. This will
-    /// happen if there currently is no active decode target.
+    /// happen if a pending decode target switch is waiting for a keyframe, or if a broken chain
+    /// forced forwarding to be suppressed.
     fn dispatch_packet(
         &mut self,
         inbound_rtp: &rtp::Packet<&[u8]>,
@@ -776,16 +780,18 @@ impl ScalableVideoReceiver {
                 if can_switch {
                     self.switch_decode_target();
                     if !sender.is_chain_intact(switch_target, *frame_number, frame_dep)? {
-                        self.on_chain_broken(sender, frame_dep)?;
+                        needs_keyframe |= self.on_chain_broken(sender, frame_dep)?;
                     }
                 }
             }
         }
 
-        // At this point, if we sill don't have a decode target we'll request a keyframe.
+        // No active decode target. Either a switch is pending and the check above has already
+        // asked for a keyframe if one is needed, or the allocator chose not to forward to this
+        // receiver, in which case a keyframe would be wasted.
         let Some(decode_target) = self.active_decode_target else {
             self.on_dropped_packet(ext_info);
-            return Ok(true);
+            return Ok(needs_keyframe);
         };
 
         let dti = frame_dep
@@ -1614,6 +1620,86 @@ mod tests {
         let ext = state.handle_packet(&delta.borrow(), now).unwrap();
         let forwarded = state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
         assert!(forwarded.is_empty());
+        // ...and the sender must not be asked for a keyframe the receiver has no use for.
+        assert!(!state.needs_keyframe());
+    }
+
+    // === Keyframe requests from receivers without a decode target ===
+
+    /// A receiver the allocator stops forwarding to (e.g. an off-screen tile) must not keep
+    /// asking the sender for keyframes: every client receives from every SVC sender, so a
+    /// single paused receiver would otherwise keep the sender producing keyframes for all.
+    #[test]
+    fn test_paused_receiver_does_not_request_keyframe() {
+        let now = Instant::now();
+        let mut state = ScalableVideoState::default();
+        state.add_receiver(DEMUX_A, now);
+
+        let kf = make_keyframe_packet(1, 0, make_l1t1_structure(), Some(make_vla(500)));
+        let ext = state.handle_packet(&kf.borrow(), now).unwrap();
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(0))
+            .unwrap();
+        let forwarded = state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        assert!(!forwarded.is_empty());
+        assert!(!state.needs_keyframe());
+
+        state.set_decode_target_for_receiver(DEMUX_A, None).unwrap();
+        for frame_number in 1..=3 {
+            let delta = make_delta_packet(frame_number as u64 + 1, frame_number);
+            let ext = state.handle_packet(&delta.borrow(), now).unwrap();
+            let forwarded = state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+            assert!(forwarded.is_empty());
+        }
+        assert!(!state.needs_keyframe());
+    }
+
+    /// A receiver that has not been allocated a decode target yet has nothing to switch to, so
+    /// a keyframe would be wasted. `add_receiver` asks for one up front, and the pending switch
+    /// asks again once the allocator arms a target.
+    #[test]
+    fn test_unallocated_receiver_does_not_request_keyframe() {
+        let now = Instant::now();
+        let mut state = ScalableVideoState::default();
+        state.add_receiver(DEMUX_A, now);
+
+        let kf = make_keyframe_packet(1, 0, make_l1t1_structure(), Some(make_vla(500)));
+        let ext = state.handle_packet(&kf.borrow(), now).unwrap();
+        let forwarded = state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        assert!(forwarded.is_empty());
+
+        for frame_number in 1..=3 {
+            let delta = make_delta_packet(frame_number as u64 + 1, frame_number);
+            let ext = state.handle_packet(&delta.borrow(), now).unwrap();
+            state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+        }
+        assert!(!state.needs_keyframe());
+    }
+
+    /// A receiver with a decode target armed but no active target can only start forwarding on
+    /// a keyframe, so a delta frame must request one.
+    #[test]
+    fn test_armed_receiver_without_active_target_requests_keyframe() {
+        let now = Instant::now();
+        let mut state = ScalableVideoState::default();
+        state.add_receiver(DEMUX_A, now);
+
+        let kf = make_keyframe_packet(1, 0, make_l1t1_structure(), Some(make_vla(500)));
+        state.handle_packet(&kf.borrow(), now).unwrap();
+        state
+            .set_decode_target_for_receiver(DEMUX_A, Some(0))
+            .unwrap();
+        assert!(!state.needs_keyframe());
+
+        let delta = make_delta_packet(2, 1);
+        let ext = state.handle_packet(&delta.borrow(), now).unwrap();
+        let forwarded = state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+
+        assert!(forwarded.is_empty());
+        assert!(state.needs_keyframe());
+        let receiver = state.receivers.get(DEMUX_A).unwrap();
+        assert_eq!(receiver.active_decode_target, None);
+        assert_eq!(receiver.switch_decode_target, Some(0));
     }
 
     // === Decode target re-selection ===
