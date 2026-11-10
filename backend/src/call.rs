@@ -2715,9 +2715,7 @@ impl CallInner {
             .scalable_video_state
             .as_mut()
             .expect("must be an SVC client");
-        state
-            .dispatch_packet(packet, ext_info, now)
-            .map_err(Error::from)
+        Ok(state.dispatch_packet(packet, ext_info, now))
     }
 }
 

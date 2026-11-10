@@ -6,6 +6,7 @@
 use std::cmp::{max, min};
 
 use calling_common::{DataRate, DemuxId, Instant, VideoHeight};
+use metrics::{metric_config::TimingOptions, time_scope};
 use smallvec::SmallVec;
 
 use crate::{
@@ -158,6 +159,11 @@ pub fn allocate(
     sender_allocation_info: &[SenderAllocationInfo<'_>],
     ideal_decode_targets: &SelectedDecodeTargets,
 ) -> AllocationResult {
+    time_scope!(
+        "calling.svc.allocate",
+        TimingOptions::microsecond_1000_per_minute()
+    );
+
     let max_targets = sender_allocation_info
         .iter()
         .map(|info| info.decode_target_info_list.len())

@@ -7,6 +7,7 @@ use std::cmp::min;
 
 use calling_common::{DataRate, DemuxId, Instant};
 use log::{trace, warn};
+use metrics::{metric_config::TimingOptions, time_scope};
 
 use crate::{
     call::{Clients, TARGET_RATE_MINIMUM_ALLOCATION_RATIO, simulcast_helpers, svc_helpers},
@@ -16,6 +17,11 @@ use crate::{
 /// Performs a full reallocation, invoking `allocate` for every receiver in the call at
 /// their current send rate.
 pub(super) fn reallocate(clients: &mut Clients, active_speaker_id: Option<DemuxId>, now: Instant) {
+    time_scope!(
+        "calling.allocator.call_allocate",
+        TimingOptions::microsecond_1000_per_minute()
+    );
+
     let receivers: Vec<_> = clients
         .iter()
         .map(|client| (client.demux_id, client.target_send_rate))
@@ -83,6 +89,11 @@ pub(super) fn allocate(
         warn!("Attempting to allocate for a non-existent client: {receiver_demux_id:?}");
         return;
     };
+
+    time_scope!(
+        "calling.allocator.receiver_allocate",
+        TimingOptions::microsecond_1000_per_minute()
+    );
 
     let simulcast_allocatable_videos =
         simulcast_helpers::get_allocatable_videos(clients, client, active_speaker_demux_id);

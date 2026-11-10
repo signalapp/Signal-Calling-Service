@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 
 use calling_common::{Duration, Instant};
+use metrics::event;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -168,6 +169,31 @@ impl FrameTracker {
     }
 
     pub fn update(
+        &mut self,
+        now: Instant,
+        packet_info: PacketInfo,
+    ) -> Result<(), FrameTrackerError> {
+        self.update_inner(now, packet_info)
+            .inspect_err(|e| match e {
+                FrameTrackerError::StartFlagAlreadySet(_) => {
+                    event!("calling.svc.frame_tracker.start_flag_already_set");
+                }
+                FrameTrackerError::EndFlagAlreadySet(_) => {
+                    event!("calling.svc.frame_tracker.end_flag_already_set");
+                }
+                FrameTrackerError::FrameTooLarge(_) => {
+                    event!("calling.svc.frame_tracker.frame_too_large");
+                }
+                FrameTrackerError::FrameIsInvalid(_) => {
+                    event!("calling.svc.frame_tracker.invalid_frame");
+                }
+                FrameTrackerError::TooManyFramesInFlight => {
+                    event!("calling.svc.frame_tracker.too_many_frames_in_flight");
+                }
+            })
+    }
+
+    fn update_inner(
         &mut self,
         now: Instant,
         packet_info: PacketInfo,

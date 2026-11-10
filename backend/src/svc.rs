@@ -16,7 +16,7 @@ use std::{
 use calling_common::{
     CheckedDataRateTracker, DataRate, DataRateTracker, DemuxId, Duration, Instant, VideoHeight,
 };
-use log::{error, info, trace, warn};
+use log::{info, trace, warn};
 use metrics::event;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -33,11 +33,9 @@ use crate::{
     },
     svc::{
         ScalableVideoError::{
-            ActiveDecodeTargetsBitmaskNotAvailable, DecodeTargetChainIndicesNotAvailable,
-            DependencyDescriptorNotAvailable, DependencyStructureNotAvailable,
-            FailedToCreatePacket, IncomingVideoLimitExceeded, InconsistentState, InvalidChainIndex,
-            InvalidDecodeTarget, InvalidDemuxId, InvalidFrameDependencyTemplateId,
-            ResolutionsNotAvailable, VideoLayerAllocationNotAvailable,
+            ActiveDecodeTargetsBitmaskNotAvailable, DependencyDescriptorNotAvailable,
+            DependencyStructureNotAvailable, FailedToCreatePacket, IncomingVideoLimitExceeded,
+            InconsistentState, InvalidDemuxId, InvalidTemplateId,
         },
         frame_tracker::{FrameTracker, PacketInfo},
     },
@@ -74,34 +72,14 @@ pub enum ScalableVideoError {
     DependencyDescriptorNotAvailable,
     #[error("Failed to create packet")]
     FailedToCreatePacket,
-    #[error("Decode target chain indices not available")]
-    DecodeTargetChainIndicesNotAvailable,
-    #[error("Invalid frame dependency template ID {0:?}")]
-    InvalidFrameDependencyTemplateId(u8),
-    #[error("Invalid DTI {0:?}")]
-    InvalidDti(usize),
-    #[error("Invalid frame delta {0:?}")]
-    InvalidFrameDelta(u8),
-    #[error("Invalid chain index {0:?}")]
-    InvalidChainIndex(usize),
-    #[error("Invalid active decode targets bitmask")]
-    InvalidActiveDecodeTargetsBitmask,
-    #[error("Invalid decode target {0:?}")]
-    InvalidDecodeTarget(usize),
-    #[error("No suitable decode target found")]
-    NoSuitableDecodeTargetFound,
-    #[error("Resolutions are not available")]
-    ResolutionsNotAvailable,
-    #[error("Invalid video layer allocation size")]
-    InvalidVideoLayerAllocationSize,
     #[error("Invalid demux ID {0:?}")]
     InvalidDemuxId(DemuxId),
     #[error("Inconsistent state")]
     InconsistentState,
+    #[error("Invalid template ID")]
+    InvalidTemplateId,
     #[error("Active decode targets bitmask is not available")]
     ActiveDecodeTargetsBitmaskNotAvailable,
-    #[error("Video layer allocation is not available")]
-    VideoLayerAllocationNotAvailable,
     #[error("Frame tracker error")]
     FrameTrackerError(#[from] frame_tracker::FrameTrackerError),
     #[error("Incoming video limit exceeded")]
@@ -329,17 +307,23 @@ impl Receivers {
         ext_info: ExtendedPacketInfo,
         sender: &ScalableVideoSender,
         now: Instant,
-    ) -> Result<(Vec<RtpToSend>, bool), ScalableVideoError> {
+    ) -> (Vec<RtpToSend>, bool) {
         let mut rtp_to_send = Vec::with_capacity(self.0.len());
         let mut needs_keyframe = false;
         for receiver in self.0.values_mut() {
-            let keyframe_requested =
-                receiver.dispatch_packet(inbound_rtp, &ext_info, sender, now, &mut rtp_to_send)?;
-            if !needs_keyframe {
-                needs_keyframe = keyframe_requested;
+            match receiver.dispatch_packet(inbound_rtp, &ext_info, sender, now, &mut rtp_to_send) {
+                Ok(keyframe_requested) => needs_keyframe |= keyframe_requested,
+                Err(e) => {
+                    warn!(
+                        "svc: {:?}: failed to dispatch packet: {e}",
+                        receiver.demux_id
+                    );
+                    receiver.on_dropped_packet(&ext_info);
+                    receiver.suppress_forwarding();
+                }
             }
         }
-        Ok((rtp_to_send, needs_keyframe))
+        (rtp_to_send, needs_keyframe)
     }
 }
 
@@ -454,7 +438,7 @@ impl ScalableVideoState {
                 }
                 Some(_) => {
                     warn!("svc: {receiver_demux_id:?} bad decode target: {decode_target}");
-                    return Err(InvalidDecodeTarget(decode_target));
+                    return Err(InconsistentState);
                 }
                 None => {
                     warn!("svc: {receiver_demux_id:?} no decode targets");
@@ -480,6 +464,8 @@ impl ScalableVideoState {
         inbound_rtp: &rtp::Packet<&[u8]>,
         now: Instant,
     ) -> Result<ExtendedPacketInfo, ScalableVideoError> {
+        let size = inbound_rtp.size();
+        event!("calling.svc.inbound.bytes", size.as_bytes() as usize);
         match self.sender.handle_packet(inbound_rtp, now) {
             Ok(ext_info) => {
                 // Allocation is required if the underlying dependency structure has been
@@ -490,15 +476,26 @@ impl ScalableVideoState {
                 }
                 Ok(ext_info)
             }
-            Err(DependencyDescriptorNotAvailable) => {
-                trace!("svc: needs keyframe");
-                self.sender.needs_keyframe = true;
-                Err(DependencyDescriptorNotAvailable)
-            }
-            Err(e) => {
-                trace!("svc: error: {e}");
-                Err(e)
-            }
+            Err(e) => match e {
+                DependencyDescriptorNotAvailable => {
+                    self.sender.needs_keyframe = true;
+                    event!("calling.video.no_descriptor");
+                    Err(DependencyDescriptorNotAvailable)
+                }
+                DependencyStructureNotAvailable => {
+                    event!("calling.svc.inbound.no_dependency_structure");
+                    Err(DependencyStructureNotAvailable)
+                }
+                InvalidTemplateId => {
+                    self.sender.needs_keyframe = true;
+                    event!("calling.svc.inbound.invalid_template");
+                    Err(InvalidTemplateId)
+                }
+                e => {
+                    trace!("svc: error: {e}");
+                    Err(e)
+                }
+            },
         }
     }
 
@@ -507,24 +504,14 @@ impl ScalableVideoState {
         inbound_rtp: &rtp::Packet<&[u8]>,
         ext_info: ExtendedPacketInfo,
         now: Instant,
-    ) -> Result<Vec<RtpToSend>, ScalableVideoError> {
-        match self
-            .receivers
-            .dispatch_packet(inbound_rtp, ext_info, &self.sender, now)
-        {
-            Ok((rtp_to_send, needs_keyframe)) => {
-                if needs_keyframe {
-                    self.sender.needs_keyframe = true;
-                }
-                Ok(rtp_to_send)
-            }
-            Err(e) => {
-                error!("svc: {:?}: failed to dispatch packet: {e}", self.demux_id);
-                self.sender.needs_keyframe = true;
-                self.receivers.suppress_forwarding();
-                Err(e)
-            }
+    ) -> Vec<RtpToSend> {
+        let (rtp_to_send, needs_keyframe) =
+            self.receivers
+                .dispatch_packet(inbound_rtp, ext_info, &self.sender, now);
+        if needs_keyframe {
+            self.sender.needs_keyframe = true;
         }
+        rtp_to_send
     }
 
     /// Advances time-dependent state for all receivers and the sender, emits a periodic log
@@ -570,7 +557,9 @@ impl ScalableVideoReceiver {
     #[inline]
     fn on_sent(&mut self, outbound_rtp: &rtp::Packet<Vec<u8>>, now: Instant) {
         self.stats.inc_sent();
-        self.send_rate.push(outbound_rtp.size(), now);
+        let size = outbound_rtp.size();
+        self.send_rate.push(size, now);
+        event!("calling.svc.outbound.bytes", size.as_bytes() as usize);
     }
 
     #[inline]
@@ -660,7 +649,7 @@ impl ScalableVideoReceiver {
         if let Some((target, size)) = decode_target {
             // If the request is to set the same decode target as the target that is currently
             // selected, we'll simply clear the current switch request, if there is one. It is
-            // simply being overriden by something that is, effectively, a no-op.
+            // simply being overridden by something that is, effectively, a no-op.
             if self.active_decode_target == Some(target) {
                 self.switch_decode_target = None;
                 self.switch_decode_target_bitmask = ActiveDecodeTargetsBitmask::Uninitialized;
@@ -782,7 +771,7 @@ impl ScalableVideoReceiver {
                     None => {
                         let dti = frame_dep
                             .dti(switch_target)
-                            .map_err(|_| InvalidDecodeTarget(switch_target))?;
+                            .map_err(|_| InconsistentState)?;
                         dti == Dti::Switch
                     }
                 };
@@ -805,7 +794,7 @@ impl ScalableVideoReceiver {
 
         let dti = frame_dep
             .dti(decode_target)
-            .map_err(|_| InvalidDecodeTarget(decode_target))?;
+            .map_err(|_| InconsistentState)?;
         if dti != Dti::NotPresent {
             let outbound_rtp = self.rewrite_packet(inbound_rtp, *end_of_frame)?;
             self.on_sent(&outbound_rtp, now);
@@ -897,7 +886,7 @@ impl ScalableVideoSender {
     ) -> Result<(), ScalableVideoError> {
         let size = incoming_rtp.size().as_bytes() as usize;
         if self.rate_tracker.push_bytes(size, now).is_err() {
-            event!("calling.bandwidth.incoming.svc.video_overlimit_bytes", size);
+            event!("calling.bandwidth.incoming.rtp_overlimit_bytes.svc", size);
             Err(IncomingVideoLimitExceeded)
         } else {
             Ok(())
@@ -931,7 +920,7 @@ impl ScalableVideoSender {
             descriptor.extended_fields.as_ref(),
             frame_dependency_template_id,
         )
-        .map_err(|_| InvalidFrameDependencyTemplateId(frame_dependency_template_id))
+        .map_err(|_| InvalidTemplateId)
     }
 
     fn handle_packet(
@@ -1053,28 +1042,25 @@ impl ScalableVideoSender {
     fn update_decode_targets(&mut self) -> Result<bool, ScalableVideoError> {
         let vla = &self.video_layer_allocation;
         if vla.is_empty() {
-            return Err(VideoLayerAllocationNotAvailable);
+            return Ok(false);
         }
-        let dependency_structure = self
-            .dependency_structure
-            .as_ref()
-            .ok_or(DependencyStructureNotAvailable)?;
-        let chain_indices = dependency_structure
-            .decode_target_chain_indices
-            .as_ref()
-            .ok_or(DecodeTargetChainIndicesNotAvailable)?;
+        let (Some(dependency_structure), Some(bitmask)) = (
+            self.dependency_structure.as_ref(),
+            self.active_decode_targets_bitmask.bitmask(),
+        ) else {
+            return Ok(false);
+        };
+        let (Some(chain_indices), Some(resolutions)) = (
+            dependency_structure.decode_target_chain_indices.as_ref(),
+            dependency_structure.resolutions.as_ref(),
+        ) else {
+            return Ok(false);
+        };
+
         let n = dependency_structure.decode_target_count;
         if dependency_structure.decode_target_layers.len() < n || chain_indices.len() < n {
             return Err(InconsistentState);
         }
-        let resolutions = dependency_structure
-            .resolutions
-            .as_ref()
-            .ok_or(ResolutionsNotAvailable)?;
-        let bitmask = self
-            .active_decode_targets_bitmask
-            .bitmask()
-            .ok_or(ActiveDecodeTargetsBitmaskNotAvailable)?;
 
         let mut targets = DecodeTargetInfoList::default();
         for i in 0..n {
@@ -1145,18 +1131,17 @@ impl ScalableVideoSender {
             return false;
         }
         match self.update_decode_targets() {
-            Err(InconsistentState) => {
-                event!("calling.svc.inconsistent_state");
-                warn!("failed to update decode targets: inconsistent state");
+            Ok(targets_updated) => targets_updated,
+            Err(e) => {
+                // Keep processing the packet (it's usually the keyframe's first packet), but
+                // stop the allocator from using the stale decode targets until the next
+                // structure or bitmask triggers another rebuild.
+                event!("calling.svc.inbound.inconsistent_state");
+                warn!("svc: failed to update decode targets: {e}");
                 self.active_decode_targets_bitmask = ActiveDecodeTargetsBitmask::Uninitialized;
                 self.needs_keyframe = true;
                 false
             }
-            Err(e) => {
-                warn!("failed to update decode targets: {e}");
-                false
-            }
-            Ok(targets_updated) => targets_updated,
         }
     }
 
@@ -1169,18 +1154,13 @@ impl ScalableVideoSender {
         let chain_index = self
             .decode_targets
             .get(decode_target)
-            .ok_or(InvalidDecodeTarget(decode_target))?
+            .ok_or(InconsistentState)?
             .chain_index;
         let frame_delta = match frame_dep.custom_chains.as_ref() {
-            Some(chains) => chains
-                .get(chain_index)
-                .ok_or(InvalidChainIndex(chain_index))?,
+            Some(chains) => chains.get(chain_index).ok_or(InconsistentState)?,
             None => {
                 let template = frame_dep.template();
-                template
-                    .chains
-                    .get(chain_index)
-                    .ok_or(InvalidChainIndex(chain_index))?
+                template.chains.get(chain_index).ok_or(InconsistentState)?
             }
         };
         if *frame_delta == 0 {
@@ -1188,7 +1168,7 @@ impl ScalableVideoSender {
         } else {
             let frame_number = frame_number
                 .checked_sub(*frame_delta as FullFrameNumber)
-                .ok_or(ScalableVideoError::InvalidFrameDelta(*frame_delta))?;
+                .ok_or(InconsistentState)?;
             Ok(self.frame_tracker.is_complete(frame_number))
         }
     }
@@ -1210,7 +1190,7 @@ mod tests {
             DecodeTargetInfo, DecodeTargetInfoList,
             ScalableVideoError::{
                 ActiveDecodeTargetsBitmaskNotAvailable, DependencyDescriptorNotAvailable,
-                DependencyStructureNotAvailable, IncomingVideoLimitExceeded, InvalidDecodeTarget,
+                DependencyStructureNotAvailable, IncomingVideoLimitExceeded, InconsistentState,
                 InvalidDemuxId,
             },
             ScalableVideoSender, ScalableVideoState,
@@ -1630,6 +1610,37 @@ mod tests {
         ));
     }
 
+    /// A keyframe whose VLA doesn't match its structure is still accepted, but the sender's
+    /// bitmask is reset and a keyframe requested. A consistent keyframe then recovers.
+    #[test]
+    fn test_handle_packet_inconsistent_decode_targets_keeps_packet() {
+        let now = Instant::now();
+        let mut state = ScalableVideoState::default();
+
+        // L1T1 structure with decode target 0 active, but the VLA has no temporal layer rates.
+        let bad_vla = vec![vec![SpatialLayer {
+            temporal_layer_rates: vec![],
+            size: None,
+        }]];
+        let kf = make_keyframe_packet(1, 0, make_l1t1_structure(), Some(bad_vla));
+        let ext = state.handle_packet(&kf.borrow(), now).unwrap();
+        assert!(!ext.needs_allocation);
+        assert!(state.needs_keyframe());
+        assert!(
+            state
+                .sender
+                .active_decode_targets_bitmask
+                .is_uninitialized()
+        );
+        assert!(state.get_decode_targets().is_empty());
+
+        let kf = make_keyframe_packet(2, 1, make_l1t1_structure(), Some(make_vla(500)));
+        let ext = state.handle_packet(&kf.borrow(), now).unwrap();
+        assert!(ext.needs_allocation);
+        assert!(!state.needs_keyframe());
+        assert_eq!(state.get_decode_targets().len(), 1);
+    }
+
     // === update_decode_target_for_receiver errors ===
 
     #[test]
@@ -1667,7 +1678,7 @@ mod tests {
         // size=1, so index 1 is out of bounds
         assert_eq!(
             state.set_decode_target_for_receiver(DEMUX_A, Some(1)),
-            Err(InvalidDecodeTarget(1))
+            Err(InconsistentState)
         );
     }
 
@@ -1685,7 +1696,7 @@ mod tests {
         // After clearing, packets should not be forwarded.
         let delta = make_delta_packet(2, 1);
         let ext = state.handle_packet(&delta.borrow(), now).unwrap();
-        let forwarded = state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+        let forwarded = state.dispatch_packet(&delta.borrow(), ext, now);
         assert!(forwarded.is_empty());
         // ...and the sender must not be asked for a keyframe the receiver has no use for.
         assert!(!state.needs_keyframe());
@@ -1707,7 +1718,7 @@ mod tests {
         state
             .set_decode_target_for_receiver(DEMUX_A, Some(0))
             .unwrap();
-        let forwarded = state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        let forwarded = state.dispatch_packet(&kf.borrow(), ext, now);
         assert!(!forwarded.is_empty());
         assert!(!state.needs_keyframe());
 
@@ -1715,7 +1726,7 @@ mod tests {
         for frame_number in 1..=3 {
             let delta = make_delta_packet(frame_number as u64 + 1, frame_number);
             let ext = state.handle_packet(&delta.borrow(), now).unwrap();
-            let forwarded = state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+            let forwarded = state.dispatch_packet(&delta.borrow(), ext, now);
             assert!(forwarded.is_empty());
         }
         assert!(!state.needs_keyframe());
@@ -1732,13 +1743,13 @@ mod tests {
 
         let kf = make_keyframe_packet(1, 0, make_l1t1_structure(), Some(make_vla(500)));
         let ext = state.handle_packet(&kf.borrow(), now).unwrap();
-        let forwarded = state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        let forwarded = state.dispatch_packet(&kf.borrow(), ext, now);
         assert!(forwarded.is_empty());
 
         for frame_number in 1..=3 {
             let delta = make_delta_packet(frame_number as u64 + 1, frame_number);
             let ext = state.handle_packet(&delta.borrow(), now).unwrap();
-            state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+            state.dispatch_packet(&delta.borrow(), ext, now);
         }
         assert!(!state.needs_keyframe());
     }
@@ -1760,7 +1771,7 @@ mod tests {
 
         let delta = make_delta_packet(2, 1);
         let ext = state.handle_packet(&delta.borrow(), now).unwrap();
-        let forwarded = state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+        let forwarded = state.dispatch_packet(&delta.borrow(), ext, now);
 
         assert!(forwarded.is_empty());
         assert!(state.needs_keyframe());
@@ -1784,7 +1795,7 @@ mod tests {
         state
             .set_decode_target_for_receiver(DEMUX_A, Some(0))
             .unwrap();
-        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now);
 
         let receiver = state.receivers.get(DEMUX_A).unwrap();
         assert_eq!(receiver.active_decode_target, Some(0));
@@ -1871,9 +1882,7 @@ mod tests {
         let mut state = ScalableVideoState::default();
         let kf = make_keyframe_packet(1, 0, make_l1t1_structure(), Some(make_vla(500)));
         let ext = state.handle_packet(&kf.borrow(), Instant::now()).unwrap();
-        let forwarded = state
-            .dispatch_packet(&kf.borrow(), ext, Instant::now())
-            .unwrap();
+        let forwarded = state.dispatch_packet(&kf.borrow(), ext, Instant::now());
         assert!(forwarded.is_empty());
     }
 
@@ -1896,14 +1905,12 @@ mod tests {
         state
             .set_decode_target_for_receiver(DEMUX_A, Some(0))
             .unwrap();
-        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now);
 
         // Template 1 (Required): should be forwarded to the receiver.
         let required_pkt = make_packet(2, 1, 1, true, true);
         let ext = state.handle_packet(&required_pkt.borrow(), now).unwrap();
-        let forwarded = state
-            .dispatch_packet(&required_pkt.borrow(), ext, now)
-            .unwrap();
+        let forwarded = state.dispatch_packet(&required_pkt.borrow(), ext, now);
 
         assert_eq!(forwarded.len(), 1);
         assert_eq!(forwarded[0].0, DEMUX_A);
@@ -1921,11 +1928,11 @@ mod tests {
             .set_decode_target_for_receiver(DEMUX_A, Some(0))
             .unwrap();
         // Dispatching the keyframe itself completes the initial switch (see note above).
-        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now);
 
         let delta = make_delta_packet(2, 1);
         let ext = state.handle_packet(&delta.borrow(), now).unwrap();
-        let forwarded = state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+        let forwarded = state.dispatch_packet(&delta.borrow(), ext, now);
 
         assert_eq!(forwarded.len(), 1);
         assert_eq!(forwarded[0].0, DEMUX_A);
@@ -1947,11 +1954,11 @@ mod tests {
             .unwrap();
         // Dispatching the keyframe itself completes the initial switch for both
         // receivers (see note in test_dispatch_packet_required_dti_forwarded).
-        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now);
 
         let delta = make_delta_packet(2, 1);
         let ext = state.handle_packet(&delta.borrow(), now).unwrap();
-        let forwarded = state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+        let forwarded = state.dispatch_packet(&delta.borrow(), ext, now);
 
         assert_eq!(forwarded.len(), 2);
         let demux_ids: std::collections::HashSet<_> = forwarded.iter().map(|(id, _)| *id).collect();
@@ -1973,7 +1980,7 @@ mod tests {
 
         let delta = make_delta_packet(2, 1);
         let ext = state.handle_packet(&delta.borrow(), now).unwrap();
-        let forwarded = state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+        let forwarded = state.dispatch_packet(&delta.borrow(), ext, now);
         assert!(forwarded.is_empty());
     }
 
@@ -1989,16 +1996,16 @@ mod tests {
             .unwrap();
         // Dispatching the keyframe itself completes the initial switch (see note in
         // test_dispatch_packet_required_dti_forwarded).
-        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now);
 
         let delta1 = make_delta_packet(2, 1);
         let ext1 = state.handle_packet(&delta1.borrow(), now).unwrap();
-        let fwd1 = state.dispatch_packet(&delta1.borrow(), ext1, now).unwrap();
+        let fwd1 = state.dispatch_packet(&delta1.borrow(), ext1, now);
         let seqnum1 = fwd1[0].1.seqnum();
 
         let delta2 = make_delta_packet(3, 2);
         let ext2 = state.handle_packet(&delta2.borrow(), now).unwrap();
-        let fwd2 = state.dispatch_packet(&delta2.borrow(), ext2, now).unwrap();
+        let fwd2 = state.dispatch_packet(&delta2.borrow(), ext2, now);
         let seqnum2 = fwd2[0].1.seqnum();
 
         assert_eq!(seqnum2, seqnum1 + 1);
@@ -2015,15 +2022,15 @@ mod tests {
         state
             .set_decode_target_for_receiver(DEMUX_A, Some(0))
             .unwrap();
-        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now);
 
         let delta1 = make_delta_packet(2, 1);
         let ext1 = state.handle_packet(&delta1.borrow(), now).unwrap();
-        state.dispatch_packet(&delta1.borrow(), ext1, now).unwrap();
+        state.dispatch_packet(&delta1.borrow(), ext1, now);
 
         let delta2 = make_delta_packet(3, 2);
         let ext2 = state.handle_packet(&delta2.borrow(), now).unwrap();
-        let fwd2 = state.dispatch_packet(&delta2.borrow(), ext2, now).unwrap();
+        let fwd2 = state.dispatch_packet(&delta2.borrow(), ext2, now);
         let emitted = fwd2[0].1.seqnum();
 
         // Frame 1 arrives again, after frame 2 has already been forwarded. It is dropped as a
@@ -2033,14 +2040,12 @@ mod tests {
         let late = make_delta_packet(2, 1);
         let ext_late = state.handle_packet(&late.borrow(), now).unwrap();
         assert!(!ext_late.is_new_max_seqnum);
-        let fwd_late = state
-            .dispatch_packet(&late.borrow(), ext_late, now)
-            .unwrap();
+        let fwd_late = state.dispatch_packet(&late.borrow(), ext_late, now);
         assert!(fwd_late.is_empty());
 
         let delta3 = make_delta_packet(4, 3);
         let ext3 = state.handle_packet(&delta3.borrow(), now).unwrap();
-        let fwd3 = state.dispatch_packet(&delta3.borrow(), ext3, now).unwrap();
+        let fwd3 = state.dispatch_packet(&delta3.borrow(), ext3, now);
 
         assert_eq!(fwd3[0].1.seqnum(), emitted + 1);
     }
@@ -2056,13 +2061,13 @@ mod tests {
         state
             .set_decode_target_for_receiver(DEMUX_A, Some(0))
             .unwrap();
-        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now);
 
         // Run the stream forward so the sender's max inbound seqnum is well clear of zero.
         for seqnum in 2..=10u64 {
             let delta = make_delta_packet(seqnum, seqnum as u16 - 1);
             let ext = state.handle_packet(&delta.borrow(), now).unwrap();
-            state.dispatch_packet(&delta.borrow(), ext, now).unwrap();
+            state.dispatch_packet(&delta.borrow(), ext, now);
         }
         let max_at_join = 10u64;
 
@@ -2078,7 +2083,7 @@ mod tests {
         // structure and VLA, so it does not force a reallocation.
         let kf2 = make_keyframe_packet(11, 10, make_l1t1_structure_switch(), Some(make_vla(500)));
         let ext2 = state.handle_packet(&kf2.borrow(), now).unwrap();
-        let fwd = state.dispatch_packet(&kf2.borrow(), ext2, now).unwrap();
+        let fwd = state.dispatch_packet(&kf2.borrow(), ext2, now);
 
         let (_, packet_b) = fwd
             .iter()
@@ -2123,7 +2128,7 @@ mod tests {
         state
             .set_decode_target_for_receiver(DEMUX_A, Some(0))
             .unwrap();
-        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now);
 
         assert_eq!(
             state.receivers.get(DEMUX_A).unwrap().active_decode_target,
@@ -2147,7 +2152,7 @@ mod tests {
             .unwrap();
         let frame5 = make_packet(2, 5, 1, true, true);
         let ext = state.handle_packet(&frame5.borrow(), now).unwrap();
-        state.dispatch_packet(&frame5.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&frame5.borrow(), ext, now);
 
         let receiver = state.receivers.get(DEMUX_A).unwrap();
         assert_eq!(receiver.active_decode_target, Some(1));
@@ -2166,7 +2171,7 @@ mod tests {
             .unwrap();
         let frame5 = make_packet(2, 5, 2, true, true);
         let ext = state.handle_packet(&frame5.borrow(), now).unwrap();
-        let forwarded = state.dispatch_packet(&frame5.borrow(), ext, now).unwrap();
+        let forwarded = state.dispatch_packet(&frame5.borrow(), ext, now);
 
         // Forwarding is suppressed and the sender is asked for a keyframe on this same
         // packet, rather than the receiver being pinned to a broken chain.
@@ -2199,7 +2204,7 @@ mod tests {
         state
             .set_decode_target_for_receiver(DEMUX_A, Some(0))
             .unwrap();
-        state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&kf.borrow(), ext, now);
         assert!(!state.needs_keyframe());
 
         // Schedule a switch to DT2.
@@ -2210,14 +2215,14 @@ mod tests {
         // Template-0 has DTI[2]=Switch; dispatching it completes the switch to DT2.
         let trigger = make_packet(2, 1, 0, true, true);
         let ext = state.handle_packet(&trigger.borrow(), now).unwrap();
-        state.dispatch_packet(&trigger.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&trigger.borrow(), ext, now);
 
         // Frame 5 uses template 1, which has chain delta=1 for DT2 → references frame 4
         // (never received, so incomplete). DT1 chain delta=0 → always intact.
         // try_downgrade selects DT1, not DT0, so is_switching_to(BASE_LAYER) is false.
         let frame5 = make_packet(3, 5, 1, true, true);
         let ext = state.handle_packet(&frame5.borrow(), now).unwrap();
-        state.dispatch_packet(&frame5.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&frame5.borrow(), ext, now);
 
         assert!(!state.needs_keyframe());
     }
@@ -2240,22 +2245,20 @@ mod tests {
         state
             .set_decode_target_for_receiver(DEMUX_A, Some(1))
             .unwrap();
-        let fwd = state.dispatch_packet(&kf.borrow(), ext, now).unwrap();
+        let fwd = state.dispatch_packet(&kf.borrow(), ext, now);
         assert_eq!(fwd.len(), 1);
         let seqnum_after_switch = fwd[0].1.seqnum();
 
         // Template 0 (DT1=NotPresent): packet must be dropped and seqnum_offset incremented.
         let not_present_pkt = make_packet(2, 1, 0, true, true);
         let ext = state.handle_packet(&not_present_pkt.borrow(), now).unwrap();
-        let fwd = state
-            .dispatch_packet(&not_present_pkt.borrow(), ext, now)
-            .unwrap();
+        let fwd = state.dispatch_packet(&not_present_pkt.borrow(), ext, now);
         assert!(fwd.is_empty(), "packet with NotPresent DTI must be dropped");
 
         // Next forwarded packet accounts for the skipped seqnum.
         let next_pkt = make_packet(3, 2, 1, true, true);
         let ext = state.handle_packet(&next_pkt.borrow(), now).unwrap();
-        let fwd = state.dispatch_packet(&next_pkt.borrow(), ext, now).unwrap();
+        let fwd = state.dispatch_packet(&next_pkt.borrow(), ext, now);
         assert_eq!(fwd.len(), 1);
         assert_eq!(fwd[0].1.seqnum(), seqnum_after_switch + 1);
     }
@@ -2275,12 +2278,12 @@ mod tests {
         state
             .set_decode_target_for_receiver(DEMUX_A, Some(0))
             .unwrap();
-        state.dispatch_packet(&kf1.borrow(), ext, now).unwrap();
+        state.dispatch_packet(&kf1.borrow(), ext, now);
 
         // A subsequent non-keyframe packet should be forwarded normally.
         let p1 = make_delta_packet(2, 1);
         let ext = state.handle_packet(&p1.borrow(), now).unwrap();
-        let fwd = state.dispatch_packet(&p1.borrow(), ext, now).unwrap();
+        let fwd = state.dispatch_packet(&p1.borrow(), ext, now);
         assert_eq!(
             fwd.len(),
             1,
@@ -2291,7 +2294,7 @@ mod tests {
         let kf2 = make_keyframe_packet(3, 2, make_l1t1_structure_switch(), Some(make_vla(1000)));
         let ext = state.handle_packet(&kf2.borrow(), now).unwrap();
         assert!(ext.needs_allocation);
-        let fwd = state.dispatch_packet(&kf2.borrow(), ext, now).unwrap();
+        let fwd = state.dispatch_packet(&kf2.borrow(), ext, now);
         assert!(
             fwd.is_empty(),
             "forwarding should be suppressed after new structure"
@@ -2307,7 +2310,7 @@ mod tests {
         state
             .set_decode_target_for_receiver(DEMUX_A, Some(0))
             .unwrap();
-        let fwd = state.dispatch_packet(&kf3.borrow(), ext, now).unwrap();
+        let fwd = state.dispatch_packet(&kf3.borrow(), ext, now);
         assert_eq!(
             fwd.len(),
             1,
@@ -2506,15 +2509,13 @@ mod tests {
         // Template 0 (DT1 = NotPresent): packet must be dropped and seqnum_offset incremented.
         let dropped_pkt = make_packet(2, 1, 0, true, true);
         let ext = state.handle_packet(&dropped_pkt.borrow(), now).unwrap();
-        let fwd = state
-            .dispatch_packet(&dropped_pkt.borrow(), ext, now)
-            .unwrap();
+        let fwd = state.dispatch_packet(&dropped_pkt.borrow(), ext, now);
         assert!(fwd.is_empty(), "packet with NotPresent DTI must be dropped");
 
         // Next forwarded packet's seqnum must account for the skipped one.
         let next_pkt = make_packet(3, 2, 1, true, true);
         let ext = state.handle_packet(&next_pkt.borrow(), now).unwrap();
-        let fwd = state.dispatch_packet(&next_pkt.borrow(), ext, now).unwrap();
+        let fwd = state.dispatch_packet(&next_pkt.borrow(), ext, now);
         assert_eq!(fwd.len(), 1);
         assert_eq!(fwd[0].1.seqnum(), next_pkt.seqnum() - 1);
     }
