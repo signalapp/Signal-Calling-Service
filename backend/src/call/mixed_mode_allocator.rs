@@ -124,8 +124,8 @@ struct SplitTargetSendRateArgs<'a> {
     target_send_rate: DataRate,
     min_target_send_rate: DataRate,
     drain_rate: DataRate,
-    svc_target_rate_fraction: f64,
-    simulcast_target_rate_fraction: f64,
+    svc_ideal_send_rate: DataRate,
+    simulcast_ideal_send_rate: DataRate,
     svc_requested_base_rate: DataRate,
     simulcast_requested_base_rate: DataRate,
     svc_sender_allocation_info: &'a [SenderAllocationInfo<'a>],
@@ -133,8 +133,9 @@ struct SplitTargetSendRateArgs<'a> {
 }
 
 /// Divides `target_send_rate` between the SVC and simulcast pools. Each pool's base rate is
-/// reserved first, and only the surplus is split in proportion to ideal demand. If both base
-/// rates don't fit, the split is proportional, except that a pool never keeps more than its
+/// reserved first. The surplus then goes to each pool in proportion to what it still needs to
+/// reach its ideal rate, and anything beyond both ideals in proportion to ideal demand. If both
+/// base rates don't fit, the split is proportional, except that a pool never keeps more than its
 /// reservation while the other pool is short of its own.
 ///
 /// Just enough is then moved into the priority sender's pool (see `get_priority_sender_info`)
@@ -165,13 +166,23 @@ fn split_target_send_rate(args: SplitTargetSendRateArgs<'_>) -> (DataRate, DataR
         target_send_rate,
         min_target_send_rate,
         drain_rate,
-        svc_target_rate_fraction,
-        simulcast_target_rate_fraction,
+        svc_ideal_send_rate,
+        simulcast_ideal_send_rate,
         svc_requested_base_rate,
         simulcast_requested_base_rate,
         svc_sender_allocation_info,
         simulcast_allocatable_videos,
     } = args;
+
+    // Each pool's share of the combined ideal demand.
+    let ideal_total = svc_ideal_send_rate + simulcast_ideal_send_rate;
+    let (svc_target_rate_fraction, simulcast_target_rate_fraction) = if ideal_total > DataRate::ZERO
+    {
+        let svc_frac = svc_ideal_send_rate / ideal_total;
+        (svc_frac, 1.0 - svc_frac)
+    } else {
+        (0.0, 0.0)
+    };
 
     // The fractions of a pool's share its allocator can spend on layers it is already
     // forwarding, and on layers it isn't. This is exactly how the pool allocators derive
@@ -197,11 +208,32 @@ fn split_target_send_rate(args: SplitTargetSendRateArgs<'_>) -> (DataRate, DataR
     let simulcast_reserved_rate = scale_rate(simulcast_requested_base_rate, spendable_fraction);
     let reserved = svc_reserved_rate + simulcast_reserved_rate;
     let (svc_rate, simulcast_rate) = if reserved <= target_send_rate {
+        // Both reservations fit. Give the surplus to each pool in proportion to its headroom,
+        // what it still needs to reach its ideal rate, so a pool already at its ideal doesn't
+        // take rate it can't use while the other pool falls short. Anything beyond both ideals
+        // is split in proportion to ideal demand. Headroom is scaled like the reservations, so
+        // that it survives `drain_rate`.
         let surplus = target_send_rate - reserved;
-        (
-            svc_reserved_rate + surplus * svc_target_rate_fraction,
-            simulcast_reserved_rate + surplus * simulcast_target_rate_fraction,
-        )
+        let svc_headroom =
+            scale_rate(svc_ideal_send_rate, spendable_fraction).saturating_sub(svc_reserved_rate);
+        let simulcast_headroom = scale_rate(simulcast_ideal_send_rate, spendable_fraction)
+            .saturating_sub(simulcast_reserved_rate);
+        let headroom = svc_headroom + simulcast_headroom;
+        if surplus < headroom {
+            let svc_surplus = surplus * (svc_headroom / headroom);
+            (
+                svc_reserved_rate + svc_surplus,
+                simulcast_reserved_rate + (surplus - svc_surplus),
+            )
+        } else {
+            let leftover = surplus - headroom;
+            (
+                svc_reserved_rate + svc_headroom + leftover * svc_target_rate_fraction,
+                simulcast_reserved_rate
+                    + simulcast_headroom
+                    + leftover * simulcast_target_rate_fraction,
+            )
+        }
     } else {
         // Not enough for both pools' reservations. Split in proportion to ideal demand, but
         // never leave a pool more than its reservation while the other pool is short.
@@ -322,24 +354,14 @@ pub(super) fn allocate(
         requested_max_send_rate,
     );
 
-    // Determine the proportional split between SVC and simulcast.
-    let ideal_total = svc_ideal_send_rate_uncapped + simulcast_ideal_send_rate_uncapped;
-    let (svc_target_rate_fraction, simulcast_target_rate_fraction) = if ideal_total > DataRate::ZERO
-    {
-        let svc_frac = svc_ideal_send_rate_uncapped / ideal_total;
-        (svc_frac, 1.0 - svc_frac)
-    } else {
-        (0.0, 0.0)
-    };
-
     // Derive the actual bandwidth partition sizes.
     let (svc_target_send_rate, simulcast_target_send_rate) =
         split_target_send_rate(SplitTargetSendRateArgs {
             target_send_rate: allocation_target_send_rate,
             min_target_send_rate,
             drain_rate: client.outgoing_queue_drain_rate,
-            svc_target_rate_fraction,
-            simulcast_target_rate_fraction,
+            svc_ideal_send_rate: svc_ideal_send_rate_uncapped,
+            simulcast_ideal_send_rate: simulcast_ideal_send_rate_uncapped,
             svc_requested_base_rate,
             simulcast_requested_base_rate,
             svc_sender_allocation_info: &svc_sender_allocation_info,
@@ -432,17 +454,6 @@ mod tests {
         simulcast::AllocatableVideoLayer,
         svc::{DecodeTargetInfo, DecodeTargetInfoList, MAX_EXPECTED_CLIENTS},
     };
-
-    /// Mirrors how `allocate` derives the fractions from the two pools' ideal rates.
-    fn fractions(svc_ideal: DataRate, simulcast_ideal: DataRate) -> (f64, f64) {
-        let ideal_total = svc_ideal + simulcast_ideal;
-        if ideal_total > DataRate::ZERO {
-            let svc_frac = svc_ideal / ideal_total;
-            (svc_frac, 1.0 - svc_frac)
-        } else {
-            (0.0, 0.0)
-        }
-    }
 
     fn kbps(kbps: u64) -> DataRate {
         DataRate::from_kbps(kbps)
@@ -689,7 +700,6 @@ mod tests {
         let svc_base = svc::allocator::calculate_base_rate(&svc_senders, &svc_ideal_targets);
         let simulcast_ideal = simulcast::ideal_send_rate(&simulcast_videos);
         let simulcast_base = simulcast::requested_base_rate(&simulcast_videos, DataRate::MAX);
-        let (svc_frac, simulcast_frac) = fractions(svc_ideal, simulcast_ideal);
 
         // The first target at which the priority sender can be shown but isn't.
         let failed_target_kbps = target_rates_kbps.iter().copied().find(|&target_kbps| {
@@ -711,8 +721,8 @@ mod tests {
                 target_send_rate: target,
                 min_target_send_rate: min_target,
                 drain_rate,
-                svc_target_rate_fraction: svc_frac,
-                simulcast_target_rate_fraction: simulcast_frac,
+                svc_ideal_send_rate: svc_ideal,
+                simulcast_ideal_send_rate: simulcast_ideal,
                 svc_requested_base_rate: svc_base,
                 simulcast_requested_base_rate: simulcast_base,
                 svc_sender_allocation_info: &svc_senders,
@@ -883,13 +893,12 @@ mod tests {
         // One SVC sender dominating the ideal demand alongside a single VP8 sender. The
         // simulcast pool's proportional share alone would be ~70kbps, below its 150kbps base
         // layer, which would forward nothing at all.
-        let (svc_frac, simulcast_frac) = fractions(kbps(2000), kbps(150));
         let (svc_budget, simulcast_budget) = split_target_send_rate(SplitTargetSendRateArgs {
             target_send_rate: kbps(1000),
             min_target_send_rate: kbps(1000),
             drain_rate: DataRate::ZERO,
-            svc_target_rate_fraction: svc_frac,
-            simulcast_target_rate_fraction: simulcast_frac,
+            svc_ideal_send_rate: kbps(2000),
+            simulcast_ideal_send_rate: kbps(150),
             svc_requested_base_rate: kbps(200),
             simulcast_requested_base_rate: kbps(150),
             svc_sender_allocation_info: &[],
@@ -909,21 +918,21 @@ mod tests {
     fn test_split_falls_back_to_proportional_when_bases_do_not_fit() {
         // Base layers total 350kbps against a 100kbps budget, so neither pool can be made
         // whole; the split degrades to straight proportional.
-        let (svc_frac, simulcast_frac) = fractions(kbps(2000), kbps(150));
         let (svc_budget, simulcast_budget) = split_target_send_rate(SplitTargetSendRateArgs {
             target_send_rate: kbps(100),
             min_target_send_rate: kbps(100),
             drain_rate: DataRate::ZERO,
-            svc_target_rate_fraction: svc_frac,
-            simulcast_target_rate_fraction: simulcast_frac,
+            svc_ideal_send_rate: kbps(2000),
+            simulcast_ideal_send_rate: kbps(150),
             svc_requested_base_rate: kbps(200),
             simulcast_requested_base_rate: kbps(150),
             svc_sender_allocation_info: &[],
             simulcast_allocatable_videos: &[],
         });
 
+        let svc_frac = kbps(2000) / kbps(2150);
         assert_eq!(svc_budget, kbps(100) * svc_frac);
-        assert_eq!(simulcast_budget, kbps(100) * simulcast_frac);
+        assert_eq!(simulcast_budget, kbps(100) * (1.0 - svc_frac));
         assert!(svc_budget + simulcast_budget <= kbps(100));
     }
 
@@ -934,15 +943,13 @@ mod tests {
             for simulcast_ideal in [0, 100, 1500, 20_000] {
                 for svc_base in [0, 150, 900] {
                     for simulcast_base in [0, 150, 900] {
-                        let (svc_frac, simulcast_frac) =
-                            fractions(kbps(svc_ideal), kbps(simulcast_ideal));
                         let (svc_budget, simulcast_budget) =
                             split_target_send_rate(SplitTargetSendRateArgs {
                                 target_send_rate: target,
                                 min_target_send_rate: target,
                                 drain_rate: DataRate::ZERO,
-                                svc_target_rate_fraction: svc_frac,
-                                simulcast_target_rate_fraction: simulcast_frac,
+                                svc_ideal_send_rate: kbps(svc_ideal),
+                                simulcast_ideal_send_rate: kbps(simulcast_ideal),
                                 svc_requested_base_rate: kbps(svc_base),
                                 simulcast_requested_base_rate: kbps(simulcast_base),
                                 svc_sender_allocation_info: &[],
@@ -968,13 +975,12 @@ mod tests {
         // fraction, the scaled minimum can never exceed the pool's budget -- which is what
         // simulcast::allocate_send_rate needs for "existing layers >= different layers".
         let target = kbps(1000);
-        let (svc_frac, simulcast_frac) = fractions(kbps(2000), kbps(150));
         let (_svc_budget, simulcast_budget) = split_target_send_rate(SplitTargetSendRateArgs {
             target_send_rate: target,
             min_target_send_rate: target,
             drain_rate: DataRate::ZERO,
-            svc_target_rate_fraction: svc_frac,
-            simulcast_target_rate_fraction: simulcast_frac,
+            svc_ideal_send_rate: kbps(2000),
+            simulcast_ideal_send_rate: kbps(150),
             svc_requested_base_rate: kbps(200),
             simulcast_requested_base_rate: kbps(150),
             svc_sender_allocation_info: &[],
@@ -995,13 +1001,12 @@ mod tests {
     fn test_split_allocates_nothing_when_the_client_requests_zero() {
         // A client asking for max_kbps: 0 caps the whole allocation budget at zero, whatever
         // congestion control says the link can carry.
-        let (svc_frac, simulcast_frac) = fractions(kbps(2000), kbps(150));
         let (svc_budget, simulcast_budget) = split_target_send_rate(SplitTargetSendRateArgs {
             target_send_rate: DataRate::ZERO,
             min_target_send_rate: DataRate::ZERO,
             drain_rate: DataRate::ZERO,
-            svc_target_rate_fraction: svc_frac,
-            simulcast_target_rate_fraction: simulcast_frac,
+            svc_ideal_send_rate: kbps(2000),
+            simulcast_ideal_send_rate: kbps(150),
             svc_requested_base_rate: kbps(200),
             simulcast_requested_base_rate: kbps(150),
             svc_sender_allocation_info: &[],
@@ -1045,13 +1050,12 @@ mod tests {
 
     #[test]
     fn test_split_allocates_nothing_without_demand() {
-        let (svc_frac, simulcast_frac) = fractions(DataRate::ZERO, DataRate::ZERO);
         let (svc_budget, simulcast_budget) = split_target_send_rate(SplitTargetSendRateArgs {
             target_send_rate: kbps(1000),
             min_target_send_rate: kbps(1000),
             drain_rate: DataRate::ZERO,
-            svc_target_rate_fraction: svc_frac,
-            simulcast_target_rate_fraction: simulcast_frac,
+            svc_ideal_send_rate: DataRate::ZERO,
+            simulcast_ideal_send_rate: DataRate::ZERO,
             svc_requested_base_rate: DataRate::ZERO,
             simulcast_requested_base_rate: DataRate::ZERO,
             svc_sender_allocation_info: &[],
@@ -1066,13 +1070,12 @@ mod tests {
     fn test_split_gives_the_whole_budget_to_the_only_pool_with_demand() {
         // An SVC-only call: the simulcast pool has no senders, so it must not hold back any
         // of the receiver's budget.
-        let (svc_frac, simulcast_frac) = fractions(kbps(2000), DataRate::ZERO);
         let (svc_budget, simulcast_budget) = split_target_send_rate(SplitTargetSendRateArgs {
             target_send_rate: kbps(1000),
             min_target_send_rate: kbps(1000),
             drain_rate: DataRate::ZERO,
-            svc_target_rate_fraction: svc_frac,
-            simulcast_target_rate_fraction: simulcast_frac,
+            svc_ideal_send_rate: kbps(2000),
+            simulcast_ideal_send_rate: DataRate::ZERO,
             svc_requested_base_rate: kbps(200),
             simulcast_requested_base_rate: DataRate::ZERO,
             svc_sender_allocation_info: &[],
@@ -1099,14 +1102,14 @@ mod tests {
             video.ideal_layer_index = None;
         }
 
-        for (svc_frac, simulcast_frac) in [(0.99, 0.01), (0.01, 0.99)] {
+        for (svc_ideal, simulcast_ideal) in [(kbps(9900), kbps(100)), (kbps(100), kbps(9900))] {
             let split = |svc_sender_allocation_info, simulcast_allocatable_videos| {
                 split_target_send_rate(SplitTargetSendRateArgs {
                     target_send_rate: kbps(1000),
                     min_target_send_rate: kbps(1000),
                     drain_rate: DataRate::ZERO,
-                    svc_target_rate_fraction: svc_frac,
-                    simulcast_target_rate_fraction: simulcast_frac,
+                    svc_ideal_send_rate: svc_ideal,
+                    simulcast_ideal_send_rate: simulcast_ideal,
                     svc_requested_base_rate: kbps(40 * 100),
                     simulcast_requested_base_rate: kbps(5 * 150),
                     svc_sender_allocation_info,
@@ -1116,14 +1119,14 @@ mod tests {
             assert_eq!(
                 split(&svc_senders, &simulcast_videos),
                 split(&[], &[]),
-                "fractions ({svc_frac}, {simulcast_frac})"
+                "ideals ({svc_ideal}, {simulcast_ideal})"
             );
         }
     }
 
     #[test]
     fn test_split_gives_the_short_pool_any_excess_over_a_reservation() {
-        // The base rates don't both fit, and SVC dominates the ideal demand: its proportional
+        // The base rates don't both fit, and SVC dominates the ideal demand (93%): its proportional
         // share (837kbps) is more than its reservation (750kbps), while the simulcast pool's
         // share (63kbps) is short of its own (300kbps). The SVC pool keeps its reservation and
         // the simulcast pool gets the rest, rather than the SVC pool keeping the excess.
@@ -1131,8 +1134,8 @@ mod tests {
             target_send_rate: kbps(900),
             min_target_send_rate: kbps(900),
             drain_rate: DataRate::ZERO,
-            svc_target_rate_fraction: 0.93,
-            simulcast_target_rate_fraction: 0.07,
+            svc_ideal_send_rate: kbps(3990),
+            simulcast_ideal_send_rate: kbps(300),
             svc_requested_base_rate: kbps(750),
             simulcast_requested_base_rate: kbps(300),
             svc_sender_allocation_info: &[],
@@ -1172,13 +1175,12 @@ mod tests {
         let svc_base = svc::allocator::calculate_base_rate(&svc_senders, &svc_ideal_targets);
         let simulcast_ideal = simulcast::ideal_send_rate(&simulcast_videos);
         let simulcast_base = simulcast::requested_base_rate(&simulcast_videos, DataRate::MAX);
-        let (svc_frac, simulcast_frac) = fractions(svc_ideal, simulcast_ideal);
         let (svc_budget, simulcast_budget) = split_target_send_rate(SplitTargetSendRateArgs {
             target_send_rate: target,
             min_target_send_rate: target,
             drain_rate: DataRate::ZERO,
-            svc_target_rate_fraction: svc_frac,
-            simulcast_target_rate_fraction: simulcast_frac,
+            svc_ideal_send_rate: svc_ideal,
+            simulcast_ideal_send_rate: simulcast_ideal,
             svc_requested_base_rate: svc_base,
             simulcast_requested_base_rate: simulcast_base,
             svc_sender_allocation_info: &svc_senders,
@@ -1246,13 +1248,12 @@ mod tests {
             let svc_base = svc::allocator::calculate_base_rate(&svc_senders, &svc_ideal_targets);
             let simulcast_ideal = simulcast::ideal_send_rate(&simulcast_videos);
             let simulcast_base = simulcast::requested_base_rate(&simulcast_videos, DataRate::MAX);
-            let (svc_frac, simulcast_frac) = fractions(svc_ideal, simulcast_ideal);
             let (svc_budget, simulcast_budget) = split_target_send_rate(SplitTargetSendRateArgs {
                 target_send_rate: target,
                 min_target_send_rate: target,
                 drain_rate: DataRate::ZERO,
-                svc_target_rate_fraction: svc_frac,
-                simulcast_target_rate_fraction: simulcast_frac,
+                svc_ideal_send_rate: svc_ideal,
+                simulcast_ideal_send_rate: simulcast_ideal,
                 svc_requested_base_rate: svc_base,
                 simulcast_requested_base_rate: simulcast_base,
                 svc_sender_allocation_info: &svc_senders,
@@ -1288,5 +1289,170 @@ mod tests {
                  {simulcast_budget})"
             );
         }
+    }
+
+    #[test]
+    fn test_split_lets_both_pools_reach_ideal_when_everything_fits() {
+        // When the target covers both pools' ideal rates, every sender should get its ideal
+        // layer. This call has:
+        // - a simulcast active speaker requested at 720p, with layers of 150, 450 and 1125kbps,
+        //   so its base is 150kbps and its ideal 1125kbps;
+        // - four SVC thumbnails requested at 360p, with decode targets of 100, 300 and 750kbps
+        //   each, so the pool's base is 400kbps and its ideal 1200kbps.
+        // The ideal total is 2325kbps, and the target is 2400kbps.
+        let target = kbps(2400);
+        let svc_lists = generate_svc_pool_entries(kbps(400), 4);
+        let mut svc_senders = get_sender_allocation_info(&svc_lists);
+        for info in &mut svc_senders {
+            info.requested_height = Some(VideoHeight::from(LAYER_HEIGHTS[1]));
+        }
+        let mut simulcast_videos = generate_simulcast_entries(kbps(150), 1);
+        simulcast_videos[0].interesting = Some(Instant::now());
+        let speaker = simulcast_videos[0].sender_demux_id;
+
+        // Derive the pools' rates the way `allocate` does.
+        let svc_ideal_targets = svc::allocator::find_ideal_decode_targets(&svc_senders);
+        let svc_ideal = svc::allocator::calculate_ideal_send_rate(&svc_senders, &svc_ideal_targets);
+        let svc_base = svc::allocator::calculate_base_rate(&svc_senders, &svc_ideal_targets);
+        let simulcast_ideal = simulcast::ideal_send_rate(&simulcast_videos);
+        let simulcast_base = simulcast::requested_base_rate(&simulcast_videos, DataRate::MAX);
+        assert_eq!(svc_ideal, kbps(1200));
+        assert_eq!(simulcast_ideal, kbps(1125));
+        assert!(svc_ideal + simulcast_ideal <= target);
+
+        // Both bases are reserved (550kbps). Of the remaining 1850kbps, each pool first gets what
+        // it needs to reach its ideal (800kbps for SVC, 975kbps for simulcast), and the last
+        // 75kbps is split by ideal rates. The SVC pool gets 1239kbps and the simulcast pool
+        // 1161kbps. Splitting all 1850kbps by ideal rates would instead give the SVC pool
+        // 1355kbps, more than it can use, and the simulcast pool 1045kbps, short of the
+        // speaker's 1125kbps layer.
+        let (svc_budget, simulcast_budget) = split_target_send_rate(SplitTargetSendRateArgs {
+            target_send_rate: target,
+            min_target_send_rate: target,
+            drain_rate: DataRate::ZERO,
+            svc_ideal_send_rate: svc_ideal,
+            simulcast_ideal_send_rate: simulcast_ideal,
+            svc_requested_base_rate: svc_base,
+            simulcast_requested_base_rate: simulcast_base,
+            svc_sender_allocation_info: &svc_senders,
+            simulcast_allocatable_videos: &simulcast_videos,
+        });
+
+        // Allocate each pool from its share, as `allocate` does. Neither pool allocator can use
+        // more than its pool's ideal, and neither pool's unused share goes to the other pool.
+        let svc_result = svc::allocator::allocate(
+            svc_budget,
+            scale_to_pool_share(target, svc_budget, target),
+            TARGET_RATE_MINIMUM_ALLOCATION_RATIO,
+            DataRate::ZERO,
+            svc_ideal,
+            &svc_senders,
+            &svc_ideal_targets,
+        );
+        let simulcast_result = simulcast::allocate_send_rate(
+            simulcast_budget,
+            scale_to_pool_share(target, simulcast_budget, target),
+            simulcast_ideal,
+            DataRate::ZERO,
+            &simulcast_videos,
+        );
+
+        // Every thumbnail gets its 360p decode target.
+        assert!(
+            svc_result
+                .selected_decode_targets
+                .iter()
+                .all(|selected| selected.decode_target == Some(1)),
+            "thumbnails not at 360p: svc budget {svc_budget}"
+        );
+        // The speaker gets its 720p layer.
+        assert_eq!(
+            simulcast_result[&speaker].layer_index, 2,
+            "speaker not at 720p: simulcast budget {simulcast_budget}"
+        );
+    }
+
+    #[test]
+    fn test_split_gives_the_surplus_to_the_pool_that_can_use_it() {
+        // When the target covers both pools' bases but not both ideals, the surplus should go to
+        // the pool that can still move up. This call has:
+        // - a simulcast active speaker requested at 720p, with layers of 150, 450 and 1125kbps,
+        //   so its base is 150kbps and its ideal 1125kbps;
+        // - forty SVC thumbnails requested at 180p, with a 100kbps decode target each, so the
+        //   pool's base and ideal are both 4000kbps and it has no headroom.
+        // The bases total 4150kbps, and the target is 4650kbps.
+        let target = kbps(4650);
+        let svc_lists = generate_svc_pool_entries(kbps(4000), 40);
+        let mut svc_senders = get_sender_allocation_info(&svc_lists);
+        for info in &mut svc_senders {
+            info.requested_height = Some(VideoHeight::from(LAYER_HEIGHTS[0]));
+        }
+        let mut simulcast_videos = generate_simulcast_entries(kbps(150), 1);
+        simulcast_videos[0].interesting = Some(Instant::now());
+        let speaker = simulcast_videos[0].sender_demux_id;
+
+        // Derive the pools' rates the way `allocate` does.
+        let svc_ideal_targets = svc::allocator::find_ideal_decode_targets(&svc_senders);
+        let svc_ideal = svc::allocator::calculate_ideal_send_rate(&svc_senders, &svc_ideal_targets);
+        let svc_base = svc::allocator::calculate_base_rate(&svc_senders, &svc_ideal_targets);
+        let simulcast_ideal = simulcast::ideal_send_rate(&simulcast_videos);
+        let simulcast_base = simulcast::requested_base_rate(&simulcast_videos, DataRate::MAX);
+        assert_eq!(svc_ideal, kbps(4000));
+        assert_eq!(svc_base, kbps(4000));
+        assert_eq!(simulcast_ideal, kbps(1125));
+
+        // Both bases are reserved (4150kbps). The remaining 500kbps is less than the 975kbps the
+        // simulcast pool needs to reach its ideal, and the SVC pool needs nothing, so all of it
+        // goes to the simulcast pool: 650kbps, enough for the speaker's 450kbps layer. Splitting
+        // the 500kbps by ideal rates would instead give the SVC pool 390kbps it can't use, and
+        // leave the simulcast pool 260kbps, enough only for the speaker's 150kbps layer.
+        let (svc_budget, simulcast_budget) = split_target_send_rate(SplitTargetSendRateArgs {
+            target_send_rate: target,
+            min_target_send_rate: target,
+            drain_rate: DataRate::ZERO,
+            svc_ideal_send_rate: svc_ideal,
+            simulcast_ideal_send_rate: simulcast_ideal,
+            svc_requested_base_rate: svc_base,
+            simulcast_requested_base_rate: simulcast_base,
+            svc_sender_allocation_info: &svc_senders,
+            simulcast_allocatable_videos: &simulcast_videos,
+        });
+        assert!(svc_budget < kbps(4001), "got svc budget {svc_budget}");
+        assert!(
+            simulcast_budget > kbps(649),
+            "got simulcast budget {simulcast_budget}"
+        );
+
+        // Allocate each pool from its share, as `allocate` does.
+        let svc_result = svc::allocator::allocate(
+            svc_budget,
+            scale_to_pool_share(target, svc_budget, target),
+            TARGET_RATE_MINIMUM_ALLOCATION_RATIO,
+            DataRate::ZERO,
+            svc_ideal,
+            &svc_senders,
+            &svc_ideal_targets,
+        );
+        let simulcast_result = simulcast::allocate_send_rate(
+            simulcast_budget,
+            scale_to_pool_share(target, simulcast_budget, target),
+            simulcast_ideal,
+            DataRate::ZERO,
+            &simulcast_videos,
+        );
+
+        // Every thumbnail still gets its 180p decode target.
+        assert!(
+            svc_result
+                .selected_decode_targets
+                .iter()
+                .all(|selected| selected.decode_target == Some(0)),
+            "thumbnails not at 180p: svc budget {svc_budget}"
+        );
+        // The speaker moves up to its 360p layer.
+        assert_eq!(
+            simulcast_result[&speaker].layer_index, 1,
+            "speaker not at 360p: simulcast budget {simulcast_budget}"
+        );
     }
 }
