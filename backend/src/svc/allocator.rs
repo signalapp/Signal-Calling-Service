@@ -9,10 +9,7 @@ use calling_common::{DataRate, DemuxId, Instant, VideoHeight};
 use metrics::{metric_config::TimingOptions, time_scope};
 use smallvec::SmallVec;
 
-use crate::{
-    rtp::MAX_DECODE_TARGETS,
-    svc::{DecodeTarget, DecodeTargetInfo, DecodeTargetInfoList, MAX_EXPECTED_CLIENTS},
-};
+use crate::svc::{DecodeTarget, DecodeTargetInfo, DecodeTargetInfoList, MAX_EXPECTED_CLIENTS};
 
 /// This structure represents a selected decode target.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -170,8 +167,6 @@ pub fn allocate(
         .max()
         .unwrap_or(0);
 
-    debug_assert!(max_targets <= MAX_DECODE_TARGETS);
-
     let mut selected_decode_targets = SelectedDecodeTargets::default();
     for info in sender_allocation_info {
         selected_decode_targets.push(SelectedDecodeTarget {
@@ -240,8 +235,6 @@ pub fn calculate_ideal_send_rate(
     target_infos: &[SenderAllocationInfo<'_>],
     ideal_decode_targets: &SelectedDecodeTargets,
 ) -> DataRate {
-    debug_assert_eq!(target_infos.len(), ideal_decode_targets.len());
-
     target_infos
         .iter()
         .zip(ideal_decode_targets)
@@ -253,14 +246,11 @@ pub fn calculate_ideal_send_rate(
         .sum()
 }
 
-/// Calculates the base rate. The senders in the `sender_allocation_info` array
-/// are expected to be sorted in the order of preference.
+/// Calculates the base rate.
 pub fn calculate_base_rate(
     target_infos: &[SenderAllocationInfo<'_>],
     ideal_decode_targets: &SelectedDecodeTargets,
 ) -> DataRate {
-    debug_assert_eq!(target_infos.len(), ideal_decode_targets.len());
-
     target_infos
         .iter()
         .zip(ideal_decode_targets)
