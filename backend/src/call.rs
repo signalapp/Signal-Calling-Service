@@ -1532,6 +1532,7 @@ impl CallInner {
     ) -> Result<(), Error> {
         // Snapshot this so we can get a mutable reference to the sender.
         let default_requested_max_send_rate = call_info.default_requested_max_send_rate;
+        let demux_ids = self.clients.demux_ids();
 
         let sender = self
             .clients
@@ -1553,7 +1554,7 @@ impl CallInner {
 
                     if let Some(raw_demux_id) = request.demux_id {
                         let demux_id = DemuxId::try_from(raw_demux_id).ok()?;
-                        Some((demux_id, height))
+                        demux_ids.contains(&demux_id).then_some((demux_id, height))
                     } else {
                         None
                     }
@@ -2837,7 +2838,6 @@ impl Clients {
         self.0.values_mut()
     }
 
-    #[cfg(test)]
     fn demux_ids(&self) -> Vec<DemuxId> {
         self.0.keys().cloned().collect()
     }
